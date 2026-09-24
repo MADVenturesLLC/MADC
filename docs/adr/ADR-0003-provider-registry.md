@@ -4,7 +4,7 @@
 - **Date:** 2026-09-24
 - **Sources:** [PLAN-madc-idea-plan-v2.md](../plan/PLAN-madc-idea-plan-v2.md) §6.2, §6.3, §9;
   [planning record](../plan/PLAN-MAD-AGENT-planning-record.md) Appendix R (amendment 13);
-  `subscription-lanes-2026-09-24.md` (not yet in this repo)
+  [subscription-lanes-2026-09-24.md](../plan/subscription-lanes-2026-09-24.md)
 
 ## Context
 
