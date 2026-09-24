@@ -1,0 +1,17 @@
+#!/bin/sh
+# Runs the same checks as CI before anything leaves this machine.
+# Installed by `npm install` (the "prepare" script sets core.hooksPath=.githooks).
+set -e
+
+echo "pre-push: typecheck"
+npm run --silent typecheck
+echo "pre-push: lint"
+npm run --silent lint
+echo "pre-push: test (node)"
+npm run --silent test:node
+if command -v bun >/dev/null 2>&1; then
+  echo "pre-push: test (bun)"
+  bun test
+else
+  echo "pre-push: bun not found; CI will still run the Bun job" >&2
+fi

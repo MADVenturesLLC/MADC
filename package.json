@@ -1,0 +1,27 @@
+{
+  "name": "madc-workspace",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=22.19.0",
+    "bun": ">=1.2.0"
+  },
+  "scripts": {
+    "prepare": "git config core.hooksPath .githooks || true",
+    "typecheck": "tsc -p tsconfig.json",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "test": "npm run test:node",
+    "test:node": "node --test \"packages/*/src/**/*.test.ts\"",
+    "test:bun": "bun test",
+    "check": "npm run typecheck && npm run lint && npm run test:node && npm run test:bun"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.14",
+    "@types/node": "^22.20.4",
+    "typescript": "^7.0.2"
+  }
+}

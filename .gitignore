@@ -1,0 +1,35 @@
+# Dependencies and build output
+node_modules/
+dist/
+*.tsbuildinfo
+coverage/
+
+# Secrets: never commit keys or env files
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+secrets/
+credentials*.json
+auth.json
+
+# Session records and agent transcripts
+sessions/
+.sessions/
+*.session.json
+*.transcript.jsonl
+transcripts/
+.madc/
+.claude/settings.local.json
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.log
