@@ -4,7 +4,7 @@
 - **Date:** 2026-09-24
 - **Sources:** [PLAN-madc-idea-plan-v2.md](../plan/PLAN-madc-idea-plan-v2.md) §11.2, §12.2;
   [planning record](../plan/PLAN-MAD-AGENT-planning-record.md) Appendix R (ruling 1, amendment 10);
-  `pi-check-2026-09-24.md` (not yet in this repo)
+  [pi-check-2026-09-24.md](../plan/pi-check-2026-09-24.md)
 - **Relates to:** planning-record ADR-01 (omp), ruled HYBRID
 
 ## Context
