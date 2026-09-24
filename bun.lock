@@ -10,8 +10,30 @@
         "typescript": "^7.0.2",
       },
     },
+    "packages/adapters": {
+      "name": "@madc/adapters",
+      "version": "0.0.0",
+    },
+    "packages/cli": {
+      "name": "@madc/cli",
+      "version": "0.0.0",
+      "bin": {
+        "madc": "./src/bin.ts",
+      },
+      "dependencies": {
+        "@madc/core": "*",
+      },
+    },
     "packages/core": {
       "name": "@madc/core",
+      "version": "0.0.0",
+    },
+    "packages/engine": {
+      "name": "@madc/engine",
+      "version": "0.0.0",
+    },
+    "packages/registry": {
+      "name": "@madc/registry",
       "version": "0.0.0",
     },
   },
@@ -34,7 +56,15 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.14", "", { "os": "win32", "cpu": "x64" }, "sha512-oJWmBhoHsnhUKIke+0gXDX0mltJrWHA1UyHsrTlXwX0TL64ilVZAo+TYZm97baecV0esBdpzy3k96q+09JaZUQ=="],
 
+    "@madc/adapters": ["@madc/adapters@workspace:packages/adapters"],
+
+    "@madc/cli": ["@madc/cli@workspace:packages/cli"],
+
     "@madc/core": ["@madc/core@workspace:packages/core"],
+
+    "@madc/engine": ["@madc/engine@workspace:packages/engine"],
+
+    "@madc/registry": ["@madc/registry@workspace:packages/registry"],
 
     "@types/node": ["@types/node@22.20.4", "", { "dependencies": { "undici-types": "~6.21.0" } }, "sha512-zJRE40jpHtKqE/C4fgHrAKQLJuSpzEnP9ff9Y7YtoR3Wd2pwqzlekDeEuUQXjRd+QCYnVnNwuJYmhdk9XV8gvA=="],
 

@@ -1,6 +1,7 @@
 # ADR-0003: Rules-aware provider registry
 
-- **Status:** PROPOSED — pending Founder ruling
+- **Status:** ACCEPTED
+- **Accepted:** Accepted by Founder 2026-09-24 (madc M0 commission; PLAN-madc-M0-build-plan.md).
 - **Date:** 2026-09-24
 - **Sources:** [PLAN-madc-idea-plan-v2.md](../plan/PLAN-madc-idea-plan-v2.md) §6.2, §6.3, §9;
   [planning record](../plan/PLAN-MAD-AGENT-planning-record.md) Appendix R (amendment 13);

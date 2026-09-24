@@ -1,2 +1,2 @@
-// Placeholder. No engine code lands here until ADR-0001..0003 are ruled on.
+// Placeholder. ADRs ACCEPTED; engine loop and protocol still land in later M0 acts.
 export const MADC_VERSION = "0.0.0";

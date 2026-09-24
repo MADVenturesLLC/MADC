@@ -1,6 +1,7 @@
 # ADR-0002: Native protocol — Codex app-server thread/turn/item, ACP as an adapter
 
-- **Status:** PROPOSED — pending Founder ruling
+- **Status:** ACCEPTED
+- **Accepted:** Accepted by Founder 2026-09-24 (madc M0 commission; PLAN-madc-M0-build-plan.md).
 - **Date:** 2026-09-24
 - **Sources:** [PLAN-madc-idea-plan-v2.md](../plan/PLAN-madc-idea-plan-v2.md) §6.1;
   [planning record](../plan/PLAN-MAD-AGENT-planning-record.md) Appendix R (amendment 11)
