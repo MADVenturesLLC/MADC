@@ -20,6 +20,7 @@ import {
   fileId,
   holdsThreadLock,
   isPidAlive,
+  lockGuardPath,
   readLock,
   reclaimIfUnchanged,
   releaseThreadLock,
@@ -296,6 +297,52 @@ test("lock: reclaim never deletes a lock that changed after it was judged dead",
   }
 });
 
+test("lock: reclaim/release defer to a live mutation guard; a dead holder's guard is broken", async () => {
+  const { home, cleanup } = makeHome();
+  const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+    stdio: "ignore",
+  });
+  try {
+    const dead = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    const deadPid = dead.pid ?? 0;
+    await new Promise((r) => dead.once("exit", r));
+    const path = threadLockPath(home, "thr_g");
+    const guard = lockGuardPath(path);
+
+    // Another live engine is mid-reclaim/release (holds the guard): we must not touch the lock.
+    writeFileSync(path, JSON.stringify({ pid: deadPid, startedAt: 1 }));
+    const seenId = fileId(path);
+    assert.ok(seenId);
+    writeFileSync(guard, JSON.stringify({ pid: other.pid, startedAt: 1 }));
+    assert.equal(reclaimIfUnchanged(path, seenId, readLock(path)), false);
+    assert.equal(readLock(path).state, "held", "dead lock left for the guard holder");
+    unlinkSync(path);
+
+    const mine = acquireThreadLock(home, "thr_g");
+    assert.equal(mine.ok, true);
+    if (!mine.ok) return;
+    assert.equal(releaseThreadLock(mine.handle), false);
+    assert.equal(holdsThreadLock(mine.handle), true, "lock untouched while guard is held");
+
+    // Guard released → release proceeds; no stray guard/temp files.
+    unlinkSync(guard);
+    assert.equal(releaseThreadLock(mine.handle), true);
+    assert.equal(readLock(path).state, "missing");
+
+    // A guard left behind by a crashed (dead) process is broken, then cleaned up.
+    const again = acquireThreadLock(home, "thr_g");
+    assert.equal(again.ok, true);
+    if (!again.ok) return;
+    writeFileSync(guard, JSON.stringify({ pid: deadPid, startedAt: 1 }));
+    assert.equal(releaseThreadLock(again.handle), true);
+    assert.equal(readLock(path).state, "missing");
+    assert.deepEqual(readdirSync(join(home, "sessions")), [], "no stray guard/temp files");
+  } finally {
+    other.kill();
+    cleanup();
+  }
+});
+
 test("lock: a stale handle never deletes a replacement lock (per-acquisition identity)", () => {
   const { home, cleanup } = makeHome();
   try {
@@ -317,11 +364,11 @@ test("lock: a stale handle never deletes a replacement lock (per-acquisition ide
 
     releaseThreadLock(first.handle); // stale → must leave the replacement in place
     assert.equal(readLock(first.path).state, "held");
-    assert.equal(holdsThreadLock(second.handle), true, "replacement lock restored intact");
+    assert.equal(holdsThreadLock(second.handle), true, "replacement lock left intact");
     assert.deepEqual(
       readdirSync(join(home, "sessions")).filter((f) => f !== "thr_c.lock"),
       [],
-      "no stray temp/release files",
+      "no stray temp/guard files",
     );
     releaseThreadLock(second.handle);
     assert.equal(readLock(first.path).state, "missing");
