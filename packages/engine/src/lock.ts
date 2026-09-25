@@ -71,17 +71,38 @@ function removeQuietly(path: string): void {
 
 // Every lock read goes through one fd opened with O_NOFOLLOW (a symlink at the path fails with
 // ELOOP instead of being followed) and O_NONBLOCK (a FIFO planted there cannot block the engine);
-// the fd is then checked with fstat to be a regular file. Platforms without O_NOFOLLOW fall back to
-// an lstat pre-check (residual race there only).
+// the fd is then checked with fstat to be a regular file.
 const HAS_NOFOLLOW = typeof constants.O_NOFOLLOW === "number";
 const OPEN_READ_NOFOLLOW =
   constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
 
-/** Open `path` for reading without following a symlink. Null if missing; "symlink" if it is one. */
-function openNoFollow(path: string): number | null | "symlink" {
+/** Test seams for `openNoFollow`. */
+export type OpenNoFollowOptions = { noFollowFlag?: boolean; afterLstat?: () => void };
+
+/**
+ * Open `path` for reading without following a symlink. Null if missing; "symlink" if it is one (or
+ * if the path changed while it was opened). Without O_NOFOLLOW (e.g. Windows) the check is
+ * lstat → open → fstat, and the fd is accepted only if it is the very file lstat saw (same dev +
+ * inode): a swap to a symlink between lstat and open yields a different inode and is refused, so a
+ * symlink target is never read or trusted. Internal; exported for tests.
+ */
+export function openNoFollow(
+  path: string,
+  opts: OpenNoFollowOptions = {},
+): number | null | "symlink" {
+  const noFollowFlag = opts.noFollowFlag ?? HAS_NOFOLLOW;
   try {
-    if (!HAS_NOFOLLOW && lstatSync(path).isSymbolicLink()) return "symlink";
-    return openSync(path, OPEN_READ_NOFOLLOW);
+    if (noFollowFlag) return openSync(path, OPEN_READ_NOFOLLOW);
+    const seen = lstatSync(path, { bigint: true });
+    if (seen.isSymbolicLink()) return "symlink";
+    opts.afterLstat?.();
+    const fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    const opened = fstatSync(fd, { bigint: true });
+    if (opened.dev !== seen.dev || opened.ino !== seen.ino) {
+      closeSync(fd);
+      return "symlink";
+    }
+    return fd;
   } catch (err) {
     const code = errCode(err);
     if (code === "ENOENT") return null;

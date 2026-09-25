@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
+  closeSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -23,6 +24,7 @@ import {
   isPidAlive,
   LOCK_TOKEN_PATTERN,
   LockPathNotAFileError,
+  openNoFollow,
   readLock,
   reclaimIfUnchanged,
   releaseThreadLock,
@@ -458,6 +460,40 @@ test("lock: a directory or FIFO at the lock path is refused, never reclaimed or 
       releaseThreadLock({ path: fifo, pid: process.pid, startedAt: 1, token: TOKEN_A }),
       false,
     );
+  } finally {
+    cleanup();
+  }
+});
+
+test("lock: without O_NOFOLLOW, a swap to a symlink between lstat and open is refused", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const path = threadLockPath(home, "thr_n");
+    const target = join(home, "..", "target-n.json");
+    writeFileSync(target, JSON.stringify({ pid: process.pid, startedAt: 1, token: TOKEN_A }));
+    writeFileSync(path, JSON.stringify({ pid: process.pid, startedAt: 1, token: TOKEN_B }));
+    let swapped = false;
+    const fd = openNoFollow(path, {
+      noFollowFlag: false,
+      afterLstat: () => {
+        unlinkSync(path);
+        try {
+          symlinkSync(target, path);
+          swapped = true;
+        } catch {
+          // symlinks unavailable
+        }
+      },
+    });
+    if (typeof fd === "number") closeSync(fd);
+    if (!swapped) return;
+    assert.equal(fd, "symlink", "the symlink target is never opened as the lock");
+    // Untouched regular file: fallback path opens it.
+    unlinkSync(path);
+    writeFileSync(path, "{}");
+    const ok = openNoFollow(path, { noFollowFlag: false });
+    assert.equal(typeof ok, "number");
+    if (typeof ok === "number") closeSync(ok);
   } finally {
     cleanup();
   }
