@@ -669,6 +669,15 @@ test("A7 §3 doctor never follows a sessions symlink out of MADC_HOME; a non-dir
       join(outside, "thr_x.lock"),
       JSON.stringify({ pid: 4_194_301, startedAt: Date.now(), token }),
     );
+    // A dangling sessions symlink is still a symlink: WARN, never PASS "no locks".
+    symlinkSync(join(sb.root, "gone"), join(sb.home, "sessions"));
+    const dangling = check(
+      JSON.parse((await runCli(sb, ["doctor", "--json"])).stdout) as DoctorJson,
+      "locks",
+    );
+    assert.equal(dangling.status, "warn");
+    assert.match(dangling.summary, /not inspected/);
+    rmSync(join(sb.home, "sessions"));
     symlinkSync(outside, join(sb.home, "sessions"));
     const before = snapshot(outside);
     const r = await runCli(sb, ["doctor", "--json"]);
@@ -724,6 +733,29 @@ test("A7 §2 a first SIGINT while turn/start is in flight still sends turn/inter
     const out = JSON.parse(r.stdout) as { turn: { status: string }; session: { chain: string } };
     assert.equal(out.turn.status, "interrupted");
     assert.equal(out.session.chain, "verified");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("A7 §4 exit 3: a non-JSON engine line mid-turn ends the turn wait even if the engine hangs (Copilot r4107904955)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    const started = Date.now();
+    const r = await runCli(sb, ["-p", "hi", "--json"], {
+      engine: FAKE,
+      env: { MADC_TEST_FAKE_SCENARIO: "junk-hang" },
+      onSpawn: (child) => {
+        setTimeout(() => child.kill("SIGKILL"), 20_000).unref();
+      },
+    });
+    assert.equal(r.code, 3, r.stdout + r.stderr);
+    const out = JSON.parse(r.stdout) as { error: { class: string; message: string } };
+    assert.equal(out.error.class, "engine");
+    assert.match(out.error.message, /protocol violation/);
+    assert.ok(Date.now() - started < 15_000, "did not wait for the turn");
   } finally {
     sb.cleanup();
   }
