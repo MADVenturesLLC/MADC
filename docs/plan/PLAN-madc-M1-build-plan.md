@@ -91,9 +91,9 @@ Each act is its own PR (stacked is fine) based on current `main`. Founder merges
 
 ### M1-A0 — Pin amendments accepted (Surface Architect gate, docs only)
 
-- **Scope:** Surface Architect turns §9 PROPOSED AMENDMENTS into **new dated pin files that supersede** the M0 pins (for example `PIN-madc-M1-protocol-messages.md`, `PIN-madc-M1-seat-format.md`). Per `docs/plan/README.md`, dated planning files stay verbatim. However, PR #8 (`main` @ `2e26b4d`) set a precedent: a Founder-authorized, in-place, numbered amendment (Amendment 1, lock token) to the M0 protocol pin. Surface picks the form (superseding files, or numbered in-place amendments with Founder authorization), and **either way every M1 pin carries Amendment 1 forward unchanged.** Daedalus does not edit pins.
-- **Files:** new `docs/plan/PIN-madc-M1-*.md` (Surface only), `docs/plan/README.md` index rows (mark the M0 pins as superseded).
-- **Acceptance:** Founder merges the pin PR. Hephaestus acts A1+ cite the merged pin SHA.
+- **Scope:** Surface Architect turns §9 PROPOSED AMENDMENTS into accepted pin text, by default as **new dated pin files that supersede** the M0 pins (for example `PIN-madc-M1-protocol-messages.md`, `PIN-madc-M1-seat-format.md`). Per `docs/plan/README.md`, dated planning files stay verbatim. However, PR #8 (`main` @ `2e26b4d`) set a precedent: a Founder-authorized, in-place, numbered amendment (Amendment 1, lock token) to the M0 protocol pin. Surface picks the form (superseding files, or numbered in-place amendments with Founder authorization), and **either way every M1 pin carries Amendment 1 forward unchanged.** Daedalus does not edit pins.
+- **Files (depend on the form Surface picks):** superseding form: new `docs/plan/PIN-madc-M1-*.md` plus `docs/plan/README.md` index rows marking the M0 pins as superseded. In-place form: numbered, Founder-authorized amendments inside `docs/plan/PIN-madc-M0-*.md` (as PR #8 did), with no new pin files and no superseded marking. Surface only, either way.
+- **Acceptance:** Founder merges the pin PR, whichever form it uses. Hephaestus acts A1+ cite the merged pin SHA.
 - **Forbidden:** code; changing M0 semantics that M0 tests already lock without a Founder note.
 
 ### M1-A1 — Registry v2 (pure)
