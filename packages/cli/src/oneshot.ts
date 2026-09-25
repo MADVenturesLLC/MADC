@@ -126,7 +126,10 @@ function isTurnShape(t: unknown): t is Turn {
     (r.completedAt === null || typeof r.completedAt === "number") &&
     // Copilot r4108941737: `error` is required, and is null or an RPC error body.
     Object.hasOwn(r, "error") &&
-    (r.error === null || isErrorBody(r.error))
+    (r.error === null || isErrorBody(r.error)) &&
+    // Protocol type: `error` is set iff the status is `failed` (Copilot r4109224803), so a
+    // `completed` turn carrying an error can never map to exit 0. Status strings stay verbatim.
+    (r.status === "failed") === (r.error !== null)
   );
 }
 
