@@ -21,7 +21,7 @@
 | Framing | JSON-RPC 2.0 *shape*: request `{ id, method, params? }`, response `{ id, result }` or `{ id, error }`, notification `{ method, params }` (no `id`). |
 | `jsonrpc` field | **Omitted** by the engine (Codex app-server convention). Parsers on both sides must accept messages with or without `"jsonrpc":"2.0"`. |
 | Encoding | UTF-8. No binary frames. stderr is logs only — never protocol. |
-| IDs | Request `id`: number or string. Domain ids (`threadId`, `turnId`, `itemId`): opaque strings (`thr_…`, `turn_…`, `item_…` recommended). |
+| IDs | Request `id`: number or string. Domain ids (`threadId`, `turnId`, `itemId`) and `seatId`: opaque strings matching `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$` (no `.`, `/`, `\`, whitespace, or control chars; `thr_…`, `turn_…`, `item_…` recommended). Any other value → `-32602` **before** it is joined into a path. |
 
 Engine process owns the protocol host. CLI is a client only (no loop/tools/adapters in `packages/cli`; plan §6 import rules).
 
@@ -76,6 +76,7 @@ Connection lifecycle:
 
 `UserInput` M0: `{ type: "text", text: string }` only.
 **One active turn per thread in M0:** `turn/start` while a turn is `inProgress` on that thread → `-32004 TurnAlreadyActive`.
+**Cross-process ownership:** each CLI run spawns its own engine, so the rule is enforced on disk. `thread/start` / `thread/resume` take an exclusive lock `sessions/<threadId>.lock` (create-exclusive, contents `{ pid, startedAt }`) held until the connection ends. Lock held by a live process → `-32004` with `activeTurnId: null` and `lockHolderPid`; lock whose pid is dead is reclaimed. Only the lock holder appends to `sessions/<threadId>.jsonl`.
 
 ### 3.4 Items (notifications only)
 
@@ -106,7 +107,7 @@ Response error shape: `{ id, error: { code: number, message: string, data?: obje
 | -32001 | AlreadyInitialized | Second `initialize` on the same connection. | omitted |
 | -32002 | ThreadNotFound | `thread/resume`, `turn/start`, `turn/interrupt` with unknown `threadId`. | `{ threadId: string }` |
 | -32003 | TurnNotFound | `turn/interrupt` with a `turnId` not in that thread. | `{ threadId: string, turnId: string }` |
-| -32004 | TurnAlreadyActive | `turn/start` while the thread has an `inProgress` turn (one active turn per thread in M0). | `{ threadId: string, activeTurnId: string }` |
+| -32004 | TurnAlreadyActive | `turn/start` while the thread has an `inProgress` turn (one active turn per thread in M0), or `thread/start` / `thread/resume` / `turn/start` on a thread locked by another engine process (§3.3). | `{ threadId: string, activeTurnId: string \| null, lockHolderPid?: number }` |
 | -32005 | SeatNotFound | `thread/start.seatId` has no `seats/<id>.json` (`madc-default` is auto-seeded, so this is non-default ids). | `{ seatId: string, path: string }` |
 | -32006 | SeatInvalid | Seat file unreadable, not JSON, or fails seat schema (see seat pin §2). | `{ seatId: string, path: string, issues: string[] }` |
 | -32007 | ProviderDenied | `assertAllowed` throws `RegistryDeniedError` with reason `unknown-provider` \| `forbidden` \| `interactive-only-headless` \| `connect-mismatch`. | `{ providerId: string, status: ProviderStatus \| null, reason: DenyReason }` (`status` null for `unknown-provider`) |
@@ -255,7 +256,7 @@ A2 is done when all pass on **Node 22.19 and Bun**:
 1. Engine starts as a child process; `initialize` / `initialized` handshake completes.
 2. Round-trip test (no live providers): `thread/start` → `turn/start` (text) → fake/echo agent emits `item/started` + `item/completed` for `userMessage` and `agentMessage` → `turn/completed` with status `completed`.
 3. `turn/interrupt` yields `turn/completed` with status `interrupted`.
-4. Error tests: request before `initialize` → `-32000`; unknown method → `-32601`; unknown `threadId` → `-32002`; second `turn/start` on an active thread → `-32004`; malformed line → `-32700`.
+4. Error tests: request before `initialize` → `-32000`; unknown method → `-32601`; unknown `threadId` → `-32002`; second `turn/start` on an active thread → `-32004`; `thread/resume` from a second engine while the first holds the lock → `-32004`; `threadId: "../x"` → `-32602`; malformed line → `-32700`.
 5. Types for `Thread`, `Turn`, `Item` (six kinds in §5) and the §4.1 code constants live in `packages/engine` (or `packages/core`); CLI imports **types / client SDK only**.
 6. ACP module exports stub + `NotImplemented`; no editor wiring.
 7. No WS/HTTP server code paths in M0 packages.

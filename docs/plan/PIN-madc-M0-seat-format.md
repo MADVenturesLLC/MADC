@@ -30,6 +30,7 @@
 | Why home-dir, not repo `.madc/` | Seats and receipts belong to the operator machine, not a worktree; one place for doctor regardless of `cwd`. Thread `cwd` is still recorded. Repo-local seat overlay is post-M0. |
 | Seed | **Engine auto-seeds `madc-default` on first start if `seats/madc-default.json` is missing** (creates `seats/`, `sessions/`, `memory/`). Never overwrites an existing file. `madc doctor --init` calls the **same writer function** — one source of seed content. |
 | Permissions | Dirs `0700`, files `0600` on POSIX (best effort on Windows). |
+| Path confinement | `seatId` / `threadId` must match the protocol id grammar (`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`, protocol pin §1) before any path join; else `-32602`. Every resolved path (seat, session, lock, memory) must stay under the real path of `$MADC_HOME`; else reject (`-32006` for seat/memory paths). |
 
 ---
 
@@ -53,10 +54,9 @@ type SeatHandoffsStub = {
   targets: string[];       // always [] in M0
 };
 
-type SeatMemory = {
-  mode: "file" | "in-session";
-  path?: string;           // mode=file: relative to MADC_HOME, e.g. "memory/madc-default.md"
-};
+type SeatMemory =
+  | { mode: "file"; path: string }  // required; relative, normalized, under "memory/", ends ".md"; no "..", no absolute
+  | { mode: "in-session" };         // no path key allowed
 
 type Seat = {
   id: string;              // == filename stem
@@ -84,7 +84,7 @@ Engine builds `Intent = { providerId: preferredBacking, mode, connect, requireLi
 
 `ollama-cloud` is in the registry as `allowed-direct`, `wired: false` — a stub, **not** a valid `preferredBacking` in M0 (seat load → `-32006 SeatInvalid`).
 
-**Resolution:** `thread/start.seatId` → `seats/<id>.json`. Missing → `-32005 SeatNotFound`. Unparseable / schema fail (including unknown `preferredBacking`, `handoffs.enabled !== false`) → `-32006 SeatInvalid`.
+**Resolution:** `thread/start.seatId` → `seats/<id>.json`. Missing → `-32005 SeatNotFound`. Unparseable / schema fail (including unknown `preferredBacking`, `handoffs.enabled !== false`, `memory.mode: "file"` without a valid confined `path`, or `in-session` with a `path`) → `-32006 SeatInvalid`.
 
 ---
 
@@ -145,7 +145,7 @@ type SessionEvent = {
 
 If an append fails: `thread/start` returns `-32009 SessionWriteFailed`; mid-turn the turn ends `failed` with `error.code = -32009`.
 
-Secrets: never store API keys, tokens, or raw env. Redact secret-looking tool output (best effort in A4).
+**Secrets (mandatory, every append):** payload fields are the enumerated ones above — env, headers, and credentials are never copied into a payload. Before each append, a redactor runs over every string in `payload`: (1) exact-value match of every credential the engine holds in memory (provider keys, tokens) → `"[REDACTED]"` — this guarantees configured secrets never persist; (2) pattern match for common token shapes (`sk-…`, `gh[pousr]_…`, `xox[abp]-…`, `AKIA…`, `Bearer …`, PEM private-key blocks) → `"[REDACTED]"`. Redaction runs before hashing, so the chain covers the redacted line.
 
 ### 4.3 Hash chain
 
@@ -183,8 +183,9 @@ hash            = sha256_hex(prevHash + "\n" + canonicalPayload)   // UTF-8 byte
 3. One E2E seat run (mock provider OK in CI) creates `sessions/<threadId>.jsonl` with ≥ `session.open`, `turn.start`, `item` (user + agent), `servedModel`, `turn.end`.
 4. Protocol stream for the same turn contains a `servedModel` item equal in `requestedModel` / `servedModel` / `backing` / `providerId` to the JSONL event.
 5. Hash chain verifies with sorted-key JSON (§4.3); editing any one line fails verify.
-6. No secrets in session files (test / doctor heuristic).
-7. `madc doctor` (A7) **or** an A4 helper reports seat id, last session path, chain OK.
+6. Redaction test: a configured provider key and a `ghp_…`-shaped token injected into tool output and agent text are absent from the session file (replaced by `[REDACTED]`), and the chain still verifies.
+7. Path tests: `seatId: "../x"` → `-32602`; seat with `memory.path: "../../etc/passwd"` → `-32006`.
+8. `madc doctor` (A7) **or** an A4 helper reports seat id, last session path, chain OK.
 
 ## 7. Not in M0
 
