@@ -326,6 +326,7 @@ export class EngineConnection {
         },
         () => this.#secrets(this.#threads.get(id)?.lock ?? handle),
         now, // session.open ts == thread.createdAt
+        this.#opts.home,
       );
     } catch (err) {
       this.#releaseOrKeep(handle);
@@ -437,6 +438,7 @@ export class EngineConnection {
       verified.nextSeq,
       verified.lastHash,
       () => this.#secrets(this.#threads.get(threadId)?.lock ?? handle),
+      this.#opts.home,
     );
     for (const turnId of rebuilt.danglingTurnIds) {
       // Same ts as the rebuilt turn's completedAt; the thread's updatedAt covers the close.
