@@ -6,6 +6,7 @@
 export {
   ENGINE_ENTRY,
   EngineClient,
+  EngineExitedError,
   EngineRpcError,
   type Notification,
   type SpawnEngineOptions,

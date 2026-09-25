@@ -1,4 +1,4 @@
-import { mkdirSync, realpathSync } from "node:fs";
+import { chmodSync, mkdirSync, realpathSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { internalError, invalidParams } from "./protocol/errors.ts";
@@ -27,6 +27,17 @@ function isStrictlyUnder(child: string, parent: string): boolean {
 }
 
 /**
+ * `mkdir`'s mode only applies to newly created dirs, so a pre-existing `$MADC_HOME` or subdir keeps
+ * whatever it had. Tighten group/other bits to reach the pinned `0700` (seat pin §1). POSIX only;
+ * best effort on Windows (mode bits are not meaningful there).
+ */
+export function enforcePrivateDir(dir: string): void {
+  if (process.platform === "win32") return;
+  const mode = statSync(dir).mode & 0o777;
+  if ((mode & 0o077) !== 0) chmodSync(dir, mode & 0o700);
+}
+
+/**
  * Resolve `$MADC_HOME/<subdir>/<id><ext>` with confinement:
  * 1. `id` must match the protocol id grammar — checked FIRST, before any path join or mkdir (→ -32602).
  * 2. The real path of `<subdir>` (after symlinks) must stay under the real path of `$MADC_HOME`.
@@ -37,6 +48,8 @@ export function confinedPath(home: string, subdir: HomeSubdir, id: string, ext: 
     throw invalidParams([`${subdir} id must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`]);
   }
   mkdirSync(join(home, subdir), { recursive: true, mode: 0o700 });
+  enforcePrivateDir(home);
+  enforcePrivateDir(join(home, subdir));
   const realHome = realpathSync(home);
   const realDir = realpathSync(join(home, subdir));
   const target = join(realDir, `${id}${ext}`);

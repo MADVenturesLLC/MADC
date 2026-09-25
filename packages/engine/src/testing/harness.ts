@@ -8,6 +8,7 @@ import type { InitializeResult } from "../protocol/types.ts";
 
 export const HANG_ENGINE = fileURLToPath(new URL("./hang-agent-engine.ts", import.meta.url));
 export const FAILING_ENGINE = fileURLToPath(new URL("./failing-agent-engine.ts", import.meta.url));
+export const EXIT_ENGINE = fileURLToPath(new URL("./exit-engine.ts", import.meta.url));
 
 export function makeHome(): { home: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), "madc-a2-"));

@@ -8,6 +8,7 @@ export { type Agent, type AgentTurnContext, echoAgent, type TurnSink } from "./a
 export {
   ENGINE_ENTRY,
   EngineClient,
+  EngineExitedError,
   EngineRpcError,
   type Notification,
   type SpawnEngineOptions,
@@ -18,7 +19,9 @@ export { confinedPath, type HomeSubdir, resolveMadcHome } from "./home.ts";
 export {
   type AcquireResult,
   acquireThreadLock,
+  holdsThreadLock,
   isPidAlive,
+  type LockHandle,
   type LockInfo,
   readLock,
   releaseThreadLock,

@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { linkSync, lstatSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { linkSync, lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { confinedPath } from "./home.ts";
 
 /** Contents of `sessions/<threadId>.lock` (protocol pin §3.3). */
@@ -10,8 +10,21 @@ export type LockState =
   | { state: "corrupt" }
   | { state: "held"; info: LockInfo };
 
+/**
+ * Per-acquisition ownership token: the device + inode of the exact lock file this acquisition
+ * linked into place, plus its pinned `{ pid, startedAt }` body. Inode numbers can be reused as soon
+ * as a file is deleted, so both must match for the on-disk lock to count as "this acquisition".
+ */
+export type LockHandle = {
+  path: string;
+  pid: number;
+  startedAt: number;
+  dev: bigint;
+  ino: bigint;
+};
+
 export type AcquireResult =
-  | { ok: true; path: string }
+  | { ok: true; path: string; handle: LockHandle }
   | { ok: false; path: string; holderPid: number | null };
 
 export function threadLockPath(home: string, threadId: string): string {
@@ -63,6 +76,32 @@ export function isPidAlive(pid: number): boolean {
   }
 }
 
+function fileId(path: string): { dev: bigint; ino: bigint } | null {
+  try {
+    const st = lstatSync(path, { bigint: true });
+    return { dev: st.dev, ino: st.ino };
+  } catch (err) {
+    if (errCode(err) === "ENOENT") return null;
+    throw err;
+  }
+}
+
+/** True iff `path` is the handle's file: same dev/inode AND same `{ pid, startedAt }` body. */
+function isHandleFile(path: string, h: LockHandle): boolean {
+  const id = fileId(path);
+  if (id === null || id.dev !== h.dev || id.ino !== h.ino) return false;
+  const body = readLock(path);
+  return body.state === "held" && body.info.pid === h.pid && body.info.startedAt === h.startedAt;
+}
+
+function handleFor(path: string, pid: number): LockHandle | null {
+  const id = fileId(path);
+  if (id === null) return null;
+  const body = readLock(path);
+  if (body.state !== "held" || body.info.pid !== pid) return null;
+  return { path, pid, startedAt: body.info.startedAt, ...id };
+}
+
 function removeQuietly(path: string): void {
   try {
     unlinkSync(path);
@@ -90,19 +129,27 @@ export function acquireThreadLock(
       flag: "wx",
       mode: 0o600,
     });
+    let handle: LockHandle | null = null;
     try {
       linkSync(tmp, path);
-      return { ok: true, path };
+      // tmp and path are the same inode until tmp is unlinked below.
+      handle = handleFor(tmp, pid);
     } catch (err) {
       if (errCode(err) !== "EEXIST") throw err;
     } finally {
       removeQuietly(tmp);
     }
+    if (handle !== null) return { ok: true, path, handle: { ...handle, path } };
 
     const current = readLock(path);
     if (current.state === "missing") continue;
     if (current.state === "held") {
-      if (current.info.pid === pid) return { ok: true, path };
+      if (current.info.pid === pid) {
+        // Re-entrant: this process already holds it; adopt the on-disk file as our handle.
+        const handle = handleFor(path, pid);
+        if (handle !== null) return { ok: true, path, handle };
+        continue;
+      }
       lastHolder = current.info.pid;
       if (isPidAlive(current.info.pid)) {
         return { ok: false, path, holderPid: current.info.pid };
@@ -114,16 +161,35 @@ export function acquireThreadLock(
   return { ok: false, path, holderPid: lastHolder };
 }
 
-/** Release only if the lock on disk is still ours. */
-export function releaseThreadLock(path: string, pid: number = process.pid): void {
-  const current = readLock(path);
-  if (current.state === "held" && current.info.pid === pid) {
-    removeQuietly(path);
+/**
+ * Release only if the lock on disk is still THIS acquisition's file. Check-then-unlink on the path
+ * would race with a replacement lock, so the lock is first atomically renamed to a private name;
+ * the renamed file is then compared against the handle's identity. Ours → unlinked. Not ours (the lock
+ * was replaced after ours vanished) → linked back into place (EEXIST: a newer lock already exists,
+ * leave it) and the private name removed. The foreign lock is never deleted.
+ */
+export function releaseThreadLock(handle: LockHandle): void {
+  const aside = `${handle.path}.${handle.pid}.${randomUUID()}.release`;
+  try {
+    renameSync(handle.path, aside);
+  } catch (err) {
+    if (errCode(err) === "ENOENT") return;
+    throw err;
+  }
+  try {
+    if (!isHandleFile(aside, handle)) {
+      try {
+        linkSync(aside, handle.path);
+      } catch (err) {
+        if (errCode(err) !== "EEXIST") throw err;
+      }
+    }
+  } finally {
+    removeQuietly(aside);
   }
 }
 
-/** True iff the lock on disk exists and names `pid`. */
-export function holdsThreadLock(path: string, pid: number = process.pid): boolean {
-  const current = readLock(path);
-  return current.state === "held" && current.info.pid === pid;
+/** True iff the lock on disk is this acquisition's file (dev/inode + `{ pid, startedAt }`). */
+export function holdsThreadLock(handle: LockHandle): boolean {
+  return isHandleFile(handle.path, handle);
 }
