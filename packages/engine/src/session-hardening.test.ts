@@ -1,10 +1,12 @@
 /**
  * M0-A4 session hardening (Copilot review 5317152678 on PR #13): a broken writer refuses turn/start
  * with -32009 before preflight; appends never follow a symlink without O_NOFOLLOW; rebuild checks
- * the session.open / servedModel backing enum. Network-free: in-process engines only.
+ * the session.open / servedModel backing enum. Copilot review 5317282838: a `sessions/` directory
+ * swapped for a symlink is never appended to or read; item ids use the shared id grammar.
+ * Network-free: in-process engines only.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
@@ -261,5 +263,68 @@ test("R-shape backing: a hash-valid session.open or servedModel event with a non
     e.input.end();
     await e.done;
     cleanup();
+  }
+});
+
+test("R-parent-swap: a sessions/ directory swapped for a symlink after confinement is never appended to or read", () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside-parent");
+  try {
+    const sessions = join(home, "sessions");
+    const path = writeSampleSession(sessions);
+    const target = writeSampleSession(outside);
+    const targetBytes = readFileSync(target, "utf8");
+    const insideBytes = readFileSync(path, "utf8");
+    const w = SessionWriter.resume(
+      path,
+      "thr_sample",
+      "madc-default",
+      4,
+      readLines(path)[3]?.hash ?? "",
+      () => [],
+    );
+    assert.equal(verifySessionFile(path, "thr_sample", {}, home).ok, true);
+    // The confined sessions/ directory is replaced by a symlink to a directory outside the home.
+    renameSync(sessions, join(home, "sessions-moved"));
+    symlinkSync(outside, sessions);
+    assert.throws(
+      () => w.append("turn.start", { turnId: "turn_2", inputText: "x" }),
+      (err: RpcError) => err.code === -32009 && (err.data as { seq: number }).seq === 4,
+    );
+    assert.equal(w.broken, true);
+    assert.equal(readFileSync(target, "utf8"), targetBytes, "nothing written outside the home");
+    assert.equal(
+      readFileSync(join(home, "sessions-moved", "thr_sample.jsonl"), "utf8"),
+      insideBytes,
+    );
+    assert.deepEqual(verifySessionFile(path, "thr_sample", {}, home), {
+      ok: false,
+      line: 0,
+      reason: "session file resolves outside MADC_HOME",
+    });
+  } finally {
+    cleanup();
+  }
+});
+
+test("R-shape item id: a hash-valid item whose id breaks the shared id grammar is never loaded", () => {
+  const open = { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" };
+  for (const id of ["", "../x", "a b", 7]) {
+    const r = verifySessionText(
+      forgeSession("thr_bad", [
+        ["session.open", open],
+        [
+          "item",
+          { turnId: "turn_1", item: { id, kind: "agentMessage", status: "completed", text: "x" } },
+        ],
+      ]),
+    );
+    assert.equal(r.ok, true, String(id));
+    assert.throws(
+      () => rebuildSession(r.ok ? r.events : []),
+      (err: Error) => /^line 2: malformed item payload$/.test(err.message),
+      String(id),
+    );
   }
 });
