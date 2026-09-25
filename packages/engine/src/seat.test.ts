@@ -7,6 +7,8 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  renameSync,
+  rmSync,
   statSync,
   symlinkSync,
   writeFileSync,
@@ -483,4 +485,50 @@ test("validateSeat / memoryPathIssue units: the built-in seat is valid; lexical 
   assert.notEqual(memoryPathIssue("memory/"), null);
   assert.notEqual(memoryPathIssue("C:/memory/x.md"), null);
   assert.notEqual(memoryPathIssue("./memory/x.md"), null);
+});
+
+test("R-seat-swap: a seat file swapped after the realpath check is never read (-32006)", () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside-swap");
+  try {
+    seedDefaultSeat(home);
+    const outsideSeat = writeSeatFile(outside, {
+      ...PIN_MADC_DEFAULT,
+      id: "swap",
+      role: "outside",
+    });
+    const changed = (e: { code?: number; data?: { issues?: string[] } }) =>
+      e.code === -32006 && e.data?.issues?.[0] === "seat file changed while it was being read";
+    for (const noFollowFlag of [true, false]) {
+      const path = writeSeatFile(home, { ...PIN_MADC_DEFAULT, id: "swap" });
+      assert.equal(loadSeat(home, "swap", { noFollowFlag }).seat.role, "general builder");
+      // The file itself becomes a symlink to an outside seat.
+      const swapFile = () => {
+        rmSync(path);
+        symlinkSync(outsideSeat, path);
+      };
+      assert.throws(
+        () => loadSeat(home, "swap", { noFollowFlag, afterRealpath: swapFile }),
+        changed,
+      );
+      rmSync(path);
+      // A parent directory becomes a symlink to an outside seats/ dir.
+      writeSeatFile(home, { ...PIN_MADC_DEFAULT, id: "swap" });
+      const seats = join(home, "seats");
+      const swapDir = () => {
+        renameSync(seats, join(home, "seats-moved"));
+        symlinkSync(join(outside, "seats"), seats);
+      };
+      assert.throws(
+        () => loadSeat(home, "swap", { noFollowFlag, afterRealpath: swapDir }),
+        changed,
+      );
+      rmSync(seats);
+      renameSync(join(home, "seats-moved"), seats);
+      rmSync(path);
+    }
+  } finally {
+    cleanup();
+  }
 });

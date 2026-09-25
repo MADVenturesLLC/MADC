@@ -6,6 +6,7 @@ import { randomBytes } from "node:crypto";
 import {
   closeSync,
   constants,
+  fstatSync,
   fsyncSync,
   linkSync,
   lstatSync,
@@ -13,13 +14,13 @@ import {
   openSync,
   readFileSync,
   realpathSync,
-  statSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { KIMI_CODE_PROVIDER_ID, resolveKimiPinnedModel } from "@madc/adapters";
 import { enforcePrivateDir, isStrictlyUnder } from "./home.ts";
+import { type OpenNoFollowOptions, openNoFollow } from "./lock.ts";
 import {
   ErrorCode,
   invalidParams,
@@ -228,6 +229,9 @@ function escapesHome(realHome: string, path: string): boolean {
   }
 }
 
+/** Test seams for `loadSeat` (internal): a hook after the realpath check, and `openNoFollow`'s. */
+export type LoadSeatTestOptions = OpenNoFollowOptions & { afterRealpath?: () => void };
+
 /**
  * Resolve and validate `seats/<seatId>.json` (seat pin §2 resolution):
  * - invalid id → -32602 (before any path join);
@@ -236,7 +240,7 @@ function escapesHome(realHome: string, path: string): boolean {
  *   `memory.path`) / a kimi-code `pinnedModel` that the pinned pi-ai catalog does not resolve
  *   → -32006 `{ seatId, path, issues }`.
  */
-export function loadSeat(home: string, seatId: string): LoadedSeat {
+export function loadSeat(home: string, seatId: string, opts: LoadSeatTestOptions = {}): LoadedSeat {
   if (!isValidId(seatId)) {
     throw invalidParams(["seatId must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"]);
   }
@@ -259,15 +263,31 @@ export function loadSeat(home: string, seatId: string): LoadedSeat {
   if (!isStrictlyUnder(realFile, realHome)) {
     throw invalid(["seat file resolves outside MADC_HOME"]);
   }
+  opts.afterRealpath?.();
+  // Read through one fd opened without following a symlink (lock.ts `openNoFollow`), then require
+  // that the resolved path still has no symlinks and still names that same inode (dev + ino), so a
+  // swap after the realpath check is refused and the checked file is the one parsed.
+  const changed = () => invalid(["seat file changed while it was being read"]);
   let text: string;
+  let fd: number | null | "symlink" = null;
   try {
-    const st = statSync(realFile);
+    fd = openNoFollow(realFile, opts);
+    if (fd === null || fd === "symlink") throw changed();
+    const st = fstatSync(fd, { bigint: true });
     if (!st.isFile()) throw invalid(["seat file is not a regular file"]);
-    if (st.size > MAX_SEAT_BYTES) throw invalid([`seat file exceeds ${MAX_SEAT_BYTES} bytes`]);
-    text = readFileSync(realFile, "utf8");
+    const now = lstatSync(realFile, { bigint: true });
+    if (realpathSync(realFile) !== realFile || now.dev !== st.dev || now.ino !== st.ino) {
+      throw changed();
+    }
+    if (st.size > BigInt(MAX_SEAT_BYTES)) {
+      throw invalid([`seat file exceeds ${MAX_SEAT_BYTES} bytes`]);
+    }
+    text = readFileSync(fd, "utf8");
   } catch (err) {
     if (err instanceof RpcError) throw err;
     throw invalid([`seat file is unreadable (${errCode(err) ?? "error"})`]);
+  } finally {
+    if (typeof fd === "number") closeSync(fd);
   }
   let raw: unknown;
   try {
