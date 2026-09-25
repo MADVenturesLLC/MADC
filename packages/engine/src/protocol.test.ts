@@ -19,6 +19,7 @@ import { EngineExitedError, spawnEngine } from "./client.ts";
 import { ErrorCode } from "./protocol/errors.ts";
 import { ID_PATTERN } from "./protocol/ids.ts";
 import type { AgentMessageItem, UserMessageItem } from "./protocol/types.ts";
+import { verifySessionText } from "./session-store.ts";
 import {
   EXIT_ENGINE,
   expectRpcError,
@@ -358,12 +359,17 @@ test("§8.4 thread/resume from a second engine while the first holds the lock �
     // The loser did not disturb the holder's lock.
     assert.equal(JSON.parse(readFileSync(lockPath, "utf8")).pid, first.pid);
 
-    // Holder exits → lock released → second engine is no longer blocked (A2 store is in-memory → -32002).
+    // Holder exits → lock released → the second engine cold-resumes it from the session JSONL (A4).
     await first.close();
     assert.equal(existsSync(lockPath), false);
-    const after = await expectRpcError(second.request("thread/resume", { threadId: thread.id }));
-    assert.equal(after.code, ErrorCode.ThreadNotFound);
-    assert.equal(existsSync(lockPath), false, "probe lock released after not-found");
+    const after = await second.request("thread/resume", { threadId: thread.id });
+    assert.equal(after.thread.id, thread.id);
+    assert.equal(after.thread.seatId, "madc-default");
+    assert.equal(
+      JSON.parse(readFileSync(lockPath, "utf8")).pid,
+      second.pid,
+      "resumer holds the lock",
+    );
   } finally {
     await first.close();
     await second.close();
@@ -586,12 +592,17 @@ test("§8.9 lock token never appears on the wire, on stderr, or in session JSONL
       lockHolderPid: a.client.pid,
     });
 
-    // Files other than the lock itself (session JSONL included, whenever it exists) never carry it.
+    // Files other than the lock itself never carry it.
     for (const file of filesUnder(home).filter((f) => f !== lockPath)) {
       assert.equal(readFileSync(file, "utf8").includes(token), false, file);
     }
+    // A4: the session JSONL is real — exactly this thread's file, a verified chain, no token.
     const jsonl = filesUnder(home).filter((f) => f.endsWith(".jsonl"));
-    for (const file of jsonl) assert.equal(readFileSync(file, "utf8").includes(token), false);
+    assert.deepEqual(jsonl, [join(home, "sessions", `${thread.id}.jsonl`)]);
+    const sessionText = readFileSync(jsonl[0] ?? "", "utf8");
+    assert.ok(sessionText.includes('"type":"turn.end"'), "the failed turn was recorded");
+    assert.equal(verifySessionText(sessionText, thread.id).ok, true);
+    assert.equal(sessionText.includes(token), false);
 
     await a.client.close();
     await b.client.close();
