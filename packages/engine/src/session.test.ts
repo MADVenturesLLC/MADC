@@ -1,0 +1,784 @@
+/**
+ * M0-A4 session JSONL + hash chain (seat pin §4, §6 items 3–6, 8; protocol pin §3.3 token rule).
+ * Network-free: the Kimi fixture engine (fake transport, `.invalid` host) and in-process engines.
+ */
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { PassThrough, Writable } from "node:stream";
+import { test } from "node:test";
+import type { FakeKimiReply, FakeKimiRequest } from "@madc/adapters/testing";
+import type { Agent } from "./agent.ts";
+import type { EngineClient } from "./client.ts";
+import { inspectMadcHome } from "./inspect.ts";
+import { RpcError } from "./protocol/errors.ts";
+import type { Item, ServedModelItem, Turn } from "./protocol/types.ts";
+import { EngineConnection } from "./server.ts";
+import {
+  createRedactor,
+  GENESIS_HASH,
+  REDACTED,
+  SessionWriter,
+  sortedKeyJson,
+  verifySessionFile,
+  verifySessionText,
+} from "./session-store.ts";
+import {
+  expectRpcError,
+  HANG_ENGINE,
+  handshake,
+  KIMI_FAKE_ENGINE,
+  makeHome,
+  startEngine,
+  startEngineCapturingStderr,
+} from "./testing/harness.ts";
+
+const KEY = "test-sentinel-key-4b7e";
+const GHP = `ghp_${"A1b2C3d4E5".repeat(4)}`;
+const POSIX = process.platform !== "win32";
+
+type Line = {
+  v: number;
+  seq: number;
+  ts: number;
+  type: string;
+  threadId: string;
+  seatId: string;
+  prevHash: string;
+  hash: string;
+  payload: Record<string, unknown>;
+};
+
+function sessionPath(home: string, threadId: string): string {
+  return join(home, "sessions", `${threadId}.jsonl`);
+}
+
+function readLines(path: string): Line[] {
+  return readFileSync(path, "utf8")
+    .split("\n")
+    .filter((l) => l !== "")
+    .map((l) => JSON.parse(l) as Line);
+}
+
+/** Pin §4.3 written independently of the engine: deep key sort, then sha256(prev + "\n" + json). */
+function independentCanonical(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(independentCanonical);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .filter((k) => (value as Record<string, unknown>)[k] !== undefined)
+        .map((k) => [k, independentCanonical((value as Record<string, unknown>)[k])]),
+    );
+  }
+  return value;
+}
+
+function independentVerify(path: string): void {
+  let prev = "0".repeat(64);
+  readLines(path).forEach((line, i) => {
+    assert.equal(line.seq, i);
+    assert.equal(line.prevHash, prev, `line ${i + 1} prevHash`);
+    const { v, seq, ts, type, threadId, seatId, payload } = line;
+    const canonical = JSON.stringify(
+      independentCanonical({ v, seq, ts, type, threadId, seatId, payload }),
+    );
+    const expected = createHash("sha256").update(`${prev}\n${canonical}`, "utf8").digest("hex");
+    assert.equal(line.hash, expected, `line ${i + 1} hash`);
+    prev = line.hash;
+  });
+}
+
+type KimiRun = {
+  client: EngineClient;
+  home: string;
+  stderr: () => string;
+  wire: () => FakeKimiRequest[];
+};
+
+function kimiEngine(
+  home: string,
+  opts: { reply?: FakeKimiReply; toolOutput?: string; wireLog?: string } = {},
+): KimiRun {
+  const wireLog = opts.wireLog ?? join(home, "..", "wire.jsonl");
+  const extra: Record<string, string | undefined> = {
+    KIMI_API_KEY: KEY,
+    MADC_TEST_WIRE_LOG: wireLog,
+  };
+  if (opts.reply !== undefined) extra.MADC_TEST_KIMI_REPLY = JSON.stringify(opts.reply);
+  if (opts.toolOutput !== undefined) extra.MADC_TEST_TOOL_OUTPUT = opts.toolOutput;
+  const { client, stderr } = startEngineCapturingStderr(home, KIMI_FAKE_ENGINE, extra);
+  const wire = () =>
+    existsSync(wireLog)
+      ? readFileSync(wireLog, "utf8")
+          .split("\n")
+          .filter((l) => l !== "")
+          .map((l) => JSON.parse(l) as FakeKimiRequest)
+      : [];
+  return { client, home, stderr, wire };
+}
+
+async function runTurn(client: EngineClient, threadId: string, text: string): Promise<Turn> {
+  const { turn } = await client.request("turn/start", {
+    threadId,
+    input: [{ type: "text", text }],
+  });
+  const done = await client.waitForNotification("turn/completed", (p) => p.turn.id === turn.id);
+  return done.turn;
+}
+
+function wireMessages(request: FakeKimiRequest | undefined): Array<{ role: string; text: string }> {
+  const body = JSON.parse(request?.body ?? "{}") as {
+    messages: Array<{ role: string; content: string | Array<{ type: string; text?: string }> }>;
+  };
+  return body.messages.map((m) => ({
+    role: m.role,
+    text:
+      typeof m.content === "string" ? m.content : m.content.map((part) => part.text ?? "").join(""),
+  }));
+}
+
+test("§6.3 / §6.4: a seat run writes session.open → turn.start → items → servedModel → turn.end; receipt == protocol item", async () => {
+  const { home, cleanup } = makeHome();
+  const run = kimiEngine(home, {
+    reply: { type: "stream", chunks: ["Hi", " there"], model: "kimi-for-coding-2026-09" },
+  });
+  try {
+    await handshake(run.client);
+    const { thread } = await run.client.request("thread/start", { cwd: "/tmp/proj" });
+    const turn = await runTurn(run.client, thread.id, "say hi");
+    assert.equal(turn.status, "completed");
+    const path = sessionPath(home, thread.id);
+    const lines = readLines(path);
+    assert.deepEqual(
+      lines.map((l) => (l.type === "item" ? `item:${(l.payload.item as Item).kind}` : l.type)),
+      [
+        "session.open",
+        "turn.start",
+        "item:userMessage",
+        "item:agentMessage",
+        "item:servedModel",
+        "servedModel",
+        "turn.end",
+      ],
+    );
+    for (const line of lines) {
+      assert.equal(line.v, 1);
+      assert.equal(line.threadId, thread.id);
+      assert.equal(line.seatId, "madc-default");
+    }
+    assert.equal(lines[0]?.prevHash, GENESIS_HASH);
+    assert.deepEqual(lines[0]?.payload, {
+      cwd: "/tmp/proj",
+      backing: "kimi-code",
+      providerId: "kimi-code",
+      pinnedModel: "kimi-coding/kimi-for-coding",
+    });
+    assert.deepEqual(lines[1]?.payload, { turnId: turn.id, inputText: "say hi" });
+    assert.deepEqual(lines[6]?.payload, { turnId: turn.id, status: "completed", error: null });
+    // Items on disk are the item/completed items, in order.
+    assert.deepEqual(
+      lines.filter((l) => l.type === "item").map((l) => l.payload.item),
+      turn.items,
+    );
+    // §6.4 dual write: the JSONL servedModel event equals the protocol servedModel item.
+    const item = turn.items.find((i) => i.kind === "servedModel") as ServedModelItem;
+    const event = lines.find((l) => l.type === "servedModel")?.payload;
+    assert.deepEqual(event, {
+      turnId: turn.id,
+      requestedModel: item.requestedModel,
+      servedModel: item.servedModel,
+      backing: item.backing,
+      providerId: item.providerId,
+    });
+    assert.equal(item.servedModel, "kimi-for-coding-2026-09");
+    // §6.5: chain verifies (engine verifier and an independent implementation of pin §4.3).
+    assert.equal(verifySessionFile(path, thread.id).ok, true);
+    independentVerify(path);
+    if (POSIX) assert.equal(statSync(path).mode & 0o777, 0o600);
+  } finally {
+    await run.client.close();
+    cleanup();
+  }
+});
+
+test("sortedKeyJson: recursive key sort, array order kept, undefined keys omitted, no whitespace", () => {
+  assert.equal(
+    sortedKeyJson({ b: 1, a: { d: [{ z: 1, y: 2 }, 3], c: undefined }, é: "x", B: null }),
+    '{"B":null,"a":{"d":[{"y":2,"z":1},3]},"b":1,"é":"x"}',
+  );
+});
+
+/** A short valid chain written by the engine's writer (used by tamper tests). */
+function writeSampleSession(dir: string): string {
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, "thr_sample.jsonl");
+  const w = SessionWriter.create(
+    path,
+    "thr_sample",
+    "madc-default",
+    { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" },
+    () => [],
+  );
+  w.append("turn.start", { turnId: "turn_1", inputText: "hi" });
+  w.append("item", {
+    turnId: "turn_1",
+    item: { id: "item_1", kind: "agentMessage", status: "completed", text: "hello" },
+  });
+  w.append("turn.end", { turnId: "turn_1", status: "completed", error: null });
+  return path;
+}
+
+test("honesty §6.5: editing any single line (or dropping / reordering / truncating) fails verification", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const path = writeSampleSession(home);
+    const text = readFileSync(path, "utf8");
+    assert.equal(verifySessionText(text).ok, true);
+    const lines = text.slice(0, -1).split("\n");
+    const edits: Array<[string, (l: Line) => void]> = [
+      ["payload", (l) => (l.payload.tampered = true)],
+      ["ts", (l) => (l.ts += 1)],
+      ["type", (l) => (l.type = l.type === "item" ? "servedModel" : "item")],
+      ["seatId", (l) => (l.seatId = "other-seat")],
+      ["hash", (l) => (l.hash = l.hash.replace(/^./, (c) => (c === "0" ? "1" : "0")))],
+    ];
+    for (let i = 0; i < lines.length; i++) {
+      for (const [what, edit] of edits) {
+        const copy = [...lines];
+        const line = JSON.parse(copy[i] ?? "") as Line;
+        edit(line);
+        copy[i] = JSON.stringify(line);
+        const result = verifySessionText(`${copy.join("\n")}\n`);
+        assert.equal(result.ok, false, `line ${i + 1} ${what}`);
+        if (!result.ok) assert.equal(result.line, i + 1, `line ${i + 1} ${what}: first bad line`);
+      }
+      // A one-character edit inside the raw line text.
+      const raw = [...lines];
+      raw[i] = (raw[i] ?? "").replace(/"seq":(\d+)/, (_m, n) => `"seq":${Number(n) + 10}`);
+      assert.equal(verifySessionText(`${raw.join("\n")}\n`).ok, false, `raw line ${i + 1}`);
+    }
+    // Re-hashing an edited middle line still breaks the next line's prevHash.
+    const forged = JSON.parse(lines[1] ?? "") as Line;
+    forged.payload.inputText = "forged";
+    const { prevHash: _p, hash: _h, ...body } = forged;
+    forged.hash = createHash("sha256")
+      .update(`${forged.prevHash}\n${sortedKeyJson(body)}`)
+      .digest("hex");
+    const withForged = [...lines];
+    withForged[1] = JSON.stringify(forged);
+    const r = verifySessionText(`${withForged.join("\n")}\n`);
+    assert.deepEqual(r.ok ? null : [r.line, r.reason], [
+      3,
+      "prevHash does not match the previous hash",
+    ]);
+    const dropped = lines.filter((_l, i) => i !== 2);
+    const gap = verifySessionText(`${dropped.join("\n")}\n`);
+    assert.deepEqual(gap.ok ? null : [gap.line, gap.reason], [3, "seq 3 where 2 expected"]);
+    const swapped = [lines[0], lines[2], lines[1], lines[3]];
+    const reordered = verifySessionText(`${swapped.join("\n")}\n`);
+    assert.deepEqual(reordered.ok ? null : [reordered.line, reordered.reason], [
+      2,
+      "seq 2 where 1 expected",
+    ]);
+    assert.equal(verifySessionText(text.slice(0, -1)).ok, false, "unterminated last line");
+    assert.equal(verifySessionText(`${text}{}\n`).ok, false, "junk line appended");
+    assert.equal(verifySessionText(text, "thr_other").ok, false, "wrong thread");
+  } finally {
+    cleanup();
+  }
+});
+
+test("honesty §6.5: thread/resume of a tampered session → -32603, lock released, file untouched", async () => {
+  const { home, cleanup } = makeHome();
+  const a = startEngine(home);
+  try {
+    await handshake(a);
+    const { thread } = await a.request("thread/start", {});
+    await runTurn(a, thread.id, "hello");
+    await a.close();
+    const path = sessionPath(home, thread.id);
+    const tampered = readFileSync(path, "utf8").replace(
+      '"inputText":"hello"',
+      '"inputText":"HELLO"',
+    );
+    writeFileSync(path, tampered);
+    const b = startEngineCapturingStderr(home);
+    try {
+      await handshake(b.client);
+      const err = await expectRpcError(b.client.request("thread/resume", { threadId: thread.id }));
+      assert.equal(err.code, -32603);
+      assert.equal(existsSync(join(home, "sessions", `${thread.id}.lock`)), false);
+      assert.equal(readFileSync(path, "utf8"), tampered, "nothing appended to a broken chain");
+      const list = await b.client.request("thread/list", {});
+      assert.deepEqual(list.data, [], "an unverifiable session is not listed");
+      const report = inspectMadcHome(home);
+      assert.deepEqual(report.lastSession?.chain, {
+        ok: false,
+        line: 2,
+        reason: "hash mismatch",
+      });
+    } finally {
+      await b.client.close();
+    }
+  } finally {
+    await a.close();
+    cleanup();
+  }
+});
+
+test("honesty §6.6: a configured key and ghp_ token in tool output and agent text never reach the JSONL; chain verifies", async () => {
+  const { home, cleanup } = makeHome();
+  const hostile = `key=${KEY} token=${GHP} Bearer abcdefghijklmnop123 AKIAABCDEFGHIJKLMNOP`;
+  const run = kimiEngine(home, {
+    reply: { type: "stream", chunks: ["leak ", KEY, " and ", GHP], model: "kimi-for-coding" },
+    toolOutput: hostile,
+  });
+  try {
+    await handshake(run.client);
+    const { thread } = await run.client.request("thread/start", {});
+    const lockPath = join(home, "sessions", `${thread.id}.lock`);
+    const token: string = JSON.parse(readFileSync(lockPath, "utf8")).token;
+    const turn = await runTurn(run.client, thread.id, `user pasted ${GHP}`);
+    assert.equal(turn.status, "completed");
+    // The live stream carries what the agent/tool produced (sanity: the secrets were injected).
+    const agentText = (turn.items.find((i) => i.kind === "agentMessage") as { text: string }).text;
+    assert.ok(agentText.includes(KEY) && agentText.includes(GHP));
+    const toolResult = turn.items.find((i) => i.kind === "toolResult") as { output: string };
+    assert.equal(toolResult.output, hostile);
+
+    const path = sessionPath(home, thread.id);
+    const text = readFileSync(path, "utf8");
+    for (const secret of [KEY, GHP, "abcdefghijklmnop123", "AKIAABCDEFGHIJKLMNOP", token]) {
+      assert.equal(text.includes(secret), false, `secret persisted: ${secret.slice(0, 6)}…`);
+    }
+    const items = readLines(path)
+      .filter((l) => l.type === "item")
+      .map((l) => l.payload.item as Item);
+    assert.equal(
+      (items.find((i) => i.kind === "agentMessage") as { text: string }).text,
+      `leak ${REDACTED} and ${REDACTED}`,
+    );
+    assert.equal(
+      (items.find((i) => i.kind === "toolResult") as { output: string }).output,
+      `key=${REDACTED} token=${REDACTED} ${REDACTED} ${REDACTED}`,
+    );
+    assert.equal(readLines(path)[1]?.payload.inputText, `user pasted ${REDACTED}`);
+    assert.equal(verifySessionFile(path, thread.id).ok, true, "chain covers the redacted lines");
+    independentVerify(path);
+  } finally {
+    await run.client.close();
+    cleanup();
+  }
+});
+
+test("redactor units: every pinned token shape and exact secrets (longest first), keys included", () => {
+  const redact = createRedactor(["s3cret-value", "s3cret-value-longer", ""]);
+  const pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIabc\n-----END RSA PRIVATE KEY-----";
+  const input = {
+    a: "x s3cret-value-longer y s3cret-value z",
+    b: [`sk-${"a".repeat(20)}`, `gho_${"b".repeat(30)}`, `xoxb-${"1".repeat(12)}`],
+    c: { nested: `AKIA${"Q".repeat(16)} Bearer ${"t".repeat(24)}`, pem },
+    [`k-${GHP}`]: 1,
+    n: 5,
+    t: true,
+    z: null,
+  };
+  assert.deepEqual(redact(input), {
+    a: `x ${REDACTED} y ${REDACTED} z`,
+    b: [REDACTED, REDACTED, REDACTED],
+    c: { nested: `${REDACTED} ${REDACTED}`, pem: REDACTED },
+    [`k-${REDACTED}`]: 1,
+    n: 5,
+    t: true,
+    z: null,
+  });
+  assert.equal(redact("plain text sk-short madc-default"), "plain text sk-short madc-default");
+});
+
+test("§8.9 upgrade: session JSONL exists, verifies, and never contains the lock token (resume + re-lock)", async () => {
+  const { home, cleanup } = makeHome();
+  const a = startEngine(home);
+  try {
+    await handshake(a);
+    const { thread } = await a.request("thread/start", {});
+    const lockPath = join(home, "sessions", `${thread.id}.lock`);
+    const tokens = [JSON.parse(readFileSync(lockPath, "utf8")).token as string];
+    await runTurn(a, thread.id, "one");
+    await a.close();
+    const b = startEngine(home);
+    try {
+      await handshake(b);
+      await b.request("thread/resume", { threadId: thread.id });
+      tokens.push(JSON.parse(readFileSync(lockPath, "utf8")).token as string);
+      await runTurn(b, thread.id, "two");
+    } finally {
+      await b.close();
+    }
+    const path = sessionPath(home, thread.id);
+    const text = readFileSync(path, "utf8");
+    assert.equal(readLines(path).filter((l) => l.type === "turn.end").length, 2);
+    for (const token of tokens) {
+      assert.match(token, /^[0-9a-f]{32}$/);
+      assert.equal(text.includes(token), false);
+    }
+    assert.equal(verifySessionFile(path, thread.id).ok, true);
+  } finally {
+    await a.close();
+    cleanup();
+  }
+});
+
+test("A4 resume: a second engine cold-resumes from JSONL and continues the chain (no history replay)", async () => {
+  const { home, cleanup } = makeHome();
+  const wireLog = join(home, "..", "wire-resume.jsonl");
+  const a = kimiEngine(home, { wireLog });
+  try {
+    await handshake(a.client);
+    const { thread } = await a.client.request("thread/start", { cwd: "/w" });
+    await runTurn(a.client, thread.id, "first question");
+    await runTurn(a.client, thread.id, "second question");
+    // Ruling item 12: turn context stays current-input-only in A4 (replay deferred to a pin).
+    assert.deepEqual(wireMessages(a.wire()[1]), [{ role: "user", text: "second question" }]);
+    await a.client.close();
+
+    const b = kimiEngine(home, { wireLog });
+    try {
+      await handshake(b.client);
+      // Listed from disk before it is resumed.
+      const listed = await b.client.request("thread/list", {});
+      assert.deepEqual(
+        listed.data.map((t) => [t.id, t.seatId, t.preview, t.status]),
+        [[thread.id, "madc-default", "first question", "idle"]],
+      );
+      const { thread: resumed } = await b.client.request("thread/resume", { threadId: thread.id });
+      assert.deepEqual(
+        { ...resumed, updatedAt: 0 },
+        { ...thread, preview: "first question", updatedAt: 0 },
+      );
+      const started = await b.client.waitForNotification("thread/started");
+      assert.equal(started.thread.id, thread.id);
+      await runTurn(b.client, thread.id, "third question");
+      assert.deepEqual(wireMessages(b.wire()[2]), [{ role: "user", text: "third question" }]);
+      const path = sessionPath(home, thread.id);
+      const lines = readLines(path);
+      assert.deepEqual(
+        lines.map((l) => l.seq),
+        lines.map((_l, i) => i),
+      );
+      assert.equal(lines.filter((l) => l.type === "session.open").length, 1);
+      assert.equal(lines.filter((l) => l.type === "turn.end").length, 3);
+      assert.equal(verifySessionFile(path, thread.id).ok, true);
+      independentVerify(path);
+      // A turn id from the previous engine is known (finished): interrupt is a no-op.
+      const oldTurnId = lines[1]?.payload.turnId as string;
+      assert.deepEqual(
+        await b.client.request("turn/interrupt", { threadId: thread.id, turnId: oldTurnId }),
+        {},
+      );
+    } finally {
+      await b.client.close();
+    }
+  } finally {
+    await a.client.close();
+    cleanup();
+  }
+});
+
+test("A4: a failed turn is recorded with turn.end.error = {code, message} only; resume continues", async () => {
+  const { home, cleanup } = makeHome();
+  const wireLog = join(home, "..", "wire-fail.jsonl");
+  const a = kimiEngine(home, { wireLog, reply: { type: "status", status: 500, body: "{}" } });
+  try {
+    await handshake(a.client);
+    const { thread } = await a.client.request("thread/start", {});
+    const failed = await runTurn(a.client, thread.id, "doomed");
+    assert.equal(failed.status, "failed");
+    await a.client.close();
+    const lines = readLines(sessionPath(home, thread.id));
+    assert.deepEqual(lines.at(-1)?.payload, {
+      turnId: failed.id,
+      status: "failed",
+      error: { code: -32603, message: "kimi-code request failed (HTTP 500)" },
+    });
+    // Ruling item 6: no receipt for a failed invocation (neither item nor event).
+    assert.equal(lines.filter((l) => l.type === "servedModel").length, 0);
+    assert.ok(!lines.some((l) => (l.payload.item as Item | undefined)?.kind === "servedModel"));
+    const b = kimiEngine(home, { wireLog });
+    try {
+      await handshake(b.client);
+      await b.client.request("thread/resume", { threadId: thread.id });
+      const retry = await runTurn(b.client, thread.id, "retry");
+      assert.equal(retry.status, "completed");
+      assert.equal(verifySessionFile(sessionPath(home, thread.id), thread.id).ok, true);
+    } finally {
+      await b.client.close();
+    }
+  } finally {
+    await a.client.close();
+    cleanup();
+  }
+});
+
+test("A4 resume: an engine killed mid-turn leaves turn.start without turn.end; resume closes it as interrupted", async () => {
+  if (!POSIX) return; // SIGKILL semantics
+  const { home, cleanup } = makeHome();
+  const a = startEngine(home, HANG_ENGINE);
+  try {
+    await handshake(a);
+    const { thread } = await a.request("thread/start", {});
+    await a.request("turn/start", { threadId: thread.id, input: [{ type: "text", text: "x" }] });
+    await a.waitForNotification("item/completed");
+    const path = sessionPath(home, thread.id);
+    // item/completed is emitted before its append: wait for the durable line, then kill.
+    const deadline = Date.now() + 3000;
+    while (!readLines(path).some((l) => l.type === "item") && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    const killed = new Promise((r) => a.child.once("exit", r));
+    a.child.kill("SIGKILL");
+    await killed;
+    const before = readLines(path);
+    assert.equal(before.at(-1)?.type, "item");
+    assert.equal(before.filter((l) => l.type === "turn.end").length, 0);
+
+    const b = startEngine(home);
+    try {
+      await handshake(b);
+      await b.request("thread/resume", { threadId: thread.id });
+      const after = readLines(path);
+      assert.deepEqual(after.at(-1)?.payload, {
+        turnId: before[1]?.payload.turnId,
+        status: "interrupted",
+        error: null,
+      });
+      assert.equal(verifySessionFile(path, thread.id).ok, true);
+    } finally {
+      await b.close();
+    }
+  } finally {
+    await a.close();
+    cleanup();
+  }
+});
+
+test("A4 resume: session file missing → -32002 and the probe lock is released", async () => {
+  const { home, cleanup } = makeHome();
+  const client = startEngine(home);
+  try {
+    await handshake(client);
+    const err = await expectRpcError(client.request("thread/resume", { threadId: "thr_gone" }));
+    assert.equal(err.code, -32002);
+    assert.deepEqual(err.data, { threadId: "thr_gone" });
+    assert.equal(existsSync(join(home, "sessions", "thr_gone.lock")), false);
+  } finally {
+    await client.close();
+    cleanup();
+  }
+});
+
+// ------------------------------------------------------------ -32009 paths
+
+type Wire = Record<string, unknown> & { params?: Record<string, unknown> };
+
+function inProcess(home: string, agent: Agent, newThreadId?: () => string) {
+  const input = new PassThrough();
+  const received: Wire[] = [];
+  const output = new Writable({
+    write(chunk, _enc, cb) {
+      for (const line of String(chunk).split("\n"))
+        if (line !== "") received.push(JSON.parse(line));
+      cb();
+    },
+  });
+  const conn = new EngineConnection({
+    input,
+    output,
+    home,
+    agent,
+    log: () => {},
+    ...(newThreadId === undefined ? {} : { newThreadId }),
+  });
+  const done = conn.run();
+  let nextId = 1;
+  const waitFor = async (pred: (m: Wire) => boolean): Promise<Wire> => {
+    const until = Date.now() + 3000;
+    for (;;) {
+      const hit = received.find(pred);
+      if (hit !== undefined) return hit;
+      if (Date.now() > until) throw new Error("timed out");
+      await new Promise((r) => setTimeout(r, 5));
+    }
+  };
+  const request = async (method: string, params: unknown = {}): Promise<Wire> => {
+    const id = nextId++;
+    input.write(`${JSON.stringify({ id, method, params })}\n`);
+    return waitFor((m) => m.id === id);
+  };
+  return { input, received, done, waitFor, request };
+}
+
+const replyAgent: Agent = {
+  name: "reply",
+  async run(_ctx, sink) {
+    const id = sink.newItemId();
+    sink.startItem({ id, kind: "agentMessage", status: "inProgress", text: "" });
+    sink.completeItem({ id, kind: "agentMessage", status: "completed", text: "ok" });
+  },
+};
+
+test("-32009 at thread/start: session file cannot be created → {threadId, path, seq: 0}; lock released", async () => {
+  const { home, cleanup } = makeHome();
+  const e = inProcess(home, replyAgent, () => "thr_fixed");
+  try {
+    await e.request("initialize", { clientInfo: { name: "t", version: "0" } });
+    mkdirSync(join(home, "sessions", "thr_fixed.jsonl"), { recursive: true });
+    const res = await e.request("thread/start", {});
+    const error = res.error as { code: number; data: Record<string, unknown> };
+    assert.equal(error.code, -32009);
+    assert.deepEqual(error.data, {
+      threadId: "thr_fixed",
+      path: join(home, "sessions", "thr_fixed.jsonl"),
+      seq: 0,
+    });
+    assert.equal(existsSync(join(home, "sessions", "thr_fixed.lock")), false);
+    assert.ok(!e.received.some((m) => m.method === "thread/started"));
+  } finally {
+    e.input.end();
+    await e.done;
+    cleanup();
+  }
+});
+
+test("-32009 mid-turn: an append failure ends the turn failed with -32009 and stops recording", async () => {
+  const { home, cleanup } = makeHome();
+  let calls = 0;
+  const breaking: Agent = {
+    name: "breaking",
+    async run(ctx, sink) {
+      calls++;
+      const path = join(home, "sessions", `${ctx.threadId}.jsonl`);
+      rmSync(path);
+      mkdirSync(path); // appends now fail (EISDIR)
+      const id = sink.newItemId();
+      sink.startItem({ id, kind: "agentMessage", status: "inProgress", text: "" });
+      sink.completeItem({ id, kind: "agentMessage", status: "completed", text: "lost" });
+      sink.completeItem({ id: sink.newItemId(), kind: "error", status: "completed", message: "x" });
+    },
+  };
+  const e = inProcess(home, breaking);
+  try {
+    await e.request("initialize", { clientInfo: { name: "t", version: "0" } });
+    const start = await e.request("thread/start", {});
+    const threadId = (start.result as { thread: { id: string } }).thread.id;
+    await e.request("turn/start", { threadId, input: [{ type: "text", text: "x" }] });
+    const done = await e.waitFor((m) => m.method === "turn/completed");
+    const turn = (done.params as { turn: Turn }).turn;
+    assert.equal(turn.status, "failed");
+    assert.equal(turn.error?.code, -32009);
+    assert.deepEqual(turn.error?.data, {
+      threadId,
+      path: join(home, "sessions", `${threadId}.jsonl`),
+      seq: 3,
+    });
+    assert.deepEqual(
+      turn.items.map((i) => i.kind),
+      ["userMessage", "agentMessage", "error"],
+    );
+    // The writer is broken: the next turn is refused with -32009 before it starts.
+    const next = await e.request("turn/start", { threadId, input: [{ type: "text", text: "y" }] });
+    assert.equal((next.error as { code: number }).code, -32009);
+    assert.equal(calls, 1);
+  } finally {
+    e.input.end();
+    await e.done;
+    cleanup();
+  }
+});
+
+test("item 8: turn.end.error on disk is {code, message} only, even when the protocol error has data", async () => {
+  const { home, cleanup } = makeHome();
+  const failing: Agent = {
+    name: "failing-with-data",
+    async run() {
+      throw new RpcError(-32008, "Provider unavailable", {
+        providerId: "claude-code",
+        reason: "binary-missing",
+      });
+    },
+  };
+  const e = inProcess(home, failing);
+  try {
+    await e.request("initialize", { clientInfo: { name: "t", version: "0" } });
+    const start = await e.request("thread/start", {});
+    const threadId = (start.result as { thread: { id: string } }).thread.id;
+    await e.request("turn/start", { threadId, input: [{ type: "text", text: "x" }] });
+    const done = await e.waitFor((m) => m.method === "turn/completed");
+    const turn = (done.params as { turn: Turn }).turn;
+    assert.deepEqual(turn.error?.data, { providerId: "claude-code", reason: "binary-missing" });
+    const end = readLines(sessionPath(home, threadId)).at(-1);
+    assert.equal(end?.type, "turn.end");
+    assert.deepEqual(end?.payload.error, { code: -32008, message: "Provider unavailable" });
+  } finally {
+    e.input.end();
+    await e.done;
+    cleanup();
+  }
+});
+
+test("§6.8 A4 helper: inspectMadcHome reports seat id, last session path, and chain OK", async () => {
+  const { home, cleanup } = makeHome();
+  const client = startEngine(home);
+  try {
+    await handshake(client);
+    const { thread: older } = await client.request("thread/start", {});
+    await new Promise((r) => setTimeout(r, 20));
+    const { thread } = await client.request("thread/start", {});
+    await runTurn(client, thread.id, "hi");
+    const report = inspectMadcHome(home);
+    assert.deepEqual(report, {
+      home,
+      seat: { id: "madc-default", path: join(home, "seats", "madc-default.json"), ok: true },
+      lastSession: {
+        threadId: thread.id,
+        path: sessionPath(home, thread.id),
+        seatId: "madc-default",
+        events: 5,
+        chain: { ok: true },
+      },
+    });
+    assert.notEqual(older.id, thread.id);
+    // Read-only: it never creates anything in an empty home.
+    const { home: empty, cleanup: cleanupEmpty } = makeHome();
+    try {
+      const r = inspectMadcHome(empty);
+      assert.equal(r.lastSession, null);
+      assert.equal(r.seat.ok, false);
+      assert.equal(existsSync(empty), false);
+    } finally {
+      cleanupEmpty();
+    }
+  } finally {
+    await client.close();
+    cleanup();
+  }
+});
+
+test("no-secrets guard: session payloads never copy env (a hermetic engine env value is absent)", async () => {
+  const { home, cleanup } = makeHome();
+  const run = kimiEngine(home);
+  try {
+    await handshake(run.client);
+    const { thread } = await run.client.request("thread/start", {});
+    await runTurn(run.client, thread.id, "x");
+    const text = readFileSync(sessionPath(home, thread.id), "utf8");
+    assert.equal(text.includes(KEY), false);
+    assert.equal(text.includes("MADC_TEST_WIRE_LOG"), false);
+    assert.equal(text.includes("kimi-fake.invalid"), false, "no request URL / headers");
+    assert.equal(text.includes("user-agent"), false);
+  } finally {
+    await run.client.close();
+    cleanup();
+  }
+});
