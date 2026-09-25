@@ -451,8 +451,14 @@ export class EngineConnection {
       completeItem: (item) => {
         if (!live() || !tr.open.has(item.id)) return;
         tr.open.delete(item.id);
-        turn.items.push(item);
-        this.#notify("item/completed", { threadId: turn.threadId, turnId: turn.id, item });
+        // The engine owns the lifecycle: a completed item is `completed`, whatever the agent sent.
+        const completed = { ...item, status: "completed" } as Item;
+        turn.items.push(completed);
+        this.#notify("item/completed", {
+          threadId: turn.threadId,
+          turnId: turn.id,
+          item: completed,
+        });
       },
     };
 
