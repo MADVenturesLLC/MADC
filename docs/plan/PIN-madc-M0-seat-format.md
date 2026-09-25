@@ -2,6 +2,8 @@
 
 *Surface Architect · 2026-09-24 · Venue: `MADVenturesLLC/MADC` · Status: **build pin** for Hephaestus Act M0-A4 (read by A2/A3). Docs only.*
 
+*Amended by `PIN-madc-M0-amendment-2-session-integrity.md` (2026-09-25): session integrity, additive.*
+
 **Authority:**
 
 - `docs/plan/PLAN-madc-M0-build-plan.md` §9 — Founder-accepted; on `main` via PR #2, merge commit `9c71afd5c99d44443eecce2a0b4678e90dea6cb0`.
