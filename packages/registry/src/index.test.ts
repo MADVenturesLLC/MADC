@@ -167,3 +167,53 @@ test("allowed-direct rejects vendor-agent intent", () => {
     (err: unknown) => err instanceof RegistryDeniedError && err.reason === "connect-mismatch",
   );
 });
+
+test("catalog entries are frozen; mutation cannot poison assertAllowed", () => {
+  const unwired = getById("ollama-cloud");
+  assert.ok(unwired);
+  assert.equal(unwired.wired, false);
+  assert.throws(
+    () => {
+      (unwired as { wired: boolean }).wired = true;
+    },
+    (err: unknown) => err instanceof TypeError,
+  );
+  assert.equal(getById("ollama-cloud")?.wired, false);
+  assert.throws(
+    () =>
+      assertAllowed({
+        providerId: "ollama-cloud",
+        mode: "headless",
+        connect: "direct",
+        requireLive: true,
+      }),
+    (err: unknown) => err instanceof RegistryDeniedError && err.reason === "unwired",
+  );
+
+  const forbidden = listCatalog().find((e) => e.id === "zai-glm-coding-plan");
+  assert.ok(forbidden);
+  assert.equal(forbidden.status, "forbidden");
+  assert.throws(
+    () => {
+      (forbidden as { status: string }).status = "allowed-direct";
+    },
+    (err: unknown) => err instanceof TypeError,
+  );
+  assert.equal(getById("zai-glm-coding-plan")?.status, "forbidden");
+  assert.throws(
+    () =>
+      assertAllowed({
+        providerId: "zai-glm-coding-plan",
+        mode: "interactive",
+        connect: "direct",
+      }),
+    (err: unknown) => err instanceof RegistryDeniedError && err.reason === "forbidden",
+  );
+
+  assert.throws(
+    () => {
+      (listCatalog() as unknown as { pop: () => unknown }).pop();
+    },
+    (err: unknown) => err instanceof TypeError,
+  );
+});

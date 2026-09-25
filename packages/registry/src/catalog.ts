@@ -1,5 +1,16 @@
 import type { ProviderEntry } from "./types.ts";
 
+/** Deep-freeze so catalog policy cannot be mutated via shared object refs. */
+function deepFreeze<T extends object>(value: T): T {
+  Reflect.ownKeys(value).forEach((key) => {
+    const child = Reflect.get(value, key);
+    if (child !== null && typeof child === "object" && !Object.isFrozen(child)) {
+      deepFreeze(child as object);
+    }
+  });
+  return Object.freeze(value);
+}
+
 /**
  * M0 provider catalog — 3 live + stubs (forbidden / interactive-only / allowed-direct).
  * Quotes cite docs/plan/subscription-lanes-2026-09-24.md and PLAN-madc-M0-build-plan.md §8.
@@ -182,6 +193,11 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     sourceUrl: "docs/plan/PLAN-madc-M0-build-plan.md#3-out-of-m0-hard-non-goals",
   },
 ] as const;
+
+for (const entry of PROVIDER_CATALOG) {
+  deepFreeze(entry);
+}
+Object.freeze(PROVIDER_CATALOG);
 
 const BY_ID: ReadonlyMap<string, ProviderEntry> = new Map(
   PROVIDER_CATALOG.map((entry) => [entry.id, entry]),
