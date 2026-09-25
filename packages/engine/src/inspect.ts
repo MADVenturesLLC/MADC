@@ -95,7 +95,7 @@ export function inspectMadcHome(home: string, seatId: string = DEFAULT_SEAT_ID):
   const last = lastSessionPath(home);
   let lastSession: SessionReport | null = null;
   if (last !== null) {
-    const result = verifySessionFile(last.path, last.threadId);
+    const result = verifySessionFile(last.path, last.threadId, {}, home);
     lastSession = result.ok
       ? {
           ...last,

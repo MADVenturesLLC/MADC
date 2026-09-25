@@ -413,7 +413,7 @@ export class EngineConnection {
   #loadColdThread(threadId: string, handle: LockHandle): ThreadRecord {
     const path = confinedPath(this.#opts.home, "sessions", threadId, ".jsonl");
     if (!existsSync(path)) throw threadNotFound(threadId);
-    const verified = verifySessionFile(path, threadId);
+    const verified = verifySessionFile(path, threadId, {}, this.#opts.home);
     if (!verified.ok) {
       this.#log(
         `session ${threadId} failed verification at line ${verified.line}: ${verified.reason}`,
@@ -527,7 +527,7 @@ export class EngineConnection {
       } catch {
         continue;
       }
-      const verified = verifySessionFile(path, threadId);
+      const verified = verifySessionFile(path, threadId, {}, this.#opts.home);
       if (!verified.ok) {
         this.#log(`thread/list: skipping ${threadId} (session failed verification)`);
         continue;
