@@ -1,25 +1,19 @@
 /**
- * Child process for `madc doctor`'s `seat` and `session` rows (CLI pin §3: every check has a hard
- * timeout). `inspectMadcHome` and `verifySessionFile` are synchronous and read whole files, so the
- * parent runs them here under a deadline it can enforce by killing this process. Read-only:
- * prints one JSON line (no event bodies, no credentials) and exits.
+ * Child process for `madc doctor`'s MADC_HOME-reading work (CLI pin §3: every check has a hard
+ * timeout). The `seat`, `session` and `locks` rows and `--init`'s seat hash are synchronous file
+ * reads, so the parent runs them here under a deadline it enforces by killing this process.
+ * Read-only: prints one JSON value (rows carry no event bodies, lock tokens or credentials).
+ *   inspect-child rows <HomeState JSON>   → Check[] for seat, session, locks
+ *   inspect-child init-sha <home>         → seat sha256 or null
  */
-import { inspectMadcHome, verifySessionFile } from "@madc/engine/client";
+import { initSeatSha, localRows } from "./doctor.ts";
 
-const [home, seatId] = process.argv.slice(2);
-if (home === undefined || seatId === undefined) {
-  process.stderr.write("usage: inspect-child <home> <seatId>\n");
+const [mode, arg] = process.argv.slice(2);
+if (mode === "rows" && arg !== undefined) {
+  process.stdout.write(`${JSON.stringify(localRows(JSON.parse(arg)))}\n`);
+} else if (mode === "init-sha" && arg !== undefined) {
+  process.stdout.write(`${JSON.stringify(initSeatSha(arg))}\n`);
+} else {
+  process.stderr.write("usage: inspect-child rows <home-json> | init-sha <home>\n");
   process.exit(2);
 }
-const report = inspectMadcHome(home, seatId);
-const last = report.lastSession;
-let verify: unknown = null;
-if (last !== null) {
-  const v = verifySessionFile(last.path, last.threadId, {}, home);
-  verify = v.ok
-    ? { ok: true, events: v.events.length, lastHash: v.lastHash }
-    : { ok: false, line: v.line, reason: v.reason, kind: v.kind };
-}
-process.stdout.write(
-  `${JSON.stringify({ seat: report.seat, lastSession: last === null ? null : { threadId: last.threadId, path: last.path }, verify })}\n`,
-);

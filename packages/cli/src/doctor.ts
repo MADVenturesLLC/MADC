@@ -25,13 +25,14 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MADC_VERSION } from "@madc/core";
 import {
-  type inspectMadcHome,
+  inspectMadcHome,
   isPidAlive,
   listCatalog,
   PROTOCOL_VERSION,
   readLock,
   resolveMadcHome,
   spawnEngine,
+  verifySessionFile,
 } from "@madc/engine/client";
 import { EXIT } from "./exit-codes.ts";
 import { type CliIO, colorEnabled, paint, TimeoutError, withTimeout } from "./io.ts";
@@ -241,7 +242,7 @@ async function checkEngine(io: CliIO): Promise<Check> {
   }
 }
 
-type HomeState =
+export type HomeState =
   | { kind: "invalid"; message: string }
   | { kind: "missing"; path: string; source: string }
   | { kind: "present"; path: string; source: string };
@@ -324,15 +325,55 @@ type Inspection =
     }
   | { readonly ok: false; readonly reason: string };
 
-const INSPECT_CHILD = fileURLToPath(new URL("./inspect-child.ts", import.meta.url));
+const LOCAL_CHILD = fileURLToPath(new URL("./inspect-child.ts", import.meta.url));
+
+/** In-process read-only inspection (runs inside the bounded child). */
+function inspectDirect(home: string): Inspection {
+  const report = inspectMadcHome(home, DEFAULT_SEAT);
+  const last = report.lastSession;
+  let verify: Extract<Inspection, { ok: true }>["verify"] = null;
+  if (last !== null) {
+    const v = verifySessionFile(last.path, last.threadId, {}, home);
+    verify = v.ok
+      ? { ok: true, events: v.events.length, lastHash: v.lastHash }
+      : { ok: false, line: v.line, reason: v.reason, kind: v.kind };
+  }
+  return {
+    ok: true,
+    seat: report.seat,
+    lastSession: last === null ? null : { threadId: last.threadId, path: last.path },
+    verify,
+  };
+}
 
 /**
- * Run `inspectMadcHome` + `verifySessionFile` in a child killed at the deadline (Copilot
- * r4109051001): a huge or stalled session file can no longer hang doctor.
+ * The rows that read MADC_HOME: `seat` (inspection + no-follow hash), `session` (chain verify)
+ * and `locks` (survey). Synchronous; the parent only ever runs this inside the bounded child.
  */
-function inspectBounded(home: string): Inspection {
+export function localRows(home: HomeState): Check[] {
+  const insp = home.kind === "present" ? inspectDirect(home.path) : null;
+  return [
+    checkSeat(home, insp),
+    checkSession(home, insp),
+    home.kind === "invalid" ? skip("locks", "MADC_HOME is invalid") : checkLocks(home),
+  ];
+}
+
+/** Seat sha256 for `--init`'s before/after comparison (runs inside the bounded child). */
+export function initSeatSha(home: string): string | null {
+  return confinedSeatSha(home, `${DEFAULT_SEAT}.json`);
+}
+
+type ChildResult = { ok: true; value: unknown } | { ok: false; reason: string };
+
+/**
+ * Run one read-only local job in a child killed at the deadline (CLI pin §3 "every check has a
+ * hard timeout"; Copilot r4109051001, r4109123404, r4109123434): a huge or stalled seat, session
+ * or `sessions/` tree can no longer hang doctor.
+ */
+function runLocalChild(mode: "rows" | "init-sha", arg: string): ChildResult {
   const flags = process.versions.bun !== undefined ? [] : ["--disable-warning=ExperimentalWarning"];
-  const r = spawnSync(process.execPath, [...flags, INSPECT_CHILD, home, DEFAULT_SEAT], {
+  const r = spawnSync(process.execPath, [...flags, LOCAL_CHILD, mode, arg], {
     timeout: inspectTimeoutMs,
     killSignal: "SIGKILL",
     encoding: "utf8",
@@ -345,11 +386,30 @@ function inspectBounded(home: string): Inspection {
   if (r.signal !== null) return { ok: false, reason: `timeout ${inspectTimeoutMs}ms` };
   if (r.status !== 0) return { ok: false, reason: `inspection failed (exit ${String(r.status)})` };
   try {
-    const parsed = JSON.parse(r.stdout) as Omit<Extract<Inspection, { ok: true }>, "ok">;
-    return { ok: true, ...parsed };
+    return { ok: true, value: JSON.parse(r.stdout) as unknown };
   } catch {
     return { ok: false, reason: "inspection returned malformed output" };
   }
+}
+
+function localRowsBounded(home: HomeState): Check[] {
+  if (home.kind !== "present") return localRows(home); // no MADC_HOME reads
+  const r = runLocalChild("rows", JSON.stringify(home));
+  if (r.ok && Array.isArray(r.value) && r.value.length === 3) return r.value as Check[];
+  const reason = r.ok ? "inspection returned malformed output" : r.reason;
+  return ["seat", "session", "locks"].map((id) => ({
+    id,
+    status: "fail" as const,
+    summary: reason,
+    evidence: {},
+  }));
+}
+
+/** `--init` seat hash under the same deadline; a timeout is reported as its own reason. */
+function initSeatShaBounded(home: string): { sha: string | null } | { reason: string } {
+  const r = runLocalChild("init-sha", home);
+  if (!r.ok) return { reason: r.reason };
+  return { sha: typeof r.value === "string" ? r.value : null };
 }
 
 function checkSeat(home: HomeState, insp: Inspection | null): Check {
@@ -698,7 +758,11 @@ function skip(id: string, why: string): Check {
 /** `--init`: seed via the engine against the real home (seat pin §1 same writer). Never writes seat bytes itself. */
 async function runInit(io: CliIO, home: string): Promise<Check> {
   const seatPath = join(home, "seats", `${DEFAULT_SEAT}.json`);
-  const before = confinedSeatSha(home, `${DEFAULT_SEAT}.json`);
+  const pre = initSeatShaBounded(home);
+  if ("reason" in pre) {
+    return { id: "init", status: "fail", summary: pre.reason, evidence: { path: seatPath } };
+  }
+  const before = pre.sha;
   const r = await runProbe(io, home, INIT_TIMEOUT_MS);
   if (!r.ok)
     return {
@@ -707,7 +771,11 @@ async function runInit(io: CliIO, home: string): Promise<Check> {
       summary: `engine ${r.reason}`,
       evidence: { path: seatPath },
     };
-  const after = confinedSeatSha(home, `${DEFAULT_SEAT}.json`);
+  const post = initSeatShaBounded(home);
+  if ("reason" in post) {
+    return { id: "init", status: "fail", summary: post.reason, evidence: { path: seatPath } };
+  }
+  const after = post.sha;
   if (after === null) {
     return {
       id: "init",
@@ -780,10 +848,7 @@ export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number>
     homeInvalid ? skip("engine", "MADC_HOME is invalid: nothing spawned") : await checkEngine(io),
   );
   emit(checkHome(home));
-  const insp = home.kind === "present" ? inspectBounded(home.path) : null;
-  emit(checkSeat(home, insp));
-  emit(checkSession(home, insp));
-  emit(home.kind === "invalid" ? skip("locks", "MADC_HOME is invalid") : checkLocks(home));
+  for (const row of localRowsBounded(home)) emit(row);
   emit(checkRegistry());
   emit(checkKimiCredential(io));
   emit(checkBin(io, "claude", "A5"));

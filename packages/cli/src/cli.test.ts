@@ -903,6 +903,7 @@ test("A7 §4 exit 3: a turn/completed without items is a protocol violation, one
       "bad-thread-id",
       "no-error-field",
       "item-other-turn",
+      "no-thread-turn",
     ]) {
       const sb4 = sandbox();
       const w = await runCli(sb4, ["-p", "hi", "--json"], {

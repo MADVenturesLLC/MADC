@@ -303,11 +303,11 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
             if (s !== null) served = s;
           }
         }
-        // One turn per thread in a one-shot: match on the thread, since `turn/completed` can be
-        // read in the same chunk as the `turn/start` response, before `turnId` is known here.
-        return (
-          m.method === "turn/completed" && (params?.turn as Turn | undefined)?.threadId === tid
-        );
+        // A one-shot connection has exactly one thread and one turn, so ANY `turn/completed` ends
+        // the wait (it can arrive before the `turn/start` response). Its shape, thread and turn id
+        // are validated afterwards; a malformed one is a protocol violation, never an endless wait
+        // (Copilot r4109123473).
+        return m.method === "turn/completed";
       }, NO_TIMEOUT_MS);
       done.catch(() => undefined);
       if (stream && io.stderrIsTTY) {

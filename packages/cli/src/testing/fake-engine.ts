@@ -189,6 +189,11 @@ rl.on("line", (line) => {
         });
         return;
       }
+      if (scenario === "no-thread-turn") {
+        // "no-thread-turn": turn/completed whose turn has no threadId at all.
+        send({ method: "turn/completed", params: { turn: { id: turnId, status: "completed" } } });
+        return;
+      }
       if (scenario === "bad-turn") {
         // "bad-turn": turn/completed names the thread but carries no items array.
         send({ method: "turn/completed", params: { turn: { threadId, status: "completed" } } });
