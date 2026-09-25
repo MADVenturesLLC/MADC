@@ -419,7 +419,15 @@ export class EngineConnection {
       );
       throw internalError("Session record failed verification");
     }
-    const rebuilt: RebuiltSession = rebuildSession(verified.events);
+    let rebuilt: RebuiltSession;
+    try {
+      rebuilt = rebuildSession(verified.events);
+    } catch (err) {
+      this.#log(
+        `session ${threadId} could not be rebuilt: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      throw internalError("Session record failed verification");
+    }
     const seat = loadSeat(this.#opts.home, rebuilt.thread.seatId);
     const session = SessionWriter.resume(
       path,
