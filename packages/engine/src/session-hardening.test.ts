@@ -13,6 +13,10 @@
  * holds more.
  * Copilot review 5317965607: the seat seed's cleanup never unlinks a file it did not create, and a
  * home subdirectory's mode is tightened on the checked directory's fd, never by path.
+ * Copilot review 5319307067 (r4105871146): the seed re-pins seats/ (dev + inode, real path) right
+ * before its path-based open and link, so a swap before either creates or links nothing; a swap in
+ * the remaining check-to-syscall gap is detected and the seed's own stray name removed. An existing
+ * owner-unreadable (0300) home subdir no longer fails the seed.
  * Network-free: in-process engines only.
  */
 import assert from "node:assert/strict";
@@ -750,6 +754,127 @@ test("R-seed-dir-chmod: a home subdir swapped after its lstat check is never chm
     assert.equal(mode(outside), 0o755);
   } finally {
     setSeedHooksForTests(null);
+    cleanup();
+  }
+});
+
+test("R-seed-open-swap: the seed never leaves a file in a seats/ swapped around its temp open", () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside-seed-open");
+  const seats = join(home, "seats");
+  const moved = join(home, "seats-moved");
+  const swap = () => {
+    renameSync(seats, moved);
+    symlinkSync(outside, seats);
+  };
+  const reset = () => {
+    rmSync(seats, { recursive: true, force: true });
+    rmSync(moved, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+    mkdirSync(seats, { recursive: true, mode: 0o700 });
+    mkdirSync(outside);
+  };
+  try {
+    // Swapped before the pre-open re-pin: refused, the open is never attempted.
+    reset();
+    const steps: string[] = [];
+    setSeedHooksForTests({ beforeOpen: swap, afterPinCheck: (step) => steps.push(step) });
+    assert.throws(() => seedDefaultSeat(home), /changed while the seed was being written/);
+    assert.deepEqual(steps, [], "no open through the swapped seats/");
+    assert.deepEqual(readdirSync(outside), [], "nothing created outside");
+    // Swapped in the re-pin-to-open gap: refused before a byte, its own empty file removed.
+    reset();
+    setSeedHooksForTests({ afterPinCheck: (step) => (step === "open" ? swap() : undefined) });
+    assert.throws(() => seedDefaultSeat(home), /changed while the seed was being written/);
+    assert.deepEqual(readdirSync(outside), [], "own stray temp file removed from outside");
+  } finally {
+    setSeedHooksForTests(null);
+    cleanup();
+  }
+});
+
+test("R-seed-link-swap: the seed never leaves a hard link in a seats/ swapped around its link", () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside-seed-link");
+  const seats = join(home, "seats");
+  const moved = join(home, "seats-moved");
+  const stray = join(outside, "madc-default.json");
+  let name = "";
+  // Swap seats/ for a symlink to `outside`, where an unrelated file already has the temp's name.
+  const swapWithDecoy = () => {
+    renameSync(seats, moved);
+    symlinkSync(outside, seats);
+    writeFileSync(join(outside, name), "operator data\n");
+  };
+  const reset = () => {
+    rmSync(seats, { recursive: true, force: true });
+    rmSync(moved, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+    mkdirSync(seats, { recursive: true, mode: 0o700 });
+    mkdirSync(outside);
+  };
+  const decoyIntact = () => {
+    assert.equal(readFileSync(join(outside, name), "utf8"), "operator data\n", "decoy unchanged");
+    assert.equal(statSync(join(outside, name)).nlink, 1, "decoy has no extra hard link");
+  };
+  try {
+    // Swapped before the pre-link re-pin: refused, the link is never attempted.
+    reset();
+    const steps: string[] = [];
+    setSeedHooksForTests({
+      beforeLink: (tmp) => {
+        name = basename(tmp);
+        swapWithDecoy();
+      },
+      afterPinCheck: (step) => steps.push(step),
+    });
+    assert.throws(() => seedDefaultSeat(home), /changed while the seed was being linked/);
+    assert.deepEqual(steps, ["open"], "no link through the swapped seats/");
+    assert.equal(existsSync(stray), false, "nothing linked outside");
+    decoyIntact();
+    // Swapped in the re-pin-to-link gap (Node has no linkat): the link lands outside, is detected,
+    // and the name it created there is removed; the decoy keeps its only link.
+    reset();
+    setSeedHooksForTests({
+      beforeLink: (tmp) => {
+        name = basename(tmp);
+      },
+      afterPinCheck: (step) => (step === "link" ? swapWithDecoy() : undefined),
+    });
+    assert.throws(() => seedDefaultSeat(home), /changed while the seed was being linked/);
+    assert.equal(existsSync(stray), false, "stray hard link removed from outside");
+    decoyIntact();
+    // A normal seed still works and leaves only the seat file.
+    reset();
+    setSeedHooksForTests(null);
+    assert.equal(seedDefaultSeat(home).created, true);
+    assert.deepEqual(readdirSync(seats), ["madc-default.json"]);
+  } finally {
+    setSeedHooksForTests(null);
+    cleanup();
+  }
+});
+
+test("R-seed-dir-0300: an existing owner-unreadable home subdir does not fail the seed", () => {
+  // POSIX mode bits only; root ignores the missing read bit, so the case cannot arise there.
+  if (!POSIX || process.getuid?.() === 0) return;
+  const { home, cleanup } = makeHome();
+  const memory = join(home, "memory");
+  const mode = () => statSync(memory).mode & 0o777;
+  try {
+    mkdirSync(memory, { recursive: true });
+    chmodSync(memory, 0o300);
+    assert.equal(seedDefaultSeat(home).created, true);
+    assert.equal(mode(), 0o300, "nothing to tighten: left as it was");
+    // Group/other bits but no owner read: it cannot be fchmod'ed via a no-follow fd, so the seed
+    // fails closed instead of falling back to a path-based chmod.
+    chmodSync(memory, 0o310);
+    assert.throws(() => seedDefaultSeat(home), { code: "EACCES" });
+    assert.equal(mode(), 0o310, "never chmod'ed by path");
+  } finally {
+    chmodSync(memory, 0o700);
     cleanup();
   }
 });

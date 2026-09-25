@@ -79,6 +79,10 @@ export function enforcePrivateDirAt(
   } catch (err) {
     const code = errCode(err);
     if (code === "ELOOP" || code === "ENOTDIR" || code === "ENOENT") return false;
+    // An owner-unreadable directory (e.g. 0300) cannot be opened O_RDONLY. If it is still the
+    // checked directory and has no group/other bits there is nothing to tighten (the path-based
+    // `enforcePrivateDir` never chmod'ed it either); otherwise fail closed rather than chmod by path.
+    if (code === "EACCES" && noGroupOtherBits(dir, expected)) return true;
     throw err;
   }
   try {
@@ -89,6 +93,25 @@ export function enforcePrivateDirAt(
     return true;
   } finally {
     closeSync(fd);
+  }
+}
+
+/** `dir` is still the lstat-checked real directory `expected` and its mode has no 0o077 bits. */
+function noGroupOtherBits(
+  dir: string,
+  expected: { readonly dev: bigint; readonly ino: bigint },
+): boolean {
+  try {
+    const st = lstatSync(dir, { bigint: true });
+    return (
+      st.isDirectory() &&
+      !st.isSymbolicLink() &&
+      st.dev === expected.dev &&
+      st.ino === expected.ino &&
+      (st.mode & 0o077n) === 0n
+    );
+  } catch {
+    return false;
   }
 }
 
