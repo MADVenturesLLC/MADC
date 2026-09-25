@@ -3,16 +3,29 @@
  * with -32009 before preflight; appends never follow a symlink without O_NOFOLLOW; rebuild checks
  * the session.open / servedModel backing enum. Copilot review 5317282838: a `sessions/` directory
  * swapped for a symlink is never appended to or read; item ids use the shared id grammar.
+ * Copilot review 5317426919 / Bugbot r4104324505: a writer never snapshots a real path outside the
+ * home (create / resume), and the seat seed never writes through a swapped `seats/` directory.
  * Network-free: in-process engines only.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
 import type { Agent } from "./agent.ts";
 import { RpcError } from "./protocol/errors.ts";
 import type { Turn } from "./protocol/types.ts";
+import { seedDefaultSeat, setSeedHooksForTests } from "./seat-store.ts";
 import { EngineConnection } from "./server.ts";
 import {
   GENESIS_HASH,
@@ -326,5 +339,106 @@ test("R-shape item id: a hash-valid item whose id breaks the shared id grammar i
       (err: Error) => /^line 2: malformed item payload$/.test(err.message),
       String(id),
     );
+  }
+});
+
+test("R-snapshot-confined: a sessions/ swapped before the writer snapshots its real path is refused at create and resume", () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside-snapshot");
+  const isWriteFailed = (seq: number) => (err: RpcError) =>
+    err.code === -32009 && (err.data as { seq: number }).seq === seq;
+  try {
+    const sessions = join(home, "sessions");
+    const path = writeSampleSession(sessions);
+    const target = writeSampleSession(outside);
+    const targetBytes = readFileSync(target, "utf8");
+    renameSync(sessions, join(home, "sessions-moved"));
+    symlinkSync(outside, sessions);
+    // resume: the path now resolves outside the home, so no writer is built.
+    assert.throws(
+      () =>
+        SessionWriter.resume(
+          path,
+          "thr_sample",
+          "madc-default",
+          4,
+          readLines(target)[3]?.hash ?? "",
+          () => [],
+          home,
+        ),
+      isWriteFailed(4),
+    );
+    // create: the exclusive create lands outside, is detected before session.open is written,
+    // and is never unlinked through the outside path.
+    const created = join(sessions, "thr_new.jsonl");
+    assert.throws(
+      () =>
+        SessionWriter.create(
+          created,
+          "thr_new",
+          "madc-default",
+          { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" },
+          () => [],
+          1000,
+          home,
+        ),
+      isWriteFailed(0),
+    );
+    assert.equal(
+      readFileSync(join(outside, "thr_new.jsonl"), "utf8"),
+      "",
+      "session.open never written",
+    );
+    assert.equal(readFileSync(target, "utf8"), targetBytes, "nothing written outside the home");
+  } finally {
+    cleanup();
+  }
+});
+
+test("R-seed-parent-swap: the seat seed never writes seed bytes through a seats/ swapped for a symlink", () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside-seats");
+  const seats = join(home, "seats");
+  const seatFile = join(seats, "madc-default.json");
+  const swapTo = (dir: string) => () => {
+    renameSync(seats, dir);
+    symlinkSync(dir, seats);
+  };
+  const reset = () => {
+    rmSync(seats, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+    mkdirSync(seats, { mode: 0o700 });
+  };
+  try {
+    seedDefaultSeat(home);
+    // Swap before the temp file is opened: refused before a byte is written.
+    reset();
+    mkdirSync(outside);
+    setSeedHooksForTests({
+      beforeOpen: () => {
+        rmSync(seats, { recursive: true });
+        symlinkSync(outside, seats);
+      },
+    });
+    assert.throws(() => seedDefaultSeat(home), /changed while the seed was being written/);
+    for (const name of readdirSync(outside)) {
+      assert.equal(statSync(join(outside, name)).size, 0, `${name} holds no seed bytes`);
+    }
+    assert.equal(existsSync(join(outside, "madc-default.json")), false);
+    // Swap between the temp write and the link: the link is detected outside and the seed fails.
+    rmSync(seats);
+    reset();
+    setSeedHooksForTests({ beforeLink: swapTo(outside) });
+    assert.throws(() => seedDefaultSeat(home), /changed while the seed was being linked/);
+    // A normal seed still works.
+    rmSync(seats);
+    reset();
+    setSeedHooksForTests(null);
+    assert.deepEqual(seedDefaultSeat(home), { path: seatFile, created: true });
+  } finally {
+    setSeedHooksForTests(null);
+    cleanup();
   }
 });
