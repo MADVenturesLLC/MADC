@@ -207,6 +207,16 @@ function fdIsFileAt(fd: number, path: string, accept: (real: string) => boolean)
   return seen.dev === opened.dev && seen.ino === opened.ino;
 }
 
+/** True without a home; with one, `real` must be strictly under realpath(home). */
+function resolvesUnderHome(real: string, home: string | undefined): boolean {
+  if (home === undefined) return true;
+  try {
+    return isStrictlyUnder(real, realpathSync(home));
+  } catch {
+    return false;
+  }
+}
+
 type WriteChunk = (fd: number, buf: Buffer, off: number, len: number) => number;
 let writeChunk: WriteChunk = (fd, buf, off, len) => writeSync(fd, buf, off, len);
 
@@ -230,7 +240,10 @@ export class SessionWriter {
   #prevHash: string;
   #broken = false;
   readonly #secrets: () => readonly string[];
-  /** Real path at create / resume (the caller confined it); every append must still resolve here. */
+  /**
+   * Real path at create / resume; with a home it was checked to be strictly under realpath(home).
+   * Every append must still resolve here.
+   */
   readonly #realPath: string;
 
   private constructor(
@@ -254,6 +267,8 @@ export class SessionWriter {
   /**
    * Start a new session: create the file exclusively (0600) and append `session.open` (seq 0).
    * Any failure → -32009 `{ threadId, path, seq: 0 }`, and a file this call created is removed.
+   * With `home`, the created file must resolve strictly under realpath(home) before anything is
+   * written (a `sessions/` swapped for a symlink before the snapshot is refused).
    */
   static create(
     path: string,
@@ -262,6 +277,7 @@ export class SessionWriter {
     open: SessionOpenPayload,
     secrets: () => readonly string[],
     ts: number = Date.now(),
+    home?: string,
   ): SessionWriter {
     let fd: number;
     try {
@@ -281,6 +297,10 @@ export class SessionWriter {
       }
       throw sessionWriteFailed(threadId, path, 0);
     }
+    if (!resolvesUnderHome(realPath, home)) {
+      // Never unlink through a path that now resolves outside the home; nothing was written.
+      throw sessionWriteFailed(threadId, path, 0);
+    }
     const writer = new SessionWriter(path, realPath, threadId, seatId, 0, GENESIS_HASH, secrets);
     try {
       writer.append("session.open", open, ts);
@@ -295,7 +315,10 @@ export class SessionWriter {
     return writer;
   }
 
-  /** Continue a verified session (resume): next seq and last hash come from `verifySession`. */
+  /**
+   * Continue a verified session (resume): next seq and last hash come from `verifySession`. With
+   * `home`, the file must still resolve strictly under realpath(home) (else -32009).
+   */
   static resume(
     path: string,
     threadId: string,
@@ -303,6 +326,7 @@ export class SessionWriter {
     nextSeq: number,
     lastHash: string,
     secrets: () => readonly string[],
+    home?: string,
   ): SessionWriter {
     let realPath: string;
     try {
@@ -310,6 +334,7 @@ export class SessionWriter {
     } catch {
       throw sessionWriteFailed(threadId, path, nextSeq);
     }
+    if (!resolvesUnderHome(realPath, home)) throw sessionWriteFailed(threadId, path, nextSeq);
     return new SessionWriter(path, realPath, threadId, seatId, nextSeq, lastHash, secrets);
   }
 
