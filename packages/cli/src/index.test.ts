@@ -1,6 +1,7 @@
 /** A7 unit tests: argument grammar (CLI pin §1), exit-code table (§4), colour rules (§3). */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -166,6 +167,55 @@ test("A7 §3 doctor hashes through one no-follow descriptor: a symlink is never 
     assert.equal(sha256OrNull(link), null, "symlink not followed");
     assert.equal(sha256OrNull(dir), null, "directory is not a regular file");
     assert.equal(sha256OrNull(join(dir, "absent")), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("A7 §3 a FIFO at a hashed path never blocks doctor (Bugbot 4108211281)", {
+  skip: process.platform === "win32" ? "no FIFOs on Windows" : false,
+}, () => {
+  const dir = mkdtempSync(join(tmpdir(), "madc-a7-fifo-"));
+  try {
+    const fifo = join(dir, "seat.json");
+    const made = spawnSync("mkfifo", [fifo]);
+    if (made.status !== 0) {
+      console.log(`SKIP FIFO test: mkfifo unavailable (${String(made.error ?? made.status)})`);
+      return;
+    }
+    // In a child with a hard timeout: a blocking open would hang this process synchronously.
+    const doctorUrl = new URL("./doctor.ts", import.meta.url).href;
+    const code = `import { sha256OrNull } from ${JSON.stringify(doctorUrl)}; console.log(String(sha256OrNull(${JSON.stringify(fifo)})));`;
+    const args =
+      process.versions.bun !== undefined
+        ? ["-e", code]
+        : ["--disable-warning=ExperimentalWarning", "--input-type=module", "-e", code];
+    const r = spawnSync(process.execPath, args, { timeout: 10_000, encoding: "utf8" });
+    assert.equal(r.signal, null, "open did not block (child not killed by the timeout)");
+    assert.equal(r.stdout.trim(), "null", r.stderr);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("A7 §1 a dangling MADC_HOME symlink → exit 2 before anything spawns (Copilot r4108213385, r4108213417)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "madc-a7-dangling-"));
+  try {
+    const home = join(dir, "home");
+    symlinkSync(join(dir, "gone"), home);
+    const noEngine = join(dir, "no-engine.ts");
+    const one = fakeIO({ env: { MADC_HOME: home }, engineEntry: noEngine });
+    assert.equal(await main(["-p", "hi", "--json"], one), 2);
+    assert.match(
+      (JSON.parse(one.out()) as { error: { message: string } }).error.message,
+      /dangling symlink/,
+    );
+    const doc = fakeIO({ env: { MADC_HOME: home, PATH: "" }, engineEntry: noEngine });
+    assert.equal(await main(["doctor", "--init", "--json"], doc), 2);
+    const report = JSON.parse(doc.out()) as { checks: Array<{ id: string; status: string }> };
+    assert.equal(report.checks.find((c) => c.id === "home")?.status, "fail");
+    assert.equal(report.checks.find((c) => c.id === "engine")?.status, "skip", "nothing spawned");
+    assert.equal(existsSync(join(dir, "gone")), false, "the symlink target was never created");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
