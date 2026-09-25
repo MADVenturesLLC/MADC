@@ -12,15 +12,16 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
 import { createAcpAdapter, NotImplementedError } from "./acp/index.ts";
+import { echoAgent } from "./agent.ts";
 import { confinedPath, resolveMadcHome } from "./home.ts";
 import {
   acquireThreadLock,
   fileId,
   holdsThreadLock,
   isPidAlive,
-  lockGuardPath,
   readLock,
   reclaimIfUnchanged,
   releaseThreadLock,
@@ -30,6 +31,7 @@ import { ErrorCode, providerRefusalError, RpcError } from "./protocol/errors.ts"
 import { ID_PATTERN, isValidId, newId } from "./protocol/ids.ts";
 import { CLIENT_REQUEST_METHODS, ITEM_KINDS } from "./protocol/types.ts";
 import { encodeMessage, parseLine } from "./protocol/wire.ts";
+import { EngineConnection } from "./server.ts";
 import { makeHome } from "./testing/harness.ts";
 
 test("§4.1 error-code constants match the pin table exactly", () => {
@@ -167,6 +169,8 @@ test("confinedPath: id checked BEFORE any path join/mkdir (honesty guard)", () =
   }
 });
 
+const isInternal = (e: unknown) => e instanceof RpcError && e.code === ErrorCode.InternalError;
+
 test("confinedPath: symlinked subdir escaping MADC_HOME is rejected", () => {
   const { home, cleanup } = makeHome();
   try {
@@ -179,14 +183,35 @@ test("confinedPath: symlinked subdir escaping MADC_HOME is rejected", () => {
       return; // symlinks unavailable (e.g. unprivileged Windows) — nothing to assert
     }
     chmodSync(outside, 0o755);
-    assert.throws(
-      () => confinedPath(home, "sessions", "thr_ok", ".lock"),
-      (e: unknown) => e instanceof RpcError && e.code === ErrorCode.InternalError,
-    );
+    assert.throws(() => confinedPath(home, "sessions", "thr_ok", ".lock"), isInternal);
     if (process.platform !== "win32") {
       // Honesty: a rejected path never gets permissions changed outside MADC_HOME.
       assert.equal(statSync(outside).mode & 0o777, 0o755);
     }
+  } finally {
+    cleanup();
+  }
+});
+
+test("confinedPath: symlinked component rejected BEFORE any mkdir (dangling / inside targets)", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    mkdirSync(home, { recursive: true });
+    const missingOutside = join(home, "..", "not-yet");
+    try {
+      symlinkSync(missingOutside, join(home, "sessions"), "dir");
+    } catch {
+      return; // symlinks unavailable — nothing to assert
+    }
+    assert.throws(() => confinedPath(home, "sessions", "thr_ok", ".lock"), isInternal);
+    assert.equal(existsSync(missingOutside), false, "nothing created outside MADC_HOME");
+
+    // Even a symlink that points back inside MADC_HOME is refused: components must be real dirs.
+    unlinkSync(join(home, "sessions"));
+    mkdirSync(join(home, "real"));
+    symlinkSync(join(home, "real"), join(home, "sessions"), "dir");
+    assert.throws(() => confinedPath(home, "sessions", "thr_ok", ".lock"), isInternal);
+    assert.deepEqual(readdirSync(join(home, "real")), []);
   } finally {
     cleanup();
   }
@@ -218,6 +243,7 @@ test("lock: create-exclusive {pid,startedAt}; live foreign holder refused; relea
     const mine = acquireThreadLock(home, "thr_a", holderPid);
     assert.equal(mine.ok, true);
     const body = JSON.parse(readFileSync(mine.path, "utf8"));
+    assert.deepEqual(Object.keys(body).sort(), ["pid", "startedAt"], "pinned body, nothing else");
     assert.equal(body.pid, holderPid);
     assert.equal(typeof body.startedAt, "number");
 
@@ -227,12 +253,31 @@ test("lock: create-exclusive {pid,startedAt}; live foreign holder refused; relea
     assert.equal(mine.ok && holdsThreadLock(mine.handle), true);
     if (!mine.ok) return;
     // A handle for a different file (forged inode) is not ours → must not remove.
-    releaseThreadLock({ ...mine.handle, ino: mine.handle.ino + 1n });
+    assert.equal(releaseThreadLock({ ...mine.handle, ino: mine.handle.ino + 1n }), false);
     assert.equal(readLock(mine.path).state, "held");
-    releaseThreadLock(mine.handle);
+    assert.equal(releaseThreadLock(mine.handle), true);
     assert.equal(readLock(mine.path).state, "missing");
   } finally {
     holder.kill();
+    cleanup();
+  }
+});
+
+test("lock: release with a token mismatch (same file, different startedAt/pid) removes nothing", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const mine = acquireThreadLock(home, "thr_t");
+    assert.equal(mine.ok, true);
+    if (!mine.ok) return;
+    assert.equal(
+      releaseThreadLock({ ...mine.handle, startedAt: mine.handle.startedAt + 1 }),
+      false,
+    );
+    assert.equal(releaseThreadLock({ ...mine.handle, pid: mine.handle.pid + 1 }), false);
+    assert.equal(holdsThreadLock(mine.handle), true, "lock survives mismatched tokens");
+    assert.equal(releaseThreadLock(mine.handle), true);
+    assert.equal(readLock(mine.path).state, "missing");
+  } finally {
     cleanup();
   }
 });
@@ -259,6 +304,7 @@ test("lock: dead pid and corrupt body are reclaimed", async () => {
     assert.equal(again.ok, true);
     if (again.ok) releaseThreadLock(again.handle);
     assert.equal(existsSync(path), false);
+    assert.deepEqual(readdirSync(join(home, "sessions")), [], "no stray files after reclaim");
   } finally {
     cleanup();
   }
@@ -284,8 +330,13 @@ test("lock: reclaim never deletes a lock that changed after it was judged dead",
     writeFileSync(path, JSON.stringify({ pid: holder.pid, startedAt: 2 }));
     assert.equal(reclaimIfUnchanged(path, seenId, seen), false);
     assert.deepEqual(readLock(path), { state: "held", info: { pid: holder.pid, startedAt: 2 } });
+    assert.deepEqual(
+      readdirSync(join(home, "sessions")),
+      ["thr_d.lock"],
+      "live lock back in place",
+    );
 
-    // Unchanged since observed → reclaimed, with no stray temp files left behind.
+    // Unchanged since observed → reclaimed, with no stray files left behind.
     const liveId = fileId(path);
     assert.ok(liveId);
     assert.equal(reclaimIfUnchanged(path, liveId, readLock(path)), true);
@@ -293,52 +344,6 @@ test("lock: reclaim never deletes a lock that changed after it was judged dead",
     assert.deepEqual(readdirSync(join(home, "sessions")), [], "no stray reclaim files");
   } finally {
     holder.kill();
-    cleanup();
-  }
-});
-
-test("lock: reclaim/release defer to a live mutation guard; a dead holder's guard is broken", async () => {
-  const { home, cleanup } = makeHome();
-  const other = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
-    stdio: "ignore",
-  });
-  try {
-    const dead = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
-    const deadPid = dead.pid ?? 0;
-    await new Promise((r) => dead.once("exit", r));
-    const path = threadLockPath(home, "thr_g");
-    const guard = lockGuardPath(path);
-
-    // Another live engine is mid-reclaim/release (holds the guard): we must not touch the lock.
-    writeFileSync(path, JSON.stringify({ pid: deadPid, startedAt: 1 }));
-    const seenId = fileId(path);
-    assert.ok(seenId);
-    writeFileSync(guard, JSON.stringify({ pid: other.pid, startedAt: 1 }));
-    assert.equal(reclaimIfUnchanged(path, seenId, readLock(path)), false);
-    assert.equal(readLock(path).state, "held", "dead lock left for the guard holder");
-    unlinkSync(path);
-
-    const mine = acquireThreadLock(home, "thr_g");
-    assert.equal(mine.ok, true);
-    if (!mine.ok) return;
-    assert.equal(releaseThreadLock(mine.handle), false);
-    assert.equal(holdsThreadLock(mine.handle), true, "lock untouched while guard is held");
-
-    // Guard released → release proceeds; no stray guard/temp files.
-    unlinkSync(guard);
-    assert.equal(releaseThreadLock(mine.handle), true);
-    assert.equal(readLock(path).state, "missing");
-
-    // A guard left behind by a crashed (dead) process is broken, then cleaned up.
-    const again = acquireThreadLock(home, "thr_g");
-    assert.equal(again.ok, true);
-    if (!again.ok) return;
-    writeFileSync(guard, JSON.stringify({ pid: deadPid, startedAt: 1 }));
-    assert.equal(releaseThreadLock(again.handle), true);
-    assert.equal(readLock(path).state, "missing");
-    assert.deepEqual(readdirSync(join(home, "sessions")), [], "no stray guard/temp files");
-  } finally {
-    other.kill();
     cleanup();
   }
 });
@@ -362,17 +367,64 @@ test("lock: a stale handle never deletes a replacement lock (per-acquisition ide
     assert.equal(holdsThreadLock(first.handle), false);
     assert.equal(holdsThreadLock(second.handle), true);
 
-    releaseThreadLock(first.handle); // stale → must leave the replacement in place
+    assert.equal(releaseThreadLock(first.handle), false); // stale → replacement stays
     assert.equal(readLock(first.path).state, "held");
     assert.equal(holdsThreadLock(second.handle), true, "replacement lock left intact");
     assert.deepEqual(
       readdirSync(join(home, "sessions")).filter((f) => f !== "thr_c.lock"),
       [],
-      "no stray temp/guard files",
+      "no stray temp files",
     );
     releaseThreadLock(second.handle);
     assert.equal(readLock(first.path).state, "missing");
   } finally {
+    cleanup();
+  }
+});
+
+test("server: stdout failure takes the EOF shutdown path (locks released, dispatch stops)", async () => {
+  const { home, cleanup } = makeHome();
+  const input = new PassThrough();
+  const lines: string[] = [];
+  let writes = 0;
+  const output = new Writable({
+    write(chunk, _enc, cb) {
+      writes++;
+      // initialize response + thread/start response go out; the thread/started notification fails.
+      if (writes >= 3) {
+        cb(new Error("EPIPE: reader went away"));
+        return;
+      }
+      lines.push(String(chunk));
+      cb();
+    },
+  });
+  const conn = new EngineConnection({ input, output, home, agent: echoAgent, log: () => {} });
+  const done = conn.run();
+  try {
+    input.write(
+      `${JSON.stringify({ id: 1, method: "initialize", params: { clientInfo: { name: "t", version: "0" } } })}\n`,
+    );
+    input.write(`${JSON.stringify({ id: 2, method: "thread/start", params: {} })}\n`);
+    let timer: NodeJS.Timeout | undefined;
+    const outcome = await Promise.race([
+      done.then(() => "shutdown"),
+      new Promise((r) => {
+        timer = setTimeout(() => r("timeout"), 3000);
+      }),
+    ]);
+    clearTimeout(timer);
+    assert.equal(outcome, "shutdown", "run() resolves although stdin is still open");
+    const started = JSON.parse(lines[1] ?? "{}");
+    const threadId: string = started.result?.thread?.id;
+    assert.ok(isValidId(threadId));
+    assert.equal(existsSync(join(home, "sessions", `${threadId}.lock`)), false, "lock released");
+    const before = writes;
+    input.write(`${JSON.stringify({ id: 3, method: "thread/list", params: {} })}\n`);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(writes, before, "no dispatch after shutdown");
+  } finally {
+    input.end();
     cleanup();
   }
 });
