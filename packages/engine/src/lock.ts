@@ -69,8 +69,33 @@ function removeQuietly(path: string): void {
   }
 }
 
-// O_NOFOLLOW where the platform has it; symlinks are additionally rejected by lstat in readLock.
-const OPEN_READ_NOFOLLOW = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
+// Every lock read goes through one fd opened with O_NOFOLLOW (a symlink at the path fails with
+// ELOOP instead of being followed) and O_NONBLOCK (a FIFO planted there cannot block the engine);
+// the fd is then checked with fstat to be a regular file. Platforms without O_NOFOLLOW fall back to
+// an lstat pre-check (residual race there only).
+const HAS_NOFOLLOW = typeof constants.O_NOFOLLOW === "number";
+const OPEN_READ_NOFOLLOW =
+  constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+
+/** Open `path` for reading without following a symlink. Null if missing; "symlink" if it is one. */
+function openNoFollow(path: string): number | null | "symlink" {
+  try {
+    if (!HAS_NOFOLLOW && lstatSync(path).isSymbolicLink()) return "symlink";
+    return openSync(path, OPEN_READ_NOFOLLOW);
+  } catch (err) {
+    const code = errCode(err);
+    if (code === "ENOENT") return null;
+    if (code === "ELOOP") return "symlink";
+    throw err;
+  }
+}
+
+export class LockPathNotAFileError extends Error {
+  constructor(path: string) {
+    super(`lock path is not a regular file: ${path}`);
+    this.name = "LockPathNotAFileError";
+  }
+}
 
 /** Classify a body. `fingerprint` is the exact bytes seen (pin §3.3 (b) compares pid+startedAt+token). */
 export function parseLockBody(text: string): LockState {
@@ -87,21 +112,32 @@ export function parseLockBody(text: string): LockState {
   if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
     return { state: "corrupt", fingerprint };
   }
-  const token =
-    typeof body.token === "string" && LOCK_TOKEN_PATTERN.test(body.token) ? body.token : null;
+  // A token only counts on a well-formed body: exactly { pid, startedAt, token } with a finite
+  // startedAt. Anything else is a legacy/corrupt body (pin §3.3 (c)): locked while its pid lives.
+  const wellFormed =
+    Object.keys(body).length === 3 &&
+    typeof body.startedAt === "number" &&
+    Number.isFinite(body.startedAt) &&
+    typeof body.token === "string" &&
+    LOCK_TOKEN_PATTERN.test(body.token);
+  const token = wellFormed ? (body.token as string) : null;
   return { state: "held", pid, startedAt: body.startedAt, token, fingerprint };
 }
 
-/** Read the lock at `path` without following a symlink. */
+/**
+ * Read the lock at `path` through a single no-follow fd (never re-opening the path after a check).
+ * A symlink is `corrupt` and never trusted; any other non-regular file (directory, FIFO, device) is
+ * refused with `LockPathNotAFileError` rather than reclaimed.
+ */
 export function readLock(path: string): LockState {
+  const fd = openNoFollow(path);
+  if (fd === null) return { state: "missing" };
+  if (fd === "symlink") return { state: "corrupt", fingerprint: "symlink" };
   try {
-    if (lstatSync(path).isSymbolicLink()) return { state: "corrupt", fingerprint: "symlink" };
-    return parseLockBody(readFileSync(path, "utf8"));
-  } catch (err) {
-    const code = errCode(err);
-    if (code === "ENOENT") return { state: "missing" };
-    if (code === "ELOOP") return { state: "corrupt", fingerprint: "symlink" };
-    throw err;
+    if (!fstatSync(fd).isFile()) throw new LockPathNotAFileError(path);
+    return parseLockBody(readFileSync(fd, "utf8"));
+  } finally {
+    closeSync(fd);
   }
 }
 
@@ -218,14 +254,8 @@ function withOpenLock<T>(
   handle: LockHandle,
   fn: (body: LockState, pinned: { dev: bigint; ino: bigint }) => T,
 ): T | null {
-  let fd: number;
-  try {
-    fd = openSync(handle.path, OPEN_READ_NOFOLLOW);
-  } catch (err) {
-    const code = errCode(err);
-    if (code === "ENOENT" || code === "ELOOP") return null;
-    throw err;
-  }
+  const fd = openNoFollow(handle.path);
+  if (fd === null || fd === "symlink") return null;
   try {
     const st = fstatSync(fd, { bigint: true });
     if (!st.isFile()) return null;
