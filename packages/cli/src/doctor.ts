@@ -496,6 +496,13 @@ function checkLocks(home: HomeState): Check {
       locks.push({ threadId, state: lock.state });
       continue;
     }
+    if (lock.token === null) {
+      // A held lock without a well-formed { pid, startedAt, token } body is legacy/corrupt
+      // (Copilot review 5322869130): WARN, never a healthy PASS. The body is still not printed.
+      warnings.push(`${threadId} · pid ${lock.pid}: corrupt or legacy lock body`);
+      locks.push({ threadId, pid: lock.pid, state: "corrupt" });
+      continue;
+    }
     const startedAt = typeof lock.startedAt === "number" ? lock.startedAt : null;
     const age = startedAt === null ? "?" : `${Math.max(0, Math.round((now - startedAt) / 1000))}s`;
     const entry = `${threadId} · pid ${lock.pid} · age ${age}`;

@@ -344,6 +344,8 @@ test("A7 §7.3a locks: dead pid → WARN not visible, orphaned reclaim → WARN,
       join(sessions, `thr_gone.lock.reclaim-${token}`),
       JSON.stringify({ pid: 1, startedAt: 1, token }),
     );
+    // Live pid, but a legacy body (no token): corrupt, WARN (Copilot review 5322869130).
+    writeFileSync(join(sessions, "thr_legacy.lock"), JSON.stringify({ pid: process.pid }));
     // Alive here, but it started long after this lock claims to have been taken.
     writeFileSync(
       join(sessions, "thr_reused.lock"),
@@ -361,6 +363,10 @@ test("A7 §7.3a locks: dead pid → WARN not visible, orphaned reclaim → WARN,
       /thr_dead · pid 4194301 · age \d+s: pid 4194301 not visible in this PID namespace: dead here, or live in another container\. M0 supports one PID namespace per MADC_HOME \(Amendment 2 §1\)/,
     );
     assert.match(locks.summary, /orphaned thr_gone\.lock\.reclaim-<redacted>/);
+    assert.match(
+      locks.summary,
+      new RegExp(`thr_legacy · pid ${process.pid}: corrupt or legacy lock body`),
+    );
     assert.match(text.stdout, /orphaned thr_gone\.lock\.reclaim-<redacted>/);
     if (process.platform === "linux") {
       assert.match(
@@ -890,6 +896,17 @@ test("A7 §4 exit 3: a turn/completed without items is a protocol violation, one
     });
     sb2.cleanup();
     assert.equal(h.code, 3, h.stdout + h.stderr);
+    // Items are validated too (Copilot r4108764755): an agentMessage without text → 3, in both modes.
+    for (const json of [true, false]) {
+      const sb3 = sandbox();
+      const i = await runCli(sb3, json ? ["-p", "hi", "--json"] : ["-p", "hi"], {
+        engine: FAKE,
+        env: { MADC_TEST_FAKE_SCENARIO: "bad-turn-item" },
+      });
+      sb3.cleanup();
+      assert.equal(i.code, 3, i.stdout + i.stderr);
+      if (json) assert.equal(i.stdout.trim().split("\n").length, 1, "exactly one JSON object");
+    }
   } finally {
     sb.cleanup();
   }
