@@ -334,14 +334,16 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
         : `engine exited with code ${engineExit} after the turn`,
     );
   }
-  if (exit === EXIT.ok && client !== null && client.protocolViolations.length > 0) {
+  // Protocol violations override any turn/provider/session class (the pin makes them exit 3;
+  // Copilot r4108455720); a signal exit still wins below.
+  if (signalExit === null && client !== null && client.protocolViolations.length > 0) {
     fail(
       { exit: EXIT.engine, class: "engine" },
       null,
       "protocol violation: non-JSON line on engine stdout",
     );
   }
-  if (exit === EXIT.ok && malformedItem) {
+  if (signalExit === null && malformedItem) {
     fail(
       { exit: EXIT.engine, class: "engine" },
       null,
@@ -371,7 +373,8 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
     };
   }
 
-  const text = finalTurn === null ? "" : finalText(finalTurn.items) || streamed;
+  // `turn/completed.items` is authoritative; deltas were display only (Copilot review 5322493871).
+  const text = finalTurn === null ? "" : finalText(finalTurn.items);
   const durationMs =
     finalTurn !== null && finalTurn.completedAt !== null
       ? finalTurn.completedAt - finalTurn.startedAt

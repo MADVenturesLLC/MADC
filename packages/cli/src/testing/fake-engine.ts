@@ -126,7 +126,16 @@ rl.on("line", (line) => {
         completedAt: null,
       };
       send({ id: msg.id, result: { turn } });
-      const failed = scenario === "turn-failed-internal";
+      // "junk-failed": a non-JSON line, then the turn fails -32603 (the violation must win: 3).
+      const failed = scenario === "turn-failed-internal" || scenario === "junk-failed";
+      if (scenario === "junk-failed") process.stdout.write("this is not json\n");
+      // "delta-only": a delta is streamed but the completed turn carries no agentMessage item.
+      if (scenario === "delta-only") {
+        send({
+          method: "item/agentMessage/delta",
+          params: { threadId, turnId, itemId: "item_a1", delta: "streamed only" },
+        });
+      }
       if (scenario !== "bad-chain") {
         append("turn.start", { turnId, inputText: "hi" });
         const error = failed ? { code: -32603, message: "Agent failed" } : null;
@@ -136,9 +145,10 @@ rl.on("line", (line) => {
         // "bad-item": valid JSON, but an item/completed notification without an item.
         send({ method: "item/completed", params: { threadId, turnId } });
       }
-      const items = [
-        { id: "item_a1", kind: "agentMessage", status: "completed", text: "fake reply" },
-      ];
+      const items =
+        scenario === "delta-only"
+          ? []
+          : [{ id: "item_a1", kind: "agentMessage", status: "completed", text: "fake reply" }];
       send({
         method: "turn/completed",
         params: {

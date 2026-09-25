@@ -817,6 +817,58 @@ test("A7 §4 exit 3: item/completed without an item is a protocol violation, one
   }
 });
 
+test("A7 §4 a protocol violation outranks a turn failure (exit 3); final text comes only from turn/completed items (Copilot r4108455720, review 5322493871)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    const r = await runCli(sb, ["-p", "hi", "--json"], {
+      engine: FAKE,
+      env: { MADC_TEST_FAKE_SCENARIO: "junk-failed" },
+    });
+    assert.equal(r.code, 3, r.stdout + r.stderr);
+    assert.match(
+      (JSON.parse(r.stdout) as { error: { message: string } }).error.message,
+      /protocol violation/,
+    );
+    const sb2 = sandbox(); // the fake engine uses a fixed thread id: fresh home
+    const d = await runCli(sb2, ["-p", "hi", "--json"], {
+      engine: FAKE,
+      env: { MADC_TEST_FAKE_SCENARIO: "delta-only" },
+    });
+    sb2.cleanup();
+    assert.equal(d.code, 0, d.stdout + d.stderr);
+    const out = JSON.parse(d.stdout) as { text: string };
+    assert.equal(out.text, "", "deltas are display only, never the final text");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("A7 §3 --init never hashes through a symlinked seats/ parent (Copilot r4108455655)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    mkdirSync(sb.home);
+    const outside = join(sb.root, "outside-seats");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "madc-default.json"), '{"outside":true}\n');
+    const outsideSha = createHash("sha256")
+      .update(readFileSync(join(outside, "madc-default.json")))
+      .digest("hex");
+    symlinkSync(outside, join(sb.home, "seats"));
+    const r = await runCli(sb, ["doctor", "--init", "--json"]);
+    assert.equal(r.stdout.includes(outsideSha), false, "the outside seat is never hashed");
+    assert.doesNotMatch(r.stdout, /already present \(unchanged/);
+    const seatRow = check(JSON.parse(r.stdout) as DoctorJson, "seat");
+    assert.notEqual(seatRow.status, "pass");
+    assert.equal(readFileSync(join(outside, "madc-default.json"), "utf8"), '{"outside":true}\n');
+  } finally {
+    sb.cleanup();
+  }
+});
+
 test("A7 §4 exit 3: the turn completed but the engine exited non-zero on close (Copilot r4107601276)", {
   timeout: 60_000,
 }, async () => {
