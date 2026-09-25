@@ -9,6 +9,8 @@
  * session symlink is refused (-32603), not reported as not found.
  * Copilot review 5317728570: a `toJSON` hook never smuggles an unredacted value into the JSONL; a
  * resume is bound to the file that was verified (dev + inode).
+ * Copilot review 5317847622: a rebuilt turn error carries only {code, message}, even if the line
+ * holds more.
  * Network-free: in-process engines only.
  */
 import assert from "node:assert/strict";
@@ -621,4 +623,25 @@ test("R-resume-identity: resume refuses a different file swapped in after verifi
   } finally {
     cleanup();
   }
+});
+
+test("R-turn-error: a rebuilt turn error is {code, message} only, whatever extra fields the line holds", () => {
+  const open = { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" };
+  const r = verifySessionText(
+    forgeSession("thr_err", [
+      ["session.open", open],
+      ["turn.start", { turnId: "turn_1", inputText: "x" }],
+      [
+        "turn.end",
+        {
+          turnId: "turn_1",
+          status: "failed",
+          error: { code: -32009, message: "Session write failed", data: { path: "/secret" } },
+        },
+      ],
+    ]),
+  );
+  assert.equal(r.ok, true);
+  const rebuilt = rebuildSession(r.ok ? r.events : []);
+  assert.deepEqual(rebuilt.turns[0]?.error, { code: -32009, message: "Session write failed" });
 });
