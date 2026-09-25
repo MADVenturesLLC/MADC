@@ -1,4 +1,4 @@
-# Code advisories (Copilot, code scanning, Dependabot)
+# Code advisories (Copilot, code scanning)
 
 ## Scope
 
@@ -6,7 +6,9 @@ This policy applies to **MADVenturesLLC/MADC only**.
 
 ## Before-merge ask
 
-Before asking Founder to merge, builders list open **Copilot review findings**, **code-scanning alerts**, and **Dependabot alerts** for the PR (or for `main` when clearing debt).
+Before asking Founder to merge, builders list open **Copilot review findings**, and **code-scanning alerts only if GitHub Code Security / code scanning is enabled** on the repo, for the PR (or for `main` when clearing debt).
+
+**Dependabot is currently disabled on MADC; do not block on missing Dependabot alerts.** Dependabot stays out of the required pre-merge checklist until Founder enables it. Do not enable Dependabot under this policy alone.
 
 ## Severity handling
 
@@ -35,3 +37,4 @@ Founder may merge anytime. If `main` gains open high/critical because Founder me
 - Actions spend
 - Forcing Copilot required checks
 - Blocking Founder merges via rulesets
+- Enabling Dependabot or Code Security without a separate Founder ask
