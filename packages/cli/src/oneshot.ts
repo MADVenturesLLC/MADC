@@ -102,6 +102,10 @@ function isItemShape(i: unknown): i is Item {
   return true;
 }
 
+/** Protocol pin §1 "IDs": domain ids are opaque strings of this grammar before any path join. */
+const DOMAIN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const isDomainId = (v: unknown): v is string => typeof v === "string" && DOMAIN_ID.test(v);
+
 /** Minimal runtime shape check of a `Turn` from the wire (fields the CLI reads). */
 function isTurnShape(t: unknown): t is Turn {
   if (t === null || typeof t !== "object") return false;
@@ -248,7 +252,15 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
           RESPONSE_TIMEOUT_MS,
         ),
       );
-      threadId = started.thread.id;
+      // Copilot review 5322990263 ("previously missed"): the id becomes a path component in the
+      // receipt verifier, so it must match the pinned grammar; anything else is a protocol error.
+      const startedId = (started as { thread?: { id?: unknown } } | undefined)?.thread?.id;
+      if (!isDomainId(startedId)) {
+        throw new ProtocolMismatch(
+          "protocol violation: thread/start returned an invalid thread id",
+        );
+      }
+      threadId = startedId;
       site = "request";
       const tid = threadId;
       // Observe every message from here on, in order (deltas are display only).
@@ -289,6 +301,9 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
           RESPONSE_TIMEOUT_MS,
         ),
       );
+      if (!isTurnShape(ts?.turn) || !isDomainId(ts.turn.id) || ts.turn.threadId !== tid) {
+        throw new ProtocolMismatch("protocol violation: turn/start returned an invalid turn");
+      }
       turnId = ts.turn.id;
       turn = ts.turn;
       if (sigintPending && !softUsed) {
@@ -313,7 +328,8 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
         // Copilot r4108653874: validate the completed turn before trusting it; a malformed one is
         // a protocol violation (exit 3) and never reaches the receipt / JSON renderers.
         const t = (completed.params as { turn?: unknown } | undefined)?.turn;
-        if (isTurnShape(t)) turn = t;
+        // Copilot r4108865790: it must be THIS turn (id from turn/start, same thread).
+        if (isTurnShape(t) && t.id === turnId && t.threadId === tid) turn = t;
         else malformedItem = true;
       }
     } catch (err) {

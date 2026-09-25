@@ -14,7 +14,7 @@ import { createInterface } from "node:readline";
 const scenario = process.env.MADC_TEST_FAKE_SCENARIO ?? "";
 const home = process.env.MADC_HOME ?? "";
 const send = (m: unknown) => process.stdout.write(`${JSON.stringify(m)}\n`);
-const threadId = "thr_fake0001";
+const threadId = scenario === "bad-thread-id" ? "../escape" : "thr_fake0001";
 const turnId = "turn_fake0001";
 const sessionFile = () => join(home, "sessions", `${threadId}.jsonl`);
 
@@ -149,6 +149,14 @@ rl.on("line", (line) => {
         scenario === "delta-only"
           ? []
           : [{ id: "item_a1", kind: "agentMessage", status: "completed", text: "fake reply" }];
+      if (scenario === "wrong-turn-id") {
+        // "wrong-turn-id": a well-formed turn/completed for another turn of the same thread.
+        send({
+          method: "turn/completed",
+          params: { turn: { ...turn, id: "turn_other", status: "completed", completedAt: 2 } },
+        });
+        return;
+      }
       if (scenario === "bad-turn-item") {
         // "bad-turn-item": a well-formed turn whose agentMessage item has no text.
         send({
