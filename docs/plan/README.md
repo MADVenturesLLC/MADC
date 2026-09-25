@@ -17,4 +17,4 @@ The plan cites these files at `/workspace/briefs/...`; in this repo the path is 
 
 | File | Status in this repo |
 | --- | --- |
-| [`../policy/CODE-ADVISORIES.md`](../policy/CODE-ADVISORIES.md) | Present (Copilot / code scanning / Dependabot DoD for builders) |
+| [`../policy/CODE-ADVISORIES.md`](../policy/CODE-ADVISORIES.md) | Present (Copilot DoD; code scanning if enabled; Dependabot out of scope until enabled) |
