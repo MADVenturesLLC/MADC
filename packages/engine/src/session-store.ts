@@ -12,9 +12,11 @@ import {
   lstatSync,
   openSync,
   readFileSync,
+  realpathSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
+import { isStrictlyUnder } from "./home.ts";
 import { type OpenNoFollowOptions, openNoFollow } from "./lock.ts";
 import { ErrorCode, RpcError, type SessionWriteFailedData } from "./protocol/errors.ts";
 import { isValidId } from "./protocol/ids.ts";
@@ -192,6 +194,19 @@ function openForAppend(path: string): number {
   return fd;
 }
 
+/**
+ * The open fd is the file now at `path`, and `path` (every component, parents included) resolves to
+ * a real path `accept` allows. A parent directory swapped for a symlink after the path was confined
+ * changes the real path; a swap undone after the open changes the inode. Either is refused.
+ */
+function fdIsFileAt(fd: number, path: string, accept: (real: string) => boolean): boolean {
+  const real = realpathSync(path);
+  if (!accept(real)) return false;
+  const seen = lstatSync(real, { bigint: true });
+  const opened = fstatSync(fd, { bigint: true });
+  return seen.dev === opened.dev && seen.ino === opened.ino;
+}
+
 type WriteChunk = (fd: number, buf: Buffer, off: number, len: number) => number;
 let writeChunk: WriteChunk = (fd, buf, off, len) => writeSync(fd, buf, off, len);
 
@@ -215,9 +230,12 @@ export class SessionWriter {
   #prevHash: string;
   #broken = false;
   readonly #secrets: () => readonly string[];
+  /** Real path at create / resume (the caller confined it); every append must still resolve here. */
+  readonly #realPath: string;
 
   private constructor(
     path: string,
+    realPath: string,
     threadId: string,
     seatId: string,
     seq: number,
@@ -225,6 +243,7 @@ export class SessionWriter {
     secrets: () => readonly string[],
   ) {
     this.path = path;
+    this.#realPath = realPath;
     this.threadId = threadId;
     this.seatId = seatId;
     this.#seq = seq;
@@ -251,7 +270,18 @@ export class SessionWriter {
     } catch {
       throw sessionWriteFailed(threadId, path, 0);
     }
-    const writer = new SessionWriter(path, threadId, seatId, 0, GENESIS_HASH, secrets);
+    let realPath: string;
+    try {
+      realPath = realpathSync(path);
+    } catch {
+      try {
+        unlinkSync(path);
+      } catch {
+        // best effort: the file was created by this call under the thread lock
+      }
+      throw sessionWriteFailed(threadId, path, 0);
+    }
+    const writer = new SessionWriter(path, realPath, threadId, seatId, 0, GENESIS_HASH, secrets);
     try {
       writer.append("session.open", open, ts);
     } catch (err) {
@@ -274,7 +304,13 @@ export class SessionWriter {
     lastHash: string,
     secrets: () => readonly string[],
   ): SessionWriter {
-    return new SessionWriter(path, threadId, seatId, nextSeq, lastHash, secrets);
+    let realPath: string;
+    try {
+      realPath = realpathSync(path);
+    } catch {
+      throw sessionWriteFailed(threadId, path, nextSeq);
+    }
+    return new SessionWriter(path, realPath, threadId, seatId, nextSeq, lastHash, secrets);
   }
 
   get nextSeq(): number {
@@ -332,6 +368,9 @@ export class SessionWriter {
       try {
         const st = fstatSync(fd);
         if (!st.isFile()) throw new Error("session file is not a regular file");
+        if (!fdIsFileAt(fd, this.path, (real) => real === this.#realPath)) {
+          throw new Error("session file no longer resolves to its confined path");
+        }
         const sizeBefore = st.size;
         try {
           let off = 0;
@@ -437,7 +476,7 @@ const SERVED_BACKINGS: readonly unknown[] = ["kimi-code", "claude-code", "codex"
 
 /** Each M0 `Item` variant (protocol/types.ts) with its required fields. Extra fields are allowed. */
 function isM0Item(item: unknown): boolean {
-  if (!isPlainRecord(item) || !isStr(item.id) || !ITEM_STATUSES.includes(item.status)) {
+  if (!isPlainRecord(item) || !isValidId(item.id) || !ITEM_STATUSES.includes(item.status)) {
     return false;
   }
   switch (item.kind) {
@@ -517,12 +556,15 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
  * never a symlink, so a planted link cannot make list / resume / the home report read data from
  * outside `MADC_HOME`. The open is `openNoFollow` (lock.ts): `O_NOFOLLOW` where available,
  * otherwise lstat → open → fstat with the same dev + inode required, so a swap to a symlink
- * between the check and the open is refused. `opts` are test seams.
+ * between the check and the open is refused. With `home`, the opened file must also still resolve
+ * (parent directories included) strictly under the real `home`, and be the file found there, so a
+ * `sessions/` directory swapped for a symlink after confinement is never read. `opts` are test seams.
  */
 export function verifySessionFile(
   path: string,
   expectedThreadId?: string,
   opts: OpenNoFollowOptions = {},
+  home?: string,
 ): SessionVerifyResult {
   let text: string;
   try {
@@ -534,6 +576,12 @@ export function verifySessionFile(
     try {
       if (!fstatSync(fd).isFile()) {
         return { ok: false, line: 0, reason: "session file is not a regular file" };
+      }
+      if (home !== undefined) {
+        const realHome = realpathSync(home);
+        if (!fdIsFileAt(fd, path, (real) => isStrictlyUnder(real, realHome))) {
+          return { ok: false, line: 0, reason: "session file resolves outside MADC_HOME" };
+        }
       }
       text = readFileSync(fd, "utf8");
     } finally {
