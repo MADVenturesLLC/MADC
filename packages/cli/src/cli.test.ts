@@ -907,6 +907,7 @@ test("A7 §4 exit 3: a turn/completed without items is a protocol violation, one
       "completed-with-error",
       "delta-other-turn",
       "delta-non-string",
+      "unknown-kind",
     ]) {
       const sb4 = sandbox();
       const w = await runCli(sb4, ["-p", "hi", "--json"], {

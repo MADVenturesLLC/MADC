@@ -125,6 +125,13 @@ rl.on("line", (line) => {
         startedAt: 1,
         completedAt: null,
       };
+      if (scenario === "delta-early-other-turn") {
+        // A foreign-turn delta that arrives before the turn/start response (turnId not yet known).
+        send({
+          method: "item/agentMessage/delta",
+          params: { threadId, turnId: "turn_other", itemId: "item_a1", delta: "FOREIGN-DELTA" },
+        });
+      }
       send({ id: msg.id, result: { turn } });
       // "junk-failed": a non-JSON line, then the turn fails -32603 (the violation must win: 3).
       const failed = scenario === "turn-failed-internal" || scenario === "junk-failed";
@@ -149,7 +156,7 @@ rl.on("line", (line) => {
             threadId,
             turnId: scenario === "delta-other-turn" ? "turn_other" : turnId,
             itemId: "item_a1",
-            delta: scenario === "delta-other-turn" ? "x" : 42,
+            delta: scenario === "delta-other-turn" ? "FOREIGN-DELTA" : 42,
           },
         });
       }
@@ -195,6 +202,21 @@ rl.on("line", (line) => {
               ...turn,
               status: "completed",
               items: [{ id: "item_a1", kind: "agentMessage", status: "completed" }],
+              completedAt: 2,
+            },
+          },
+        });
+        return;
+      }
+      if (scenario === "unknown-kind") {
+        // "unknown-kind": a turn whose only item has a kind/status outside the pinned unions.
+        send({
+          method: "turn/completed",
+          params: {
+            turn: {
+              ...turn,
+              status: "completed",
+              items: [{ id: "item_x", kind: "unknown", status: "bogus" }],
               completedAt: 2,
             },
           },
