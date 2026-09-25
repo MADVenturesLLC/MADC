@@ -631,21 +631,29 @@ export class EngineConnection {
 
   /**
    * Durable record of one completed item (seat pin §4.2): an `item` event, plus the dedicated
-   * `servedModel` event for a receipt (dual write). Returns false after a -32009 failure, which
-   * fails the turn.
+   * `servedModel` event for a receipt (dual write). The receipt pair is one append (`appendAll`):
+   * both lines are durable or neither is. Returns false after a -32009 failure, which fails the
+   * turn.
    */
   #persistItem(record: ThreadRecord, tr: TurnRecord, item: Item): boolean {
     const turnId = tr.turn.id;
     try {
-      record.session.append("item", { turnId, item });
       if (item.kind === "servedModel") {
-        record.session.append("servedModel", {
-          turnId,
-          requestedModel: item.requestedModel,
-          servedModel: item.servedModel,
-          backing: item.backing,
-          providerId: item.providerId,
-        });
+        record.session.appendAll([
+          { type: "item", payload: { turnId, item } },
+          {
+            type: "servedModel",
+            payload: {
+              turnId,
+              requestedModel: item.requestedModel,
+              servedModel: item.servedModel,
+              backing: item.backing,
+              providerId: item.providerId,
+            },
+          },
+        ]);
+      } else {
+        record.session.append("item", { turnId, item });
       }
       return true;
     } catch (err) {
@@ -698,9 +706,23 @@ export class EngineConnection {
       },
       completeItem: (item) => {
         if (!live() || !tr.open.has(item.id)) return;
-        tr.open.delete(item.id);
         // The engine owns the lifecycle: a completed item is `completed`, whatever the agent sent.
         const completed = { ...item, status: "completed" } as Item;
+        if (completed.kind === "servedModel") {
+          // A receipt is durable (item + servedModel event) before it is exposed. If that append
+          // fails, the turn fails and the still-open receipt is closed as `failed`, never
+          // `completed`, and nothing of it is on disk.
+          if (!this.#persistItem(record, tr, completed)) return;
+          tr.open.delete(item.id);
+          turn.items.push(completed);
+          this.#notify("item/completed", {
+            threadId: turn.threadId,
+            turnId: turn.id,
+            item: completed,
+          });
+          return;
+        }
+        tr.open.delete(item.id);
         turn.items.push(completed);
         this.#notify("item/completed", {
           threadId: turn.threadId,
