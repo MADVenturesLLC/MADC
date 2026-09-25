@@ -2,6 +2,8 @@
 
 *Daedalus · 2026-09-24 · Venue: `MADVenturesLLC/MADC` only · Status: **proposed roadmap**. It does not authorize a build, spend, publish, or merge.*
 
+*Founder rulings recorded 2026-09-25 (Founder): D-R1 through D-R6 are ruled; see §6.*
+
 Base: `main` @ `6a7266a0e7ddd58ee3244a4e73070306511705b4` (after M0 plan PR #2, merge commit `9c71afd`; Surface pins PR #6; M0-A2 engine protocol PR #7). M0 acts A0–A2 are on `main`; A3–A9 are still to come. This roadmap assumes M0 A0–A9 land as planned. It builds on them and does not change them.
 
 Sizes are **estimates in acts**. An act is one reviewable PR in the M0 sense (about one M0 act's worth of scope). Confidence is how sure I am that the size and scope hold.
@@ -20,9 +22,9 @@ The Founder's definition of "fully functional" has six parts. Here is the path:
 | **M4** | Memory, tools, editors | Seat memory that persists and is provable, MCP tools per seat, and an ACP server so other editors can attach. | 8 | Med |
 | **M5** | Ship it | One-command install and `madc` published on npm. | 5 | Med-high |
 
-**Recommended order:** M1 → M2 → M3 → M4 → M5, plus a tiny npm name-reserve act as soon as the Founder un-parks it (D-R5).
+**Recommended order:** M1 → M2 → M3 → M4 → M5, plus a tiny npm name-reserve act as soon as the Founder un-parks it (D-R5; un-parked 2026-09-25).
 
-**Where this differs from the Founder default** (subscriptions + seats, then desktop, then multi-seat and memory): I agree on M1. I recommend **multi-seat before desktop**. Reasons are in §2.
+**Where this differs from the Founder default** (subscriptions + seats, then desktop, then multi-seat and memory): I agree on M1. I recommend **multi-seat before desktop**. Reasons are in §2. The Founder accepted this order on 2026-09-25 (D-R2).
 
 ---
 
@@ -49,7 +51,7 @@ The Founder's definition of "fully functional" has six parts. Here is the path:
 
 - **Goal:** A desktop app that is a second window onto the same engine: dark glass, big type, keyboard-first, and every widget bound to real evidence.
 - **Founder can then:** see seats side by side, watch handoffs move, clear the decision inbox, and search sessions. No widget shows green unless a verifier checked a hash, SHA, or served-model receipt behind it.
-- **Depends on:** M2 schema v2 frozen. Surface Architect picks the stack (GPUI vs Tauri is open; planning record Appendix R, amendment 1) and signs off on the visual system.
+- **Depends on:** M2 schema v2 frozen. Surface Architect recommends the stack during M2 and the Founder rules before M3 (D-R6, ruled 2026-09-25; GPUI vs Tauri is open; planning record Appendix R, amendment 1). Surface Architect signs off on the visual system.
 - **Size:** 9 acts (est.). **Confidence:** med-low, because the stack is not chosen and "instant keyboard feel" is a performance bar that has not been measured yet.
 - **Top risks:** stack churn (Appendix R notes GPUI is pre-1.0); the engine currently has a stdio-only transport, so the desktop needs a local socket transport (a protocol amendment); scope creep into an IDE, which is a v1 non-goal.
 
@@ -65,7 +67,7 @@ The Founder's definition of "fully functional" has six parts. Here is the path:
 
 - **Goal:** One-command install on the Founder's machines and the `madc` npm package published.
 - **Founder can then:** install on a clean Mac with one command and run `madc doctor` green.
-- **Depends on:** Founder un-parks npm (M0 plan §1 ruling 10). The name-reserve act can run any time after that (D-R5). A full release needs M1 at minimum.
+- **Depends on:** Founder un-parks npm (M0 plan §1 ruling 10). The Founder un-parked npm on 2026-09-25 for the name-reserve act (D-R5), which can run any time now. A full release needs M1 at minimum.
 - **Size:** 5 acts (est.). **Confidence:** med-high on packaging. Low on signing/notarization until the Founder picks a distribution path.
 - **Top risks:** name squatting before reservation (npm `madc` returned HTTP 404, meaning free, when I checked on 2026-09-24); supply-chain posture of a published package; binary signing.
 
@@ -93,7 +95,7 @@ The Founder's definition of "fully functional" has six parts. Here is the path:
 
 ## 3. Subscription table (all lanes)
 
-**Where the list comes from.** No single doc on `main` enumerates exactly ten subscriptions. I rebuilt the ten from idea plan §6.2 (model adapters: Kimi, Mistral, DeepSeek, MiniMax, Qwen Cloud, Ollama Cloud, Gemini; agent adapters: Claude, Codex), §6.3 (forbidden paths, which add Z.ai GLM Coding Plan) and the subscription-lanes brief. "Ollama local" is in §6.2, but it is free local software, not a paid subscription, so it is not counted. GitHub Copilot, OpenRouter and Groq are registry stubs from the brief's "other" section. There is no evidence that they are Mike's paid plans, so they are not counted either. **The Founder should confirm the list (D-R1).**
+**Where the list comes from.** No single doc on `main` enumerates exactly ten subscriptions. I rebuilt the ten from idea plan §6.2 (model adapters: Kimi, Mistral, DeepSeek, MiniMax, Qwen Cloud, Ollama Cloud, Gemini; agent adapters: Claude, Codex), §6.3 (forbidden paths, which add Z.ai GLM Coding Plan) and the subscription-lanes brief. "Ollama local" is in §6.2, but it is free local software, not a paid subscription, so it is not counted. GitHub Copilot, OpenRouter and Groq are registry stubs from the brief's "other" section. There is no evidence that they are Mike's paid plans, so they are not counted either. **The Founder confirmed on 2026-09-25 that all 11 rows below (the ten plus Grok as #11) are plans he pays for (D-R1 accepted).** Being paid does not change any lane: each row keeps the status its terms allow (for example, Z.ai stays `forbidden`).
 
 **Row 11: Grok (xAI).** **Founder added this on 2026-09-24.** It is not one of the ten in the original subscription-lanes brief. The brief mentions xAI only as a one-line "other" row (lane C, "Consumer SuperGrok ≠ API"). That row is now incomplete, because xAI ships an official coding agent (Grok Build) that SuperGrok and X Premium+ subscribers sign into (details below).
 
@@ -110,12 +112,12 @@ The Founder's definition of "fully functional" has six parts. Here is the path:
 | 7 | **OpenAI ChatGPT Plus/Pro** → Codex | `allowed-via-vendor-agent` (Codex app-server). Token replay: `forbidden` | [developers.openai.com/codex/auth](https://developers.openai.com/codex/auth) (redirects to learn.chatgpt.com/docs/auth): "Codex supports two ways for a person to sign in … Sign in with ChatGPT for subscription access". [learn.chatgpt.com/docs/app-server](https://learn.chatgpt.com/docs/app-server): "Use it when you want a deep integration inside your own product: authentication, conversation history, approvals, and streamed agent events." Same page: "If you are automating jobs or running Codex in CI, use the Codex SDK instead." **VERIFIED** | Done in M0 (A6) | M0 (seat use in M1) |
 | 8 | **MiniMax Token Plan** | `interactive-only` (kept fail-closed) | [platform.minimax.io/docs/token-plan/intro](https://platform.minimax.io/docs/token-plan/intro): Subscription Key "is not interchangeable with pay-as-you-go API Keys". Today's pages list integrations for Claude Code, Cursor, TRAE, Hermes Agent, OpenClaw, Pi and "Other Tools". The planning record's MM-37 quote ("designed for individual, interactive developer use") **was not found on the pages I fetched today → UNVERIFIED**. The entry stays `interactive-only` until re-confirmed. Founder ruling 13 (Appendix R): non-sensitive repos only. | 0.5 act (pi-ai built-in `minimax`), plus the shared interactive-mode gate | M1 |
 | 9 | **Alibaba Cloud Coding Plan** (Qwen Cloud) | `interactive-only` | [alibabacloud.com/help/en/model-studio/coding-plan](https://www.alibabacloud.com/help/en/model-studio/coding-plan) (Last Updated: Sep 11, 2026): "This plan is for interactive use in programming tools such as Claude Code, Qoder, Qoder CN, and OpenClaw. Do not use the plan's API key for automated scripts, application backends, or other non-interactive scenarios." **VERIFIED** | 0.5 act (pi-ai `qwen-token-plan*` catalog, endpoint match to confirm at build time) | M1 |
-| 10 | **Z.ai GLM Coding Plan** | `forbidden` in the MAD loop | [docs.z.ai/devpack/quick-start](https://docs.z.ai/devpack/quick-start): "The GLM Coding Plan is strictly limited to use within officially supported tools and products." [docs.z.ai/devpack/faq](https://docs.z.ai/devpack/faq): "The subscriber shall not use the subscription benefits in any unsupported tools or scenarios." [docs.z.ai/devpack/usage-policy](https://docs.z.ai/devpack/usage-policy): "Use in unsupported tools may result in restricted benefits." **VERIFIED** | 0 acts. An option to drive an allowlisted tool (for example unmodified Claude Code pointed at Z.ai) as a vendor agent is **UNVERIFIED** as permitted, so it stays off unless the Founder decides otherwise (D-R3). | Not wired (parked) |
+| 10 | **Z.ai GLM Coding Plan** | `forbidden` in the MAD loop | [docs.z.ai/devpack/quick-start](https://docs.z.ai/devpack/quick-start): "The GLM Coding Plan is strictly limited to use within officially supported tools and products." [docs.z.ai/devpack/faq](https://docs.z.ai/devpack/faq): "The subscriber shall not use the subscription benefits in any unsupported tools or scenarios." [docs.z.ai/devpack/usage-policy](https://docs.z.ai/devpack/usage-policy): "Use in unsupported tools may result in restricted benefits." **VERIFIED** | 0 acts. An option to drive an allowlisted tool (for example unmodified Claude Code pointed at Z.ai) as a vendor agent is **UNVERIFIED** as permitted, so it stays off. The Founder ruled on 2026-09-25 that Z.ai stays forbidden (D-R3). | Not wired (parked) |
 | 11 | **Grok (xAI)**. **Founder-added 2026-09-24; not in the original brief** | (a) xAI API key: `allowed-direct`. (b) Consumer SuperGrok / X Premium+ sign-in reused by a third-party client: `forbidden` (fail-closed; terms UNVERIFIED). (c) Grok Build (official CLI): `allowed-via-vendor-agent` | (a) [docs.x.ai/build/overview](https://docs.x.ai/build/overview.md): "`grok-4.7` … is available directly on the xAI API. Drop it into your own agent loop, IDE integration, or coding tool." pi-ai 0.87.1 has a built-in `xai` provider (base `https://api.x.ai/v1`, env `XAI_API_KEY`; I inspected the published package on 2026-09-24). **VERIFIED**. (b) [x.ai/legal/terms-of-service](https://x.ai/legal/terms-of-service) (Consumer, Last Updated: September 11, 2026) and [AUP](https://x.ai/legal/acceptable-use-policy) (Effective: August 14, 2026): no clause permits third-party clients to use consumer-subscription sign-in. The AUP bars "bypassing our systems or protective measures". pi-ai also ships an xAI OAuth device-code flow whose scope includes `grok-cli:access`; **MAD must not use it**. Status: **UNVERIFIED → treated as forbidden**. (c) [x.ai/news/grok-build-cli](https://x.ai/news/grok-build-cli) (May 25, 2026): "Now in early beta for all SuperGrok and X Premium Plus subscribers — Grok Build is a new coding agent that runs right from your terminal." [docs.x.ai/build/cli/headless-scripting](https://docs.x.ai/build/cli/headless-scripting.md): "`grok agent stdio` … runs Grok as an ACP agent over JSON-RPC on stdin/stdout", and its ACP example "assumes `grok` is already authenticated locally, or `XAI_API_KEY` is set." **VERIFIED** that it exists and has ACP and headless modes. | (a) ≤0.5 act; (c) 1 act (generic ACP-client adapter, reusable for other ACP agents) | M1 |
 
 **Terms flags the Founder should see:**
 
-- **xAI AUP.** It bars "Using the Service or any Output to develop (or assist anyone in developing) machine learning models or any products or services that compete with SpaceXAI". madc is a personal, local-first agent platform. Whether that counts as "competing" is a legal read I cannot make. **UNVERIFIED; Founder check (D-R4).**
+- **xAI AUP.** It bars "Using the Service or any Output to develop (or assist anyone in developing) machine learning models or any products or services that compete with SpaceXAI". madc is a personal, local-first agent platform. Whether that counts as "competing" is a legal read I cannot make. **UNVERIFIED; Founder check (D-R4).** Ruled 2026-09-25: the default holds, so only the xAI API key path and Grok Build are wired until the Founder reads the clause.
 - **Claude parallel use.** "Ordinary, individual usage" is the stated assumption behind Pro/Max limits. M2 parallel seats on Claude Code should be rate-capped per seat.
 - **Codex automation.** OpenAI points CI and automation at the Codex SDK and API keys, not the app-server. madc headless runs on a ChatGPT sign-in should prefer an API key (credential class by mode, Founder ruling 12).
 - **Gemini.** Standard keys stop working in September 2026 per Google's page. Auth keys only.
@@ -152,20 +154,22 @@ No clones and no CRUD-ware. Each row names the public mechanism and what MAD doe
 - Vendoring or forking OpenCode, Hermes, omp, Claude Code, Codex or Grok Build.
 - Account rotation at usage limits (planning record: Ghostex SKIP, terms risk).
 - Changing branch protection or rulesets.
-- Publishing to npm before the Founder un-parks it.
+- Publishing to npm before the Founder un-parks it (un-parked 2026-09-25 for the `madc@0.0.0` name-reserve act only, D-R5).
 
 ---
 
 ## 6. Roadmap-level Founder decisions
 
-| # | Decision | Recommended default |
-| --- | --- | --- |
-| D-R1 | Confirm the ten paid subscriptions (my reconstruction in §3) plus Grok as #11. | Accept §3 as the list; the Founder corrects any row. |
-| D-R2 | Order: M2 (multi-seat) before M3 (desktop)? | **Yes**, per §2. |
-| D-R3 | Z.ai via an allowlisted vendor tool (for example unmodified Claude Code on Z.ai's endpoint)? | **No** until Z.ai terms clearly cover a tool driven by another program; stays `forbidden`. |
-| D-R4 | xAI AUP "compete" clause: acceptable risk for a personal, local-first platform? | Founder reads the clause; until then wire only the xAI API **key** path and Grok Build as a vendor agent, both of which xAI documents for use in your own tools. |
-| D-R5 | Un-park npm to reserve `madc` at `0.0.0` now (one tiny act), ahead of M5? | **Yes**. The name was free on 2026-09-24 and could be taken. |
-| D-R6 | Desktop stack (GPUI vs Tauri) owner and timing. | Surface Architect recommends during M2; Founder rules before M3-A0. |
+All rows ruled by the Founder on 2026-09-25.
+
+| # | Decision | Recommended default | Founder ruling (2026-09-25) |
+| --- | --- | --- | --- |
+| D-R1 | Confirm the ten paid subscriptions (my reconstruction in §3) plus Grok as #11. | Accept §3 as the list; the Founder corrects any row. | **Accepted.** All 11 rows in §3 are plans the Founder pays for. No lane status changes. |
+| D-R2 | Order: M2 (multi-seat) before M3 (desktop)? | **Yes**, per §2. | **Yes.** |
+| D-R3 | Z.ai via an allowlisted vendor tool (for example unmodified Claude Code on Z.ai's endpoint)? | **No** until Z.ai terms clearly cover a tool driven by another program; stays `forbidden`. | **Z.ai stays forbidden.** |
+| D-R4 | xAI AUP "compete" clause: acceptable risk for a personal, local-first platform? | Founder reads the clause; until then wire only the xAI API **key** path and Grok Build as a vendor agent, both of which xAI documents for use in your own tools. | **Default:** xAI API key + Grok Build only until the Founder reads the compete clause. |
+| D-R5 | Un-park npm to reserve `madc` at `0.0.0` now (one tiny act), ahead of M5? | **Yes**. The name was free on 2026-09-24 and could be taken. | **Yes**, npm un-parked. |
+| D-R6 | Desktop stack (GPUI vs Tauri) owner and timing. | Surface Architect recommends during M2; Founder rules before M3-A0. | **Yes:** Surface recommends during M2; the Founder rules before M3. |
 
 ---
 
