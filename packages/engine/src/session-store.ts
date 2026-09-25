@@ -317,7 +317,9 @@ const ENVELOPE_KEYS = [
 /**
  * Verify a session file's text (seat pin §4.3): recompute every hash forward from seq 0. Any
  * unparseable line, envelope drift, seq gap, prevHash break, hash mismatch, thread / seat change,
- * or unterminated last line fails, reporting the 1-based line number.
+ * or unterminated last line fails, reporting the 1-based line number. Payloads are not
+ * shape-checked here and unknown event types pass, so events added later (envelope v:1) still
+ * verify; `rebuildSession` checks the M0 payload shapes before any state is built from them.
  */
 export function verifySessionText(text: string, expectedThreadId?: string): SessionVerifyResult {
   if (text === "") return { ok: false, line: 1, reason: "empty session file" };
@@ -342,7 +344,9 @@ export function verifySessionText(text: string, expectedThreadId?: string): Sess
     if (e.v !== 1) return fail("unsupported v");
     if (e.seq !== i) return fail(`seq ${String(e.seq)} where ${i} expected`);
     if (typeof e.ts !== "number" || !Number.isFinite(e.ts)) return fail("ts is not a number");
-    if (!SESSION_EVENT_TYPES.includes(e.type)) return fail("unknown event type");
+    // Unknown event types are tolerated (later milestones add events additively, envelope v:1).
+    if (typeof e.type !== "string" || (e.type as string) === "")
+      return fail("type is not a string");
     if ((i === 0) !== (e.type === "session.open")) return fail("session.open must be line 1 only");
     if (typeof e.threadId !== "string" || !isValidId(e.threadId)) return fail("bad threadId");
     if (threadId !== undefined && e.threadId !== threadId) return fail("threadId changed");
@@ -352,8 +356,6 @@ export function verifySessionText(text: string, expectedThreadId?: string): Sess
     seatId = e.seatId;
     if (e.prevHash !== prevHash) return fail("prevHash does not match the previous hash");
     if (!isPlainRecord(e.payload)) return fail("payload is not an object");
-    const payloadIssue = checkPayload(e.type, e.payload);
-    if (payloadIssue !== null) return fail(payloadIssue);
     if (sessionEventHash(prevHash, e) !== e.hash) return fail("hash mismatch");
     prevHash = e.hash;
     events.push(e);
@@ -365,8 +367,9 @@ const isStr = (v: unknown): v is string => typeof v === "string";
 const TURN_END_STATUSES: readonly unknown[] = ["completed", "interrupted", "failed"];
 
 /**
- * Shape of each event payload (what `rebuildSession` reads). A hash-valid line with a malformed
- * payload is rejected like any other bad line, so a crafted file can never crash list / resume.
+ * Shape of each M0 event payload (what `rebuildSession` reads). Extra fields are allowed. A
+ * hash-valid line with a malformed payload makes `rebuildSession` throw, so a crafted file is
+ * skipped by list and refused by resume (-32603), never crashing either.
  */
 function checkPayload(type: SessionEventType, p: Record<string, unknown>): string | null {
   switch (type) {
@@ -465,6 +468,12 @@ export function rebuildSession(events: readonly SessionEvent[], now = Date.now()
   const turns = new Map<string, Turn>();
   let preview: string | null = null;
   for (const e of events) {
+    // Payload shapes are checked here, for the M0 event types only: the verifier covers the
+    // envelope, seq and hash chain; unknown event types and extra payload fields are ignored.
+    if (SESSION_EVENT_TYPES.includes(e.type)) {
+      const issue = checkPayload(e.type, e.payload as Record<string, unknown>);
+      if (issue !== null) throw new Error(`line ${e.seq + 1}: ${issue}`);
+    }
     if (e.type === "turn.start") {
       const p = e.payload as TurnStartPayload;
       turns.set(p.turnId, {

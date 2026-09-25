@@ -2,7 +2,15 @@
  * M0-A4 seat files (seat pin §1–§3, §6 items 1, 2, 7). Network-free: echo fixture engine.
  */
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { DEFAULT_SEAT_ID } from "./protocol/types.ts";
@@ -110,6 +118,26 @@ test("seedDefaultSeat (shared with doctor --init): creates once, then reports ex
       false,
       "memory file not seeded",
     );
+    assert.deepEqual(readdirSync(join(home, "seats")), ["madc-default.json"], "no temp left");
+  } finally {
+    cleanup();
+  }
+});
+
+test("seed is atomic: a partial seat file never appears; an existing file (even empty) is never touched", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    // A leftover temp from an interrupted seeder is ignored and never loaded as a seat.
+    mkdirSync(join(home, "seats"), { recursive: true });
+    writeFileSync(join(home, "seats", ".madc-default.json.1.abc.tmp"), "{");
+    const a = seedDefaultSeat(home);
+    assert.equal(a.created, true);
+    assert.equal(readFileSync(a.path, "utf8"), serializeSeat(MADC_DEFAULT_SEAT));
+    if (POSIX) assert.equal(mode(a.path), 0o600);
+    // Operator-owned content wins, whatever it is.
+    writeFileSync(a.path, "");
+    assert.deepEqual(seedDefaultSeat(home), { path: a.path, created: false });
+    assert.equal(readFileSync(a.path, "utf8"), "");
   } finally {
     cleanup();
   }
@@ -139,6 +167,22 @@ const PIN_SEED_BYTES = `{
   }
 }
 `;
+
+/** Golden fixture shared with later milestones (M1 compares its seed against the same file). */
+const GOLDEN_SEED = join(import.meta.dirname, "testing", "fixtures", "madc-default.json");
+
+test("seed writer output is byte-equal to the golden fixture testing/fixtures/madc-default.json", () => {
+  const golden = readFileSync(GOLDEN_SEED);
+  assert.equal(golden.toString("utf8"), PIN_SEED_BYTES, "golden fixture == pin §3 bytes");
+  assert.deepEqual(Buffer.from(serializeSeat(MADC_DEFAULT_SEAT), "utf8"), golden);
+  const { home, cleanup } = makeHome();
+  try {
+    const { path } = seedDefaultSeat(home);
+    assert.deepEqual(readFileSync(path), golden);
+  } finally {
+    cleanup();
+  }
+});
 
 test("seed writer bytes are pinned exactly; serializeSeat is key-order independent", () => {
   assert.equal(serializeSeat(MADC_DEFAULT_SEAT), PIN_SEED_BYTES);
