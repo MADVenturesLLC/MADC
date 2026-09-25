@@ -298,6 +298,41 @@ test("confinement: a seat file or memory dir resolving outside MADC_HOME → -32
   }
 });
 
+test("R-memory: a not-yet-existing memory.path under a symlinked (or dangling) component → -32006", () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside-mem");
+  try {
+    seedDefaultSeat(home);
+    mkdirSync(outside, { recursive: true });
+    symlinkSync(outside, join(home, "memory", "link"));
+    symlinkSync(join(outside, "missing"), join(home, "memory", "dang"));
+    for (const [id, path] of [
+      ["via-link", "memory/link/new.md"],
+      ["via-link-deep", "memory/link/a/b/new.md"],
+      ["via-dangling", "memory/dang/new.md"],
+    ] as const) {
+      writeSeatFile(home, { ...PIN_MADC_DEFAULT, id, memory: { mode: "file", path } });
+      assert.throws(
+        () => loadSeat(home, id),
+        (e: { code?: number; data?: { issues?: string[] } }) =>
+          e.code === -32006 && e.data?.issues?.[0] === "memory.path resolves outside MADC_HOME",
+        id,
+      );
+    }
+    // A missing file in a real subdirectory of memory/ is fine.
+    mkdirSync(join(home, "memory", "sub"));
+    writeSeatFile(home, {
+      ...PIN_MADC_DEFAULT,
+      id: "inside",
+      memory: { mode: "file", path: "memory/sub/deeper/new.md" },
+    });
+    assert.equal(loadSeat(home, "inside").seat.id, "inside");
+  } finally {
+    cleanup();
+  }
+});
+
 test("validateSeat / memoryPathIssue units: the built-in seat is valid; lexical path rules", () => {
   assert.deepEqual(validateSeat(PIN_MADC_DEFAULT, "madc-default"), {
     ok: true,

@@ -4,7 +4,15 @@
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
@@ -20,6 +28,7 @@ import {
   GENESIS_HASH,
   REDACTED,
   SessionWriter,
+  sessionEventHash,
   sortedKeyJson,
   verifySessionFile,
   verifySessionText,
@@ -664,7 +673,10 @@ test("-32009 mid-turn: an append failure ends the turn failed with -32009 and st
       const id = sink.newItemId();
       sink.startItem({ id, kind: "agentMessage", status: "inProgress", text: "" });
       sink.completeItem({ id, kind: "agentMessage", status: "completed", text: "lost" });
-      sink.completeItem({ id: sink.newItemId(), kind: "error", status: "completed", message: "x" });
+      // The turn failed on that append: the sink is closed, so nothing after it is streamed.
+      const late = sink.newItemId();
+      sink.startItem({ id: late, kind: "agentMessage", status: "inProgress", text: "" });
+      sink.completeItem({ id: late, kind: "agentMessage", status: "completed", text: "late" });
     },
   };
   const e = inProcess(home, breaking);
@@ -686,6 +698,7 @@ test("-32009 mid-turn: an append failure ends the turn failed with -32009 and st
       turn.items.map((i) => i.kind),
       ["userMessage", "agentMessage", "error"],
     );
+    assert.ok(!JSON.stringify(e.received).includes('"late"'), "no item streamed after the failure");
     // The writer is broken: the next turn is refused with -32009 before it starts.
     const next = await e.request("turn/start", { threadId, input: [{ type: "text", text: "y" }] });
     assert.equal((next.error as { code: number }).code, -32009);
@@ -779,6 +792,209 @@ test("no-secrets guard: session payloads never copy env (a hermetic engine env v
     assert.equal(text.includes("user-agent"), false);
   } finally {
     await run.client.close();
+    cleanup();
+  }
+});
+
+// ------------------------------------------------------- Copilot review (PR #13) regressions
+
+test("R-proto: a __proto__ payload key is canonicalized, hashed, and redacted as a key", () => {
+  assert.equal(
+    sortedKeyJson(JSON.parse('{"b":1,"__proto__":{"z":1,"a":2}}')),
+    '{"__proto__":{"a":2,"z":1},"b":1}',
+  );
+  const redacted = createRedactor([])(JSON.parse('{"__proto__":"x"}')) as Record<string, unknown>;
+  assert.equal(Object.hasOwn(redacted, "__proto__"), true);
+  const { home, cleanup } = makeHome();
+  try {
+    mkdirSync(home, { recursive: true });
+    const path = join(home, "thr_proto.jsonl");
+    const w = SessionWriter.create(
+      path,
+      "thr_proto",
+      "madc-default",
+      { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" },
+      () => [],
+    );
+    w.append("turn.start", { turnId: "turn_1", inputText: "hi" });
+    w.append("item", {
+      turnId: "turn_1",
+      item: {
+        id: "item_1",
+        kind: "toolCall",
+        status: "completed",
+        name: "t",
+        arguments: JSON.parse('{"__proto__":"original"}'),
+      },
+    });
+    const text = readFileSync(path, "utf8");
+    assert.ok(text.includes('"__proto__":"original"'), "the key is persisted");
+    assert.equal(verifySessionText(text).ok, true);
+    const edited = text.replace('"__proto__":"original"', '"__proto__":"edited"');
+    const r = verifySessionText(edited);
+    assert.deepEqual(r.ok ? null : [r.line, r.reason], [3, "hash mismatch"]);
+  } finally {
+    cleanup();
+  }
+});
+
+/** Hash-valid lines with arbitrary payloads (a forger who knows the algorithm). */
+function forgeSession(threadId: string, events: Array<[string, Record<string, unknown>]>): string {
+  let prev = GENESIS_HASH;
+  return events
+    .map(([type, payload], seq) => {
+      const body = {
+        v: 1 as const,
+        seq,
+        ts: 1000 + seq,
+        type,
+        threadId,
+        seatId: "madc-default",
+        payload,
+      };
+      const hash = sessionEventHash(prev, body as never);
+      const line = JSON.stringify({ ...body, prevHash: prev, hash });
+      prev = hash;
+      return `${line}\n`;
+    })
+    .join("");
+}
+
+test("R-shape: a hash-valid line with a malformed payload fails verification and never breaks thread/list", async () => {
+  const open = { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" };
+  const bad: Array<[string, Array<[string, Record<string, unknown>]>]> = [
+    [
+      "item-no-item",
+      [
+        ["session.open", open],
+        ["turn.start", { turnId: "turn_1", inputText: "x" }],
+        ["item", { turnId: "turn_1" }],
+      ],
+    ],
+    [
+      "user-no-content",
+      [
+        ["session.open", open],
+        ["item", { turnId: "turn_1", item: { id: "i", kind: "userMessage" } }],
+      ],
+    ],
+    ["open-no-cwd", [["session.open", { backing: "kimi-code" }]]],
+    [
+      "end-bad-status",
+      [
+        ["session.open", open],
+        ["turn.end", { turnId: "turn_1", status: "done", error: null }],
+      ],
+    ],
+    [
+      "end-error-data",
+      [
+        ["session.open", open],
+        ["turn.end", { turnId: "turn_1", status: "failed", error: { code: "x" } }],
+      ],
+    ],
+    [
+      "start-bad-turn",
+      [
+        ["session.open", open],
+        ["turn.start", { turnId: "../x", inputText: "x" }],
+      ],
+    ],
+  ];
+  for (const [name, events] of bad) {
+    const r = verifySessionText(forgeSession("thr_bad", events));
+    assert.equal(r.ok, false, name);
+    if (!r.ok) assert.match(r.reason, /^malformed /, name);
+  }
+  const { home, cleanup } = makeHome();
+  const e = inProcess(home, replyAgent);
+  try {
+    await e.request("initialize", { clientInfo: { name: "t", version: "0" } });
+    mkdirSync(join(home, "sessions"), { recursive: true });
+    writeFileSync(
+      join(home, "sessions", "thr_bad.jsonl"),
+      forgeSession("thr_bad", bad[0]?.[1] ?? []),
+    );
+    const list = await e.request("thread/list", {});
+    assert.deepEqual(list.result, { data: [], nextCursor: null });
+    const resume = await e.request("thread/resume", { threadId: "thr_bad" });
+    assert.equal((resume.error as { code: number }).code, -32603);
+  } finally {
+    e.input.end();
+    await e.done;
+    cleanup();
+  }
+});
+
+test("R-symlink: a sessions/<id>.jsonl symlink to a valid chain outside MADC_HOME is never read", async () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside-sessions");
+  const e = inProcess(home, replyAgent);
+  try {
+    await e.request("initialize", { clientInfo: { name: "t", version: "0" } });
+    const target = writeSampleSession(outside);
+    assert.equal(verifySessionFile(target, "thr_sample").ok, true, "the outside chain is valid");
+    mkdirSync(join(home, "sessions"), { recursive: true });
+    const link = join(home, "sessions", "thr_sample.jsonl");
+    symlinkSync(target, link);
+    assert.deepEqual(verifySessionFile(link, "thr_sample"), {
+      ok: false,
+      line: 0,
+      reason: "session file is not a regular file",
+    });
+    const list = await e.request("thread/list", {});
+    assert.deepEqual(list.result, { data: [], nextCursor: null });
+    const resume = await e.request("thread/resume", { threadId: "thr_sample" });
+    assert.equal((resume.error as { code: number }).code, -32603);
+    assert.equal(existsSync(join(home, "sessions", "thr_sample.lock")), false, "lock released");
+    assert.equal(inspectMadcHome(home).lastSession, null, "home report skips the link");
+    // sessions/ itself symlinked outside: the home report ignores it.
+    const { home: home2, cleanup: cleanup2 } = makeHome();
+    try {
+      mkdirSync(home2, { recursive: true });
+      symlinkSync(outside, join(home2, "sessions"));
+      assert.equal(inspectMadcHome(home2).lastSession, null);
+    } finally {
+      cleanup2();
+    }
+  } finally {
+    e.input.end();
+    await e.done;
+    cleanup();
+  }
+});
+
+test("R-terminal: a turn.end append failure is never acknowledged as completed (-32009 + error item)", async () => {
+  const { home, cleanup } = makeHome();
+  const breakAfterItems: Agent = {
+    name: "break-after-items",
+    async run(ctx, sink) {
+      const id = sink.newItemId();
+      sink.startItem({ id, kind: "agentMessage", status: "inProgress", text: "" });
+      sink.completeItem({ id, kind: "agentMessage", status: "completed", text: "done" });
+      const path = join(home, "sessions", `${ctx.threadId}.jsonl`);
+      rmSync(path);
+      mkdirSync(path); // only the terminal turn.end append fails (EISDIR)
+    },
+  };
+  const e = inProcess(home, breakAfterItems);
+  try {
+    await e.request("initialize", { clientInfo: { name: "t", version: "0" } });
+    const start = await e.request("thread/start", {});
+    const threadId = (start.result as { thread: { id: string } }).thread.id;
+    await e.request("turn/start", { threadId, input: [{ type: "text", text: "x" }] });
+    const done = await e.waitFor((m) => m.method === "turn/completed");
+    const turn = (done.params as { turn: Turn }).turn;
+    assert.equal(turn.status, "failed");
+    assert.equal(turn.error?.code, -32009);
+    assert.deepEqual(
+      turn.items.map((i) => i.kind),
+      ["userMessage", "agentMessage", "error"],
+    );
+  } finally {
+    e.input.end();
+    await e.done;
     cleanup();
   }
 });
