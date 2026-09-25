@@ -19,6 +19,7 @@ import { ErrorCode } from "@madc/engine/client";
 import { CHAT_RESERVED, parseArgs } from "./args.ts";
 import {
   confinedSeatSha,
+  localRows,
   setDoctorInspectTimeoutForTests,
   setDoctorSwapHookForTests,
   sha256OrNull,
@@ -258,12 +259,10 @@ test("A7 §3 a seats/ or sessions/ swapped during doctor's read discards the res
       renameSync(join(home, "sessions"), join(home, "sessions.old"));
       mkdirSync(join(home, "sessions"));
     });
-    const doc = fakeIO({ env: { MADC_HOME: home, PATH: "" } });
-    await main(["doctor", "--json"], doc);
-    const report = JSON.parse(doc.out()) as {
-      checks: Array<{ id: string; status: string; summary: string }>;
-    };
-    const locks = report.checks.find((c) => c.id === "locks");
+    // In-process (the survey normally runs inside doctor's bounded child).
+    const locks = localRows({ kind: "present", path: home, source: "MADC_HOME" }).find(
+      (c) => c.id === "locks",
+    );
     assert.equal(locks?.status, "warn");
     assert.match(locks?.summary ?? "", /changed during the survey: not inspected/);
   } finally {
@@ -283,7 +282,7 @@ test("A7 §3 the seat/session inspection has a hard deadline: timeout → FAIL, 
     const report = JSON.parse(doc.out()) as {
       checks: Array<{ id: string; status: string; summary: string }>;
     };
-    for (const id of ["seat", "session"]) {
+    for (const id of ["seat", "session", "locks"]) {
       const row = report.checks.find((c) => c.id === id);
       assert.equal(row?.status, "fail", id);
       assert.equal(row?.summary, "timeout 1ms", id);
