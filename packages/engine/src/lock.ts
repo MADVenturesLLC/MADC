@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { linkSync, lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { linkSync, lstatSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { confinedPath } from "./home.ts";
 
 /** Contents of `sessions/<threadId>.lock` (protocol pin §3.3). */
@@ -32,6 +32,11 @@ export type AcquireResult =
 
 export function threadLockPath(home: string, threadId: string): string {
   return confinedPath(home, "sessions", threadId, ".lock");
+}
+
+/** Mutation guard for a lock file: `<lock>.guard`. Internal; exported for tests. */
+export function lockGuardPath(lockPath: string): string {
+  return `${lockPath}.guard`;
 }
 
 function errCode(err: unknown): string | undefined {
@@ -120,38 +125,81 @@ function removeQuietly(path: string): void {
   }
 }
 
+function sleepSync(ms: number): void {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
 /**
- * Reclaim a lock judged dead/corrupt only if `path` still holds exactly that file (same dev/inode
- * and body). The lock is first atomically renamed aside; if it changed in the meantime (another
- * engine reclaimed it and installed its own), it is linked back and left alone. Returns true iff
- * the observed lock was removed. Internal; exported for tests.
+ * Create `target` exclusively with a complete `{ pid, startedAt }` body: written to a private temp
+ * file, then hard-linked into place (`link` fails with EEXIST if `target` exists), so readers never
+ * observe a half-written file. Returns true iff this call created `target`.
  */
-export function reclaimIfUnchanged(
-  path: string,
-  seenId: FileId,
-  seen: LockState,
-  pid: number = process.pid,
-): boolean {
-  const aside = `${path}.${pid}.${randomUUID()}.reclaim`;
+function linkExclusive(target: string, pid: number): boolean {
+  const tmp = `${target}.${pid}.${randomUUID()}.tmp`;
+  writeFileSync(tmp, JSON.stringify({ pid, startedAt: Date.now() } satisfies LockInfo), {
+    flag: "wx",
+    mode: 0o600,
+  });
   try {
-    renameSync(path, aside);
+    linkSync(tmp, target);
+    return true;
   } catch (err) {
-    if (errCode(err) === "ENOENT") return false;
-    throw err;
-  }
-  try {
-    const id = fileId(aside);
-    const sameFile = id !== null && id.dev === seenId.dev && id.ino === seenId.ino;
-    if (sameFile && sameLockState(readLock(aside), seen)) return true;
-    try {
-      linkSync(aside, path);
-    } catch (err) {
-      if (errCode(err) !== "EEXIST") throw err;
-    }
+    if (errCode(err) !== "EEXIST") throw err;
     return false;
   } finally {
-    removeQuietly(aside);
+    removeQuietly(tmp);
   }
+}
+
+const GUARD_ATTEMPTS = 50;
+const GUARD_WAIT_MS = 2;
+
+/**
+ * Run `fn` while holding the lock's mutation guard (`<lock>.guard`, created exclusively, body
+ * `{ pid, startedAt }` of this process). Every operation that REMOVES a lock file (dead-lock reclaim,
+ * release) runs under the guard; acquisition only ever links into an absent path. So while the guard
+ * is held, the lock file cannot be swapped between an identity check and the unlink that follows —
+ * the lock is never moved aside or left briefly absent. A guard held by a live process is waited on
+ * briefly; one left behind by a dead process (or with an unreadable body) is broken. Returns
+ * `{ ok: false }` if the guard could not be taken.
+ */
+function withLockGuard<T>(lockPath: string, fn: () => T): { ok: true; value: T } | { ok: false } {
+  const guard = lockGuardPath(lockPath);
+  for (let attempt = 0; attempt < GUARD_ATTEMPTS; attempt++) {
+    if (linkExclusive(guard, process.pid)) {
+      try {
+        return { ok: true, value: fn() };
+      } finally {
+        // Only a dead holder's guard is ever broken, so while we run this is still ours.
+        removeQuietly(guard);
+      }
+    }
+    const held = readLock(guard);
+    if (held.state === "missing") continue;
+    if (held.state === "held" && isPidAlive(held.info.pid)) {
+      sleepSync(GUARD_WAIT_MS);
+      continue;
+    }
+    removeQuietly(guard); // left by a crashed process (or tampered with): break it
+  }
+  return { ok: false };
+}
+
+/**
+ * Reclaim a lock judged dead/corrupt only if `path` still holds exactly that file (same dev/inode
+ * and body). Verification and unlink happen under the lock's mutation guard, so a lock that another
+ * engine installed after the judgement is never deleted. Returns true iff the observed lock was
+ * removed. Internal; exported for tests.
+ */
+export function reclaimIfUnchanged(path: string, seenId: FileId, seen: LockState): boolean {
+  const res = withLockGuard(path, () => {
+    const id = fileId(path);
+    if (id === null || id.dev !== seenId.dev || id.ino !== seenId.ino) return false;
+    if (!sameLockState(readLock(path), seen)) return false;
+    removeQuietly(path);
+    return true;
+  });
+  return res.ok && res.value;
 }
 
 /**
@@ -202,37 +250,25 @@ export function acquireThreadLock(
       }
     }
     // Dead holder or corrupt body → reclaim only the file we judged, then retry.
-    reclaimIfUnchanged(path, seenId, current, pid);
+    reclaimIfUnchanged(path, seenId, current);
   }
   return { ok: false, path, holderPid: lastHolder };
 }
 
 /**
- * Release only if the lock on disk is still THIS acquisition's file. Check-then-unlink on the path
- * would race with a replacement lock, so the lock is first atomically renamed to a private name;
- * the renamed file is then compared against the handle's identity. Ours → unlinked. Not ours (the lock
- * was replaced after ours vanished) → linked back into place (EEXIST: a newer lock already exists,
- * leave it) and the private name removed. The foreign lock is never deleted.
+ * Release only if the lock on disk is still THIS acquisition's file (dev/inode + body). The check
+ * and the unlink run under the lock's mutation guard, so a replacement lock installed by another
+ * engine is never deleted and the lock path is never left briefly absent. Returns true iff our lock
+ * was removed. If the guard stays busy, the lock is left in place; once this process exits it is a
+ * dead-pid lock and is reclaimed by the next acquirer.
  */
-export function releaseThreadLock(handle: LockHandle): void {
-  const aside = `${handle.path}.${handle.pid}.${randomUUID()}.release`;
-  try {
-    renameSync(handle.path, aside);
-  } catch (err) {
-    if (errCode(err) === "ENOENT") return;
-    throw err;
-  }
-  try {
-    if (!isHandleFile(aside, handle)) {
-      try {
-        linkSync(aside, handle.path);
-      } catch (err) {
-        if (errCode(err) !== "EEXIST") throw err;
-      }
-    }
-  } finally {
-    removeQuietly(aside);
-  }
+export function releaseThreadLock(handle: LockHandle): boolean {
+  const res = withLockGuard(handle.path, () => {
+    if (!isHandleFile(handle.path, handle)) return false;
+    removeQuietly(handle.path);
+    return true;
+  });
+  return res.ok && res.value;
 }
 
 /** True iff the lock on disk is this acquisition's file (dev/inode + `{ pid, startedAt }`). */
