@@ -1,5 +1,8 @@
 /** A7 unit tests: argument grammar (CLI pin §1), exit-code table (§4), colour rules (§3). */
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { ErrorCode } from "@madc/engine/client";
@@ -132,4 +135,21 @@ test("A7 §1 MADC_HOME set but not absolute → exit 2 before anything spawns (o
   const report = JSON.parse(doc.out()) as { checks: Array<{ id: string; status: string }> };
   assert.equal(report.checks.find((c) => c.id === "home")?.status, "fail");
   assert.equal(report.checks.find((c) => c.id === "engine")?.status, "skip", "nothing spawned");
+});
+
+test("A7 §1 MADC_HOME that exists but is not a directory → one-shot exit 2 before anything spawns", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "madc-a7-file-"));
+  try {
+    const file = join(dir, "home");
+    writeFileSync(file, "x");
+    // The engine entry does not exist: reaching spawn would end as an engine exit (3), not 2.
+    const one = fakeIO({ env: { MADC_HOME: file }, engineEntry: join(dir, "no-engine.ts") });
+    assert.equal(await main(["-p", "hi", "--json"], one), 2);
+    const parsed = JSON.parse(one.out()) as { error: { class: string; message: string } };
+    assert.equal(parsed.error.class, "usage");
+    assert.match(parsed.error.message, /not a directory/);
+    assert.equal(readFileSync(file, "utf8"), "x");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
