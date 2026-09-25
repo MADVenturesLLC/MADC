@@ -1,18 +1,20 @@
 import type { Item, UserInput } from "./protocol/types.ts";
-
-/** What the engine hands an agent for one turn. */
-export type AgentTurnContext = {
-  readonly threadId: string;
-  readonly turnId: string;
-  readonly seatId: string;
-  readonly input: readonly UserInput[];
-};
+import type { EngineSeat } from "./seat.ts";
 
 /** What `preflight` sees: the turn has not been created yet. */
 export type TurnPreflightContext = {
   readonly threadId: string;
   readonly seatId: string;
+  /** The thread's seat, loaded and validated from `seats/<seatId>.json` at thread/start / resume. */
+  readonly seat: EngineSeat;
+  /** The seat file the seat came from (reported in -32006 data). */
+  readonly seatPath: string;
   readonly input: readonly UserInput[];
+};
+
+/** What the engine hands an agent for one turn. */
+export type AgentTurnContext = TurnPreflightContext & {
+  readonly turnId: string;
 };
 
 /**
@@ -41,6 +43,11 @@ export type Agent = {
    * seat refusals are response errors, never a started turn). Throw an `RpcError` to refuse.
    */
   preflight?(ctx: TurnPreflightContext): void;
+  /**
+   * Exact secret values this agent holds in memory (e.g. a provider key). The engine redacts each
+   * one from every session JSONL payload before hashing (seat pin §4.2).
+   */
+  readonly redactValues?: readonly string[];
   run(ctx: AgentTurnContext, sink: TurnSink): Promise<void>;
 };
 
