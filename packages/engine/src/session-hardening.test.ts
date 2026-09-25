@@ -5,6 +5,8 @@
  * swapped for a symlink is never appended to or read; item ids use the shared id grammar.
  * Copilot review 5317426919 / Bugbot r4104324505: a writer never snapshots a real path outside the
  * home (create / resume), and the seat seed never writes through a swapped `seats/` directory.
+ * Copilot review 5317584394: create's cleanup never deletes a file it did not create; a dangling
+ * session symlink is refused (-32603), not reported as not found.
  * Network-free: in-process engines only.
  */
 import assert from "node:assert/strict";
@@ -33,6 +35,7 @@ import {
   SessionWriter,
   sessionEventHash,
   setSessionAppendOpenForTests,
+  setSessionWriteForTests,
   verifySessionFile,
   verifySessionText,
 } from "./session-store.ts";
@@ -439,6 +442,89 @@ test("R-seed-parent-swap: the seat seed never writes seed bytes through a seats/
     assert.deepEqual(seedDefaultSeat(home), { path: seatFile, created: true });
   } finally {
     setSeedHooksForTests(null);
+    cleanup();
+  }
+});
+
+test("R-create-cleanup: a failed create never unlinks an unrelated file after a sessions/ swap", () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside-cleanup");
+  const sessions = join(home, "sessions");
+  try {
+    mkdirSync(sessions, { recursive: true });
+    mkdirSync(outside, { recursive: true });
+    const unrelated = join(outside, "thr_new.jsonl");
+    writeFileSync(unrelated, "operator data\n");
+    // The first append (session.open) opens the file, and a swap after its lstat makes the open
+    // land on the unrelated outside file: the append is refused and cleanup must leave it alone.
+    setSessionAppendOpenForTests({
+      noFollowFlag: false,
+      afterLstat: () => {
+        renameSync(sessions, join(home, "sessions-moved"));
+        symlinkSync(outside, sessions);
+      },
+    });
+    assert.throws(
+      () =>
+        SessionWriter.create(
+          join(sessions, "thr_new.jsonl"),
+          "thr_new",
+          "madc-default",
+          { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" },
+          () => [],
+          1000,
+          home,
+        ),
+      (err: RpcError) => err.code === -32009 && (err.data as { seq: number }).seq === 0,
+    );
+    assert.equal(readFileSync(unrelated, "utf8"), "operator data\n", "unrelated file kept");
+    // Without a swap, a failed create still removes the file it created.
+    setSessionAppendOpenForTests(null);
+    rmSync(sessions);
+    renameSync(join(home, "sessions-moved"), sessions);
+    rmSync(join(sessions, "thr_new.jsonl"));
+    setSessionWriteForTests(() => {
+      throw new Error("disk full");
+    });
+    assert.throws(
+      () =>
+        SessionWriter.create(
+          join(sessions, "thr_own.jsonl"),
+          "thr_own",
+          "madc-default",
+          { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" },
+          () => [],
+          1000,
+          home,
+        ),
+      (err: RpcError) => err.code === -32009,
+    );
+    assert.equal(existsSync(join(sessions, "thr_own.jsonl")), false, "own file removed");
+  } finally {
+    setSessionAppendOpenForTests(null);
+    setSessionWriteForTests(null);
+    cleanup();
+  }
+});
+
+test("R-dangling: a dangling sessions/<id>.jsonl symlink is refused (-32603), not reported as not found", async () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const e = inProcess(home, { name: "idle", async run() {} });
+  try {
+    await e.request("initialize", { clientInfo: { name: "t", version: "0" } });
+    symlinkSync(
+      join(home, "..", "does-not-exist.jsonl"),
+      join(home, "sessions", "thr_dangle.jsonl"),
+    );
+    const resume = await e.request("thread/resume", { threadId: "thr_dangle" });
+    assert.equal((resume.error as { code: number }).code, -32603);
+    const missing = await e.request("thread/resume", { threadId: "thr_absent" });
+    assert.equal((missing.error as { code: number }).code, -32002);
+  } finally {
+    e.input.end();
+    await e.done;
     cleanup();
   }
 });
