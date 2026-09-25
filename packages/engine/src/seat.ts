@@ -146,7 +146,6 @@ export function validateSeat(raw: unknown, expectedId: string): SeatValidation {
   if (!isRecord(memory)) {
     issues.push("memory must be an object");
   } else if (memory.mode === "file") {
-    unknownKeys(memory, ["mode", "path"], "memory.", issues);
     if (typeof memory.path !== "string") {
       issues.push('memory.path is required when memory.mode is "file"');
     } else {
@@ -157,10 +156,11 @@ export function validateSeat(raw: unknown, expectedId: string): SeatValidation {
     if (Object.hasOwn(memory, "path")) {
       issues.push('memory.path is not allowed when memory.mode is "in-session"');
     }
-    unknownKeys(memory, ["mode", "path"], "memory.", issues);
   } else {
     issues.push('memory.mode must be "file" or "in-session"');
   }
+  // Unknown keys are rejected at every depth, whatever the mode (issue names the full key path).
+  if (isRecord(memory)) unknownKeys(memory, ["mode", "path"], "memory.", issues);
 
   const tools = raw.tools;
   if (!isRecord(tools)) {

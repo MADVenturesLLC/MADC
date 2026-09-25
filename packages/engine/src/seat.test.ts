@@ -316,6 +316,40 @@ const BAD_SEATS: Array<{
     issues: ["policy.headlessOk must be a boolean"],
   },
   { name: "unknown-key", seat: { extra: true }, issues: ["extra is not a seat field"] },
+  {
+    name: "unknown-nested-tools",
+    seat: { tools: { deny: [], foo: 1 } },
+    issues: ["tools.foo is not a seat field"],
+  },
+  {
+    name: "unknown-nested-memory",
+    seat: { memory: { mode: "file", path: "memory/madc-default.md", extra: "x" } },
+    issues: ["memory.extra is not a seat field"],
+  },
+  {
+    name: "unknown-nested-bad-mode",
+    seat: { memory: { mode: "cloud", extra: "x" } },
+    issues: ['memory.mode must be "file" or "in-session"', "memory.extra is not a seat field"],
+  },
+  {
+    name: "unknown-nested-policy",
+    seat: { policy: { headlessOk: false, auto: true } },
+    issues: ["policy.auto is not a seat field"],
+  },
+  {
+    name: "unknown-nested-handoffs",
+    seat: { handoffs: { enabled: false, targets: [], mode: "x" } },
+    issues: ["handoffs.mode is not a seat field"],
+  },
+  {
+    name: "unknown-every-depth",
+    seat: { extra: 1, tools: { deny: [], foo: { bar: 1 } }, policy: { headlessOk: true, x: 0 } },
+    issues: [
+      "extra is not a seat field",
+      "tools.foo is not a seat field",
+      "policy.x is not a seat field",
+    ],
+  },
   { name: "empty-role", seat: { role: " " }, issues: ["role must be a non-empty string"] },
   {
     name: "no-model",
