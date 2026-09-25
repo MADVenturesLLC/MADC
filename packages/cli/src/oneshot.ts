@@ -80,6 +80,20 @@ function finalText(items: readonly Item[]): string {
   return text;
 }
 
+/** Minimal runtime shape check of a `Turn` from the wire (fields the CLI reads). */
+function isTurnShape(t: unknown): t is Turn {
+  if (t === null || typeof t !== "object") return false;
+  const r = t as Record<string, unknown>;
+  return (
+    typeof r.id === "string" &&
+    typeof r.threadId === "string" &&
+    typeof r.status === "string" &&
+    Array.isArray(r.items) &&
+    typeof r.startedAt === "number" &&
+    (r.completedAt === null || typeof r.completedAt === "number")
+  );
+}
+
 function servedModelOf(item: Item | null | undefined): ServedModel | null {
   if (item === null || typeof item !== "object" || item.kind !== "servedModel") return null;
   return {
@@ -270,7 +284,13 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
           throw err;
         });
       }
-      if (completed !== null) turn = (completed.params as { turn: Turn }).turn;
+      if (completed !== null) {
+        // Copilot r4108653874: validate the completed turn before trusting it; a malformed one is
+        // a protocol violation (exit 3) and never reaches the receipt / JSON renderers.
+        const t = (completed.params as { turn?: unknown } | undefined)?.turn;
+        if (isTurnShape(t)) turn = t;
+        else malformedItem = true;
+      }
     } catch (err) {
       if (err instanceof Forced) {
         // exit code comes from the signal
@@ -347,7 +367,7 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
     fail(
       { exit: EXIT.engine, class: "engine" },
       null,
-      "protocol violation: item/completed without an item",
+      "protocol violation: malformed item/completed or turn/completed",
     );
   }
 

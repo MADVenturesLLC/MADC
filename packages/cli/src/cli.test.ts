@@ -811,7 +811,7 @@ test("A7 §4 exit 3: item/completed without an item is a protocol violation, one
     assert.equal(r.stdout.trim().split("\n").length, 1, "exactly one JSON object");
     const out = JSON.parse(r.stdout) as { error: { class: string; message: string } };
     assert.equal(out.error.class, "engine");
-    assert.match(out.error.message, /item\/completed without an item/);
+    assert.match(out.error.message, /malformed item\/completed/);
   } finally {
     sb.cleanup();
   }
@@ -864,6 +864,32 @@ test("A7 §3 --init never hashes through a symlinked seats/ parent (Copilot r410
     const seatRow = check(JSON.parse(r.stdout) as DoctorJson, "seat");
     assert.notEqual(seatRow.status, "pass");
     assert.equal(readFileSync(join(outside, "madc-default.json"), "utf8"), '{"outside":true}\n');
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("A7 §4 exit 3: a turn/completed without items is a protocol violation, one JSON object (Copilot r4108653874)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    const r = await runCli(sb, ["-p", "hi", "--json"], {
+      engine: FAKE,
+      env: { MADC_TEST_FAKE_SCENARIO: "bad-turn" },
+    });
+    assert.equal(r.code, 3, r.stdout + r.stderr);
+    assert.equal(r.stdout.trim().split("\n").length, 1, "exactly one JSON object");
+    const out = JSON.parse(r.stdout) as { error: { class: string; message: string } };
+    assert.equal(out.error.class, "engine");
+    assert.match(out.error.message, /protocol violation/);
+    const sb2 = sandbox(); // human mode (receipt renderer) too; fixed thread id: fresh home
+    const h = await runCli(sb2, ["-p", "hi"], {
+      engine: FAKE,
+      env: { MADC_TEST_FAKE_SCENARIO: "bad-turn" },
+    });
+    sb2.cleanup();
+    assert.equal(h.code, 3, h.stdout + h.stderr);
   } finally {
     sb.cleanup();
   }
