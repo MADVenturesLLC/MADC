@@ -4,13 +4,15 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { EngineExitedError } from "./client.ts";
 import { ErrorCode } from "./protocol/errors.ts";
 import { ID_PATTERN } from "./protocol/ids.ts";
 import type { AgentMessageItem, UserMessageItem } from "./protocol/types.ts";
 import {
+  EXIT_ENGINE,
   expectRpcError,
   FAILING_ENGINE,
   HANG_ENGINE,
@@ -192,6 +194,13 @@ test("§8.3 turn/interrupt → turn/completed(interrupted); -32004 on second tur
     const agentItem = done.turn.items.find((i) => i.kind === "agentMessage") as AgentMessageItem;
     assert.equal(agentItem.status, "failed");
     assert.equal(agentItem.text, "partial");
+    // Honesty: the fixture's abort listener tries to emit late events; the sink is closed first.
+    const turnEvents = client.notifications.filter(
+      (n) => (n.params as { turnId?: string }).turnId === turn.id,
+    );
+    assert.equal(JSON.stringify(client.messages).includes("late"), false, "no late emits");
+    assert.equal(turnEvents.filter((n) => n.method === "item/started").length, 2);
+    assert.equal(turnEvents.filter((n) => n.method === "item/completed").length, 2);
 
     // Already finished → {} no-op, and exactly one turn/completed was emitted.
     assert.deepEqual(
@@ -255,6 +264,13 @@ test("agent failure after turn/start → turn/completed(failed) with error + err
     assert.equal(done.turn.error?.code, -32603);
     const errItem = done.turn.items.find((i) => i.kind === "error");
     assert.ok(errItem);
+    assert.equal(errItem.status, "completed");
+    // Pin §5 lifecycle: item/started carries inProgress, item/completed the final snapshot.
+    const isErr = (p: { item: { id: string } }) => p.item.id === errItem.id;
+    const started = await client.waitForNotification("item/started", isErr);
+    assert.equal(started.item.status, "inProgress");
+    const completed = await client.waitForNotification("item/completed", isErr);
+    assert.equal(completed.item.status, "completed");
     assert.equal(
       JSON.stringify(done).includes("fixture agent failure"),
       false,
@@ -340,6 +356,56 @@ test("§8.4 thread/resume from a second engine while the first holds the lock �
   } finally {
     await first.close();
     await second.close();
+    cleanup();
+  }
+});
+
+test("thread/resume of a thread known in-process re-verifies the on-disk lock (-32004 if lost)", async () => {
+  const { home, cleanup } = makeHome();
+  const engine = startEngine(home);
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+    stdio: "ignore",
+  });
+  try {
+    await handshake(engine);
+    const { thread } = await engine.request("thread/start", {});
+    const ok = await engine.request("thread/resume", { threadId: thread.id });
+    assert.equal(ok.thread.id, thread.id);
+
+    // Our lock is removed out from under us and a live foreign process takes it.
+    const lockPath = join(home, "sessions", `${thread.id}.lock`);
+    rmSync(lockPath);
+    writeFileSync(lockPath, JSON.stringify({ pid: holder.pid, startedAt: Date.now() }));
+
+    const err = await expectRpcError(engine.request("thread/resume", { threadId: thread.id }));
+    assert.equal(err.code, ErrorCode.TurnAlreadyActive);
+    assert.deepEqual(err.data, {
+      threadId: thread.id,
+      activeTurnId: null,
+      lockHolderPid: holder.pid,
+    });
+
+    // Exiting must not delete the foreign holder's lock.
+    await engine.close();
+    assert.equal(JSON.parse(readFileSync(lockPath, "utf8")).pid, holder.pid);
+  } finally {
+    holder.kill();
+    await engine.close();
+    cleanup();
+  }
+});
+
+test("client: pending requests reject when the engine exits without responding", async () => {
+  const { home, cleanup } = makeHome();
+  const client = startEngine(home, EXIT_ENGINE);
+  try {
+    await assert.rejects(
+      client.request("initialize", { clientInfo: { name: "t", version: "0" } }),
+      (e: unknown) => e instanceof EngineExitedError && e.exitCode === 3,
+    );
+    await assert.rejects(client.request("thread/list", {}), EngineExitedError);
+  } finally {
+    await client.close();
     cleanup();
   }
 });

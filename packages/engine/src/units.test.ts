@@ -1,11 +1,27 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { createAcpAdapter, NotImplementedError } from "./acp/index.ts";
 import { confinedPath, resolveMadcHome } from "./home.ts";
-import { acquireThreadLock, isPidAlive, readLock, releaseThreadLock } from "./lock.ts";
+import {
+  acquireThreadLock,
+  holdsThreadLock,
+  isPidAlive,
+  readLock,
+  releaseThreadLock,
+} from "./lock.ts";
 import { ErrorCode, providerRefusalError, RpcError } from "./protocol/errors.ts";
 import { ID_PATTERN, isValidId, newId } from "./protocol/ids.ts";
 import { CLIENT_REQUEST_METHODS, ITEM_KINDS } from "./protocol/types.ts";
@@ -167,6 +183,21 @@ test("confinedPath: symlinked subdir escaping MADC_HOME is rejected", () => {
   }
 });
 
+test("confinedPath tightens pre-existing MADC_HOME / subdir to 0700 (POSIX)", () => {
+  if (process.platform === "win32") return; // POSIX mode bits only
+  const { home, cleanup } = makeHome();
+  try {
+    mkdirSync(join(home, "sessions"), { recursive: true });
+    chmodSync(home, 0o755);
+    chmodSync(join(home, "sessions"), 0o777);
+    confinedPath(home, "sessions", "thr_p", ".lock");
+    assert.equal(statSync(home).mode & 0o777, 0o700);
+    assert.equal(statSync(join(home, "sessions")).mode & 0o777, 0o700);
+  } finally {
+    cleanup();
+  }
+});
+
 test("lock: create-exclusive {pid,startedAt}; live foreign holder refused; release only own", async () => {
   const { home, cleanup } = makeHome();
   // A live foreign process to act as the holder.
@@ -184,9 +215,12 @@ test("lock: create-exclusive {pid,startedAt}; live foreign holder refused; relea
     const other = acquireThreadLock(home, "thr_a");
     assert.deepEqual(other, { ok: false, path: mine.path, holderPid });
 
-    releaseThreadLock(mine.path); // not ours (process.pid) → must not remove
+    assert.equal(mine.ok && holdsThreadLock(mine.handle), true);
+    if (!mine.ok) return;
+    // A handle for a different file (forged inode) is not ours → must not remove.
+    releaseThreadLock({ ...mine.handle, ino: mine.handle.ino + 1n });
     assert.equal(readLock(mine.path).state, "held");
-    releaseThreadLock(mine.path, holderPid);
+    releaseThreadLock(mine.handle);
     assert.equal(readLock(mine.path).state, "missing");
   } finally {
     holder.kill();
@@ -209,12 +243,47 @@ test("lock: dead pid and corrupt body are reclaimed", async () => {
     const res = acquireThreadLock(home, "thr_b");
     assert.equal(res.ok, true);
     assert.equal(JSON.parse(readFileSync(path, "utf8")).pid, process.pid);
-    releaseThreadLock(path);
+    if (res.ok) releaseThreadLock(res.handle);
 
     writeFileSync(path, "not json");
-    assert.equal(acquireThreadLock(home, "thr_b").ok, true);
-    releaseThreadLock(path);
+    const again = acquireThreadLock(home, "thr_b");
+    assert.equal(again.ok, true);
+    if (again.ok) releaseThreadLock(again.handle);
     assert.equal(existsSync(path), false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("lock: a stale handle never deletes a replacement lock (per-acquisition identity)", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const first = acquireThreadLock(home, "thr_c");
+    assert.equal(first.ok, true);
+    if (!first.ok) return;
+    // Our lock vanishes and is re-created by someone else with the same pid (the freed inode is
+    // typically reused here, so identity must not rest on the inode alone).
+    unlinkSync(first.path);
+    writeFileSync(
+      first.path,
+      JSON.stringify({ pid: process.pid, startedAt: first.handle.startedAt + 1 }),
+    );
+    const second = acquireThreadLock(home, "thr_c"); // re-entrant adopt of the on-disk file
+    assert.equal(second.ok, true);
+    if (!second.ok) return;
+    assert.equal(holdsThreadLock(first.handle), false);
+    assert.equal(holdsThreadLock(second.handle), true);
+
+    releaseThreadLock(first.handle); // stale → must leave the replacement in place
+    assert.equal(readLock(first.path).state, "held");
+    assert.equal(holdsThreadLock(second.handle), true, "replacement lock restored intact");
+    assert.deepEqual(
+      readdirSync(join(home, "sessions")).filter((f) => f !== "thr_c.lock"),
+      [],
+      "no stray temp/release files",
+    );
+    releaseThreadLock(second.handle);
+    assert.equal(readLock(first.path).state, "missing");
   } finally {
     cleanup();
   }
