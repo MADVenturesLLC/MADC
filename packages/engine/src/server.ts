@@ -376,6 +376,8 @@ export class EngineConnection {
     const record = this.#threads.get(threadId);
     if (record === undefined) throw threadNotFound(threadId);
     if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
+    // Seat / registry / credential refusals are response errors before any turn exists (§4.2).
+    this.#opts.agent.preflight?.({ threadId, seatId: record.thread.seatId, input });
     this.#ensureLock(record);
 
     const now = Date.now();
