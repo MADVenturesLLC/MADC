@@ -73,13 +73,31 @@ function versionAtLeast(version: string, floor: string): boolean {
 export function sha256OrNull(path: string): string | null {
   let fd: number | undefined;
   try {
-    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
-    if (!fstatSync(fd).isFile()) return null;
+    // O_NONBLOCK: a FIFO planted at the path must not block the open (Bugbot 4108211281).
+    const nofollow = constants.O_NOFOLLOW;
+    // Without O_NOFOLLOW (Windows): lstat → open → fstat, and the opened inode must be the one
+    // lstat saw (Copilot r4108213343), so a symlink is never followed.
+    const pre = nofollow === undefined ? lstatSync(path) : null;
+    if (pre !== null && !pre.isFile()) return null;
+    fd = openSync(path, constants.O_RDONLY | (nofollow ?? 0) | (constants.O_NONBLOCK ?? 0));
+    const st = fstatSync(fd);
+    if (!st.isFile()) return null;
+    if (pre !== null && (pre.ino !== st.ino || pre.dev !== st.dev)) return null;
     return createHash("sha256").update(readFileSync(fd)).digest("hex");
   } catch {
     return null;
   } finally {
     if (fd !== undefined) closeSync(fd);
+  }
+}
+
+/** True when something (even a dangling symlink) exists at `path`, without following it. */
+export function existsNoFollow(path: string): boolean {
+  try {
+    lstatSync(path);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -196,6 +214,11 @@ function resolveHome(io: CliIO): HomeState {
   try {
     st = statSync(path);
   } catch {
+    // A dangling MADC_HOME symlink exists but is not a usable directory (Copilot r4108213385);
+    // a symlink that resolves to a directory is fine (statSync above follows it).
+    if (existsNoFollow(path)) {
+      return { kind: "invalid", message: `MADC_HOME ${path} is a dangling symlink` };
+    }
     // missing (or unreadable): not initialized
     return { kind: "missing", path, source };
   }

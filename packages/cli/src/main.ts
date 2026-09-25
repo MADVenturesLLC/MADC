@@ -6,7 +6,7 @@ import { statSync } from "node:fs";
 import { MADC_VERSION } from "@madc/core";
 import { PROTOCOL_VERSION, resolveMadcHome } from "@madc/engine/client";
 import { CHAT_RESERVED, parseArgs, USAGE } from "./args.ts";
-import { runDoctor } from "./doctor.ts";
+import { existsNoFollow, runDoctor } from "./doctor.ts";
 import { EXIT } from "./exit-codes.ts";
 import type { CliIO } from "./io.ts";
 import { PROMPT_CAP_BYTES, readPromptFromStdin, runOneShot } from "./oneshot.ts";
@@ -75,7 +75,11 @@ async function oneShot(
       return usageFailure(io, json, `MADC_HOME ${home} exists but is not a directory`);
     }
   } catch {
-    // absent: the engine creates and seeds it
+    // Absent: the engine creates and seeds it. A dangling symlink is not absent (Copilot
+    // r4108213417): exit 2 before spawning.
+    if (existsNoFollow(home)) {
+      return usageFailure(io, json, `MADC_HOME ${home} is a dangling symlink`);
+    }
   }
   let prompt: string | null;
   if (promptArg === "-") {

@@ -132,6 +132,10 @@ rl.on("line", (line) => {
         const error = failed ? { code: -32603, message: "Agent failed" } : null;
         append("turn.end", { turnId, status: failed ? "failed" : "completed", error });
       }
+      if (scenario === "bad-item") {
+        // "bad-item": valid JSON, but an item/completed notification without an item.
+        send({ method: "item/completed", params: { threadId, turnId } });
+      }
       const items = [
         { id: "item_a1", kind: "agentMessage", status: "completed", text: "fake reply" },
       ];

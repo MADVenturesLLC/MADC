@@ -798,6 +798,25 @@ test("A7 §4 exit 3: a non-JSON engine line mid-turn ends the turn wait even if 
   }
 });
 
+test("A7 §4 exit 3: item/completed without an item is a protocol violation, one JSON object (Copilot r4108213460)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    const r = await runCli(sb, ["-p", "hi", "--json"], {
+      engine: FAKE,
+      env: { MADC_TEST_FAKE_SCENARIO: "bad-item" },
+    });
+    assert.equal(r.code, 3, r.stdout + r.stderr);
+    assert.equal(r.stdout.trim().split("\n").length, 1, "exactly one JSON object");
+    const out = JSON.parse(r.stdout) as { error: { class: string; message: string } };
+    assert.equal(out.error.class, "engine");
+    assert.match(out.error.message, /item\/completed without an item/);
+  } finally {
+    sb.cleanup();
+  }
+});
+
 test("A7 §4 exit 3: the turn completed but the engine exited non-zero on close (Copilot r4107601276)", {
   timeout: 60_000,
 }, async () => {

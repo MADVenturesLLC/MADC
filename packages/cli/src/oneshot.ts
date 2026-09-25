@@ -80,8 +80,8 @@ function finalText(items: readonly Item[]): string {
   return text;
 }
 
-function servedModelOf(item: Item): ServedModel | null {
-  if (item.kind !== "servedModel") return null;
+function servedModelOf(item: Item | null | undefined): ServedModel | null {
+  if (item === null || typeof item !== "object" || item.kind !== "servedModel") return null;
   return {
     requestedModel: item.requestedModel,
     servedModel: item.servedModel,
@@ -102,6 +102,7 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
   // The engine's exit code from `close()`; `null` = killed by a signal (incl. our close timeout).
   let engineExit: number | null | undefined;
   let violationTimer: ReturnType<typeof setInterval> | undefined;
+  let malformedItem = false;
   let streamed = "";
   const stream = io.stdoutIsTTY && !opts.json;
   const seatId = opts.seatId ?? DEFAULT_SEAT;
@@ -224,7 +225,10 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
           }
           streamed += delta;
         } else if (m.method === "item/completed" && params?.threadId === tid) {
-          const s = servedModelOf(params.item as Item);
+          // Copilot r4108213460: a malformed item never throws inside the client's reader; it is
+          // a protocol violation (exit 3) through the normal result path.
+          if (params.item === null || typeof params.item !== "object") malformedItem = true;
+          const s = servedModelOf(params.item as Item | null | undefined);
           if (s !== null) served = s;
         }
         // One turn per thread in a one-shot: match on the thread, since `turn/completed` can be
@@ -335,6 +339,13 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
       { exit: EXIT.engine, class: "engine" },
       null,
       "protocol violation: non-JSON line on engine stdout",
+    );
+  }
+  if (exit === EXIT.ok && malformedItem) {
+    fail(
+      { exit: EXIT.engine, class: "engine" },
+      null,
+      "protocol violation: item/completed without an item",
     );
   }
 
