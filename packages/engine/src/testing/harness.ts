@@ -1,6 +1,6 @@
 /** Shared test helpers: temp MADC_HOME + engine spawn. Not a test file itself. */
 import { spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +17,15 @@ export function makeHome(): { home: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), "madc-a2-"));
   const home = join(root, "home");
   return { home, cleanup: () => rmSync(root, { recursive: true, force: true }) };
+}
+
+/** Write `$MADC_HOME/seats/<id>.json` (creating the dirs 0700); `seat.id` names the file. */
+export function writeSeatFile(home: string, seat: Record<string, unknown>, raw?: string): string {
+  const dir = join(home, "seats");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const path = join(dir, `${String(seat.id)}.json`);
+  writeFileSync(path, raw ?? `${JSON.stringify(seat, null, 2)}\n`, { mode: 0o600 });
+  return path;
 }
 
 /** Credential-looking names never reach a test engine unless a test sets them explicitly. */

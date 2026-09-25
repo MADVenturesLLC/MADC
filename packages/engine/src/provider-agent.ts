@@ -1,17 +1,18 @@
 /**
- * Live-provider agent (Act M0-A3). Every turn runs a synchronous preflight inside `turn/start`
- * (protocol pin §4.2) before any model call:
+ * Live-provider agent (Acts M0-A3 / A4). The engine loads and validates the thread's seat file at
+ * `thread/start` / `thread/resume` (A4) and hands it over in the turn context. Every turn runs a
+ * synchronous preflight inside `turn/start` (protocol pin §4.2) before any model call:
  *
- * 1. seat resolution: only the built-in `madc-default` exists until A4 (else -32005);
- * 2. registry `assertAllowed` with `requireLive: true` (unwired → -32008, other denials → -32007);
- * 3. the backing has an adapter in this build (else -32008 `unwired`);
- * 4. `pinnedModel` resolves in the pinned pi-ai catalog for that backing (else -32006);
- * 5. a usable credential is configured (else -32008 `no-credentials`).
+ * 1. registry `assertAllowed` with `requireLive: true` (unwired → -32008, other denials → -32007);
+ * 2. the backing has an adapter in this build (else -32008 `unwired`);
+ * 3. `pinnedModel` resolves in the pinned pi-ai catalog for that backing (else -32006 with the
+ *    seat file path);
+ * 4. a usable credential is configured (else -32008 `no-credentials`).
  *
- * Only then does `run` stream from the provider port: deltas → one `agentMessage`, followed by a
- * `servedModel` receipt (protocol pin §5).
+ * Preflight is side-effect free (no port, no I/O). Only `run` builds the port and streams the
+ * current input: deltas → one `agentMessage`, followed by a `servedModel` receipt (protocol pin §5).
+ * Earlier turns are not replayed to the model in M0-A4 (Surface ruling on PR #12, item 12).
  */
-import { join } from "node:path";
 import {
   KIMI_CODE_PROVIDER_ID,
   type KimiCredential,
@@ -34,15 +35,10 @@ import {
   providerRefusalError,
   RpcError,
   type SeatInvalidData,
-  type SeatNotFoundData,
 } from "./protocol/errors.ts";
 import type { ServedModelBacking, ServedModelItem } from "./protocol/types.ts";
-import type { EngineSeat } from "./seat.ts";
 
 export type ProviderAgentOptions = {
-  /** MADC home; used only to report where A4 will look for non-built-in seats. */
-  readonly home: string;
-  readonly seat: EngineSeat;
   /** Resolved once at engine start; the key itself never leaves the adapter. */
   readonly credential: KimiCredential;
   /** Builds the port for a validated credential (tests inject a fake transport). */
@@ -51,7 +47,7 @@ export type ProviderAgentOptions = {
   readonly log?: (line: string) => void;
 };
 
-type TurnPlan = { readonly port: ProviderPort; readonly modelId: string };
+type TurnPlan = { readonly apiKey: string; readonly modelId: string };
 
 /**
  * Intent `connect` per backing (seat pin §2 backing → registry table). Unknown backings use
@@ -74,17 +70,11 @@ function providerUnavailable(
 }
 
 export function createProviderAgent(options: ProviderAgentOptions): Agent {
-  const { seat } = options;
+  const { credential } = options;
   let port: ProviderPort | undefined;
 
   const plan = (ctx: TurnPreflightContext): TurnPlan => {
-    if (ctx.seatId !== seat.id) {
-      throw new RpcError(ErrorCode.SeatNotFound, "Seat not found", {
-        seatId: ctx.seatId,
-        path: join(options.home, "seats", `${ctx.seatId}.json`),
-      } satisfies SeatNotFoundData);
-    }
-
+    const { seat } = ctx;
     const providerId = seat.preferredBacking;
     try {
       // M0 engine turns are non-interactive provider calls: `headless` is the fail-closed mode.
@@ -112,24 +102,27 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
     if (!model.ok) {
       throw new RpcError(ErrorCode.SeatInvalid, "Seat invalid", {
         seatId: seat.id,
-        path: "(built-in)",
+        path: ctx.seatPath,
         issues: [model.issue],
       } satisfies SeatInvalidData);
     }
 
-    const { credential } = options;
     if (!credential.ok) throw providerUnavailable(providerId, "no-credentials");
-    port ??= options.createPort(credential.apiKey);
-    return { port, modelId: model.modelId };
+    return { apiKey: credential.apiKey, modelId: model.modelId };
   };
 
   return Object.freeze({
-    name: `provider:${seat.preferredBacking}`,
+    name: "provider",
+    // The configured key is redacted from session JSONL by exact value (seat pin §4.2).
+    redactValues: Object.freeze(credential.ok ? [credential.apiKey] : []),
     preflight(ctx: TurnPreflightContext): void {
       plan(ctx);
     },
     async run(ctx: AgentTurnContext, sink: TurnSink): Promise<void> {
-      const { port: turnPort, modelId } = plan(ctx);
+      const { apiKey, modelId } = plan(ctx);
+      port ??= options.createPort(apiKey);
+      const turnPort = port;
+      const { seat } = ctx;
       const id = sink.newItemId();
       sink.startItem({ id, kind: "agentMessage", status: "inProgress", text: "" });
       let result: ProviderTurnResult;

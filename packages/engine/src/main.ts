@@ -3,7 +3,6 @@ import { createKimiCodePort, honestUserAgent, readKimiCredential } from "@madc/a
 import type { Agent } from "./agent.ts";
 import { resolveMadcHome } from "./home.ts";
 import { createProviderAgent } from "./provider-agent.ts";
-import { MADC_DEFAULT_SEAT } from "./seat.ts";
 import { ENGINE_VERSION, EngineConnection } from "./server.ts";
 
 /** Builds the turn agent once `MADC_HOME` is known. */
@@ -12,15 +11,13 @@ export type AgentFactory = (env: { readonly home: string }) => Agent;
 const log = (line: string) => process.stderr.write(`[madc-engine] ${line}\n`);
 
 /**
- * Production agent: built-in `madc-default` seat on Kimi Code (plan D2). The API key is read once
- * from the local environment (`KIMI_API_KEY`); without one, `turn/start` answers -32008
- * `no-credentials`. No base-URL or transport override exists here: production only talks to the
- * pinned catalog endpoint.
+ * Production agent: the thread's seat file (seeded `madc-default` by default) on Kimi Code (plan
+ * D2). The API key is read once from the local environment (`KIMI_API_KEY`); without one,
+ * `turn/start` answers -32008 `no-credentials`. No base-URL or transport override exists here:
+ * production only talks to the pinned catalog endpoint.
  */
-export const defaultAgentFactory: AgentFactory = ({ home }) =>
+export const defaultAgentFactory: AgentFactory = () =>
   createProviderAgent({
-    home,
-    seat: MADC_DEFAULT_SEAT,
     credential: readKimiCredential(process.env),
     createPort: (apiKey) =>
       createKimiCodePort({ apiKey, userAgent: honestUserAgent(ENGINE_VERSION) }),

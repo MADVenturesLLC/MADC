@@ -1,6 +1,9 @@
+import { lstatSync, readdirSync } from "node:fs";
+import { join } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
-import type { Agent, TurnSink } from "./agent.ts";
+import type { Agent, AgentTurnContext, TurnSink } from "./agent.ts";
+import { confinedPath } from "./home.ts";
 import { acquireThreadLock, holdsThreadLock, type LockHandle, releaseThreadLock } from "./lock.ts";
 import {
   alreadyInitialized,
@@ -32,6 +35,17 @@ import {
   type UserInput,
 } from "./protocol/types.ts";
 import { encodeMessage, isPlainObject, parseLine } from "./protocol/wire.ts";
+import type { SeatBacking } from "./seat.ts";
+import { type LoadedSeat, loadSeat, seedDefaultSeat } from "./seat-store.ts";
+import {
+  type RebuiltSession,
+  rebuildSession,
+  type SessionEventType,
+  type SessionPayloads,
+  SessionWriter,
+  sessionWriteFailed,
+  verifySessionFile,
+} from "./session-store.ts";
 
 export const ENGINE_VERSION = "0.0.0";
 
@@ -43,6 +57,8 @@ export type EngineOptions = {
   agent: Agent;
   /** stderr logger — never protocol. */
   log?: (message: string) => void;
+  /** Test seam: thread id generator for `thread/start` (default `newId("thr")`). */
+  newThreadId?: () => string;
 };
 
 type TurnRecord = {
@@ -58,6 +74,8 @@ type ThreadRecord = {
   lock: LockHandle;
   turns: Map<string, TurnRecord>;
   activeTurnId: string | null;
+  seat: LoadedSeat;
+  session: SessionWriter;
 };
 
 const THREAD_LIST_DEFAULT_LIMIT = 50;
@@ -129,6 +147,7 @@ export class EngineConnection {
 
   run(): Promise<void> {
     const { input, output } = this.#opts;
+    this.#seedHome();
     // A dead stdout ends the connection exactly like EOF (interrupt turns, release locks).
     output.on("error", () => this.#onOutputFailure());
     const rl = createInterface({ input, crlfDelay: Number.POSITIVE_INFINITY });
@@ -140,6 +159,18 @@ export class EngineConnection {
         resolve();
       });
     });
+  }
+
+  /**
+   * Seat pin §1: on engine start, seed `seats/madc-default.json` if missing (never overwritten).
+   * A failure is logged, not fatal: `thread/start` then reports the seat error itself.
+   */
+  #seedHome(): void {
+    try {
+      seedDefaultSeat(this.#opts.home);
+    } catch (err) {
+      this.#log(`seed failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   /** EOF / output failure / signal: in-flight turns end `interrupted`; locks are released. */
@@ -269,22 +300,76 @@ export class EngineConnection {
     if (p.cwd !== undefined && typeof p.cwd !== "string") issues.push("cwd must be a string");
     throwIfIssues(issues);
 
-    const id = newId("thr");
+    // Seat load happens in thread/start (protocol pin §4.2): -32005 / -32006 before any lock.
+    const seat = loadSeat(this.#opts.home, seatId);
+
+    const id = this.#opts.newThreadId?.() ?? newId("thr");
+    if (!isValidId(id)) throw internalError("Generated thread id is invalid");
     const lock = acquireThreadLock(this.#opts.home, id);
     if (!lock.ok) throw turnAlreadyActive(id, null, lock.holderPid ?? undefined);
+    const handle = lock.handle;
 
     const now = Date.now();
+    const cwd = typeof p.cwd === "string" ? p.cwd : null;
+    let session: SessionWriter;
+    try {
+      const path = confinedPath(this.#opts.home, "sessions", id, ".jsonl");
+      session = SessionWriter.create(
+        path,
+        id,
+        seatId,
+        {
+          cwd,
+          backing: seat.seat.preferredBacking as SeatBacking,
+          providerId: seat.seat.preferredBacking,
+          pinnedModel: seat.seat.pinnedModel,
+        },
+        () => this.#secrets(this.#threads.get(id)?.lock ?? handle),
+        now, // session.open ts == thread.createdAt
+        this.#opts.home,
+      );
+    } catch (err) {
+      this.#releaseOrKeep(handle);
+      throw err;
+    }
     const thread: Thread = {
       id,
       seatId,
-      cwd: typeof p.cwd === "string" ? p.cwd : null,
+      cwd,
       createdAt: now,
       updatedAt: now,
       status: "idle",
       preview: "",
     };
-    this.#threads.set(id, { thread, lock: lock.handle, turns: new Map(), activeTurnId: null });
+    this.#threads.set(id, {
+      thread,
+      lock: handle,
+      turns: new Map(),
+      activeTurnId: null,
+      seat,
+      session,
+    });
     return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+  }
+
+  /** Exact values redacted from every session append: the agent's secrets and our lock token. */
+  #secrets(lock: LockHandle): string[] {
+    return [...(this.#opts.agent.redactValues ?? []), lock.token];
+  }
+
+  /** Release a lock we took; if that fails while we still hold it, keep it for shutdown. */
+  #releaseOrKeep(handle: LockHandle): void {
+    let released = false;
+    try {
+      released = releaseThreadLock(handle);
+    } catch {
+      released = false;
+    }
+    try {
+      if (!released && holdsThreadLock(handle)) this.#strayLocks.push(handle);
+    } catch {
+      // unreadable lock: nothing more we can do; a dead-pid lock is reclaimed later
+    }
   }
 
   #threadResume(params: unknown): { value: { thread: Thread }; after: () => void } {
@@ -305,17 +390,89 @@ export class EngineConnection {
     const lock = acquireThreadLock(this.#opts.home, threadId);
     if (!lock.ok) throw turnAlreadyActive(threadId, null, lock.holderPid ?? undefined);
 
-    // A2 thread store is in-memory per engine process; the durable JSONL-backed load lands in A4
-    // (seat pin §4). Nothing to load → release the lock we just took and report not found. If it
-    // cannot be released now, keep the handle so shutdown releases it (never orphan our own lock).
-    let released = false;
+    const handle = lock.handle;
+    let record: ThreadRecord;
     try {
-      released = releaseThreadLock(lock.handle);
-    } catch {
-      released = false;
+      record = this.#loadColdThread(threadId, handle);
+    } catch (err) {
+      // Not found / unverifiable / seat error: release the lock we just took (or keep it for
+      // shutdown if it cannot be released now — never orphan our own lock).
+      this.#releaseOrKeep(handle);
+      throw err;
     }
-    if (!released && holdsThreadLock(lock.handle)) this.#strayLocks.push(lock.handle);
-    throw threadNotFound(threadId);
+    this.#threads.set(threadId, record);
+    const thread = record.thread;
+    return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+  }
+
+  /**
+   * Cold resume under the thread lock (seat pin §4): verify `sessions/<threadId>.jsonl`, rebuild
+   * thread + turns (engine state only; no model history replay), load the seat it was opened with,
+   * and continue the chain. A turn whose `turn.end` is missing (engine died mid-turn) is closed as
+   * `interrupted` by appending a `turn.end` event.
+   */
+  #loadColdThread(threadId: string, handle: LockHandle): ThreadRecord {
+    const path = confinedPath(this.#opts.home, "sessions", threadId, ".jsonl");
+    // lstat, not existsSync: a dangling symlink is not "not found"; verification refuses it (-32603).
+    try {
+      lstatSync(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") throw threadNotFound(threadId);
+    }
+    const verified = verifySessionFile(path, threadId, {}, this.#opts.home);
+    if (!verified.ok) {
+      this.#log(
+        `session ${threadId} failed verification at line ${verified.line}: ${verified.reason}`,
+      );
+      throw internalError("Session record failed verification");
+    }
+    let rebuilt: RebuiltSession;
+    try {
+      rebuilt = rebuildSession(verified.events);
+    } catch (err) {
+      this.#log(
+        `session ${threadId} could not be rebuilt: ${err instanceof Error ? err.message : String(err)}`,
+      );
+      throw internalError("Session record failed verification");
+    }
+    const seat = loadSeat(this.#opts.home, rebuilt.thread.seatId);
+    const session = SessionWriter.resume(
+      path,
+      threadId,
+      rebuilt.thread.seatId,
+      verified.nextSeq,
+      verified.lastHash,
+      () => this.#secrets(this.#threads.get(threadId)?.lock ?? handle),
+      this.#opts.home,
+      verified.file,
+    );
+    for (const turnId of rebuilt.danglingTurnIds) {
+      // Same ts as the rebuilt turn's completedAt; the thread's updatedAt covers the close.
+      const closedAt = rebuilt.turns.find((t) => t.id === turnId)?.completedAt ?? Date.now();
+      const event = session.append(
+        "turn.end",
+        { turnId, status: "interrupted", error: null },
+        closedAt,
+      );
+      rebuilt.thread.updatedAt = Math.max(rebuilt.thread.updatedAt, event.ts);
+    }
+    const turns = new Map<string, TurnRecord>();
+    for (const turn of rebuilt.turns) {
+      turns.set(turn.id, {
+        turn,
+        controller: new AbortController(),
+        open: new Map(),
+        finalizing: true,
+      });
+    }
+    return {
+      thread: rebuilt.thread,
+      lock: handle,
+      turns,
+      activeTurnId: null,
+      seat,
+      session,
+    };
   }
 
   #threadList(params: unknown): ThreadListResult {
@@ -332,9 +489,9 @@ export class EngineConnection {
     if (p.cursor !== undefined && !isValidId(p.cursor)) issues.push("cursor is invalid");
     throwIfIssues(issues);
 
-    const all = [...this.#threads.values()]
-      .map((r) => r.thread)
-      .sort((a, b) => b.createdAt - a.createdAt || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0));
+    const all = [...[...this.#threads.values()].map((r) => r.thread), ...this.#diskThreads()].sort(
+      (a, b) => b.createdAt - a.createdAt || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0),
+    );
     let start = 0;
     if (typeof p.cursor === "string") {
       const idx = all.findIndex((t) => t.id === p.cursor);
@@ -354,6 +511,42 @@ export class EngineConnection {
       })),
       nextCursor: start + limit < all.length && last !== undefined ? last.id : null,
     };
+  }
+
+  /**
+   * Threads recorded on disk but not loaded in this process (durable store, seat pin §4). Read-only:
+   * no lock is taken. A file that does not verify is skipped (and logged), never listed.
+   */
+  #diskThreads(): Thread[] {
+    let names: string[];
+    try {
+      names = readdirSync(join(this.#opts.home, "sessions"));
+    } catch {
+      return [];
+    }
+    const out: Thread[] = [];
+    for (const name of names) {
+      if (!name.endsWith(".jsonl")) continue;
+      const threadId = name.slice(0, -".jsonl".length);
+      if (!isValidId(threadId) || this.#threads.has(threadId)) continue;
+      let path: string;
+      try {
+        path = confinedPath(this.#opts.home, "sessions", threadId, ".jsonl");
+      } catch {
+        continue;
+      }
+      const verified = verifySessionFile(path, threadId, {}, this.#opts.home);
+      if (!verified.ok) {
+        this.#log(`thread/list: skipping ${threadId} (session failed verification)`);
+        continue;
+      }
+      try {
+        out.push(rebuildSession(verified.events).thread);
+      } catch {
+        this.#log(`thread/list: skipping ${threadId} (session could not be rebuilt)`);
+      }
+    }
+    return out;
   }
 
   /** Verify this process still owns the thread's lock file; re-take it or yield (-32004). */
@@ -376,13 +569,24 @@ export class EngineConnection {
     const record = this.#threads.get(threadId);
     if (record === undefined) throw threadNotFound(threadId);
     if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
+    // A broken session writer is permanent: -32009 before any preflight (never a later refusal).
+    const session = record.session;
+    if (session.broken) throw sessionWriteFailed(threadId, session.path, session.nextSeq);
     // Seat / registry / credential refusals are response errors before any turn exists (§4.2).
-    this.#opts.agent.preflight?.({ threadId, seatId: record.thread.seatId, input });
+    const ctx = this.#turnContext(record, input);
+    this.#opts.agent.preflight?.(ctx);
     this.#ensureLock(record);
 
     const now = Date.now();
+    const turnId = newId("turn");
+    // turn.start is durable before the turn exists: an append failure is a -32009 response error.
+    record.session.append(
+      "turn.start",
+      { turnId, inputText: input.map((part) => part.text).join("\n") },
+      now, // == turn.startedAt
+    );
     const turn: Turn = {
-      id: newId("turn"),
+      id: turnId,
       threadId,
       status: "inProgress",
       items: [],
@@ -407,7 +611,7 @@ export class EngineConnection {
       value: { turn: snapshot },
       after: () => {
         this.#notify("turn/started", { turn: structuredClone(turn) });
-        this.#runTurn(record, turnRecord, input);
+        this.#runTurn(record, turnRecord, { ...ctx, turnId: turn.id });
       },
     };
   }
@@ -427,7 +631,69 @@ export class EngineConnection {
     return { value: {}, after: () => this.#finishTurn(record, turnRecord, "interrupted") };
   }
 
-  #runTurn(record: ThreadRecord, tr: TurnRecord, input: UserInput[]): void {
+  #turnContext(record: ThreadRecord, input: UserInput[]): Omit<AgentTurnContext, "turnId"> {
+    return {
+      threadId: record.thread.id,
+      seatId: record.thread.seatId,
+      seat: record.seat.seat,
+      seatPath: record.seat.path,
+      input,
+    };
+  }
+
+  /**
+   * Durable record of one completed item (seat pin §4.2): an `item` event, plus the dedicated
+   * `servedModel` event for a receipt (dual write). The receipt pair is one append (`appendAll`):
+   * both lines are durable or neither is. Returns false after a -32009 failure, which fails the
+   * turn.
+   */
+  #persistItem(record: ThreadRecord, tr: TurnRecord, item: Item): boolean {
+    const turnId = tr.turn.id;
+    try {
+      if (item.kind === "servedModel") {
+        record.session.appendAll([
+          { type: "item", payload: { turnId, item } },
+          {
+            type: "servedModel",
+            payload: {
+              turnId,
+              requestedModel: item.requestedModel,
+              servedModel: item.servedModel,
+              backing: item.backing,
+              providerId: item.providerId,
+            },
+          },
+        ]);
+      } else {
+        record.session.append("item", { turnId, item });
+      }
+      return true;
+    } catch (err) {
+      if (!(err instanceof RpcError)) throw err;
+      this.#finishTurn(record, tr, "failed", err.toBody());
+      return false;
+    }
+  }
+
+  /** Append during the terminal transition; the turn is already ending, so failures are logged. */
+  #appendFinal<T extends SessionEventType>(
+    record: ThreadRecord,
+    type: T,
+    payload: SessionPayloads[T],
+    ts?: number,
+  ): SessionPayloads[T] | null {
+    try {
+      return record.session.append(type, payload, ts).payload;
+    } catch (err) {
+      this.#log(
+        `session append failed (${type}): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      return null;
+    }
+  }
+
+  #runTurn(record: ThreadRecord, tr: TurnRecord, ctx: AgentTurnContext): void {
+    const { input } = ctx;
     const { turn } = tr;
     const live = () => turn.status === "inProgress" && !tr.finalizing;
     const sink: TurnSink = {
@@ -452,15 +718,30 @@ export class EngineConnection {
       },
       completeItem: (item) => {
         if (!live() || !tr.open.has(item.id)) return;
-        tr.open.delete(item.id);
         // The engine owns the lifecycle: a completed item is `completed`, whatever the agent sent.
         const completed = { ...item, status: "completed" } as Item;
+        if (completed.kind === "servedModel") {
+          // A receipt is durable (item + servedModel event) before it is exposed. If that append
+          // fails, the turn fails and the still-open receipt is closed as `failed`, never
+          // `completed`, and nothing of it is on disk.
+          if (!this.#persistItem(record, tr, completed)) return;
+          tr.open.delete(item.id);
+          turn.items.push(completed);
+          this.#notify("item/completed", {
+            threadId: turn.threadId,
+            turnId: turn.id,
+            item: completed,
+          });
+          return;
+        }
+        tr.open.delete(item.id);
         turn.items.push(completed);
         this.#notify("item/completed", {
           threadId: turn.threadId,
           turnId: turn.id,
           item: completed,
         });
+        this.#persistItem(record, tr, completed);
       },
     };
 
@@ -472,13 +753,8 @@ export class EngineConnection {
     };
     sink.startItem(userItem);
     sink.completeItem(userItem);
+    if (!live()) return; // the user item could not be recorded (-32009): never call the agent
 
-    const ctx = {
-      threadId: turn.threadId,
-      turnId: turn.id,
-      seatId: record.thread.seatId,
-      input,
-    };
     Promise.resolve()
       .then(() => this.#opts.agent.run(ctx, sink))
       .then(
@@ -516,6 +792,7 @@ export class EngineConnection {
       const closed = { ...item, status: "failed" } as Item;
       turn.items.push(closed);
       this.#notify("item/completed", { ...ref, item: closed });
+      this.#appendFinal(record, "item", { turnId: turn.id, item: closed });
     }
     tr.open.clear();
     if (status === "failed" && error !== null) {
@@ -529,10 +806,49 @@ export class EngineConnection {
       this.#notify("item/started", { ...ref, item: { ...errItem, status: "inProgress" } as Item });
       turn.items.push(errItem);
       this.#notify("item/completed", { ...ref, item: errItem });
+      this.#appendFinal(record, "item", { turnId: turn.id, item: errItem });
     }
     const now = Date.now();
-    turn.status = status;
-    turn.error = status === "failed" ? error : null;
+    let finalStatus = status;
+    let finalError = status === "failed" ? error : null;
+    try {
+      record.session.append(
+        "turn.end",
+        {
+          turnId: turn.id,
+          status,
+          error:
+            finalError === null ? null : { code: finalError.code, message: finalError.message },
+        },
+        now, // == turn.completedAt
+      );
+    } catch (err) {
+      this.#log(
+        `session append failed (turn.end): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      // Never acknowledge a completion that is not durable: the record would say the turn never
+      // ended. Interrupted / failed turns already match what cold resume rebuilds (dangling →
+      // interrupted) or report an error, so only `completed` is downgraded.
+      if (status === "completed" && err instanceof RpcError) {
+        finalStatus = "failed";
+        finalError = err.toBody();
+        const errItem: Item = {
+          id: newId("item"),
+          kind: "error",
+          status: "completed",
+          message: finalError.message,
+          code: finalError.code,
+        };
+        this.#notify("item/started", {
+          ...ref,
+          item: { ...errItem, status: "inProgress" } as Item,
+        });
+        turn.items.push(errItem);
+        this.#notify("item/completed", { ...ref, item: errItem });
+      }
+    }
+    turn.status = finalStatus;
+    turn.error = finalError;
     turn.completedAt = now;
     record.activeTurnId = null;
     record.thread.status = "idle";

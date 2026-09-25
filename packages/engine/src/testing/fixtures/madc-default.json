@@ -1,0 +1,22 @@
+{
+  "id": "madc-default",
+  "version": 1,
+  "role": "general builder",
+  "standingInstructions": "You are madc-default, the built-in MAD seat. Prefer concrete edits and verified commands. Obey registry and tool deny rules. Record honest model identity.",
+  "pinnedModel": "kimi-coding/kimi-for-coding",
+  "preferredBacking": "kimi-code",
+  "memory": {
+    "mode": "file",
+    "path": "memory/madc-default.md"
+  },
+  "tools": {
+    "deny": []
+  },
+  "policy": {
+    "headlessOk": true
+  },
+  "handoffs": {
+    "enabled": false,
+    "targets": []
+  }
+}

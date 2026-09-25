@@ -8,9 +8,13 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, relative, sep } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { readKimiCredential } from "@madc/adapters";
 import type { FakeKimiReply, FakeKimiRequest } from "@madc/adapters/testing";
 import { ENGINE_ENTRY, type EngineClient } from "./client.ts";
+import { RpcError } from "./protocol/errors.ts";
 import type { Item, Turn } from "./protocol/types.ts";
+import { createProviderAgent } from "./provider-agent.ts";
+import { type EngineSeat, MADC_DEFAULT_SEAT } from "./seat.ts";
 import {
   expectRpcError,
   handshake,
@@ -18,6 +22,7 @@ import {
   makeHome,
   startEngine,
   startEngineCapturingStderr,
+  writeSeatFile,
 } from "./testing/harness.ts";
 
 const KEY = "test-sentinel-key-4b7e";
@@ -25,7 +30,9 @@ const KEY = "test-sentinel-key-4b7e";
 type Setup = {
   key?: string;
   reply?: FakeKimiReply;
-  seat?: Record<string, unknown>;
+  /** Seat files written to `$MADC_HOME/seats/<id>.json` before the engine starts. */
+  seats?: Record<string, unknown>[];
+  toolOutput?: string;
   entry?: string;
 };
 
@@ -42,7 +49,8 @@ async function withKimiEngine(setup: Setup, fn: (run: Run) => Promise<void>): Pr
   const extra: Record<string, string | undefined> = { MADC_TEST_WIRE_LOG: wireLog };
   if (setup.key !== undefined) extra.KIMI_API_KEY = setup.key;
   if (setup.reply !== undefined) extra.MADC_TEST_KIMI_REPLY = JSON.stringify(setup.reply);
-  if (setup.seat !== undefined) extra.MADC_TEST_SEAT_JSON = JSON.stringify(setup.seat);
+  if (setup.toolOutput !== undefined) extra.MADC_TEST_TOOL_OUTPUT = setup.toolOutput;
+  for (const seat of setup.seats ?? []) writeSeatFile(home, seat);
   const { client, stderr } = startEngineCapturingStderr(
     home,
     setup.entry ?? KIMI_FAKE_ENGINE,
@@ -167,6 +175,12 @@ test("honesty: no credentials → -32008 no-credentials at turn/start, before an
     assert.deepEqual(err.data, { providerId: "kimi-code", reason: "no-credentials" });
     assert.equal(run.wire().length, 0);
     assert.ok(!run.client.notifications.some((n) => n.method === "turn/started"));
+    // Ruling item 10: a refused turn writes nothing — the session holds only session.open.
+    const lines = readFileSync(join(run.home, "sessions", `${threadId}.jsonl`), "utf8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => (JSON.parse(l) as { type: string }).type);
+    assert.deepEqual(lines, ["session.open"]);
   });
 });
 
@@ -184,94 +198,170 @@ test("honesty: a Claude OAuth token in KIMI_API_KEY is refused (-32008), never s
   });
 });
 
-test("honesty: unwired backing (ollama-cloud stub, D2) → -32008 unwired, no request", async () => {
-  await withKimiEngine({ key: KEY, seat: { preferredBacking: "ollama-cloud" } }, async (run) => {
-    const threadId = await startThread(run.client);
-    const err = await expectRpcError(
-      run.client.request("turn/start", { threadId, input: [{ type: "text", text: "x" }] }),
-    );
-    assert.equal(err.code, -32008);
-    assert.deepEqual(err.data, { providerId: "ollama-cloud", reason: "unwired" });
-    assert.equal(run.wire().length, 0);
-  });
-});
+/** A seat file body: `madc-default` fields with overrides (written under `$MADC_HOME/seats`). */
+function seatJson(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return { ...MADC_DEFAULT_SEAT, id, ...overrides };
+}
 
-test("honesty: registry refusals → -32007 (forbidden, unknown-provider), no request", async () => {
-  const cases: Array<[string, Record<string, unknown>]> = [
+/** In-process preflight of the provider agent for a seat built in code (bypasses seat files). */
+function preflightFor(seat: EngineSeat, key: string | undefined = KEY): RpcError | null {
+  let created = 0;
+  const agent = createProviderAgent({
+    credential: readKimiCredential(key === undefined ? {} : { KIMI_API_KEY: key }),
+    createPort: () => {
+      created++;
+      return {
+        providerId: "kimi-code",
+        streamTurn: () => Promise.reject(new Error("preflight never streams")),
+      };
+    },
+  });
+  try {
+    agent.preflight?.({
+      threadId: "thr_unit",
+      seatId: seat.id,
+      seat,
+      seatPath: "/madc-home/seats/unit.json",
+      input: [{ type: "text", text: "x" }],
+    });
+    assert.equal(created, 0, "preflight is side-effect free: no port built");
+    return null;
+  } catch (err) {
+    assert.equal(created, 0, "refusal happened before any port was built");
+    if (err instanceof RpcError) return err;
+    throw err;
+  }
+}
+
+test("defense in depth: the agent's registry check still refuses seats built in code (-32007 / -32008)", () => {
+  const cases: Array<[string, number, Record<string, unknown>]> = [
+    ["ollama-cloud", -32008, { providerId: "ollama-cloud", reason: "unwired" }],
     [
       "zai-glm-coding-plan",
+      -32007,
       { providerId: "zai-glm-coding-plan", status: "forbidden", reason: "forbidden" },
     ],
     [
       "claude-subscription-http",
+      -32007,
       { providerId: "claude-subscription-http", status: "forbidden", reason: "forbidden" },
     ],
     [
       "no-such-provider",
+      -32007,
       { providerId: "no-such-provider", status: null, reason: "unknown-provider" },
     ],
     [
       "minimax-token-plan",
+      -32007,
       {
         providerId: "minimax-token-plan",
         status: "interactive-only",
         reason: "interactive-only-headless",
       },
     ],
+    ["claude-code", -32008, { providerId: "claude-code", reason: "unwired" }],
   ];
-  for (const [backing, data] of cases) {
-    await withKimiEngine({ key: KEY, seat: { preferredBacking: backing } }, async (run) => {
-      const threadId = await startThread(run.client);
-      const err = await expectRpcError(
-        run.client.request("turn/start", { threadId, input: [{ type: "text", text: "x" }] }),
-      );
-      assert.equal(err.code, -32007, backing);
-      assert.deepEqual(err.data, data);
-      assert.equal(run.wire().length, 0);
-    });
+  for (const [backing, code, data] of cases) {
+    const err = preflightFor({ ...MADC_DEFAULT_SEAT, preferredBacking: backing });
+    assert.equal(err?.code, code, backing);
+    assert.deepEqual(err?.data, data, backing);
   }
+  assert.equal(preflightFor(MADC_DEFAULT_SEAT), null, "the built-in seat passes preflight");
 });
 
-test("registry-allowed backing without an adapter in this build (claude-code) → -32008 unwired", async () => {
-  await withKimiEngine({ key: KEY, seat: { preferredBacking: "claude-code" } }, async (run) => {
-    const threadId = await startThread(run.client);
-    const err = await expectRpcError(
-      run.client.request("turn/start", { threadId, input: [{ type: "text", text: "x" }] }),
-    );
-    assert.equal(err.code, -32008);
-    assert.deepEqual(err.data, { providerId: "claude-code", reason: "unwired" });
+test("A4: a seat file with a non-M0 backing (ollama-cloud, forbidden, unknown) → -32006 at thread/start", async () => {
+  const seats = [
+    seatJson("oll", { preferredBacking: "ollama-cloud" }),
+    seatJson("zai", { preferredBacking: "zai-glm-coding-plan" }),
+    seatJson("nope", { preferredBacking: "no-such-provider" }),
+  ];
+  await withKimiEngine({ key: KEY, seats }, async (run) => {
+    for (const seat of seats) {
+      const err = await expectRpcError(
+        run.client.request("thread/start", { seatId: seat.id as string }),
+      );
+      assert.equal(err.code, -32006, String(seat.id));
+      assert.equal(err.data?.path, join(run.home, "seats", `${String(seat.id)}.json`));
+      assert.deepEqual(err.data?.issues, [
+        "preferredBacking must be one of kimi-code, claude-code, codex",
+      ]);
+    }
     assert.equal(run.wire().length, 0);
+    assert.deepEqual(readdirSync(join(run.home, "sessions")), [], "no session or lock written");
   });
 });
 
-test("honesty: pinnedModel mismatch → -32006 SeatInvalid, no request", async () => {
-  for (const pinnedModel of ["anthropic/claude-sonnet-4-5", "kimi-coding/not-a-model"]) {
-    await withKimiEngine({ key: KEY, seat: { pinnedModel } }, async (run) => {
-      const threadId = await startThread(run.client);
+test("registry-allowed seat backing without an adapter in this build (claude-code) → -32008 unwired", async () => {
+  await withKimiEngine(
+    {
+      key: KEY,
+      seats: [seatJson("claude", { preferredBacking: "claude-code", pinnedModel: "opus" })],
+    },
+    async (run) => {
+      const threadId = await startThread(run.client, "claude");
       const err = await expectRpcError(
         run.client.request("turn/start", { threadId, input: [{ type: "text", text: "x" }] }),
       );
-      assert.equal(err.code, -32006, pinnedModel);
-      assert.equal(err.data?.seatId, "madc-default");
-      assert.equal(err.data?.path, "(built-in)");
-      assert.ok(Array.isArray(err.data?.issues) && err.data.issues.length === 1);
+      assert.equal(err.code, -32008);
+      assert.deepEqual(err.data, { providerId: "claude-code", reason: "unwired" });
       assert.equal(run.wire().length, 0);
-    });
+    },
+  );
+});
+
+test("honesty: pinnedModel mismatch → -32006 at thread/start with the seat file path; no thread, no request", async () => {
+  for (const pinnedModel of ["anthropic/claude-sonnet-4-5", "kimi-coding/not-a-model"]) {
+    await withKimiEngine(
+      { key: KEY, seats: [seatJson("pinned", { pinnedModel })] },
+      async (run) => {
+        const err = await expectRpcError(run.client.request("thread/start", { seatId: "pinned" }));
+        assert.equal(err.code, -32006, pinnedModel);
+        assert.equal(err.data?.seatId, "pinned");
+        assert.equal(err.data?.path, join(run.home, "seats", "pinned.json"));
+        assert.ok(Array.isArray(err.data?.issues) && err.data.issues.length === 1);
+        assert.notEqual(err.data?.path, "(built-in)");
+        assert.ok(!run.client.notifications.some((n) => n.method === "thread/started"));
+        assert.deepEqual(readdirSync(join(run.home, "sessions")), []);
+        assert.equal(run.wire().length, 0);
+      },
+    );
   }
 });
 
-test("a thread on a seat other than the built-in one → -32005 SeatNotFound at turn/start", async () => {
+test("defense in depth: turn/start preflight re-checks pinnedModel with the same code and real path", () => {
+  const err = preflightFor({ ...MADC_DEFAULT_SEAT, pinnedModel: "kimi-coding/not-a-model" });
+  assert.equal(err?.code, -32006);
+  assert.equal(err?.data?.path, "/madc-home/seats/unit.json");
+});
+
+test("A4: a seat id with no seat file → -32005 SeatNotFound at thread/start (no thread, no lock)", async () => {
   await withKimiEngine({ key: KEY }, async (run) => {
-    const threadId = await startThread(run.client, "reviewer");
-    const err = await expectRpcError(
-      run.client.request("turn/start", { threadId, input: [{ type: "text", text: "x" }] }),
-    );
+    const err = await expectRpcError(run.client.request("thread/start", { seatId: "reviewer" }));
     assert.equal(err.code, -32005);
     assert.deepEqual(err.data, {
       seatId: "reviewer",
       path: join(run.home, "seats", "reviewer.json"),
     });
+    assert.deepEqual(readdirSync(join(run.home, "sessions")), []);
+    assert.ok(!run.client.notifications.some((n) => n.method === "thread/started"));
     assert.equal(run.wire().length, 0);
+  });
+});
+
+test("A4: a named seat file drives the turn (its standingInstructions reach the provider)", async () => {
+  const seat = seatJson("prometheus", {
+    role: "reviewer",
+    standingInstructions: "You are prometheus, a careful reviewer.",
+    memory: { mode: "in-session" },
+  });
+  await withKimiEngine({ key: KEY, seats: [seat] }, async (run) => {
+    const threadId = await startThread(run.client, "prometheus");
+    const turn = await runTurn(run.client, threadId);
+    assert.equal(turn.status, "completed");
+    const body = JSON.parse(run.wire()[0]?.body ?? "{}") as { system: unknown };
+    assert.match(JSON.stringify(body.system), /You are prometheus, a careful reviewer\./);
+    assert.doesNotMatch(JSON.stringify(body.system), /madc-default/);
   });
 });
 
@@ -341,6 +431,14 @@ test("turn/interrupt mid-stream → interrupted, no servedModel receipt", async 
       const final = (done.params as { turn: Turn }).turn;
       assert.equal(final.status, "interrupted");
       assert.ok(!final.items.some((item) => item.kind === "servedModel"));
+      // Ruling item 6: no durable receipt either; the turn is closed as interrupted on disk.
+      const types = readFileSync(join(run.home, "sessions", `${threadId}.jsonl`), "utf8")
+        .split("\n")
+        .filter((l) => l !== "")
+        .map((l) => JSON.parse(l) as { type: string; payload: { status?: string } });
+      assert.ok(!types.some((l) => l.type === "servedModel"));
+      assert.equal(types.at(-1)?.type, "turn.end");
+      assert.equal(types.at(-1)?.payload.status, "interrupted");
     },
   );
 });
