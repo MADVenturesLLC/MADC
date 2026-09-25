@@ -3,11 +3,16 @@
  * Network-free: the Kimi fixture engine (fake transport, `.invalid` host) and in-process engines.
  */
 import assert from "node:assert/strict";
+import { execFileSync, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
+  closeSync,
+  constants,
   existsSync,
   mkdirSync,
+  openSync,
   readFileSync,
+  readSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -931,6 +936,46 @@ test("R-shape: a hash-valid line with a malformed M0 payload is never loaded and
         ["turn.start", { turnId: "../x", inputText: "x" }],
       ],
     ],
+    ...(
+      [
+        ["item-agent-no-text", { id: "i", kind: "agentMessage", status: "completed" }],
+        ["item-unknown-kind", { id: "i", kind: "futureKind", status: "completed", text: "x" }],
+        ["item-no-status", { id: "i", kind: "agentMessage", text: "x" }],
+        [
+          "item-tool-result-no-flag",
+          { id: "i", kind: "toolResult", status: "completed", callId: "c", name: "t", output: "o" },
+        ],
+        ["item-tool-call-no-args", { id: "i", kind: "toolCall", status: "completed", name: "t" }],
+        ["item-error-no-message", { id: "i", kind: "error", status: "completed" }],
+        [
+          "item-served-bad-backing",
+          {
+            id: "i",
+            kind: "servedModel",
+            status: "completed",
+            requestedModel: "a",
+            servedModel: "b",
+            backing: "ollama-cloud",
+            providerId: "p",
+          },
+        ],
+        [
+          "item-user-part-type",
+          {
+            id: "i",
+            kind: "userMessage",
+            status: "completed",
+            content: [{ type: "image", text: "x" }],
+          },
+        ],
+      ] as Array<[string, Record<string, unknown>]>
+    ).map(([name, item]): [string, Array<[string, Record<string, unknown>]>] => [
+      name,
+      [
+        ["session.open", open],
+        ["item", { turnId: "turn_1", item }],
+      ],
+    ]),
   ];
   for (const [name, events] of bad) {
     // The chain itself is intact (the verifier checks envelope, seq and hashes only) ...
@@ -959,6 +1004,101 @@ test("R-shape: a hash-valid line with a malformed M0 payload is never loaded and
   } finally {
     e.input.end();
     await e.done;
+    cleanup();
+  }
+});
+
+test("R-shape: every M0 item variant with its required fields rebuilds", () => {
+  const open = { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" };
+  const items: Item[] = [
+    { id: "i1", kind: "userMessage", status: "completed", content: [{ type: "text", text: "q" }] },
+    { id: "i2", kind: "agentMessage", status: "completed", text: "a" },
+    { id: "i3", kind: "toolCall", status: "completed", name: "t", arguments: null },
+    {
+      id: "i4",
+      kind: "toolResult",
+      status: "failed",
+      callId: "i3",
+      name: "t",
+      output: "",
+      isError: true,
+    },
+    { id: "i5", kind: "error", status: "completed", message: "m", code: -32603 },
+    { id: "i6", kind: "error", status: "completed", message: "m" },
+    {
+      id: "i7",
+      kind: "servedModel",
+      status: "completed",
+      requestedModel: "a",
+      servedModel: "b",
+      backing: "codex",
+      providerId: "codex",
+    },
+  ];
+  const r = verifySessionText(
+    forgeSession("thr_items", [
+      ["session.open", open],
+      ["turn.start", { turnId: "turn_1", inputText: "q" }],
+      ...items.map((item): [string, Record<string, unknown>] => [
+        "item",
+        { turnId: "turn_1", item },
+      ]),
+      ["turn.end", { turnId: "turn_1", status: "completed", error: null }],
+    ]),
+  );
+  assert.equal(r.ok, true);
+  const rebuilt = rebuildSession(r.ok ? r.events : []);
+  assert.deepEqual(rebuilt.turns[0]?.items, items);
+});
+
+test("R-fifo: a session file swapped for a FIFO fails the append with -32009 (never blocks, never writes)", () => {
+  if (!POSIX) return; // FIFOs
+  const { home, cleanup } = makeHome();
+  try {
+    const path = writeSampleSession(home);
+    const lines = readLines(path);
+    const w = SessionWriter.resume(
+      path,
+      "thr_sample",
+      "madc-default",
+      4,
+      lines[3]?.hash ?? "",
+      () => [],
+    );
+    rmSync(path);
+    execFileSync("mkfifo", [path]);
+    // A reader is attached, so even a blocking open would succeed: the fstat check refuses it.
+    const reader = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    try {
+      assert.throws(
+        () => w.append("turn.start", { turnId: "turn_2", inputText: "x" }),
+        (err: RpcError) => err.code === -32009 && (err.data as { seq: number }).seq === 4,
+      );
+      const buf = Buffer.alloc(64);
+      let got = 0;
+      try {
+        got = readSync(reader, buf, 0, 64, null);
+      } catch {
+        got = 0; // EAGAIN: nothing was written
+      }
+      assert.equal(got, 0, "nothing written into the FIFO");
+    } finally {
+      closeSync(reader);
+    }
+    assert.equal(w.broken, true);
+    // No reader: the open itself must not block (O_NONBLOCK); run in a child with a timeout.
+    const probe = join(import.meta.dirname, "testing", "fifo-append-probe.ts");
+    const args =
+      process.versions.bun !== undefined
+        ? [probe, join(home, "probe")]
+        : ["--disable-warning=ExperimentalWarning", probe, join(home, "probe")];
+    const res = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 10_000 });
+    assert.equal(res.signal, null, "the append blocked on a FIFO with no reader");
+    assert.deepEqual(JSON.parse(readFileSync(join(home, "probe", "result.json"), "utf8")), {
+      code: -32009,
+      broken: true,
+    });
+  } finally {
     cleanup();
   }
 });
