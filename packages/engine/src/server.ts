@@ -327,6 +327,8 @@ export class EngineConnection {
         () => this.#secrets(this.#threads.get(id)?.lock ?? handle),
         now, // session.open ts == thread.createdAt
         this.#opts.home,
+        // Amendment 2 §2: every append re-checks that this acquisition still owns the lock.
+        { holdsLock: () => holdsThreadLock(handle) },
       );
     } catch (err) {
       this.#releaseOrKeep(handle);
@@ -380,9 +382,10 @@ export class EngineConnection {
 
     const known = this.#threads.get(threadId);
     if (known !== undefined) {
-      // Known in this process: still verify we own the on-disk lock before resuming (§3.3).
-      this.#ensureLock(known);
-      const thread = known.thread;
+      // Known in this process: still verify we own the on-disk lock before resuming (§3.3); a
+      // re-take reloads the thread from disk (Amendment 2 §3).
+      const current = this.#ensureLock(known);
+      const thread = current.thread;
       return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
     }
 
@@ -445,6 +448,8 @@ export class EngineConnection {
       () => this.#secrets(this.#threads.get(threadId)?.lock ?? handle),
       this.#opts.home,
       verified.file,
+      // Amendment 2 §2: bound to this acquisition and to the verified byte size.
+      { holdsLock: () => holdsThreadLock(handle), expectedSize: verified.size },
     );
     for (const turnId of rebuilt.danglingTurnIds) {
       // Same ts as the rebuilt turn's completedAt; the thread's updatedAt covers the close.
@@ -549,12 +554,34 @@ export class EngineConnection {
     return out;
   }
 
-  /** Verify this process still owns the thread's lock file; re-take it or yield (-32004). */
-  #ensureLock(record: ThreadRecord): void {
-    if (holdsThreadLock(record.lock)) return;
-    const lock = acquireThreadLock(this.#opts.home, record.thread.id);
-    if (!lock.ok) throw turnAlreadyActive(record.thread.id, null, lock.holderPid ?? undefined);
-    record.lock = lock.handle;
+  /**
+   * Verify this process still owns the thread's lock file; re-take it or yield (-32004). Returns
+   * the record to use from now on.
+   *
+   * Amendment 2 §3: after a re-take the in-memory writer and thread state are stale (another engine
+   * may have appended while we did not hold the lock), so they are discarded and the thread is
+   * reloaded from disk under the new lock through the cold-resume path (verify, rebuild, close
+   * dangling turns as `interrupted`). If that fails, the request fails exactly as a cold resume
+   * (-32002 / -32603), the new lock is released, the file is untouched, and the thread is no longer
+   * loaded here. A thread with a turn still running in this process is never re-taken (-32004):
+   * that turn's own appends fail -32009 on the lost lock.
+   */
+  #ensureLock(record: ThreadRecord): ThreadRecord {
+    if (holdsThreadLock(record.lock)) return record;
+    const threadId = record.thread.id;
+    if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
+    const lock = acquireThreadLock(this.#opts.home, threadId);
+    if (!lock.ok) throw turnAlreadyActive(threadId, null, lock.holderPid ?? undefined);
+    this.#threads.delete(threadId);
+    let fresh: ThreadRecord;
+    try {
+      fresh = this.#loadColdThread(threadId, lock.handle);
+    } catch (err) {
+      this.#releaseOrKeep(lock.handle);
+      throw err;
+    }
+    this.#threads.set(threadId, fresh);
+    return fresh;
   }
 
   // -------------------------------------------------------------------- turns
@@ -566,16 +593,22 @@ export class EngineConnection {
     const input = parseUserInput(p.input, issues);
     throwIfIssues(issues);
 
-    const record = this.#threads.get(threadId);
+    let record = this.#threads.get(threadId);
     if (record === undefined) throw threadNotFound(threadId);
     if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
     // A broken session writer is permanent: -32009 before any preflight (never a later refusal).
     const session = record.session;
     if (session.broken) throw sessionWriteFailed(threadId, session.path, session.nextSeq);
     // Seat / registry / credential refusals are response errors before any turn exists (§4.2).
-    const ctx = this.#turnContext(record, input);
+    let ctx = this.#turnContext(record, input);
     this.#opts.agent.preflight?.(ctx);
-    this.#ensureLock(record);
+    const current = this.#ensureLock(record);
+    if (current !== record) {
+      // Re-taken and reloaded from disk (Amendment 2 §3): preflight the reloaded seat too.
+      record = current;
+      ctx = this.#turnContext(record, input);
+      this.#opts.agent.preflight?.(ctx);
+    }
 
     const now = Date.now();
     const turnId = newId("turn");

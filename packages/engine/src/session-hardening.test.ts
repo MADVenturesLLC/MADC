@@ -330,6 +330,7 @@ test("R-parent-swap: a sessions/ directory swapped for a symlink after confineme
       ok: false,
       line: 0,
       reason: "session file resolves outside MADC_HOME",
+      kind: "integrity",
     });
   } finally {
     cleanup();

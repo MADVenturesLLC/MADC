@@ -1119,6 +1119,7 @@ test("R-symlink: a sessions/<id>.jsonl symlink to a valid chain outside MADC_HOM
       ok: false,
       line: 0,
       reason: "session file is not a regular file",
+      kind: "integrity",
     });
     const list = await e.request("thread/list", {});
     assert.deepEqual(list.result, { data: [], nextCursor: null });
@@ -1378,7 +1379,12 @@ test("R-nofollow fallback: without O_NOFOLLOW a symlink, or a swap to one after 
     const target = writeSampleSession(outside);
     mkdirSync(join(home, "sessions"), { recursive: true });
     const path = join(home, "sessions", "thr_sample.jsonl");
-    const notRegular = { ok: false, line: 0, reason: "session file is not a regular file" };
+    const notRegular = {
+      ok: false,
+      line: 0,
+      reason: "session file is not a regular file",
+      kind: "integrity",
+    };
     // A plain regular file verifies through the fallback path.
     writeFileSync(path, readFileSync(target));
     assert.equal(verifySessionFile(path, "thr_sample", { noFollowFlag: false }).ok, true);
