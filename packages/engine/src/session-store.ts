@@ -8,12 +8,13 @@ import {
   closeSync,
   constants,
   fstatSync,
-  lstatSync,
+  ftruncateSync,
   openSync,
   readFileSync,
   unlinkSync,
   writeSync,
 } from "node:fs";
+import { type OpenNoFollowOptions, openNoFollow } from "./lock.ts";
 import { ErrorCode, RpcError, type SessionWriteFailedData } from "./protocol/errors.ts";
 import { isValidId } from "./protocol/ids.ts";
 import type { Item, RpcErrorBody, Thread, Turn, TurnStatus } from "./protocol/types.ts";
@@ -158,11 +159,20 @@ export function sessionWriteFailed(threadId: string, path: string, seq: number):
 
 const APPEND_FLAGS = constants.O_WRONLY | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0);
 
+type WriteChunk = (fd: number, buf: Buffer, off: number, len: number) => number;
+let writeChunk: WriteChunk = (fd, buf, off, len) => writeSync(fd, buf, off, len);
+
+/** Test seam: replace the low-level write (null restores `writeSync`). Internal. */
+export function setSessionWriteForTests(fn: WriteChunk | null): void {
+  writeChunk = fn ?? ((fd, buf, off, len) => writeSync(fd, buf, off, len));
+}
+
 /**
  * Appender for one session file. Each append opens the file (`O_APPEND`, never following a
- * symlink), writes one full line, and closes it. After any failed append the writer is broken:
- * every later append fails with the same -32009 and nothing more is written, so a torn line is
- * never followed by more events.
+ * symlink), writes its full line(s) through one fd, and closes it. A failed append is rolled back
+ * (the file is truncated to its size before the append, best effort), so a torn line or half of a
+ * multi-event append is never left behind. After any failed append the writer is broken: every
+ * later append fails with the same -32009 and nothing more is written.
  */
 export class SessionWriter {
   readonly path: string;
@@ -248,46 +258,67 @@ export class SessionWriter {
     payload: SessionPayloads[T],
     ts: number = Date.now(),
   ): SessionEvent<T> {
-    const seq = this.#seq;
-    if (this.#broken) throw sessionWriteFailed(this.threadId, this.path, seq);
-    const redacted = createRedactor(this.#secrets())(payload) as SessionPayloads[T];
-    const body = {
-      v: 1 as const,
-      seq,
-      ts,
-      type,
-      threadId: this.threadId,
-      seatId: this.seatId,
-      payload: redacted,
-    };
-    const hash = sessionEventHash(this.#prevHash, body);
-    const event: SessionEvent<T> = {
-      v: 1,
-      seq,
-      ts,
-      type,
-      threadId: this.threadId,
-      seatId: this.seatId,
-      prevHash: this.#prevHash,
-      hash,
-      payload: redacted,
-    };
-    const bytes = Buffer.from(`${JSON.stringify(event)}\n`, "utf8");
+    return this.appendAll([{ type, payload }], ts)[0] as SessionEvent<T>;
+  }
+
+  /**
+   * Append several events as one unit (consecutive seqs, one write through one fd): either all of
+   * them are durable or none is (rolled back on failure). Used for the servedModel dual write.
+   */
+  appendAll(
+    entries: ReadonlyArray<{ type: SessionEventType; payload: SessionPayloads[SessionEventType] }>,
+    ts: number = Date.now(),
+  ): SessionEvent[] {
+    const firstSeq = this.#seq;
+    if (this.#broken) throw sessionWriteFailed(this.threadId, this.path, firstSeq);
+    const redact = createRedactor(this.#secrets());
+    const events: SessionEvent[] = [];
+    let prevHash = this.#prevHash;
+    for (const [i, { type, payload }] of entries.entries()) {
+      const redacted = redact(payload) as SessionPayloads[SessionEventType];
+      const body = {
+        v: 1 as const,
+        seq: firstSeq + i,
+        ts,
+        type,
+        threadId: this.threadId,
+        seatId: this.seatId,
+        payload: redacted,
+      };
+      const hash = sessionEventHash(prevHash, body);
+      // Line key order stays v..seatId, prevHash, hash, payload (as A4 has always written it);
+      // the hash itself uses sorted keys.
+      const { payload: p, ...head } = body;
+      events.push({ ...head, prevHash, hash, payload: p });
+      prevHash = hash;
+    }
+    const text = events.map((e) => `${JSON.stringify(e)}\n`).join("");
+    const bytes = Buffer.from(text, "utf8");
     try {
       const fd = openSync(this.path, APPEND_FLAGS);
       try {
-        let off = 0;
-        while (off < bytes.length) off += writeSync(fd, bytes, off, bytes.length - off);
+        const sizeBefore = fstatSync(fd).size;
+        try {
+          let off = 0;
+          while (off < bytes.length) off += writeChunk(fd, bytes, off, bytes.length - off);
+        } catch (err) {
+          try {
+            ftruncateSync(fd, sizeBefore);
+          } catch {
+            // best effort; the verifier still rejects a torn tail
+          }
+          throw err;
+        }
       } finally {
         closeSync(fd);
       }
     } catch {
       this.#broken = true;
-      throw sessionWriteFailed(this.threadId, this.path, seq);
+      throw sessionWriteFailed(this.threadId, this.path, firstSeq);
     }
-    this.#seq = seq + 1;
-    this.#prevHash = hash;
-    return event;
+    this.#seq = firstSeq + events.length;
+    this.#prevHash = prevHash;
+    return events;
   }
 }
 
@@ -419,20 +450,25 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
   }
 }
 
-const READ_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
-
 /**
  * Read and verify `sessions/<threadId>.jsonl`. The final path component must be a regular file,
- * never a symlink (lstat + `O_NOFOLLOW` where available), so a planted link cannot make list /
- * resume / the home report read data from outside `MADC_HOME`.
+ * never a symlink, so a planted link cannot make list / resume / the home report read data from
+ * outside `MADC_HOME`. The open is `openNoFollow` (lock.ts): `O_NOFOLLOW` where available,
+ * otherwise lstat → open → fstat with the same dev + inode required, so a swap to a symlink
+ * between the check and the open is refused. `opts` are test seams.
  */
-export function verifySessionFile(path: string, expectedThreadId?: string): SessionVerifyResult {
+export function verifySessionFile(
+  path: string,
+  expectedThreadId?: string,
+  opts: OpenNoFollowOptions = {},
+): SessionVerifyResult {
   let text: string;
   try {
-    if (!lstatSync(path).isFile()) {
+    const fd = openNoFollow(path, opts);
+    if (fd === null) return { ok: false, line: 0, reason: "session file is unreadable" };
+    if (fd === "symlink") {
       return { ok: false, line: 0, reason: "session file is not a regular file" };
     }
-    const fd = openSync(path, READ_FLAGS);
     try {
       if (!fstatSync(fd).isFile()) {
         return { ok: false, line: 0, reason: "session file is not a regular file" };
