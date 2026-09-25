@@ -7,7 +7,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { DEFAULT_SEAT_ID } from "./protocol/types.ts";
 import { MADC_DEFAULT_SEAT, memoryPathIssue, validateSeat } from "./seat.ts";
-import { loadSeat, seedDefaultSeat } from "./seat-store.ts";
+import { loadSeat, seedDefaultSeat, serializeSeat } from "./seat-store.ts";
 import {
   expectRpcError,
   handshake,
@@ -113,6 +113,67 @@ test("seedDefaultSeat (shared with doctor --init): creates once, then reports ex
   } finally {
     cleanup();
   }
+});
+
+/** Seat pin §3 madc-default seed, byte for byte (2-space JSON, pin key order, LF, one trailing newline). */
+const PIN_SEED_BYTES = `{
+  "id": "madc-default",
+  "version": 1,
+  "role": "general builder",
+  "standingInstructions": "You are madc-default, the built-in MAD seat. Prefer concrete edits and verified commands. Obey registry and tool deny rules. Record honest model identity.",
+  "pinnedModel": "kimi-coding/kimi-for-coding",
+  "preferredBacking": "kimi-code",
+  "memory": {
+    "mode": "file",
+    "path": "memory/madc-default.md"
+  },
+  "tools": {
+    "deny": []
+  },
+  "policy": {
+    "headlessOk": true
+  },
+  "handoffs": {
+    "enabled": false,
+    "targets": []
+  }
+}
+`;
+
+test("seed writer bytes are pinned exactly; serializeSeat is key-order independent", () => {
+  assert.equal(serializeSeat(MADC_DEFAULT_SEAT), PIN_SEED_BYTES);
+  const { home, cleanup } = makeHome();
+  try {
+    const { path } = seedDefaultSeat(home);
+    assert.equal(readFileSync(path, "utf8"), PIN_SEED_BYTES);
+  } finally {
+    cleanup();
+  }
+  // Same seat, keys inserted in reverse order at every level: identical bytes.
+  const reversed = {
+    handoffs: { targets: [], enabled: false },
+    policy: { headlessOk: true },
+    tools: { deny: [] },
+    memory: { path: "memory/madc-default.md", mode: "file" },
+    preferredBacking: "kimi-code",
+    pinnedModel: "kimi-coding/kimi-for-coding",
+    standingInstructions: MADC_DEFAULT_SEAT.standingInstructions,
+    role: "general builder",
+    version: 1,
+    id: "madc-default",
+  } as unknown as typeof MADC_DEFAULT_SEAT;
+  assert.equal(serializeSeat(reversed), PIN_SEED_BYTES);
+  assert.equal(
+    serializeSeat({
+      ...MADC_DEFAULT_SEAT,
+      memory: { mode: "in-session" },
+      tools: { allow: ["x"], deny: [] },
+    }),
+    PIN_SEED_BYTES.replace(
+      '"mode": "file",\n    "path": "memory/madc-default.md"',
+      '"mode": "in-session"',
+    ).replace('"deny": []\n', '"deny": [],\n    "allow": [\n      "x"\n    ]\n'),
+  );
 });
 
 /** Each case: seat file body (or raw text) → the exact -32006 issue list. */

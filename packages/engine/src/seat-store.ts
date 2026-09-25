@@ -39,9 +39,34 @@ export function seatFilePath(home: string, id: string): string {
   return join(home, "seats", `${id}.json`);
 }
 
-/** Exact seed bytes for a seat: 2-space JSON plus a trailing newline. */
+/**
+ * The one seat serializer (the seed writer uses it). Deterministic bytes: keys are emitted in
+ * seat pin §3 order regardless of the input object's key order, 2-space indentation, LF line
+ * endings, and exactly one trailing newline. `seedDefaultSeat` writes
+ * `serializeSeat(MADC_DEFAULT_SEAT)`; a test pins those bytes literally.
+ */
 export function serializeSeat(seat: EngineSeat): string {
-  return `${JSON.stringify(seat, null, 2)}\n`;
+  const memory =
+    seat.memory.mode === "file"
+      ? { mode: seat.memory.mode, path: seat.memory.path }
+      : { mode: seat.memory.mode };
+  const tools =
+    seat.tools.allow === undefined
+      ? { deny: [...seat.tools.deny] }
+      : { deny: [...seat.tools.deny], allow: [...seat.tools.allow] };
+  const ordered = {
+    id: seat.id,
+    version: seat.version,
+    role: seat.role,
+    standingInstructions: seat.standingInstructions,
+    pinnedModel: seat.pinnedModel,
+    preferredBacking: seat.preferredBacking,
+    memory,
+    tools,
+    policy: { headlessOk: seat.policy.headlessOk },
+    handoffs: { enabled: seat.handoffs.enabled, targets: [...seat.handoffs.targets] },
+  };
+  return `${JSON.stringify(ordered, null, 2)}\n`;
 }
 
 function errCode(err: unknown): string | undefined {
