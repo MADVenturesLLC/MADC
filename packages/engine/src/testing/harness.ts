@@ -4,9 +4,11 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { ENGINE_ENTRY, EngineClient, spawnEngine } from "../client.ts";
+import { EngineClient, spawnEngine, withoutUndefined } from "../client.ts";
 import type { InitializeResult } from "../protocol/types.ts";
 
+export const ECHO_ENGINE = fileURLToPath(new URL("./echo-engine.ts", import.meta.url));
+export const KIMI_FAKE_ENGINE = fileURLToPath(new URL("./kimi-fake-engine.ts", import.meta.url));
 export const HANG_ENGINE = fileURLToPath(new URL("./hang-agent-engine.ts", import.meta.url));
 export const FAILING_ENGINE = fileURLToPath(new URL("./failing-agent-engine.ts", import.meta.url));
 export const EXIT_ENGINE = fileURLToPath(new URL("./exit-engine.ts", import.meta.url));
@@ -17,10 +19,30 @@ export function makeHome(): { home: string; cleanup: () => void } {
   return { home, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
-export function startEngine(home: string, entry?: string): EngineClient {
-  return spawnEngine(
-    entry === undefined ? { env: { MADC_HOME: home } } : { env: { MADC_HOME: home }, entry },
-  );
+/** Credential-looking names never reach a test engine unless a test sets them explicitly. */
+const SECRET_ENV_NAME = /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i;
+
+/**
+ * Hermetic child env: the developer's ambient credentials (e.g. a real `KIMI_API_KEY`) are removed,
+ * then `extra` is applied. Tests can therefore never pick up or leak a real key.
+ */
+export function hermeticEnv(
+  extra: Record<string, string | undefined> = {},
+): Record<string, string | undefined> {
+  const env: Record<string, string | undefined> = {};
+  for (const name of Object.keys(process.env)) {
+    if (SECRET_ENV_NAME.test(name)) env[name] = undefined;
+  }
+  return { ...env, ...extra };
+}
+
+/** Spawns a test engine (default: the echo fixture) with a hermetic env. */
+export function startEngine(
+  home: string,
+  entry: string = ECHO_ENGINE,
+  extraEnv: Record<string, string | undefined> = {},
+): EngineClient {
+  return spawnEngine({ env: hermeticEnv({ ...extraEnv, MADC_HOME: home }), entry });
 }
 
 /**
@@ -29,13 +51,14 @@ export function startEngine(home: string, entry?: string): EngineClient {
  */
 export function startEngineCapturingStderr(
   home: string,
-  entry: string = ENGINE_ENTRY,
+  entry: string = ECHO_ENGINE,
+  extraEnv: Record<string, string | undefined> = {},
 ): { client: EngineClient; stderr: () => string } {
   const args =
     process.versions.bun !== undefined ? [entry] : ["--disable-warning=ExperimentalWarning", entry];
   const child = spawn(process.execPath, args, {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ...process.env, MADC_HOME: home },
+    env: withoutUndefined({ ...process.env, ...hermeticEnv({ ...extraEnv, MADC_HOME: home }) }),
   });
   let captured = "";
   child.stderr.setEncoding("utf8");

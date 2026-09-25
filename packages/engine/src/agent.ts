@@ -8,6 +8,13 @@ export type AgentTurnContext = {
   readonly input: readonly UserInput[];
 };
 
+/** What `preflight` sees: the turn has not been created yet. */
+export type TurnPreflightContext = {
+  readonly threadId: string;
+  readonly seatId: string;
+  readonly input: readonly UserInput[];
+};
+
 /**
  * Item stream for one turn. The engine owns ids, ordering, and notifications; after the turn ends
  * (completed / interrupted / failed) every call is a no-op, so agents cannot write past an interrupt.
@@ -24,11 +31,16 @@ export type TurnSink = {
 };
 
 /**
- * Engine-side turn runner. A2 ships only the fake echo agent (no providers);
- * A3+ plug real backings in behind this seam.
+ * Engine-side turn runner. The fake echo agent serves protocol tests; A3 adds the live provider
+ * agent (`provider-agent.ts`) behind this seam.
  */
 export type Agent = {
   readonly name: string;
+  /**
+   * Synchronous checks run inside `turn/start` before the turn exists (protocol pin §4.2: provider /
+   * seat refusals are response errors, never a started turn). Throw an `RpcError` to refuse.
+   */
+  preflight?(ctx: TurnPreflightContext): void;
   run(ctx: AgentTurnContext, sink: TurnSink): Promise<void>;
 };
 

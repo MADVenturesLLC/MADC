@@ -14,7 +14,7 @@ import type {
 export const ENGINE_ENTRY = fileURLToPath(new URL("./bin.ts", import.meta.url));
 
 export type SpawnEngineOptions = {
-  /** Merged over `process.env` (e.g. `{ MADC_HOME }`). */
+  /** Merged over `process.env` (e.g. `{ MADC_HOME }`); an `undefined` value removes the variable. */
   env?: Record<string, string | undefined>;
   /** Alternate engine entry script (tests use fixtures). */
   entry?: string;
@@ -212,6 +212,13 @@ export class EngineClient {
  * Spawn the engine as a child process — stdio ["pipe", "pipe", "inherit"] (protocol pin §2).
  * No daemon, no network listener: the connection is this child's stdin/stdout.
  */
+/** Drops `undefined` entries (Node would otherwise pass the string "undefined" to the child). */
+export function withoutUndefined(env: Record<string, string | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [name, value] of Object.entries(env)) if (value !== undefined) out[name] = value;
+  return out;
+}
+
 export function spawnEngine(opts: SpawnEngineOptions = {}): EngineClient {
   const runtime = opts.runtime ?? process.execPath;
   const isBun = runtime === process.execPath && process.versions.bun !== undefined;
@@ -220,7 +227,7 @@ export function spawnEngine(opts: SpawnEngineOptions = {}): EngineClient {
     : ["--disable-warning=ExperimentalWarning", opts.entry ?? ENGINE_ENTRY];
   const child = spawn(runtime, args, {
     stdio: ["pipe", "pipe", "inherit"],
-    env: { ...process.env, ...opts.env },
+    env: withoutUndefined({ ...process.env, ...opts.env }),
   });
   return new EngineClient(child);
 }

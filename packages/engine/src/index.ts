@@ -4,7 +4,13 @@
  */
 
 export { type AcpAdapter, createAcpAdapter, NotImplementedError } from "./acp/index.ts";
-export { type Agent, type AgentTurnContext, echoAgent, type TurnSink } from "./agent.ts";
+export {
+  type Agent,
+  type AgentTurnContext,
+  echoAgent,
+  type TurnPreflightContext,
+  type TurnSink,
+} from "./agent.ts";
 export {
   ENGINE_ENTRY,
   EngineClient,
@@ -27,9 +33,11 @@ export {
   releaseThreadLock,
   threadLockPath,
 } from "./lock.ts";
-export { startStdioEngine } from "./main.ts";
+export { type AgentFactory, defaultAgentFactory, startStdioEngine } from "./main.ts";
 export * from "./protocol/errors.ts";
 export { ID_PATTERN, isValidId, newId } from "./protocol/ids.ts";
 export * from "./protocol/types.ts";
 export { encodeMessage, type Incoming, parseLine } from "./protocol/wire.ts";
+export { createProviderAgent, type ProviderAgentOptions } from "./provider-agent.ts";
+export { type EngineSeat, MADC_DEFAULT_SEAT } from "./seat.ts";
 export { ENGINE_VERSION, EngineConnection, type EngineOptions, runEngine } from "./server.ts";
