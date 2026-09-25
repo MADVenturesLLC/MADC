@@ -2,7 +2,7 @@
 
 *Daedalus · 2026-09-24 · Venue: `MADVenturesLLC/MADC` only · Status: commissionable build plan for Hephaestus. It is **not** a merge authorization and it does not start until the Founder accepts it (D-M1-1) and M0 is done.*
 
-*Founder rulings recorded 2026-09-25 (Founder): every D-M1 decision in §12 is ruled; the repo-identity rule (§9 S5, M1-A4) fixes Copilot finding [r4101049517](https://github.com/MADVenturesLLC/MADC/pull/9#discussion_r4101049517), which PR #9 merged without.*
+*Founder rulings recorded 2026-09-25 (Founder): the D-M1 decisions in §12 are ruled (D-M1-1 still needs an explicit acceptance statement; see §12). The repo-identity rule (§9 S5, M1-A4) fixes Copilot finding [r4101049517](https://github.com/MADVenturesLLC/MADC/pull/9#discussion_r4101049517), which PR #9 merged without.*
 
 Roadmap: [`ROADMAP-madc-post-M0.md`](ROADMAP-madc-post-M0.md) (M1 row, subscription table §3).
 
@@ -129,13 +129,15 @@ Each act is its own PR (stacked is fine) based on current `main`. Founder merges
 - **Files:** `packages/adapters/src/providers/{mistral,deepseek,gemini,xai}.ts`, `packages/engine/src/policy/*` (including repo identity), tests.
 - **Acceptance:** one L1 conformance test per provider against a mock (chat, stream, one tool round-trip, served-model receipt); DeepSeek repo-deny test; xAI entry uses `XAI_API_KEY`-style key from keychain, never pi-ai's xAI OAuth. **Repo-identity tests** (temp git repos, no network), each asserting the decision and the logged reason:
   - symlinked checkout of an allowed repo: allowed **only** because the normalized `origin` matches; the same symlink pointing at a repo whose remote is not listed is denied. A symlink path alone never grants.
-  - alias or bind path (a second path to the same checkout, including a `..` path): resolves to the same realpath'd top-level and decides exactly like the canonical path.
+  - alias path (a second path to the same checkout through a symlink, including a `..` path): resolves to the same realpath'd top-level and decides exactly like the canonical path.
+  - bind path: `realpath` does not collapse bind mounts, so a bind-mounted checkout is a **distinct** path. For a remote-only entry it decides like the canonical path (the remote matches). For a path-pinned entry it is denied `repo-not-allowed` unless that bind path is itself the pinned path.
   - `ssh` and `https` forms of the same repo (`git@github.com:owner/repo.git`, `ssh://git@github.com/owner/repo`, `https://github.com/owner/repo.git`, `https://user:token@github.com/owner/repo/`): all normalize to `github.com/owner/repo` and are equal.
   - case differences in the host (`GitHub.com` vs `github.com`): equal after normalization.
   - missing `origin` (repo with no remotes, or only a non-`origin` remote): deny `repo-identity-ambiguous`.
   - fork remote with the same repo name but a different owner (`github.com/other/repo` vs allowed `github.com/owner/repo`): deny `repo-not-allowed`.
   - subdirectory of an allowed repo as `cwd`: resolves to the top-level and is allowed.
-  - `origin` with conflicting URLs or push URLs, an unparseable remote, a non-git `cwd`, and a failed `realpath`: each denies `repo-identity-ambiguous`.
+  - `origin` whose fetch URL is allowlisted but whose push URL, or a second fetch URL, normalizes to a different remote: deny `repo-identity-ambiguous`.
+  - an unparseable remote, a non-git `cwd`, and a failed `realpath`: each denies `repo-identity-ambiguous`.
   - an entry that pins a path: allowed only when both the normalized remote and the realpath'd top-level match; a path-only entry is rejected at load with a doctor warning and grants nothing.
 - **Forbidden:** pi-ai OAuth flows; any Google OAuth; sending a repo to DeepSeek that is not on the allowlist; matching repo entries by prefix, glob, substring or case-folded owner/repo.
 
@@ -209,17 +211,18 @@ Surface Architect owns the pins. These are proposals for M1-A0, which lands them
 - **S3** Seeding: the same writer seeds `daedalus`, `hephaestus`, `prometheus`, `surface-architect` and `madc-default`, and never overwrites.
 - **S4** JSONL payloads (additive; envelope stays `v: 1`): `turn.start` adds `mode` and `presence`; `servedModel` adds `lane`, `mode`, `fallbackFrom`, `vendorReported`; `session.open.backing` widened like S1; a fallback rejection event carries the seat, candidate, both lanes and the reason; a repo-policy decision records the resolved identity (normalized remote, realpath'd top-level) and the reason.
 - **S5** New file `$MADC_HOME/policy.json` (same confinement and permissions rules): `{ "version": 1, "repoAllow": { "<providerId>": ["<normalized remote>" | { "remote": "<normalized remote>", "path": "<absolute path>" }] } }`. Keys are **registry ids exactly** (not pi-ai provider names). **Repo-gated providers** (`deepseek-payg`, the id in today's catalog, plus `minimax-token-plan` and `minimax-payg`) are denied for any repo not in their list, and a **missing or empty entry means deny everywhere** (fail-closed). A clean `{}` therefore denies all three. Providers that are not repo-gated ignore this file.
-  - **Repo identity is engine-owned** (Founder ruling 2026-09-25; fixes Copilot [r4101049517](https://github.com/MADVenturesLLC/MADC/pull/9#discussion_r4101049517)). The engine never matches the caller-supplied `cwd` string. For each turn on a repo-gated provider it computes the identity as **(a)** the realpath of the git top-level of `cwd` (symlinks resolved; a subdirectory resolves to its top-level) **and (b)** the normalized URL of the `origin` remote.
+  - **Repo identity is engine-owned** (Founder ruling 2026-09-25; fixes Copilot [r4101049517](https://github.com/MADVenturesLLC/MADC/pull/9#discussion_r4101049517)). The engine never matches the caller-supplied `cwd` string. For each turn on a repo-gated provider it computes the identity as **(a)** the realpath of the git top-level of `cwd` (symlinks resolved; a subdirectory resolves to its top-level; bind mounts are not collapsed by `realpath`, so a bind-mounted path counts as a distinct path) **and (b)** the normalized URL of the `origin` remote.
   - **Remote normalization:** strip the scheme, credentials and userinfo; lowercase the host; convert scp-style `git@host:owner/repo`, `ssh://git@host/owner/repo` and `https://host/owner/repo` to `host/owner/repo`; strip a trailing `.git` and trailing `/`. Owner and repo keep their case.
+  - **Origin agreement:** every configured `origin` endpoint (each `remote.origin.url` value and each `remote.origin.pushurl` value, fetch and push alike) must normalize to the **same** remote. That single value is the identity's remote; any disagreement is ambiguous.
   - **Matching:** entries are normalized the same way at load (path entries realpath'd). An entry matches only by **exact equality** of the normalized remote, and, if the entry pins a path, also exact equality of the realpath'd top-level with the realpath'd entry path. A path alone never grants: path-only entries, and entries whose remote does not normalize, are rejected at load with a doctor warning. No prefix, glob, substring or case-folded matching.
-  - **Deny, fail-closed, with reason `repo-identity-ambiguous`** when: `cwd` is not in a git repo; there is no `origin` remote; `origin` has multiple conflicting URLs or push URLs (they normalize to different values); the remote is unparseable; `realpath` resolution fails; or a worktree or submodule identity cannot be resolved unambiguously. A resolved identity that is not listed denies with `repo-not-allowed`. Every decision is logged with its reason.
+  - **Deny, fail-closed, with reason `repo-identity-ambiguous`** when: `cwd` is not in a git repo; there is no `origin` remote; the `origin` fetch and push URLs (or multiple values of either) do not all normalize to the same remote; the remote is unparseable; `realpath` resolution fails; or a worktree or submodule identity cannot be resolved unambiguously. A resolved identity that is not listed denies with `repo-not-allowed`. Every decision is logged with its reason.
 - **S6** Redaction list adds the key shapes of every new provider (for example `xai-…`, `sk-sp-…`).
 
 ## 10. Verify bullets (Definition of Done)
 
 - [ ] M1 pin files merged by the Founder (M1-A0) and cited by SHA in A1+; M0 pins unchanged (frozen with Amendment 1).
 - [ ] Registry v2 tests: allow / forbid / interactive-only / repo-deny (including an absent entry = deny) / stale allow = deny / stale-never-relaxes-forbidden.
-- [ ] Repo identity: realpath'd top-level + normalized `origin`, exact match; the M1-A4 test matrix passes (symlink, alias/bind path, ssh vs https, host case, missing origin, fork owner, subdirectory, conflicting/unparseable remotes, non-git `cwd`, path-only entry).
+- [ ] Repo identity: realpath'd top-level + normalized `origin` (all fetch and push URLs agreeing), exact match; the M1-A4 test matrix passes (symlink, alias path, bind path, ssh vs https, host case, missing origin, fork owner, subdirectory, fetch/push URL disagreement, unparseable remote, non-git `cwd`, failed realpath, path-only entry).
 - [ ] Ollama Cloud live-capable (mock in CI; optional live in runbook); `surface-architect` refuses headless turns while D-M1-3 denies headless.
 - [ ] Mistral, DeepSeek, Gemini auth key, xAI API: L1 mock conformance each.
 - [ ] MiniMax and Alibaba refuse headless before any network call.
@@ -245,11 +248,11 @@ Surface Architect owns the pins. These are proposals for M1-A0, which lands them
 
 ## 12. FOUNDER_DECISION_REQUIRED
 
-All rows ruled by the Founder on 2026-09-25.
+Ruled by the Founder on 2026-09-25. D-M1-1 is recorded exactly as ruled and does **not** yet authorize building (see its row).
 
 | # | Decision | Recommended default | Founder ruling (2026-09-25) |
 | --- | --- | --- | --- |
-| D-M1-1 | Accept this M1 plan as commissionable (after M0 A9)? | Plan stays draft until accepted; Hephaestus does not build. | Default accepted. |
+| D-M1-1 | Accept this M1 plan as commissionable (after M0 A9)? | Plan stays draft until accepted; Hephaestus does not build. | Founder: "accept defaults". The recorded default is "plan stays draft until accepted", so this is **not** recorded as acceptance of the plan as commissionable. The header status stands, and Hephaestus does not build until the Founder states acceptance explicitly. |
 | D-M1-2 | Ollama Cloud as the first new live lane (M1-A3)? | **Yes**: the Founder named it first, it is already `allowed-direct`, and its key API needs no local install. | Default accepted. |
 | D-M1-3 | Ollama Cloud headless use, given the Terms line "Use automated means to access our services without permission"? | **Deny headless until the Founder records permission.** The Terms bar automated access "without permission", and the API docs only establish key authentication, not permission. Interactive use with the key stays allowed. If the Founder obtains or records permission, allowing headless is one registry change that cites that record. | Default accepted. |
 | D-M1-4 | Seat roster backings (§6)? | daedalus → claude-code, hephaestus → codex, prometheus → kimi-code, surface-architect → ollama-cloud. | Accepted. Note: Surface Architect on Ollama Cloud is interactive-only while D-M1-3 denies headless (§6). |
