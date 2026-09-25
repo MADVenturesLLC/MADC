@@ -189,6 +189,21 @@ rl.on("line", (line) => {
         });
         return;
       }
+      if (scenario === "completed-with-error") {
+        // "completed-with-error": status completed but a provider error attached.
+        send({
+          method: "turn/completed",
+          params: {
+            turn: {
+              ...turn,
+              status: "completed",
+              error: { code: -32008, message: "no-credentials" },
+              completedAt: 2,
+            },
+          },
+        });
+        return;
+      }
       if (scenario === "no-thread-turn") {
         // "no-thread-turn": turn/completed whose turn has no threadId at all.
         send({ method: "turn/completed", params: { turn: { id: turnId, status: "completed" } } });
