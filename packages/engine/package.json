@@ -6,5 +6,9 @@
   "exports": {
     ".": "./src/index.ts",
     "./client": "./src/sdk.ts"
+  },
+  "dependencies": {
+    "@madc/adapters": "0.0.0",
+    "@madc/registry": "0.0.0"
   }
 }
