@@ -1,7 +1,7 @@
 import { createInterface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import type { Agent, TurnSink } from "./agent.ts";
-import { acquireThreadLock, holdsThreadLock, releaseThreadLock } from "./lock.ts";
+import { acquireThreadLock, holdsThreadLock, type LockHandle, releaseThreadLock } from "./lock.ts";
 import {
   alreadyInitialized,
   ErrorCode,
@@ -49,11 +49,13 @@ type TurnRecord = {
   turn: Turn;
   controller: AbortController;
   open: Map<string, Item>;
+  /** Set before the terminal transition starts (and before abort listeners run): sink is closed. */
+  finalizing: boolean;
 };
 
 type ThreadRecord = {
   thread: Thread;
-  lockPath: string;
+  lock: LockHandle;
   turns: Map<string, TurnRecord>;
   activeTurnId: string | null;
 };
@@ -150,7 +152,7 @@ export class EngineConnection {
   releaseLocks(): void {
     for (const record of this.#threads.values()) {
       try {
-        releaseThreadLock(record.lockPath);
+        releaseThreadLock(record.lock);
       } catch {
         // best effort; a dead-pid lock is reclaimed by the next engine
       }
@@ -264,7 +266,7 @@ export class EngineConnection {
       status: "idle",
       preview: "",
     };
-    this.#threads.set(id, { thread, lockPath: lock.path, turns: new Map(), activeTurnId: null });
+    this.#threads.set(id, { thread, lock: lock.handle, turns: new Map(), activeTurnId: null });
     return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
   }
 
@@ -276,6 +278,8 @@ export class EngineConnection {
 
     const known = this.#threads.get(threadId);
     if (known !== undefined) {
+      // Known in this process: still verify we own the on-disk lock before resuming (§3.3).
+      this.#ensureLock(known);
       const thread = known.thread;
       return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
     }
@@ -286,7 +290,7 @@ export class EngineConnection {
 
     // A2 thread store is in-memory per engine process; the durable JSONL-backed load lands in A4
     // (seat pin §4). Nothing to load → release the lock we just took and report not found.
-    releaseThreadLock(lock.path);
+    releaseThreadLock(lock.handle);
     throw threadNotFound(threadId);
   }
 
@@ -328,6 +332,14 @@ export class EngineConnection {
     };
   }
 
+  /** Verify this process still owns the thread's lock file; re-take it or yield (-32004). */
+  #ensureLock(record: ThreadRecord): void {
+    if (holdsThreadLock(record.lock)) return;
+    const lock = acquireThreadLock(this.#opts.home, record.thread.id);
+    if (!lock.ok) throw turnAlreadyActive(record.thread.id, null, lock.holderPid ?? undefined);
+    record.lock = lock.handle;
+  }
+
   // -------------------------------------------------------------------- turns
 
   #turnStart(params: unknown): { value: { turn: Turn }; after: () => void } {
@@ -340,11 +352,7 @@ export class EngineConnection {
     const record = this.#threads.get(threadId);
     if (record === undefined) throw threadNotFound(threadId);
     if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
-    if (!holdsThreadLock(record.lockPath)) {
-      // Our lock vanished (deleted on disk). Re-take it or yield to the live holder.
-      const lock = acquireThreadLock(this.#opts.home, threadId);
-      if (!lock.ok) throw turnAlreadyActive(threadId, null, lock.holderPid ?? undefined);
-    }
+    this.#ensureLock(record);
 
     const now = Date.now();
     const turn: Turn = {
@@ -356,7 +364,12 @@ export class EngineConnection {
       startedAt: now,
       completedAt: null,
     };
-    const turnRecord: TurnRecord = { turn, controller: new AbortController(), open: new Map() };
+    const turnRecord: TurnRecord = {
+      turn,
+      controller: new AbortController(),
+      open: new Map(),
+      finalizing: false,
+    };
     record.turns.set(turn.id, turnRecord);
     record.activeTurnId = turn.id;
     record.thread.status = "active";
@@ -390,7 +403,7 @@ export class EngineConnection {
 
   #runTurn(record: ThreadRecord, tr: TurnRecord, input: UserInput[]): void {
     const { turn } = tr;
-    const live = () => turn.status === "inProgress";
+    const live = () => turn.status === "inProgress" && !tr.finalizing;
     const sink: TurnSink = {
       signal: tr.controller.signal,
       newItemId: () => newId("item"),
@@ -462,7 +475,9 @@ export class EngineConnection {
     error: RpcErrorBody | null = null,
   ): void {
     const { turn } = tr;
-    if (turn.status !== "inProgress") return;
+    if (turn.status !== "inProgress" || tr.finalizing) return;
+    // Close the sink BEFORE abort: abort listeners run synchronously and must not emit or mutate.
+    tr.finalizing = true;
     tr.controller.abort();
     const ref = { threadId: turn.threadId, turnId: turn.id };
     for (const item of tr.open.values()) {
@@ -479,7 +494,7 @@ export class EngineConnection {
         message: error.message,
         code: error.code,
       };
-      this.#notify("item/started", { ...ref, item: errItem });
+      this.#notify("item/started", { ...ref, item: { ...errItem, status: "inProgress" } as Item });
       turn.items.push(errItem);
       this.#notify("item/completed", { ...ref, item: errItem });
     }
