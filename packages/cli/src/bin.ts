@@ -4,14 +4,14 @@ import { pathToFileURL } from "node:url";
 import { processIO } from "./io.ts";
 import { main } from "./main.ts";
 
-/** Resolves once everything written to `stream` so far has been flushed. */
+/**
+ * Resolves once everything written to `stream` so far has been flushed: write callbacks run in
+ * order, so an empty write's callback fires after all earlier writes (Copilot r4107805267: no
+ * dependence on a `drain` event that may never come).
+ */
 function flushed(stream: NodeJS.WriteStream): Promise<void> {
   return new Promise((resolve) => {
-    if (stream.writableLength === 0 && !stream.writableNeedDrain) {
-      stream.write("", () => resolve());
-    } else {
-      stream.once("drain", () => stream.write("", () => resolve()));
-    }
+    stream.write("", () => resolve());
   });
 }
 

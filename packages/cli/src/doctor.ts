@@ -8,10 +8,12 @@ import { createHash } from "node:crypto";
 import {
   accessSync,
   constants,
+  existsSync,
   lstatSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
 } from "node:fs";
@@ -182,12 +184,16 @@ function resolveHome(io: CliIO): HomeState {
   } catch (err) {
     return { kind: "invalid", message: errText(err) };
   }
+  let st: ReturnType<typeof statSync>;
   try {
-    if (statSync(path).isDirectory()) return { kind: "present", path, source };
+    st = statSync(path);
   } catch {
     // missing (or unreadable): not initialized
+    return { kind: "missing", path, source };
   }
-  return { kind: "missing", path, source };
+  if (st.isDirectory()) return { kind: "present", path, source };
+  // Copilot (review 5321699645, "previously missed"): an existing non-directory is a config error.
+  return { kind: "invalid", message: `MADC_HOME ${path} exists but is not a directory` };
 }
 
 function checkHome(home: HomeState): Check {
@@ -336,6 +342,20 @@ function checkLocks(home: HomeState): Check {
   const dir = join(home.path, "sessions");
   let names: string[];
   try {
+    if (!existsSync(dir)) {
+      return { id: "locks", status: "pass", summary: "no locks", evidence: { locks: [] } };
+    }
+    // Copilot r4107805223: same confinement as the engine's inspection. A `sessions` that is a
+    // symlink or resolves outside the real MADC_HOME is not followed or listed.
+    const realHome = realpathSync(home.path);
+    if (lstatSync(dir).isSymbolicLink() || realpathSync(dir) !== join(realHome, "sessions")) {
+      return {
+        id: "locks",
+        status: "warn",
+        summary: `${dir} is a symlink or resolves outside MADC_HOME: not inspected`,
+        evidence: { path: dir, confined: false },
+      };
+    }
     names = readdirSync(dir).sort();
   } catch {
     return { id: "locks", status: "pass", summary: "no locks", evidence: { locks: [] } };
