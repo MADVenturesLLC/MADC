@@ -11,10 +11,13 @@
  * resume is bound to the file that was verified (dev + inode).
  * Copilot review 5317847622: a rebuilt turn error carries only {code, message}, even if the line
  * holds more.
+ * Copilot review 5317965607: the seat seed's cleanup never unlinks a file it did not create, and a
+ * home subdirectory's mode is tightened on the checked directory's fd, never by path.
  * Network-free: in-process engines only.
  */
 import assert from "node:assert/strict";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -25,7 +28,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
 import type { Agent } from "./agent.ts";
@@ -644,4 +647,109 @@ test("R-turn-error: a rebuilt turn error is {code, message} only, whatever extra
   assert.equal(r.ok, true);
   const rebuilt = rebuildSession(r.ok ? r.events : []);
   assert.deepEqual(rebuilt.turns[0]?.error, { code: -32009, message: "Session write failed" });
+});
+
+test("R-seed-cleanup-swap: the seed's cleanup never unlinks an unrelated file after a seats/ swap", () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside-seed-cleanup");
+  const seats = join(home, "seats");
+  const moved = join(home, "seats-moved");
+  // Swap seats/ for a symlink to `outside`, where an unrelated file already has the temp's name.
+  const swapWithDecoy = (name: string, bytes: string) => {
+    renameSync(seats, moved);
+    symlinkSync(outside, seats);
+    writeFileSync(join(outside, name), bytes);
+  };
+  const reset = () => {
+    rmSync(seats, { recursive: true, force: true });
+    rmSync(moved, { recursive: true, force: true });
+    rmSync(outside, { recursive: true, force: true });
+    mkdirSync(seats, { recursive: true, mode: 0o700 });
+    mkdirSync(outside);
+  };
+  try {
+    // A write failure after a swap: the partial-file cleanup leaves the unrelated file alone.
+    reset();
+    let name = "";
+    setSeedHooksForTests({
+      beforeWrite: (path) => {
+        name = basename(path);
+        swapWithDecoy(name, "operator data\n");
+        throw new Error("disk full");
+      },
+    });
+    assert.throws(() => seedDefaultSeat(home), /disk full/);
+    assert.equal(readFileSync(join(outside, name), "utf8"), "operator data\n", "unrelated kept");
+    // Without a swap, a write failure still removes the seed's own partial temp file.
+    reset();
+    setSeedHooksForTests({
+      beforeWrite: () => {
+        throw new Error("disk full");
+      },
+    });
+    assert.throws(() => seedDefaultSeat(home), /disk full/);
+    assert.deepEqual(readdirSync(seats), [], "own partial temp file removed");
+    // A swap before the link: the final temp cleanup leaves the unrelated file alone.
+    reset();
+    setSeedHooksForTests({
+      beforeLink: (tmp) => {
+        name = basename(tmp);
+        swapWithDecoy(name, "operator data 2\n");
+      },
+    });
+    assert.throws(() => seedDefaultSeat(home), /changed while the seed was being linked/);
+    assert.equal(readFileSync(join(outside, name), "utf8"), "operator data 2\n", "unrelated kept");
+    // A normal seed still leaves no temp file behind.
+    reset();
+    setSeedHooksForTests(null);
+    assert.equal(seedDefaultSeat(home).created, true);
+    assert.deepEqual(readdirSync(seats), ["madc-default.json"]);
+  } finally {
+    setSeedHooksForTests(null);
+    cleanup();
+  }
+});
+
+test("R-seed-dir-chmod: a home subdir swapped after its lstat check is never chmod'ed", () => {
+  if (!POSIX) return; // symlinks and mode bits: POSIX only (Windows is a no-op, PR #10 waiver)
+  const { home, cleanup } = makeHome();
+  const memory = join(home, "memory");
+  const outside = join(home, "..", "outside-memory");
+  const mode = (p: string) => statSync(p).mode & 0o777;
+  const reset = () => {
+    for (const p of [memory, outside, join(home, "memory-moved")]) {
+      rmSync(p, { recursive: true, force: true });
+    }
+    mkdirSync(memory, { recursive: true });
+    chmodSync(memory, 0o755);
+    mkdirSync(outside);
+    chmodSync(outside, 0o755);
+  };
+  const onMemory = (swap: () => void) => (dir: string) => {
+    if (dir !== memory) return;
+    renameSync(memory, join(home, "memory-moved"));
+    swap();
+  };
+  try {
+    // Swapped for a symlink to an outside directory: refused, the outside mode is untouched.
+    reset();
+    setSeedHooksForTests({ afterDirCheck: onMemory(() => symlinkSync(outside, memory)) });
+    assert.throws(() => seedDefaultSeat(home), /memory under MADC_HOME must be a real directory/);
+    assert.equal(mode(outside), 0o755, "symlink target not chmod'ed");
+    // Swapped for a different real directory: refused (dev + inode), its mode is untouched.
+    reset();
+    setSeedHooksForTests({ afterDirCheck: onMemory(() => renameSync(outside, memory)) });
+    assert.throws(() => seedDefaultSeat(home), /memory under MADC_HOME must be a real directory/);
+    assert.equal(mode(memory), 0o755, "replacement directory not chmod'ed");
+    // No swap: a pre-existing 0755 subdir is tightened to 0700.
+    reset();
+    setSeedHooksForTests(null);
+    assert.equal(seedDefaultSeat(home).created, true);
+    assert.equal(mode(memory), 0o700);
+    assert.equal(mode(outside), 0o755);
+  } finally {
+    setSeedHooksForTests(null);
+    cleanup();
+  }
 });

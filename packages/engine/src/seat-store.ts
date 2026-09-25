@@ -19,7 +19,7 @@ import {
 } from "node:fs";
 import { dirname, join } from "node:path";
 import { KIMI_CODE_PROVIDER_ID, resolveKimiPinnedModel } from "@madc/adapters";
-import { enforcePrivateDir, isStrictlyUnder } from "./home.ts";
+import { enforcePrivateDir, enforcePrivateDirAt, isStrictlyUnder } from "./home.ts";
 import { type OpenNoFollowOptions, openNoFollow } from "./lock.ts";
 import {
   ErrorCode,
@@ -81,12 +81,20 @@ const NO_HARD_LINKS = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EXDE
 type FileId = { readonly dev: bigint; readonly ino: bigint };
 
 /**
- * Create `path` exclusively (0600, no-follow), write all of `bytes`, fsync. `inPlace(fd)` must hold
- * right after the open (the parent still resolves to the real `seats/` under the home, and the path
- * names the opened fd) before a byte is written; otherwise the empty file is left alone and the
- * seed fails. If anything after that fails, the partial file is removed and the error rethrown.
+ * Create `path` exclusively (0600, no-follow), write all of `bytes`, fsync. `isAt(path, id)` must
+ * hold for the opened fd right after the open (the parent still resolves to the real `seats/` under
+ * the home, and the path names the opened fd) before a byte is written; otherwise the empty file is
+ * left alone and the seed fails. If anything after that fails, the partial file is removed and the
+ * error rethrown — but only while `isAt(path, id)` still holds: a `seats/` swapped after the open
+ * means the path may now name an unrelated file, which is never unlinked (the orphaned dot-temp
+ * file is harmless: it is never read as a seat). Node has no `unlinkat`, so the check and the
+ * unlink are two path operations; the window between them is the r4104462637 residual.
  */
-function writeNewFile(path: string, bytes: Buffer, inPlace: (fd: number) => boolean): FileId {
+function writeNewFile(
+  path: string,
+  bytes: Buffer,
+  isAt: (p: string, id: FileId) => boolean,
+): FileId {
   const fd = openSync(
     path,
     constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
@@ -95,7 +103,8 @@ function writeNewFile(path: string, bytes: Buffer, inPlace: (fd: number) => bool
   let id: FileId | null = null;
   try {
     const st = fstatSync(fd, { bigint: true });
-    if (inPlace(fd)) id = { dev: st.dev, ino: st.ino };
+    const opened = { dev: st.dev, ino: st.ino };
+    if (isAt(path, opened)) id = opened;
   } catch {
     id = null;
   }
@@ -105,6 +114,7 @@ function writeNewFile(path: string, bytes: Buffer, inPlace: (fd: number) => bool
   }
   try {
     try {
+      seedHooks.beforeWrite?.(path);
       let off = 0;
       while (off < bytes.length) off += writeSync(fd, bytes, off, bytes.length - off);
       fsyncSync(fd);
@@ -112,18 +122,31 @@ function writeNewFile(path: string, bytes: Buffer, inPlace: (fd: number) => bool
       closeSync(fd);
     }
   } catch (err) {
-    try {
-      unlinkSync(path);
-    } catch {
-      // Already gone.
-    }
+    unlinkIfAt(path, id, isAt);
     throw err;
   }
   return id;
 }
 
-/** Test seam (internal): hooks just before the seed's temp file is opened / linked. */
-export type SeedTestHooks = { beforeOpen?: () => void; beforeLink?: () => void };
+/** Unlink `path` only if it still names the file `id` in the real `seats/` (best effort). */
+function unlinkIfAt(path: string, id: FileId, isAt: (p: string, id: FileId) => boolean): void {
+  try {
+    if (isAt(path, id)) unlinkSync(path);
+  } catch {
+    // Already gone, or seats/ no longer resolves: leave it.
+  }
+}
+
+/**
+ * Test seam (internal): hooks just before the seed's temp file is opened / written / linked, and
+ * right after each home subdirectory passes its lstat check (before its mode is tightened).
+ */
+export type SeedTestHooks = {
+  beforeOpen?: () => void;
+  beforeWrite?: (path: string) => void;
+  beforeLink?: (tmp: string) => void;
+  afterDirCheck?: (dir: string) => void;
+};
 let seedHooks: SeedTestHooks = {};
 export function setSeedHooksForTests(hooks: SeedTestHooks | null): void {
   seedHooks = hooks ?? {};
@@ -160,11 +183,15 @@ export function seedDefaultSeat(home: string): SeedResult {
     } catch (err) {
       if (errCode(err) !== "EEXIST") throw err;
     }
-    const st = lstatSync(dir);
+    const st = lstatSync(dir, { bigint: true });
     if (st.isSymbolicLink() || !st.isDirectory()) {
       throw new Error(`${sub} under MADC_HOME must be a real directory`);
     }
-    enforcePrivateDir(dir);
+    seedHooks.afterDirCheck?.(dir);
+    // chmod on a no-follow fd that is still the lstat-checked directory, never by path.
+    if (!enforcePrivateDirAt(dir, { dev: st.dev, ino: st.ino })) {
+      throw new Error(`${sub} under MADC_HOME must be a real directory`);
+    }
   }
   const path = seatFilePath(home, MADC_DEFAULT_SEAT.id);
   try {
@@ -185,10 +212,6 @@ export function seedDefaultSeat(home: string): SeedResult {
     const st = lstatSync(p, { bigint: true });
     return st.isFile() && st.dev === id.dev && st.ino === id.ino;
   };
-  const opened = (p: string) => (fd: number) => {
-    const st = fstatSync(fd, { bigint: true });
-    return isAt(p, { dev: st.dev, ino: st.ino });
-  };
   const bytes = Buffer.from(serializeSeat(MADC_DEFAULT_SEAT), "utf8");
   const tmp = join(
     home,
@@ -196,10 +219,10 @@ export function seedDefaultSeat(home: string): SeedResult {
     `.${MADC_DEFAULT_SEAT.id}.json.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
   );
   seedHooks.beforeOpen?.();
-  const tmpId = writeNewFile(tmp, bytes, opened(tmp));
+  const tmpId = writeNewFile(tmp, bytes, isAt);
   try {
     try {
-      seedHooks.beforeLink?.();
+      seedHooks.beforeLink?.(tmp);
       linkSync(tmp, path);
       if (!isAt(path, tmpId)) {
         throw new Error("seats/ under MADC_HOME changed while the seed was being linked");
@@ -211,7 +234,7 @@ export function seedDefaultSeat(home: string): SeedResult {
       // Filesystem without hard links: exclusive create in place; a failed write removes
       // the partial file before rethrowing.
       try {
-        writeNewFile(path, bytes, opened(path));
+        writeNewFile(path, bytes, isAt);
       } catch (werr) {
         if (errCode(werr) === "EEXIST") return { path, created: false };
         throw werr;
@@ -219,11 +242,8 @@ export function seedDefaultSeat(home: string): SeedResult {
     }
     return { path, created: true };
   } finally {
-    try {
-      unlinkSync(tmp);
-    } catch {
-      // Best effort: a leftover dot-temp file is never read as a seat.
-    }
+    // Only our own temp file, still in the real seats/ (a leftover dot-temp is never read as a seat).
+    unlinkIfAt(tmp, tmpId, isAt);
   }
 }
 

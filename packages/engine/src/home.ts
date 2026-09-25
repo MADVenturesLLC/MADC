@@ -1,4 +1,15 @@
-import { chmodSync, lstatSync, mkdirSync, realpathSync, statSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  fchmodSync,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { internalError, invalidParams } from "./protocol/errors.ts";
@@ -42,6 +53,43 @@ export function enforcePrivateDir(dir: string): void {
   if (process.platform === "win32") return;
   const mode = statSync(dir).mode & 0o777;
   if ((mode & 0o077) !== 0) chmodSync(dir, mode & 0o700);
+}
+
+/**
+ * `enforcePrivateDir` for a directory already checked with `lstat` (real directory, `expected`
+ * dev + inode), without a path-based chmod after that check: the directory is opened no-follow
+ * (`O_DIRECTORY | O_NOFOLLOW`), the fd must still be that same directory (fstat dev + inode), and
+ * group/other bits are cleared with `fchmod` on the fd. Returns false (nothing changed) if the path
+ * no longer names the checked directory. Windows: the same no-op as `enforcePrivateDir` (mode bits
+ * are not meaningful there and Node has no no-follow directory open; PR #10 Windows waiver). On
+ * POSIX the dev + inode check alone pins the fd to the checked directory even if a platform lacks
+ * one of the flags; fchmod then only ever touches that directory.
+ */
+export function enforcePrivateDirAt(
+  dir: string,
+  expected: { readonly dev: bigint; readonly ino: bigint },
+): boolean {
+  if (process.platform === "win32") return true;
+  let fd: number;
+  try {
+    fd = openSync(
+      dir,
+      constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+    );
+  } catch (err) {
+    const code = errCode(err);
+    if (code === "ELOOP" || code === "ENOTDIR" || code === "ENOENT") return false;
+    throw err;
+  }
+  try {
+    const st = fstatSync(fd, { bigint: true });
+    if (!st.isDirectory() || st.dev !== expected.dev || st.ino !== expected.ino) return false;
+    const mode = Number(st.mode & 0o777n);
+    if ((mode & 0o077) !== 0) fchmodSync(fd, mode & 0o700);
+    return true;
+  } finally {
+    closeSync(fd);
+  }
 }
 
 const ESCAPES = "Resolved path escapes MADC_HOME";
