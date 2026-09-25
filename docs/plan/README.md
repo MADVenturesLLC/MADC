@@ -12,3 +12,9 @@ place; supersede them with a new dated file.
 | `PLAN-madc-M0-build-plan.md` | Present (Daedalus M0 commissionable build plan, 2026-09-24 — PR, unmerged until Founder accept) |
 
 The plan cites these files at `/workspace/briefs/...`; in this repo the path is `docs/plan/`.
+
+## Related policy
+
+| File | Status in this repo |
+| --- | --- |
+| [`../policy/CODE-ADVISORIES.md`](../policy/CODE-ADVISORIES.md) | Present (Copilot / code scanning / Dependabot DoD for builders) |
