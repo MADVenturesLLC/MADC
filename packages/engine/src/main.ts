@@ -1,14 +1,39 @@
 import type { Writable } from "node:stream";
+import { createKimiCodePort, honestUserAgent, readKimiCredential } from "@madc/adapters";
 import type { Agent } from "./agent.ts";
-import { echoAgent } from "./agent.ts";
 import { resolveMadcHome } from "./home.ts";
-import { EngineConnection } from "./server.ts";
+import { createProviderAgent } from "./provider-agent.ts";
+import { MADC_DEFAULT_SEAT } from "./seat.ts";
+import { ENGINE_VERSION, EngineConnection } from "./server.ts";
+
+/** Builds the turn agent once `MADC_HOME` is known. */
+export type AgentFactory = (env: { readonly home: string }) => Agent;
+
+const log = (line: string) => process.stderr.write(`[madc-engine] ${line}\n`);
+
+/**
+ * Production agent: built-in `madc-default` seat on Kimi Code (plan D2). The API key is read once
+ * from the local environment (`KIMI_API_KEY`); without one, `turn/start` answers -32008
+ * `no-credentials`. No base-URL or transport override exists here: production only talks to the
+ * pinned catalog endpoint.
+ */
+export const defaultAgentFactory: AgentFactory = ({ home }) =>
+  createProviderAgent({
+    home,
+    seat: MADC_DEFAULT_SEAT,
+    credential: readKimiCredential(process.env),
+    createPort: (apiKey) =>
+      createKimiCodePort({ apiKey, userAgent: honestUserAgent(ENGINE_VERSION) }),
+    log,
+  });
 
 /**
  * Engine process entry: protocol on stdin/stdout (JSONL), logs on stderr only.
- * `agent` defaults to the fake echo agent — A2 wires no providers.
+ * `agent` defaults to the live Kimi Code agent; tests pass fixture agents.
  */
-export async function startStdioEngine(agent: Agent = echoAgent): Promise<void> {
+export async function startStdioEngine(
+  agent: Agent | AgentFactory = defaultAgentFactory,
+): Promise<void> {
   let home: string;
   try {
     home = resolveMadcHome();
@@ -21,7 +46,7 @@ export async function startStdioEngine(agent: Agent = echoAgent): Promise<void> 
     input: process.stdin,
     output: process.stdout,
     home,
-    agent,
+    agent: typeof agent === "function" ? agent({ home }) : agent,
   });
   process.once("exit", () => conn.releaseLocks());
   for (const [signal, code] of [
