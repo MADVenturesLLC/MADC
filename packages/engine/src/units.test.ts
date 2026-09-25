@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -22,6 +22,7 @@ import {
   holdsThreadLock,
   isPidAlive,
   LOCK_TOKEN_PATTERN,
+  LockPathNotAFileError,
   readLock,
   reclaimIfUnchanged,
   releaseThreadLock,
@@ -434,6 +435,59 @@ test("lock: a symlink at the lock path is never followed or trusted", async () =
     assert.equal(existsSync(target), true);
     if (res.ok) releaseThreadLock(res.handle);
   } finally {
+    cleanup();
+  }
+});
+
+test("lock: a directory or FIFO at the lock path is refused, never reclaimed or blocked on", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const path = threadLockPath(home, "thr_i");
+    mkdirSync(path);
+    assert.throws(() => readLock(path), LockPathNotAFileError);
+    assert.throws(() => acquireThreadLock(home, "thr_i"), LockPathNotAFileError);
+    assert.equal(statSync(path).isDirectory(), true, "left in place");
+    assert.deepEqual(readdirSync(join(home, "sessions")), ["thr_i.lock"], "nothing moved aside");
+
+    if (process.platform === "win32") return;
+    const fifo = threadLockPath(home, "thr_j");
+    if (spawnSync("mkfifo", [fifo]).status !== 0) return; // mkfifo unavailable
+    // O_NONBLOCK: opening a FIFO with no writer must not hang the engine.
+    assert.throws(() => readLock(fifo), LockPathNotAFileError);
+    assert.equal(
+      releaseThreadLock({ path: fifo, pid: process.pid, startedAt: 1, token: TOKEN_A }),
+      false,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("lock: a token only counts on a well-formed {pid,startedAt,token} body", () => {
+  const { home, cleanup } = makeHome();
+  const holder = liveHolder();
+  try {
+    const path = threadLockPath(home, "thr_k");
+    const handle = { path, pid: holder.pid ?? 0, startedAt: 1, token: TOKEN_A };
+    for (const body of [
+      { pid: holder.pid, startedAt: "1", token: TOKEN_A },
+      { pid: holder.pid, startedAt: 1, token: TOKEN_A, extra: true },
+      { pid: holder.pid, token: TOKEN_A },
+    ]) {
+      writeFileSync(path, JSON.stringify(body));
+      const state = readLock(path);
+      assert.equal(state.state === "held" && state.token, null, JSON.stringify(body));
+      assert.equal(holdsThreadLock(handle), false, "malformed body proves no ownership");
+      assert.equal(releaseThreadLock(handle), false);
+      assert.deepEqual(acquireThreadLock(home, "thr_k"), {
+        ok: false,
+        path,
+        holderPid: holder.pid,
+      });
+      assert.deepEqual(JSON.parse(readFileSync(path, "utf8")), body, "left untouched");
+    }
+  } finally {
+    holder.kill();
     cleanup();
   }
 });
