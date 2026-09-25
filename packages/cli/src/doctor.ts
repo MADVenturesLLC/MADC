@@ -8,7 +8,6 @@ import { createHash } from "node:crypto";
 import {
   accessSync,
   constants,
-  existsSync,
   lstatSync,
   mkdtempSync,
   readdirSync,
@@ -342,13 +341,20 @@ function checkLocks(home: HomeState): Check {
   const dir = join(home.path, "sessions");
   let names: string[];
   try {
-    if (!existsSync(dir)) {
+    // Copilot r4107805223 / r4107905013, Bugbot 4107900653: same confinement as the engine's
+    // inspection. `lstat` first (no follow): any `sessions` symlink, dangling or not, and any
+    // `sessions` that resolves outside the real MADC_HOME, is never followed or listed.
+    let st: ReturnType<typeof lstatSync> | undefined;
+    try {
+      st = lstatSync(dir);
+    } catch {
       return { id: "locks", status: "pass", summary: "no locks", evidence: { locks: [] } };
     }
-    // Copilot r4107805223: same confinement as the engine's inspection. A `sessions` that is a
-    // symlink or resolves outside the real MADC_HOME is not followed or listed.
-    const realHome = realpathSync(home.path);
-    if (lstatSync(dir).isSymbolicLink() || realpathSync(dir) !== join(realHome, "sessions")) {
+    if (
+      st.isSymbolicLink() ||
+      !st.isDirectory() ||
+      realpathSync(dir) !== join(realpathSync(home.path), "sessions")
+    ) {
       return {
         id: "locks",
         status: "warn",

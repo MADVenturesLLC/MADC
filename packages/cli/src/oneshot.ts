@@ -101,6 +101,7 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
   let signalExit: number | null = null;
   // The engine's exit code from `close()`; `null` = killed by a signal (incl. our close timeout).
   let engineExit: number | null | undefined;
+  let violationTimer: ReturnType<typeof setInterval> | undefined;
   let streamed = "";
   const stream = io.stdoutIsTTY && !opts.json;
   const seatId = opts.seatId ?? DEFAULT_SEAT;
@@ -162,12 +163,25 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
       throw new EngineExitedError(code, c.child.signalCode);
     });
     exited.catch(() => undefined);
-    /** Race a step against a forced signal exit and an early engine exit. */
+    // Copilot r4107904955: the client only records a malformed stdout line; it never rejects a
+    // waiter. Poll for one so a violating engine that then hangs ends the (otherwise unbounded)
+    // turn wait with the protocol exit 3 instead of waiting forever.
+    const violated = new Promise<never>((_, reject) => {
+      violationTimer = setInterval(() => {
+        if (c.protocolViolations.length > 0) {
+          clearInterval(violationTimer);
+          reject(new ProtocolMismatch("protocol violation: non-JSON line on engine stdout"));
+        }
+      }, 100);
+    });
+    violated.catch(() => undefined);
+    /** Race a step against a forced signal exit, an early engine exit and a protocol violation. */
     const step = <T>(p: Promise<T>): Promise<T> => {
       p.catch(() => undefined);
       return Promise.race([
         p,
         exited,
+        violated,
         forced.then(() => {
           throw new Forced();
         }),
@@ -276,6 +290,7 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
     fail({ exit: EXIT.engine, class: "engine" }, null, `engine spawn failed: ${errorMessage(err)}`);
   } finally {
     clearStatus();
+    clearInterval(violationTimer);
     if (client !== null) {
       // After a signal: close stdin and kill the engine if it is still running after 1 s.
       engineExit = await client.close(signalExit !== null ? KILL_AFTER_MS : CLOSE_TIMEOUT_MS);

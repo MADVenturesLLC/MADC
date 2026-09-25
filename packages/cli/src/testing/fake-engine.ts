@@ -100,6 +100,12 @@ rl.on("line", (line) => {
       return;
     }
     case "turn/start": {
+      if (scenario === "junk-hang") {
+        // "junk-hang": a non-JSON stdout line mid-turn, then the turn never completes.
+        send({ id: msg.id, result: { turn: inProgress() } });
+        process.stdout.write("this is not json\n");
+        return;
+      }
       if (scenario === "slow-start") {
         // "slow-start": the turn/start response is delayed 1.5 s (the test signals meanwhile),
         // then the turn runs until turn/interrupt.
