@@ -27,6 +27,7 @@ import {
   createRedactor,
   GENESIS_HASH,
   REDACTED,
+  rebuildSession,
   SessionWriter,
   sessionEventHash,
   sortedKeyJson,
@@ -567,13 +568,17 @@ test("A4 resume: an engine killed mid-turn leaves turn.start without turn.end; r
     const b = startEngine(home);
     try {
       await handshake(b);
-      await b.request("thread/resume", { threadId: thread.id });
+      const { thread: resumed } = await b.request("thread/resume", { threadId: thread.id });
       const after = readLines(path);
       assert.deepEqual(after.at(-1)?.payload, {
         turnId: before[1]?.payload.turnId,
         status: "interrupted",
         error: null,
       });
+      // The close that resume just appended is reflected in updatedAt (resume and list).
+      assert.equal(resumed.updatedAt, after.at(-1)?.ts);
+      const listed = await b.request("thread/list", {});
+      assert.equal(listed.data[0]?.updatedAt, after.at(-1)?.ts);
       assert.equal(verifySessionFile(path, thread.id).ok, true);
     } finally {
       await b.close();
@@ -872,7 +877,7 @@ function forgeSession(threadId: string, events: Array<[string, Record<string, un
     .join("");
 }
 
-test("R-shape: a hash-valid line with a malformed payload fails verification and never breaks thread/list", async () => {
+test("R-shape: a hash-valid line with a malformed M0 payload is never loaded and never breaks thread/list", async () => {
   const open = { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" };
   const bad: Array<[string, Array<[string, Record<string, unknown>]>]> = [
     [
@@ -914,9 +919,15 @@ test("R-shape: a hash-valid line with a malformed payload fails verification and
     ],
   ];
   for (const [name, events] of bad) {
+    // The chain itself is intact (the verifier checks envelope, seq and hashes only) ...
     const r = verifySessionText(forgeSession("thr_bad", events));
-    assert.equal(r.ok, false, name);
-    if (!r.ok) assert.match(r.reason, /^malformed /, name);
+    assert.equal(r.ok, true, name);
+    // ... but the M0 payload shape is checked before any state is rebuilt from it.
+    assert.throws(
+      () => rebuildSession(r.ok ? r.events : []),
+      (err: Error) => /^line \d+: malformed /.test(err.message),
+      name,
+    );
   }
   const { home, cleanup } = makeHome();
   const e = inProcess(home, replyAgent);
@@ -1004,6 +1015,66 @@ test("R-terminal: a turn.end append failure is never acknowledged as completed (
       turn.items.map((i) => i.kind),
       ["userMessage", "agentMessage", "error"],
     );
+  } finally {
+    e.input.end();
+    await e.done;
+    cleanup();
+  }
+});
+
+test("forward compat: unknown event types and extra payload fields verify, list, resume, and the chain continues", async () => {
+  const open = {
+    cwd: null,
+    backing: "kimi-code",
+    providerId: "kimi-code",
+    pinnedModel: "kimi-coding/kimi-for-coding",
+    futureField: { nested: true },
+  };
+  const text = forgeSession("thr_future", [
+    ["session.open", open],
+    ["turn.start", { turnId: "turn_1", inputText: "hello", futureField: 1 }],
+    [
+      "item",
+      {
+        turnId: "turn_1",
+        item: {
+          id: "item_1",
+          kind: "userMessage",
+          status: "completed",
+          content: [{ type: "text", text: "hello" }],
+          futureField: true,
+        },
+      },
+    ],
+    ["future.event", { anything: ["goes"] }],
+    ["turn.end", { turnId: "turn_1", status: "completed", error: null, futureField: "x" }],
+  ]);
+  const r = verifySessionText(text, "thr_future");
+  assert.equal(r.ok, true);
+  const { home, cleanup } = makeHome();
+  const e = inProcess(home, replyAgent);
+  try {
+    await e.request("initialize", { clientInfo: { name: "t", version: "0" } });
+    mkdirSync(join(home, "sessions"), { recursive: true });
+    const path = join(home, "sessions", "thr_future.jsonl");
+    writeFileSync(path, text);
+    const list = await e.request("thread/list", {});
+    assert.deepEqual(
+      (list.result as { data: Array<{ id: string; preview: string }> }).data.map((t) => [
+        t.id,
+        t.preview,
+      ]),
+      [["thr_future", "hello"]],
+    );
+    const resume = await e.request("thread/resume", { threadId: "thr_future" });
+    assert.equal(resume.error, undefined);
+    await e.request("turn/start", { threadId: "thr_future", input: [{ type: "text", text: "y" }] });
+    await e.waitFor((m) => m.method === "turn/completed");
+    const lines = readLines(path);
+    assert.equal(lines[3]?.type, "future.event", "unknown lines are kept, never rewritten");
+    assert.equal(lines.at(-1)?.type, "turn.end");
+    assert.equal(verifySessionFile(path, "thr_future").ok, true);
+    independentVerify(path);
   } finally {
     e.input.end();
     await e.done;
