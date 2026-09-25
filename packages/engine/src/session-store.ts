@@ -140,6 +140,10 @@ export function createRedactor(secrets: readonly string[]): (value: unknown) => 
   };
   const walk = (value: unknown): unknown => {
     if (typeof value === "string") return redactString(value);
+    // A function never serializes as data, but an own `toJSON` hook would run during the final
+    // stringify, after redaction. Functions become undefined: dropped from objects (a `toJSON`
+    // property included), null in arrays, as JSON.stringify already rendered them.
+    if (typeof value === "function") return undefined;
     if (Array.isArray(value)) return value.map(walk);
     if (value !== null && typeof value === "object") {
       // Own data properties only (a `__proto__` key stays a key, never the prototype setter).
@@ -327,7 +331,9 @@ export class SessionWriter {
 
   /**
    * Continue a verified session (resume): next seq and last hash come from `verifySession`. With
-   * `home`, the file must still resolve strictly under realpath(home) (else -32009).
+   * `home`, the file must still resolve strictly under realpath(home) (else -32009). With
+   * `verifiedFile` (from `verifySessionFile`), it must still be that same file (dev + inode), so a
+   * swap between verification and resume never continues another session's chain (else -32009).
    */
   static resume(
     path: string,
@@ -337,6 +343,7 @@ export class SessionWriter {
     lastHash: string,
     secrets: () => readonly string[],
     home?: string,
+    verifiedFile?: SessionFileId,
   ): SessionWriter {
     let realPath: string;
     try {
@@ -345,6 +352,17 @@ export class SessionWriter {
       throw sessionWriteFailed(threadId, path, nextSeq);
     }
     if (!resolvesUnderHome(realPath, home)) throw sessionWriteFailed(threadId, path, nextSeq);
+    if (verifiedFile !== undefined) {
+      let st: { dev: bigint; ino: bigint };
+      try {
+        st = lstatSync(realPath, { bigint: true });
+      } catch {
+        throw sessionWriteFailed(threadId, path, nextSeq);
+      }
+      if (st.dev !== verifiedFile.dev || st.ino !== verifiedFile.ino) {
+        throw sessionWriteFailed(threadId, path, nextSeq);
+      }
+    }
     return new SessionWriter(path, realPath, threadId, seatId, nextSeq, lastHash, secrets);
   }
 
@@ -439,8 +457,13 @@ export type SessionVerifyResult =
       readonly events: readonly SessionEvent[];
       readonly nextSeq: number;
       readonly lastHash: string;
+      /** `verifySessionFile` only: identity of the file that was read and verified. */
+      readonly file?: SessionFileId;
     }
   | { readonly ok: false; readonly line: number; readonly reason: string };
+
+/** dev + inode of a session file (bigint, as `fstat` reports it). */
+export type SessionFileId = { readonly dev: bigint; readonly ino: bigint };
 
 const ENVELOPE_KEYS = [
   "hash",
@@ -602,6 +625,7 @@ export function verifySessionFile(
   home?: string,
 ): SessionVerifyResult {
   let text: string;
+  let file: SessionFileId;
   try {
     const fd = openNoFollow(path, opts);
     if (fd === null) return { ok: false, line: 0, reason: "session file is unreadable" };
@@ -609,9 +633,11 @@ export function verifySessionFile(
       return { ok: false, line: 0, reason: "session file is not a regular file" };
     }
     try {
-      if (!fstatSync(fd).isFile()) {
+      const st = fstatSync(fd, { bigint: true });
+      if (!st.isFile()) {
         return { ok: false, line: 0, reason: "session file is not a regular file" };
       }
+      file = { dev: st.dev, ino: st.ino };
       if (home !== undefined) {
         const realHome = realpathSync(home);
         if (!fdIsFileAt(fd, path, (real) => isStrictlyUnder(real, realHome))) {
@@ -625,7 +651,8 @@ export function verifySessionFile(
   } catch {
     return { ok: false, line: 0, reason: "session file is unreadable" };
   }
-  return verifySessionText(text, expectedThreadId);
+  const result = verifySessionText(text, expectedThreadId);
+  return result.ok ? { ...result, file } : result;
 }
 
 // ------------------------------------------------------------------ rebuild
