@@ -516,7 +516,11 @@ export class EngineConnection {
         this.#log(`thread/list: skipping ${threadId} (session failed verification)`);
         continue;
       }
-      out.push(rebuildSession(verified.events).thread);
+      try {
+        out.push(rebuildSession(verified.events).thread);
+      } catch {
+        this.#log(`thread/list: skipping ${threadId} (session could not be rebuilt)`);
+      }
     }
     return out;
   }
@@ -756,22 +760,50 @@ export class EngineConnection {
       this.#appendFinal(record, "item", { turnId: turn.id, item: errItem });
     }
     const now = Date.now();
-    turn.status = status;
-    turn.error = status === "failed" ? error : null;
+    let finalStatus = status;
+    let finalError = status === "failed" ? error : null;
+    try {
+      record.session.append(
+        "turn.end",
+        {
+          turnId: turn.id,
+          status,
+          error:
+            finalError === null ? null : { code: finalError.code, message: finalError.message },
+        },
+        now, // == turn.completedAt
+      );
+    } catch (err) {
+      this.#log(
+        `session append failed (turn.end): ${err instanceof Error ? err.message : String(err)}`,
+      );
+      // Never acknowledge a completion that is not durable: the record would say the turn never
+      // ended. Interrupted / failed turns already match what cold resume rebuilds (dangling →
+      // interrupted) or report an error, so only `completed` is downgraded.
+      if (status === "completed" && err instanceof RpcError) {
+        finalStatus = "failed";
+        finalError = err.toBody();
+        const errItem: Item = {
+          id: newId("item"),
+          kind: "error",
+          status: "completed",
+          message: finalError.message,
+          code: finalError.code,
+        };
+        this.#notify("item/started", {
+          ...ref,
+          item: { ...errItem, status: "inProgress" } as Item,
+        });
+        turn.items.push(errItem);
+        this.#notify("item/completed", { ...ref, item: errItem });
+      }
+    }
+    turn.status = finalStatus;
+    turn.error = finalError;
     turn.completedAt = now;
     record.activeTurnId = null;
     record.thread.status = "idle";
     record.thread.updatedAt = now;
-    this.#appendFinal(
-      record,
-      "turn.end",
-      {
-        turnId: turn.id,
-        status,
-        error: turn.error === null ? null : { code: turn.error.code, message: turn.error.message },
-      },
-      now, // == turn.completedAt
-    );
     this.#notify("turn/completed", { turn: structuredClone(turn) });
   }
 

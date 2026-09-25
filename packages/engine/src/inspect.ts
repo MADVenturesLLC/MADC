@@ -2,8 +2,9 @@
  * Read-only home report (seat pin §6 item 8, plan A4 "doctor reports seat + last session").
  * `madc doctor` lands in A7; until then this engine export is the A4 helper it will call.
  */
-import { readdirSync, statSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
+import { isStrictlyUnder } from "./home.ts";
 import { RpcError } from "./protocol/errors.ts";
 import { isValidId } from "./protocol/ids.ts";
 import { DEFAULT_SEAT_ID } from "./protocol/types.ts";
@@ -51,11 +52,15 @@ function seatReport(home: string, seatId: string): SeatReport {
   }
 }
 
-/** Newest session file by mtime (ties: larger file name). */
+/**
+ * Newest session file by mtime (ties: larger file name). Only regular files (never symlinks) in a
+ * `sessions/` directory that resolves under the real `MADC_HOME` are considered.
+ */
 function lastSessionPath(home: string): { threadId: string; path: string } | null {
   const dir = join(home, "sessions");
   let names: string[];
   try {
+    if (!isStrictlyUnder(realpathSync(dir), realpathSync(home))) return null;
     names = readdirSync(dir);
   } catch {
     return null;
@@ -68,7 +73,7 @@ function lastSessionPath(home: string): { threadId: string; path: string } | nul
     const path = join(dir, name);
     let mtime: number;
     try {
-      const st = statSync(path);
+      const st = lstatSync(path);
       if (!st.isFile()) continue;
       mtime = st.mtimeMs;
     } catch {

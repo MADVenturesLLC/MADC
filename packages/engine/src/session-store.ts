@@ -4,7 +4,16 @@
  * exactly the bytes on disk. Only the thread-lock holder appends (protocol pin §3.3).
  */
 import { createHash } from "node:crypto";
-import { closeSync, constants, openSync, readFileSync, unlinkSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  unlinkSync,
+  writeSync,
+} from "node:fs";
 import { ErrorCode, RpcError, type SessionWriteFailedData } from "./protocol/errors.ts";
 import { isValidId } from "./protocol/ids.ts";
 import type { Item, RpcErrorBody, Thread, Turn, TurnStatus } from "./protocol/types.ts";
@@ -80,9 +89,13 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
 export function sortedKeyJson(value: unknown): string {
   return JSON.stringify(value, (_key, v: unknown) => {
     if (!isPlainRecord(v)) return v;
-    const out: Record<string, unknown> = {};
-    for (const k of Object.keys(v).sort()) out[k] = v[k];
-    return out;
+    // Object.fromEntries defines own data properties, so a `__proto__` key is kept (and hashed)
+    // instead of hitting the prototype setter.
+    return Object.fromEntries(
+      Object.keys(v)
+        .sort()
+        .map((k) => [k, v[k]]),
+    );
   });
 }
 
@@ -125,9 +138,8 @@ export function createRedactor(secrets: readonly string[]): (value: unknown) => 
     if (typeof value === "string") return redactString(value);
     if (Array.isArray(value)) return value.map(walk);
     if (value !== null && typeof value === "object") {
-      const out: Record<string, unknown> = {};
-      for (const [k, v] of Object.entries(value)) out[redactString(k)] = walk(v);
-      return out;
+      // Own data properties only (a `__proto__` key stays a key, never the prototype setter).
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [redactString(k), walk(v)]));
     }
     return value;
   };
@@ -340,6 +352,8 @@ export function verifySessionText(text: string, expectedThreadId?: string): Sess
     seatId = e.seatId;
     if (e.prevHash !== prevHash) return fail("prevHash does not match the previous hash");
     if (!isPlainRecord(e.payload)) return fail("payload is not an object");
+    const payloadIssue = checkPayload(e.type, e.payload);
+    if (payloadIssue !== null) return fail(payloadIssue);
     if (sessionEventHash(prevHash, e) !== e.hash) return fail("hash mismatch");
     prevHash = e.hash;
     events.push(e);
@@ -347,10 +361,83 @@ export function verifySessionText(text: string, expectedThreadId?: string): Sess
   return { ok: true, events, nextSeq: events.length, lastHash: prevHash };
 }
 
+const isStr = (v: unknown): v is string => typeof v === "string";
+const TURN_END_STATUSES: readonly unknown[] = ["completed", "interrupted", "failed"];
+
+/**
+ * Shape of each event payload (what `rebuildSession` reads). A hash-valid line with a malformed
+ * payload is rejected like any other bad line, so a crafted file can never crash list / resume.
+ */
+function checkPayload(type: SessionEventType, p: Record<string, unknown>): string | null {
+  switch (type) {
+    case "session.open":
+      return (p.cwd === null || isStr(p.cwd)) &&
+        isStr(p.backing) &&
+        isStr(p.providerId) &&
+        isStr(p.pinnedModel)
+        ? null
+        : "malformed session.open payload";
+    case "turn.start":
+      return isValidId(p.turnId) && isStr(p.inputText) ? null : "malformed turn.start payload";
+    case "item": {
+      const item = p.item;
+      if (!isValidId(p.turnId) || !isPlainRecord(item) || !isStr(item.id) || !isStr(item.kind)) {
+        return "malformed item payload";
+      }
+      if (
+        item.kind === "userMessage" &&
+        !(
+          Array.isArray(item.content) &&
+          item.content.every((part: unknown) => isPlainRecord(part) && isStr(part.text))
+        )
+      ) {
+        return "malformed item payload";
+      }
+      return null;
+    }
+    case "servedModel":
+      return isValidId(p.turnId) &&
+        isStr(p.requestedModel) &&
+        isStr(p.servedModel) &&
+        isStr(p.backing) &&
+        isStr(p.providerId)
+        ? null
+        : "malformed servedModel payload";
+    case "turn.end": {
+      const err = p.error;
+      const errOk =
+        err === null || (isPlainRecord(err) && typeof err.code === "number" && isStr(err.message));
+      return isValidId(p.turnId) && TURN_END_STATUSES.includes(p.status) && errOk
+        ? null
+        : "malformed turn.end payload";
+    }
+    case "session.close":
+      return isStr(p.reason) ? null : "malformed session.close payload";
+  }
+}
+
+const READ_FLAGS = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0);
+
+/**
+ * Read and verify `sessions/<threadId>.jsonl`. The final path component must be a regular file,
+ * never a symlink (lstat + `O_NOFOLLOW` where available), so a planted link cannot make list /
+ * resume / the home report read data from outside `MADC_HOME`.
+ */
 export function verifySessionFile(path: string, expectedThreadId?: string): SessionVerifyResult {
   let text: string;
   try {
-    text = readFileSync(path, "utf8");
+    if (!lstatSync(path).isFile()) {
+      return { ok: false, line: 0, reason: "session file is not a regular file" };
+    }
+    const fd = openSync(path, READ_FLAGS);
+    try {
+      if (!fstatSync(fd).isFile()) {
+        return { ok: false, line: 0, reason: "session file is not a regular file" };
+      }
+      text = readFileSync(fd, "utf8");
+    } finally {
+      closeSync(fd);
+    }
   } catch {
     return { ok: false, line: 0, reason: "session file is unreadable" };
   }

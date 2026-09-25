@@ -13,7 +13,7 @@ import {
   statSync,
   writeSync,
 } from "node:fs";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { KIMI_CODE_PROVIDER_ID, resolveKimiPinnedModel } from "@madc/adapters";
 import { enforcePrivateDir, isStrictlyUnder } from "./home.ts";
 import {
@@ -115,16 +115,36 @@ export function seatInvalid(seatId: string, path: string, issues: string[]): Rpc
   } satisfies SeatInvalidData);
 }
 
-/** True when an existing path resolves outside `$MADC_HOME` (a missing path does not escape). */
+/**
+ * True when `path` (which may not exist yet) could resolve outside `realHome`. A missing path is
+ * judged by its deepest existing ancestor, and a missing component that is itself a (dangling)
+ * symlink counts as an escape, so `memory/link/new.md` with `link` → outside is refused even
+ * before `new.md` exists.
+ */
 function escapesHome(realHome: string, path: string): boolean {
-  let real: string;
-  try {
-    real = realpathSync(path);
-  } catch (err) {
-    if (errCode(err) === "ENOENT") return false;
-    return true;
+  let current = path;
+  for (;;) {
+    let real: string;
+    try {
+      real = realpathSync(current);
+    } catch (err) {
+      if (errCode(err) !== "ENOENT") return true;
+      try {
+        lstatSync(current);
+        return true; // exists as a dangling symlink
+      } catch (lerr) {
+        if (errCode(lerr) !== "ENOENT") return true;
+      }
+      const parent = dirname(current);
+      if (parent === current) return true;
+      current = parent;
+      continue;
+    }
+    // The path itself must be strictly under the home; an existing ancestor may be the home.
+    return current === path
+      ? !isStrictlyUnder(real, realHome)
+      : real !== realHome && !isStrictlyUnder(real, realHome);
   }
-  return !isStrictlyUnder(real, realHome);
 }
 
 /**
