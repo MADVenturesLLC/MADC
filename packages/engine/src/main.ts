@@ -33,4 +33,6 @@ export async function startStdioEngine(agent: Agent = echoAgent): Promise<void> 
     });
   }
   await conn.run();
+  // Output failure ends the connection while stdin may still be open: let the process exit.
+  process.stdin.destroy();
 }
