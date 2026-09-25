@@ -1,4 +1,4 @@
-import { existsSync, readdirSync } from "node:fs";
+import { lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
@@ -413,7 +413,12 @@ export class EngineConnection {
    */
   #loadColdThread(threadId: string, handle: LockHandle): ThreadRecord {
     const path = confinedPath(this.#opts.home, "sessions", threadId, ".jsonl");
-    if (!existsSync(path)) throw threadNotFound(threadId);
+    // lstat, not existsSync: a dangling symlink is not "not found"; verification refuses it (-32603).
+    try {
+      lstatSync(path);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") throw threadNotFound(threadId);
+    }
     const verified = verifySessionFile(path, threadId, {}, this.#opts.home);
     if (!verified.ok) {
       this.#log(
