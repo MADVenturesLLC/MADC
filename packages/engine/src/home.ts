@@ -21,7 +21,8 @@ export function resolveMadcHome(env: NodeJS.ProcessEnv = process.env): string {
 
 export type HomeSubdir = "sessions" | "seats" | "memory";
 
-function isStrictlyUnder(child: string, parent: string): boolean {
+/** `child` is strictly inside `parent` (both already resolved). */
+export function isStrictlyUnder(child: string, parent: string): boolean {
   const rel = relative(parent, child);
   return rel !== "" && !isAbsolute(rel) && rel.split(sep)[0] !== "..";
 }
