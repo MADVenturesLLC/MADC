@@ -322,6 +322,14 @@ function processStartMs(pid: number): number | null {
 
 const ORPHAN = /\.lock\.(?:reclaim|tmp)-/;
 
+/**
+ * The suffix of `*.lock.reclaim-<token>` / `*.lock.tmp-<token>` is the lock token, which doctor
+ * never prints (CLI pin §3; Copilot r4107601226): keep the thread id and kind, redact the rest.
+ */
+function redactOrphan(name: string): string {
+  return name.replace(/(\.lock\.(?:reclaim|tmp)-).*$/s, "$1<redacted>");
+}
+
 function checkLocks(home: HomeState): Check {
   if (home.kind !== "present")
     return { id: "locks", status: "pass", summary: "no locks", evidence: { locks: [] } };
@@ -338,8 +346,8 @@ function checkLocks(home: HomeState): Check {
   const now = Date.now();
   for (const name of names) {
     if (ORPHAN.test(name)) {
-      warnings.push(`orphaned ${name}`);
-      locks.push({ file: name, state: "orphaned" });
+      warnings.push(`orphaned ${redactOrphan(name)}`);
+      locks.push({ file: redactOrphan(name), state: "orphaned" });
       continue;
     }
     if (!name.endsWith(".lock")) continue;

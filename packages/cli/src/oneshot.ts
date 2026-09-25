@@ -99,6 +99,8 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
   let error: ErrorOut | null = null;
   let exit: number = EXIT.ok;
   let signalExit: number | null = null;
+  // The engine's exit code from `close()`; `null` = killed by a signal (incl. our close timeout).
+  let engineExit: number | null | undefined;
   let streamed = "";
   const stream = io.stdoutIsTTY && !opts.json;
   const seatId = opts.seatId ?? DEFAULT_SEAT;
@@ -113,11 +115,17 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
     softNow = resolve;
   });
   let softUsed = false;
+  // First SIGINT before the turn exists is held (Bugbot 4107608856): if `turn/start` is in
+  // flight, the turn is interrupted as soon as its id is known; if it was not sent yet, it never
+  // is. A second SIGINT forces.
+  let sigintPending = false;
   const onSigint = () => {
     signalExit = signalExit ?? EXIT.sigint;
     if (!softUsed && turnId !== null) {
       softUsed = true;
       softNow();
+    } else if (!softUsed && !sigintPending) {
+      sigintPending = true;
     } else {
       forceNow();
     }
@@ -217,6 +225,7 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
           io.stderr.write(`\r… ${seatId} · ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
         }, 200);
       }
+      if (sigintPending) throw new Forced();
       const ts = await step(
         withTimeout(
           c.request("turn/start", { threadId: tid, input: [{ type: "text", text: opts.prompt }] }),
@@ -225,7 +234,7 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
       );
       turnId = ts.turn.id;
       turn = ts.turn;
-      if (signalExit !== null && !softUsed) {
+      if (sigintPending && !softUsed) {
         // SIGINT arrived before the turn existed: now it can be interrupted.
         softUsed = true;
         softNow();
@@ -269,7 +278,7 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
     clearStatus();
     if (client !== null) {
       // After a signal: close stdin and kill the engine if it is still running after 1 s.
-      await client.close(signalExit !== null ? KILL_AFTER_MS : CLOSE_TIMEOUT_MS);
+      engineExit = await client.close(signalExit !== null ? KILL_AFTER_MS : CLOSE_TIMEOUT_MS);
     }
     process.removeListener("SIGINT", onSigint);
     process.removeListener("SIGTERM", onSigterm);
@@ -294,6 +303,17 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
         `turn did not complete (${finalTurn.status})`,
       );
     }
+  }
+  // Copilot r4107601276: a turn that completed but an engine that then exits non-zero or has to
+  // be killed on close is an unexpected engine exit (exit 3), unless we signalled it ourselves.
+  if (exit === EXIT.ok && signalExit === null && engineExit !== undefined && engineExit !== 0) {
+    fail(
+      { exit: EXIT.engine, class: "engine" },
+      null,
+      engineExit === null
+        ? "engine did not exit after stdin closed (killed)"
+        : `engine exited with code ${engineExit} after the turn`,
+    );
   }
   if (exit === EXIT.ok && client !== null && client.protocolViolations.length > 0) {
     fail(

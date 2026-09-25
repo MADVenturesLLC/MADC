@@ -43,7 +43,24 @@ function append(type: string, payload: Record<string, unknown>): void {
   seq++;
 }
 
-createInterface({ input: process.stdin }).on("line", (line) => {
+const mark = process.env.MADC_TEST_FAKE_MARK;
+const rl = createInterface({ input: process.stdin });
+// "exit-nonzero": the turn completes normally, then the engine exits 7 on stdin EOF.
+rl.on("close", () => {
+  if (scenario === "exit-nonzero") process.exitCode = 7;
+});
+function inProgress(): Record<string, unknown> {
+  return {
+    id: turnId,
+    threadId,
+    status: "inProgress",
+    items: [],
+    error: null,
+    startedAt: 1,
+    completedAt: null,
+  };
+}
+rl.on("line", (line) => {
   const msg = JSON.parse(line) as { id?: number; method: string; params?: Record<string, unknown> };
   if (msg.id === undefined) return;
   switch (msg.method) {
@@ -83,6 +100,16 @@ createInterface({ input: process.stdin }).on("line", (line) => {
       return;
     }
     case "turn/start": {
+      if (scenario === "slow-start") {
+        // "slow-start": the turn/start response is delayed 1.5 s (the test signals meanwhile),
+        // then the turn runs until turn/interrupt.
+        if (mark !== undefined) writeFileSync(mark, "turn/start\n");
+        setTimeout(() => {
+          append("turn.start", { turnId, inputText: "hi" });
+          send({ id: msg.id, result: { turn: inProgress() } });
+        }, 1500);
+        return;
+      }
       const turn = {
         id: turnId,
         threadId,
@@ -113,6 +140,16 @@ createInterface({ input: process.stdin }).on("line", (line) => {
             completedAt: 2,
           },
         },
+      });
+      return;
+    }
+    case "turn/interrupt": {
+      if (mark !== undefined) appendFileSync(mark, "turn/interrupt\n");
+      append("turn.end", { turnId, status: "interrupted", error: null });
+      send({ id: msg.id, result: {} });
+      send({
+        method: "turn/completed",
+        params: { turn: { ...inProgress(), status: "interrupted", completedAt: 2 } },
       });
       return;
     }
