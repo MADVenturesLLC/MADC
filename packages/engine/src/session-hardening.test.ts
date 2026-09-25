@@ -7,6 +7,8 @@
  * home (create / resume), and the seat seed never writes through a swapped `seats/` directory.
  * Copilot review 5317584394: create's cleanup never deletes a file it did not create; a dangling
  * session symlink is refused (-32603), not reported as not found.
+ * Copilot review 5317728570: a `toJSON` hook never smuggles an unredacted value into the JSONL; a
+ * resume is bound to the file that was verified (dev + inode).
  * Network-free: in-process engines only.
  */
 import assert from "node:assert/strict";
@@ -525,6 +527,98 @@ test("R-dangling: a dangling sessions/<id>.jsonl symlink is refused (-32603), no
   } finally {
     e.input.end();
     await e.done;
+    cleanup();
+  }
+});
+
+test("R-tojson: a toJSON hook in a payload never writes an unredacted secret", () => {
+  const { home, cleanup } = makeHome();
+  const secret = "super-secret-configured-value";
+  try {
+    const sessions = join(home, "sessions");
+    mkdirSync(sessions, { recursive: true });
+    const path = join(sessions, "thr_hook.jsonl");
+    const w = SessionWriter.create(
+      path,
+      "thr_hook",
+      "madc-default",
+      { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" },
+      () => [secret],
+      1000,
+      home,
+    );
+    const hookFn = Object.assign(() => 0, { toJSON: () => secret });
+    w.append("item", {
+      turnId: "turn_1",
+      item: {
+        id: "item_1",
+        kind: "agentMessage",
+        status: "completed",
+        text: "ok",
+        nested: { toJSON: () => secret },
+        list: [hookFn, { toJSON: () => `Bearer ${secret}` }],
+        toJSON: () => ({ text: secret }),
+      },
+    } as never);
+    const text = readFileSync(path, "utf8");
+    assert.equal(text.includes(secret), false, "the secret never reaches the JSONL");
+    const r = verifySessionFile(path, "thr_hook", {}, home);
+    assert.equal(r.ok, true);
+    const item = (r.ok ? r.events[1]?.payload : undefined) as { item: Record<string, unknown> };
+    assert.equal(item.item.text, "ok");
+    assert.deepEqual(item.item.nested, {});
+    assert.deepEqual(item.item.list, [null, {}]);
+  } finally {
+    cleanup();
+  }
+});
+
+test("R-resume-identity: resume refuses a different file swapped in after verification", () => {
+  if (!POSIX) return; // directory rename semantics
+  const { home, cleanup } = makeHome();
+  try {
+    const sessions = join(home, "sessions");
+    const path = writeSampleSession(sessions);
+    const verified = verifySessionFile(path, "thr_sample", {}, home);
+    assert.equal(verified.ok, true);
+    if (!verified.ok) return;
+    assert.notEqual(verified.file, undefined);
+    // The verified file still in place: resume works and the chain continues.
+    const same = SessionWriter.resume(
+      path,
+      "thr_sample",
+      "madc-default",
+      verified.nextSeq,
+      verified.lastHash,
+      () => [],
+      home,
+      verified.file,
+    );
+    same.append("turn.start", { turnId: "turn_2", inputText: "a" });
+    assert.equal(verifySessionFile(path, "thr_sample", {}, home).ok, true);
+    // Swapped (inside the home) between verification and resume: refused, nothing appended.
+    const again = verifySessionFile(path, "thr_sample", {}, home);
+    assert.equal(again.ok, true);
+    if (!again.ok) return;
+    renameSync(sessions, join(home, "sessions-old"));
+    const replacement = writeSampleSession(sessions);
+    const replacementBytes = readFileSync(replacement, "utf8");
+    assert.throws(
+      () =>
+        SessionWriter.resume(
+          path,
+          "thr_sample",
+          "madc-default",
+          again.nextSeq,
+          again.lastHash,
+          () => [],
+          home,
+          again.file,
+        ),
+      (err: RpcError) => err.code === -32009 && (err.data as { seq: number }).seq === again.nextSeq,
+    );
+    assert.equal(readFileSync(replacement, "utf8"), replacementBytes, "replacement untouched");
+  } finally {
     cleanup();
   }
 });
