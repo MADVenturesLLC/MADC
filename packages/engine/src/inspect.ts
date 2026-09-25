@@ -9,7 +9,7 @@ import { RpcError } from "./protocol/errors.ts";
 import { isValidId } from "./protocol/ids.ts";
 import { DEFAULT_SEAT_ID } from "./protocol/types.ts";
 import { loadSeat, seatFilePath } from "./seat-store.ts";
-import { verifySessionFile } from "./session-store.ts";
+import { type SessionFailureKind, verifySessionFile } from "./session-store.ts";
 
 export type SeatReport =
   | { readonly id: string; readonly path: string; readonly ok: true }
@@ -28,7 +28,13 @@ export type SessionReport = {
   readonly events: number;
   readonly chain:
     | { readonly ok: true }
-    | { readonly ok: false; readonly line: number; readonly reason: string };
+    | {
+        readonly ok: false;
+        readonly line: number;
+        readonly reason: string;
+        /** Amendment 2 §5: `torn-tail` (crash residue) or `integrity` (may be tampering). */
+        readonly kind: SessionFailureKind;
+      };
 };
 
 export type HomeReport = {
@@ -107,7 +113,7 @@ export function inspectMadcHome(home: string, seatId: string = DEFAULT_SEAT_ID):
           ...last,
           seatId: null,
           events: 0,
-          chain: { ok: false, line: result.line, reason: result.reason },
+          chain: { ok: false, line: result.line, reason: result.reason, kind: result.kind },
         };
   }
   return { home, seat: seatReport(home, seatId), lastSession };

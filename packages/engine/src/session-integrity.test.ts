@@ -24,8 +24,10 @@ import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
 import { type Agent, echoAgent } from "./agent.ts";
 import { EngineClient, withoutUndefined } from "./client.ts";
+import { inspectMadcHome } from "./inspect.ts";
 import { acquireThreadLock, isPidAlive, readLock, reclaimIfUnchanged } from "./lock.ts";
 import type { Turn } from "./protocol/types.ts";
+import { seedDefaultSeat } from "./seat-store.ts";
 import { EngineConnection } from "./server.ts";
 import {
   SessionWriter,
@@ -619,6 +621,85 @@ test("A2 §8.5 torn tail vs integrity: half line and NUL tail are torn-tail, a m
       assert.equal(existsSync(lockPath(home, "thr_torn")), false, `${name}: lock released`);
     }
     assert.equal(verifySessionText(good, "thr_torn").ok, true);
+  } finally {
+    cleanup();
+  }
+});
+
+test("A2 §5 inspectMadcHome carries the torn-tail / integrity kind (Copilot r4107434941)", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const path = sampleSession(home);
+    const good = readFileSync(path, "utf8");
+    writeFileSync(path, `${good}{"v":1`);
+    const torn = inspectMadcHome(home).lastSession?.chain;
+    assert.deepEqual(torn, {
+      ok: false,
+      line: 4,
+      reason: "unterminated last line",
+      kind: "torn-tail",
+    });
+    writeFileSync(path, good.replace('"inputText":"hi"', '"inputText":"HI"'));
+    const edited = inspectMadcHome(home).lastSession?.chain;
+    assert.equal(edited?.ok === false ? edited.kind : null, "integrity");
+  } finally {
+    cleanup();
+  }
+});
+
+test("A2 §3 dangling turns close in one batch: a failed close leaves the file untouched (Copilot r4107434889)", async () => {
+  const { home, cleanup } = makeHome();
+  try {
+    mkdirSync(join(home, "sessions"), { recursive: true });
+    seedDefaultSeat(home);
+    const path = sessionPath(home, "thr_dangle");
+    const w = SessionWriter.create(
+      path,
+      "thr_dangle",
+      "madc-default",
+      {
+        cwd: null,
+        backing: "kimi-code",
+        providerId: "kimi-code",
+        pinnedModel: "kimi-coding/kimi-for-coding",
+      },
+      () => [],
+    );
+    w.append("turn.start", { turnId: "turn_a", inputText: "a" });
+    w.append("turn.start", { turnId: "turn_b", inputText: "b" });
+    const before = sha256(path);
+    let syncs = 0;
+    setSessionFsyncForTests({
+      file: () => {
+        syncs++;
+        throw new Error("EIO (injected)");
+      },
+    });
+    const e = inProcess(home);
+    try {
+      await e.init();
+      const r = await e.request("thread/resume", { threadId: "thr_dangle" });
+      assert.equal((r.error as { code: number }).code, -32009);
+      assert.equal(syncs, 1, "both turn.end events were one batch");
+      assert.equal(sha256(path), before, "nothing of the recovery persisted");
+      assert.equal(existsSync(lockPath(home, "thr_dangle")), false, "lock released");
+    } finally {
+      setSessionFsyncForTests(null);
+    }
+    let okSyncs = 0;
+    setSessionFsyncForTests({ file: () => void okSyncs++ });
+    let ok: Awaited<ReturnType<typeof e.request>>;
+    try {
+      ok = await e.request("thread/resume", { threadId: "thr_dangle" });
+    } finally {
+      setSessionFsyncForTests(null);
+    }
+    assert.equal(okSyncs, 1, "two dangling turns → one durable batch (one fsync)");
+    assert.ok(ok.result, JSON.stringify(ok.error));
+    const tail = seqTypes(path).slice(-2);
+    assert.deepEqual(tail, ["3 turn.end", "4 turn.end"]);
+    assert.equal(verifySessionFile(path, "thr_dangle").ok, true);
+    await e.close();
   } finally {
     cleanup();
   }

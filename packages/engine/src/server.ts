@@ -451,15 +451,23 @@ export class EngineConnection {
       // Amendment 2 §2: bound to this acquisition and to the verified byte size.
       { holdsLock: () => holdsThreadLock(handle), expectedSize: verified.size },
     );
-    for (const turnId of rebuilt.danglingTurnIds) {
-      // Same ts as the rebuilt turn's completedAt; the thread's updatedAt covers the close.
-      const closedAt = rebuilt.turns.find((t) => t.id === turnId)?.completedAt ?? Date.now();
-      const event = session.append(
-        "turn.end",
-        { turnId, status: "interrupted", error: null },
+    if (rebuilt.danglingTurnIds.length > 0) {
+      // All dangling turns close in ONE append batch (Copilot r4107434889): either every
+      // `turn.end` is durable or none is (rolled back), so a failed reload / resume never leaves a
+      // partially recovered file. rebuildSession gives every dangling turn the same completedAt;
+      // that is the batch ts, and the thread's updatedAt covers the close.
+      const closedAt =
+        rebuilt.turns.find((t) => t.id === rebuilt.danglingTurnIds[0])?.completedAt ?? Date.now();
+      const events = session.appendAll(
+        rebuilt.danglingTurnIds.map((turnId) => ({
+          type: "turn.end" as const,
+          payload: { turnId, status: "interrupted" as const, error: null },
+        })),
         closedAt,
       );
-      rebuilt.thread.updatedAt = Math.max(rebuilt.thread.updatedAt, event.ts);
+      for (const event of events) {
+        rebuilt.thread.updatedAt = Math.max(rebuilt.thread.updatedAt, event.ts);
+      }
     }
     const turns = new Map<string, TurnRecord>();
     for (const turn of rebuilt.turns) {

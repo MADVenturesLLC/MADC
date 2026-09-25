@@ -359,6 +359,7 @@ test("honesty §6.5: thread/resume of a tampered session → -32603, lock releas
         ok: false,
         line: 2,
         reason: "hash mismatch",
+        kind: "integrity",
       });
     } finally {
       await b.client.close();
