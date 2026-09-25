@@ -896,6 +896,21 @@ test("A7 §4 exit 3: a turn/completed without items is a protocol violation, one
     });
     sb2.cleanup();
     assert.equal(h.code, 3, h.stdout + h.stderr);
+    // Another turn's completion, and a path-like thread id, are protocol errors (Copilot
+    // r4108865790, review 5322990263).
+    for (const scenario of ["wrong-turn-id", "bad-thread-id"]) {
+      const sb4 = sandbox();
+      const w = await runCli(sb4, ["-p", "hi", "--json"], {
+        engine: FAKE,
+        env: { MADC_TEST_FAKE_SCENARIO: scenario },
+      });
+      sb4.cleanup();
+      assert.equal(w.code, 3, `${scenario}: ${w.stdout}${w.stderr}`);
+      assert.match(
+        (JSON.parse(w.stdout) as { error: { message: string } }).error.message,
+        /protocol violation/,
+      );
+    }
     // Items are validated too (Copilot r4108764755): an agentMessage without text → 3, in both modes.
     for (const json of [true, false]) {
       const sb3 = sandbox();
