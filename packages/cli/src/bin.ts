@@ -1,11 +1,14 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { MADC_VERSION } from "@madc/core";
+import { processIO } from "./io.ts";
+import { main } from "./main.ts";
 
-export function runCli(write: (s: string) => void = (s) => process.stdout.write(s)): number {
-  write(`${MADC_VERSION}\n`);
-  return 0;
+/** Run the CLI against the real process and exit once stdout has flushed. */
+export async function runBin(engineEntry?: string): Promise<void> {
+  const code = await main(process.argv.slice(2), processIO(engineEntry));
+  process.exitCode = code;
+  process.stdout.write("", () => process.exit(code));
 }
 
 function isMain(): boolean {
@@ -19,5 +22,5 @@ function isMain(): boolean {
 }
 
 if (isMain()) {
-  process.exit(runCli());
+  await runBin();
 }
