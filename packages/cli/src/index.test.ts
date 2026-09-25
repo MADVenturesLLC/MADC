@@ -1,12 +1,13 @@
 /** A7 unit tests: argument grammar (CLI pin §1), exit-code table (§4), colour rules (§3). */
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { ErrorCode } from "@madc/engine/client";
 import { CHAT_RESERVED, parseArgs } from "./args.ts";
+import { sha256OrNull } from "./doctor.ts";
 import { classifyCode, EXIT } from "./exit-codes.ts";
 import { type CliIO, colorEnabled } from "./io.ts";
 import { main } from "./main.ts";
@@ -149,6 +150,22 @@ test("A7 §1 MADC_HOME that exists but is not a directory → one-shot exit 2 be
     assert.equal(parsed.error.class, "usage");
     assert.match(parsed.error.message, /not a directory/);
     assert.equal(readFileSync(file, "utf8"), "x");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("A7 §3 doctor hashes through one no-follow descriptor: a symlink is never followed (Copilot review 5322024643)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "madc-a7-sha-"));
+  try {
+    const real = join(dir, "real.json");
+    writeFileSync(real, "{}");
+    assert.match(sha256OrNull(real) ?? "", /^[0-9a-f]{64}$/);
+    const link = join(dir, "link.json");
+    symlinkSync(real, link);
+    assert.equal(sha256OrNull(link), null, "symlink not followed");
+    assert.equal(sha256OrNull(dir), null, "directory is not a regular file");
+    assert.equal(sha256OrNull(join(dir, "absent")), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

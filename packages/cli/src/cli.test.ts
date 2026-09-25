@@ -701,6 +701,43 @@ test("A7 §3 doctor never follows a sessions symlink out of MADC_HOME; a non-dir
   }
 });
 
+test("A7 §3 doctor never hashes through a seat symlink; an unreadable sessions/ is WARN, never PASS (Copilot review 5322024643)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  const sessions = join(sb.home, "sessions");
+  try {
+    await seedWithSession(sb);
+    const seat = join(sb.home, "seats", "madc-default.json");
+    const outside = join(sb.root, "outside-seat.json");
+    writeFileSync(outside, readFileSync(seat));
+    const outsideSha = createHash("sha256").update(readFileSync(outside)).digest("hex");
+    rmSync(seat);
+    symlinkSync(outside, seat);
+    const r = await runCli(sb, ["doctor", "--json"]);
+    const seatRow = check(JSON.parse(r.stdout) as DoctorJson, "seat");
+    assert.notEqual(seatRow.status, "pass", "a symlinked seat is not hashed as healthy");
+    assert.equal(r.stdout.includes(outsideSha), false, "bytes outside MADC_HOME never hashed");
+
+    if (process.platform === "win32") {
+      console.log("SKIP unreadable sessions/: chmod has no effect on Windows");
+      return;
+    }
+    chmodSync(sessions, 0o000);
+    const u = await runCli(sb, ["doctor", "--json"]);
+    const locks = check(JSON.parse(u.stdout) as DoctorJson, "locks");
+    assert.equal(locks.status, "warn", u.stdout);
+    assert.match(locks.summary, /unreadable \(EACCES\): not inspected/);
+  } finally {
+    try {
+      chmodSync(sessions, 0o755);
+    } catch {
+      // not created
+    }
+    sb.cleanup();
+  }
+});
+
 test("A7 §2 a first SIGINT while turn/start is in flight still sends turn/interrupt (Bugbot 4107608856)", {
   timeout: 60_000,
 }, async () => {

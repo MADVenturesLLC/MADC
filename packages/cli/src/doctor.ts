@@ -7,9 +7,12 @@
 import { createHash } from "node:crypto";
 import {
   accessSync,
+  closeSync,
   constants,
+  fstatSync,
   lstatSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
@@ -62,15 +65,21 @@ function versionAtLeast(version: string, floor: string): boolean {
   return true;
 }
 
-const sha256File = (path: string): string =>
-  createHash("sha256").update(readFileSync(path)).digest("hex");
-
-function sha256OrNull(path: string): string | null {
+/**
+ * sha256 of a regular file read through ONE no-follow descriptor (Copilot review 5322024643,
+ * "previously missed"): the type check and the bytes hashed are bound to the same inode, and a
+ * symlink swapped in at `path` is never followed. `null` = absent, not a regular file, or unreadable.
+ */
+export function sha256OrNull(path: string): string | null {
+  let fd: number | undefined;
   try {
-    if (!lstatSync(path).isFile()) return null;
-    return sha256File(path);
+    fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
+    if (!fstatSync(fd).isFile()) return null;
+    return createHash("sha256").update(readFileSync(fd)).digest("hex");
   } catch {
     return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
   }
 }
 
@@ -347,7 +356,8 @@ function checkLocks(home: HomeState): Check {
     let st: ReturnType<typeof lstatSync> | undefined;
     try {
       st = lstatSync(dir);
-    } catch {
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       return { id: "locks", status: "pass", summary: "no locks", evidence: { locks: [] } };
     }
     if (
@@ -363,8 +373,16 @@ function checkLocks(home: HomeState): Check {
       };
     }
     names = readdirSync(dir).sort();
-  } catch {
-    return { id: "locks", status: "pass", summary: "no locks", evidence: { locks: [] } };
+  } catch (err) {
+    // `sessions/` exists (lstat above) but could not be resolved or listed: never a healthy PASS
+    // (Copilot review 5322024643, "previously missed").
+    const code = (err as NodeJS.ErrnoException).code ?? "error";
+    return {
+      id: "locks",
+      status: "warn",
+      summary: `${dir} unreadable (${code}): not inspected`,
+      evidence: { path: dir, error: code },
+    };
   }
   const warnings: string[] = [];
   const held: string[] = [];
