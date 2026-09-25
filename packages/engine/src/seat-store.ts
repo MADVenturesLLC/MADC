@@ -77,16 +77,32 @@ export function serializeSeat(seat: EngineSeat): string {
 /** `link` errors meaning "this filesystem has no hard links" (fall back to an in-place create). */
 const NO_HARD_LINKS = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EXDEV"]);
 
+/** dev + inode of a file the seed writer created (checked again after the link). */
+type FileId = { readonly dev: bigint; readonly ino: bigint };
+
 /**
- * Create `path` exclusively (0600, no-follow), write all of `bytes`, fsync. If anything after the
- * create fails, the partial file is removed and the error rethrown.
+ * Create `path` exclusively (0600, no-follow), write all of `bytes`, fsync. `inPlace(fd)` must hold
+ * right after the open (the parent still resolves to the real `seats/` under the home, and the path
+ * names the opened fd) before a byte is written; otherwise the empty file is left alone and the
+ * seed fails. If anything after that fails, the partial file is removed and the error rethrown.
  */
-function writeNewFile(path: string, bytes: Buffer): void {
+function writeNewFile(path: string, bytes: Buffer, inPlace: (fd: number) => boolean): FileId {
   const fd = openSync(
     path,
     constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
     0o600,
   );
+  let id: FileId | null = null;
+  try {
+    const st = fstatSync(fd, { bigint: true });
+    if (inPlace(fd)) id = { dev: st.dev, ino: st.ino };
+  } catch {
+    id = null;
+  }
+  if (id === null) {
+    closeSync(fd);
+    throw new Error("seats/ under MADC_HOME changed while the seed was being written");
+  }
   try {
     try {
       let off = 0;
@@ -103,6 +119,14 @@ function writeNewFile(path: string, bytes: Buffer): void {
     }
     throw err;
   }
+  return id;
+}
+
+/** Test seam (internal): hooks just before the seed's temp file is opened / linked. */
+export type SeedTestHooks = { beforeOpen?: () => void; beforeLink?: () => void };
+let seedHooks: SeedTestHooks = {};
+export function setSeedHooksForTests(hooks: SeedTestHooks | null): void {
+  seedHooks = hooks ?? {};
 }
 
 function errCode(err: unknown): string | undefined {
@@ -149,16 +173,37 @@ export function seedDefaultSeat(home: string): SeedResult {
   } catch (err) {
     if (errCode(err) !== "ENOENT") throw err;
   }
+  // Every file the seed creates must sit in this real seats/ directory, strictly under the real
+  // home: a seats/ swapped for a symlink after the checks above is refused before any byte is
+  // written (Node has no openat, so this is checked on the opened fd, and again after the link).
+  const realSeats = realpathSync(join(home, "seats"));
+  if (!isStrictlyUnder(realSeats, realpathSync(home))) {
+    throw new Error("seats under MADC_HOME must be a real directory");
+  }
+  const isAt = (p: string, id: FileId): boolean => {
+    if (realpathSync(dirname(p)) !== realSeats) return false;
+    const st = lstatSync(p, { bigint: true });
+    return st.isFile() && st.dev === id.dev && st.ino === id.ino;
+  };
+  const opened = (p: string) => (fd: number) => {
+    const st = fstatSync(fd, { bigint: true });
+    return isAt(p, { dev: st.dev, ino: st.ino });
+  };
   const bytes = Buffer.from(serializeSeat(MADC_DEFAULT_SEAT), "utf8");
   const tmp = join(
     home,
     "seats",
     `.${MADC_DEFAULT_SEAT.id}.json.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
   );
-  writeNewFile(tmp, bytes);
+  seedHooks.beforeOpen?.();
+  const tmpId = writeNewFile(tmp, bytes, opened(tmp));
   try {
     try {
+      seedHooks.beforeLink?.();
       linkSync(tmp, path);
+      if (!isAt(path, tmpId)) {
+        throw new Error("seats/ under MADC_HOME changed while the seed was being linked");
+      }
     } catch (err) {
       const code = errCode(err);
       if (code === "EEXIST") return { path, created: false };
@@ -166,7 +211,7 @@ export function seedDefaultSeat(home: string): SeedResult {
       // Filesystem without hard links: exclusive create in place; a failed write removes
       // the partial file before rethrowing.
       try {
-        writeNewFile(path, bytes);
+        writeNewFile(path, bytes, opened(path));
       } catch (werr) {
         if (errCode(werr) === "EEXIST") return { path, created: false };
         throw werr;
