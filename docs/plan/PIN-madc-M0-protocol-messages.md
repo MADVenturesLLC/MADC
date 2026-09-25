@@ -2,6 +2,8 @@
 
 *Surface Architect · 2026-09-24 · Venue: `MADVenturesLLC/MADC` · Status: **build pin** — gates Hephaestus Act M0-A2. Docs only.*
 
+*Amendment 1 (2026-09-24): lock token, fixes A2 Copilot W1 (PR #7), Founder-authorized.*
+
 **Authority:**
 
 - `docs/plan/PLAN-madc-M0-build-plan.md` — Founder-accepted; on `main` via PR #2, merge commit `9c71afd5c99d44443eecce2a0b4678e90dea6cb0`.
@@ -76,7 +78,12 @@ Connection lifecycle:
 
 `UserInput` M0: `{ type: "text", text: string }` only.
 **One active turn per thread in M0:** `turn/start` while a turn is `inProgress` on that thread → `-32004 TurnAlreadyActive`.
-**Cross-process ownership:** each CLI run spawns its own engine, so the rule is enforced on disk. `thread/start` / `thread/resume` take an exclusive lock `sessions/<threadId>.lock` (create-exclusive, contents `{ pid, startedAt }`) held until the connection ends. Lock held by a live process → `-32004` with `activeTurnId: null` and `lockHolderPid`; lock whose pid is dead is reclaimed. Only the lock holder appends to `sessions/<threadId>.jsonl`.
+**Cross-process ownership:** each CLI run spawns its own engine, so the rule is enforced on disk. `thread/start` / `thread/resume` take an exclusive lock `sessions/<threadId>.lock` (create-exclusive) held until the connection ends. Lock body is exactly `{ pid, startedAt, token }`. `token` is 32 lowercase hex chars (128 random bits, e.g. `crypto.randomBytes(16).toString("hex")`), valid iff it matches `^[0-9a-f]{32}$`, generated fresh on every acquisition and never reused. The holder keeps its token in memory. Lock held by a live process → `-32004` with `activeTurnId: null` and `lockHolderPid`. Only the lock holder appends to `sessions/<threadId>.jsonl`. Ownership checks compare `token`; pid + startedAt + inode alone are not unique (Amendment 1):
+
+- **(a) Release** unlinks the lock only if the on-disk body's `token` equals the holder's in-memory token. Otherwise it leaves the file alone.
+- **(b) Reclaim** (lock pid dead): rename the lock aside to a unique name (e.g. `sessions/<threadId>.lock.reclaim-<reclaimer token>`), re-read the renamed body, and delete it only if it still matches the observed dead holder's `pid` + `startedAt` + `token` (for a (c) body, the same missing or invalid `token` value). On mismatch, restore it (link or rename back to `sessions/<threadId>.lock`) and treat the thread as locked (`-32004`).
+- **(c) Legacy / corrupt body** (`token` missing or not matching `^[0-9a-f]{32}$`): reclaimable via (b) only if its pid is dead. With a live pid the thread is locked (`-32004`).
+- **(d) Errors unchanged:** `-32004 TurnAlreadyActive` still returns `lockHolderPid` (§4.1). `token` is never sent on the wire, never logged (stderr included), and never written to session JSONL.
 
 ### 3.4 Items (notifications only)
 
@@ -261,6 +268,7 @@ A2 is done when all pass on **Node 22.19 and Bun**:
 6. ACP module exports stub + `NotImplemented`; no editor wiring.
 7. No WS/HTTP server code paths in M0 packages.
 8. A2 PR description references this pin; deviations need a Founder note.
+9. Lock-token tests (Amendment 1, A2 W1 follow-up): a same-pid, same-`startedAt` re-acquisition with a different `token` — the stale holder's release does not delete the new lock, and a reclaim does not delete a lock whose `token` changed; the `token` never appears in any protocol response, log / stderr line, or session JSONL.
 
 Codes `-32005..-32009` are defined here so A3/A4/A5/A6 share one table; their tests land in those acts.
 
