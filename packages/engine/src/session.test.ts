@@ -12,6 +12,7 @@ import {
   statSync,
   symlinkSync,
   writeFileSync,
+  writeSync,
 } from "node:fs";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
@@ -30,6 +31,7 @@ import {
   rebuildSession,
   SessionWriter,
   sessionEventHash,
+  setSessionWriteForTests,
   sortedKeyJson,
   verifySessionFile,
   verifySessionText,
@@ -174,6 +176,18 @@ test("§6.3 / §6.4: a seat run writes session.open → turn.start → items →
       ],
     );
     for (const line of lines) {
+      // Line key order is stable (payload last), including for multi-event appends.
+      assert.deepEqual(Object.keys(line), [
+        "v",
+        "seq",
+        "ts",
+        "type",
+        "threadId",
+        "seatId",
+        "prevHash",
+        "hash",
+        "payload",
+      ]);
       // Envelope is exactly the seat pin §4 line (v:1): no fields beyond the M0 pin.
       assert.deepEqual(Object.keys(line).sort(), [
         "hash",
@@ -1078,6 +1092,171 @@ test("forward compat: unknown event types and extra payload fields verify, list,
   } finally {
     e.input.end();
     await e.done;
+    cleanup();
+  }
+});
+
+// ------------------------------------------------------- Copilot re-review (PR #13) regressions
+
+/** Write seam: the first write of a buffer containing `marker` lands half its bytes, then throws. */
+function failHalfwayOn(marker: string): void {
+  let armed = false;
+  setSessionWriteForTests((fd, buf, off, len) => {
+    if (!armed && buf.toString("utf8").includes(marker)) {
+      armed = true;
+      const half = Math.max(1, Math.floor(len / 2));
+      writeSync(fd, buf, off, half);
+      return half;
+    }
+    if (armed && buf.toString("utf8").includes(marker)) throw new Error("ENOSPC (test)");
+    return writeSync(fd, buf, off, len);
+  });
+}
+
+test("R-dual: the receipt pair is one append; a failed receipt append leaves neither line and is never completed", async () => {
+  const { home, cleanup } = makeHome();
+  const receiptAgent: Agent = {
+    name: "receipt",
+    async run(_ctx, sink) {
+      const id = sink.newItemId();
+      const receipt = {
+        id,
+        kind: "servedModel" as const,
+        requestedModel: "kimi-coding/kimi-for-coding",
+        servedModel: "kimi-for-coding",
+        backing: "kimi-code" as const,
+        providerId: "kimi-code",
+      };
+      sink.startItem({ ...receipt, status: "inProgress" });
+      sink.completeItem({ ...receipt, status: "completed" });
+    },
+  };
+  const e = inProcess(home, receiptAgent);
+  try {
+    await e.request("initialize", { clientInfo: { name: "t", version: "0" } });
+    const start = await e.request("thread/start", {});
+    const threadId = (start.result as { thread: { id: string } }).thread.id;
+    failHalfwayOn('"type":"servedModel"');
+    await e.request("turn/start", { threadId, input: [{ type: "text", text: "x" }] });
+    const done = await e.waitFor((m) => m.method === "turn/completed");
+    const turn = (done.params as { turn: Turn }).turn;
+    assert.equal(turn.status, "failed");
+    assert.equal(turn.error?.code, -32009);
+    assert.deepEqual(turn.error?.data, {
+      threadId,
+      path: sessionPath(home, threadId),
+      seq: 3,
+    });
+    // Never exposed as a completed receipt: closed as failed by the terminal transition.
+    const completedReceipts = e.received.filter(
+      (m) =>
+        m.method === "item/completed" &&
+        (m.params?.item as Item | undefined)?.kind === "servedModel" &&
+        (m.params?.item as Item | undefined)?.status === "completed",
+    );
+    assert.deepEqual(completedReceipts, []);
+    assert.deepEqual(
+      turn.items.map((i) => `${i.kind}:${i.status}`),
+      ["userMessage:completed", "servedModel:failed", "error:completed"],
+    );
+    // On disk: neither half of the pair (the half-written bytes were rolled back).
+    const path = sessionPath(home, threadId);
+    assert.deepEqual(
+      readLines(path).map((l) => l.type),
+      ["session.open", "turn.start", "item"],
+    );
+    assert.equal(verifySessionFile(path, threadId).ok, true);
+  } finally {
+    setSessionWriteForTests(null);
+    e.input.end();
+    await e.done;
+    cleanup();
+  }
+});
+
+test("appendAll: a failed write is rolled back to the previous size and breaks the writer", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const path = writeSampleSession(home);
+    const before = readFileSync(path, "utf8");
+    const w = SessionWriter.resume(
+      path,
+      "thr_sample",
+      "madc-default",
+      4,
+      readLines(path)[3]?.hash ?? "",
+      () => [],
+    );
+    failHalfwayOn('"turn_2"');
+    assert.throws(
+      () =>
+        w.appendAll([
+          { type: "turn.start", payload: { turnId: "turn_2", inputText: "a" } },
+          { type: "turn.end", payload: { turnId: "turn_2", status: "completed", error: null } },
+        ]),
+      (err: RpcError) => err.code === -32009 && (err.data as { seq: number }).seq === 4,
+    );
+    setSessionWriteForTests(null);
+    assert.equal(readFileSync(path, "utf8"), before, "no torn or partial tail");
+    assert.equal(w.broken, true);
+    assert.throws(
+      () => w.append("turn.start", { turnId: "turn_3", inputText: "b" }),
+      (err: RpcError) => err.code === -32009,
+    );
+    assert.equal(readFileSync(path, "utf8"), before);
+    // A successful batch: consecutive seqs, chained, one unit.
+    const ok = SessionWriter.resume(
+      path,
+      "thr_sample",
+      "madc-default",
+      4,
+      readLines(path)[3]?.hash ?? "",
+      () => [],
+    );
+    const events = ok.appendAll([
+      { type: "turn.start", payload: { turnId: "turn_2", inputText: "a" } },
+      { type: "turn.end", payload: { turnId: "turn_2", status: "completed", error: null } },
+    ]);
+    assert.deepEqual(
+      events.map((ev) => ev.seq),
+      [4, 5],
+    );
+    assert.equal(events[1]?.prevHash, events[0]?.hash);
+    assert.equal(ok.nextSeq, 6);
+    assert.equal(verifySessionFile(path, "thr_sample").ok, true);
+  } finally {
+    setSessionWriteForTests(null);
+    cleanup();
+  }
+});
+
+test("R-nofollow fallback: without O_NOFOLLOW a symlink, or a swap to one after lstat, is never read", () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside-fallback");
+  try {
+    const target = writeSampleSession(outside);
+    mkdirSync(join(home, "sessions"), { recursive: true });
+    const path = join(home, "sessions", "thr_sample.jsonl");
+    const notRegular = { ok: false, line: 0, reason: "session file is not a regular file" };
+    // A plain regular file verifies through the fallback path.
+    writeFileSync(path, readFileSync(target));
+    assert.equal(verifySessionFile(path, "thr_sample", { noFollowFlag: false }).ok, true);
+    // Swapped for a symlink between lstat and open: dev + inode differ, refused.
+    assert.deepEqual(
+      verifySessionFile(path, "thr_sample", {
+        noFollowFlag: false,
+        afterLstat: () => {
+          rmSync(path);
+          symlinkSync(target, path);
+        },
+      }),
+      notRegular,
+    );
+    // A symlink already in place is refused before any open.
+    assert.deepEqual(verifySessionFile(path, "thr_sample", { noFollowFlag: false }), notRegular);
+    assert.equal(verifySessionFile(target, "thr_sample", { noFollowFlag: false }).ok, true);
+  } finally {
     cleanup();
   }
 });
