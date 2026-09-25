@@ -14,6 +14,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -650,6 +651,42 @@ test("A7 §7.5 exit 130: SIGINT sends turn/interrupt, prints the receipt, exits 
     } finally {
       sb2.cleanup();
     }
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("A7 §3 doctor never follows a sessions symlink out of MADC_HOME; a non-directory MADC_HOME is invalid (Copilot r4107805223, review 5321699645)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    mkdirSync(sb.home);
+    const outside = join(sb.root, "outside");
+    mkdirSync(outside);
+    const token = "fedcba9876543210fedcba9876543210";
+    writeFileSync(
+      join(outside, "thr_x.lock"),
+      JSON.stringify({ pid: 4_194_301, startedAt: Date.now(), token }),
+    );
+    symlinkSync(outside, join(sb.home, "sessions"));
+    const before = snapshot(outside);
+    const r = await runCli(sb, ["doctor", "--json"]);
+    const locks = check(JSON.parse(r.stdout) as DoctorJson, "locks");
+    assert.equal(locks.status, "warn");
+    assert.match(locks.summary, /symlink or resolves outside MADC_HOME: not inspected/);
+    assert.equal((r.stdout + r.stderr).includes("thr_x"), false, "outside locks never listed");
+    assert.equal((r.stdout + r.stderr).includes(token), false);
+    assert.deepEqual(snapshot(outside), before);
+
+    const file = join(sb.root, "home-is-a-file");
+    writeFileSync(file, "x");
+    const inv = await runCli(sb, ["doctor", "--json"], { env: { MADC_HOME: file } });
+    assert.equal(inv.code, 2, inv.stdout);
+    const home = check(JSON.parse(inv.stdout) as DoctorJson, "home");
+    assert.equal(home.status, "fail");
+    assert.match(home.summary, /exists but is not a directory/);
+    assert.equal(readFileSync(file, "utf8"), "x");
   } finally {
     sb.cleanup();
   }
