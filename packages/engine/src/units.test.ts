@@ -17,10 +17,13 @@ import { createAcpAdapter, NotImplementedError } from "./acp/index.ts";
 import { confinedPath, resolveMadcHome } from "./home.ts";
 import {
   acquireThreadLock,
+  fileId,
   holdsThreadLock,
   isPidAlive,
   readLock,
+  reclaimIfUnchanged,
   releaseThreadLock,
+  threadLockPath,
 } from "./lock.ts";
 import { ErrorCode, providerRefusalError, RpcError } from "./protocol/errors.ts";
 import { ID_PATTERN, isValidId, newId } from "./protocol/ids.ts";
@@ -174,10 +177,15 @@ test("confinedPath: symlinked subdir escaping MADC_HOME is rejected", () => {
     } catch {
       return; // symlinks unavailable (e.g. unprivileged Windows) — nothing to assert
     }
+    chmodSync(outside, 0o755);
     assert.throws(
       () => confinedPath(home, "sessions", "thr_ok", ".lock"),
       (e: unknown) => e instanceof RpcError && e.code === ErrorCode.InternalError,
     );
+    if (process.platform !== "win32") {
+      // Honesty: a rejected path never gets permissions changed outside MADC_HOME.
+      assert.equal(statSync(outside).mode & 0o777, 0o755);
+    }
   } finally {
     cleanup();
   }
@@ -251,6 +259,39 @@ test("lock: dead pid and corrupt body are reclaimed", async () => {
     if (again.ok) releaseThreadLock(again.handle);
     assert.equal(existsSync(path), false);
   } finally {
+    cleanup();
+  }
+});
+
+test("lock: reclaim never deletes a lock that changed after it was judged dead", async () => {
+  const { home, cleanup } = makeHome();
+  const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], {
+    stdio: "ignore",
+  });
+  try {
+    const dead = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+    const deadPid = dead.pid ?? 0;
+    await new Promise((r) => dead.once("exit", r));
+    const path = threadLockPath(home, "thr_d");
+    writeFileSync(path, JSON.stringify({ pid: deadPid, startedAt: 1 }));
+    const seenId = fileId(path);
+    const seen = readLock(path);
+    assert.ok(seenId);
+
+    // Another engine reclaims first and installs a live lock (the freed inode may be reused).
+    unlinkSync(path);
+    writeFileSync(path, JSON.stringify({ pid: holder.pid, startedAt: 2 }));
+    assert.equal(reclaimIfUnchanged(path, seenId, seen), false);
+    assert.deepEqual(readLock(path), { state: "held", info: { pid: holder.pid, startedAt: 2 } });
+
+    // Unchanged since observed → reclaimed, with no stray temp files left behind.
+    const liveId = fileId(path);
+    assert.ok(liveId);
+    assert.equal(reclaimIfUnchanged(path, liveId, readLock(path)), true);
+    assert.equal(readLock(path).state, "missing");
+    assert.deepEqual(readdirSync(join(home, "sessions")), [], "no stray reclaim files");
+  } finally {
+    holder.kill();
     cleanup();
   }
 });

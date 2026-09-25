@@ -7,7 +7,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
-import { EngineExitedError } from "./client.ts";
+import { EngineExitedError, spawnEngine } from "./client.ts";
 import { ErrorCode } from "./protocol/errors.ts";
 import { ID_PATTERN } from "./protocol/ids.ts";
 import type { AgentMessageItem, UserMessageItem } from "./protocol/types.ts";
@@ -407,6 +407,25 @@ test("client: pending requests reject when the engine exits without responding",
   } finally {
     await client.close();
     cleanup();
+  }
+});
+
+test("client: a failed spawn (bad runtime) rejects pending requests instead of hanging", async () => {
+  const client = (() => {
+    try {
+      return spawnEngine({ runtime: "/nonexistent/madc-runtime" });
+    } catch {
+      return null; // runtime reported the spawn failure synchronously — nothing can hang
+    }
+  })();
+  if (client === null) return;
+  try {
+    await assert.rejects(
+      client.request("initialize", { clientInfo: { name: "t", version: "0" } }),
+      EngineExitedError,
+    );
+  } finally {
+    await client.close();
   }
 });
 
