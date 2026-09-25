@@ -1,4 +1,4 @@
-import { createInterface } from "node:readline";
+import { createInterface, type Interface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import type { Agent, TurnSink } from "./agent.ts";
 import { acquireThreadLock, holdsThreadLock, type LockHandle, releaseThreadLock } from "./lock.ts";
@@ -117,7 +117,11 @@ export class EngineConnection {
   readonly #opts: EngineOptions;
   #initialized = false;
   #closed = false;
+  #shutDown = false;
+  #rl: Interface | null = null;
   readonly #threads = new Map<string, ThreadRecord>();
+  /** Locks this process still holds without a thread record (probe locks whose release failed). */
+  readonly #strayLocks: LockHandle[] = [];
 
   constructor(opts: EngineOptions) {
     this.#opts = opts;
@@ -125,10 +129,10 @@ export class EngineConnection {
 
   run(): Promise<void> {
     const { input, output } = this.#opts;
-    output.on("error", () => {
-      this.#closed = true;
-    });
+    // A dead stdout ends the connection exactly like EOF (interrupt turns, release locks).
+    output.on("error", () => this.#onOutputFailure());
     const rl = createInterface({ input, crlfDelay: Number.POSITIVE_INFINITY });
+    this.#rl = rl;
     rl.on("line", (line) => this.handleLine(line));
     return new Promise((resolve) => {
       rl.once("close", () => {
@@ -138,8 +142,10 @@ export class EngineConnection {
     });
   }
 
-  /** EOF / exit: in-flight turns end `interrupted`; this process's locks are released. */
+  /** EOF / output failure / signal: in-flight turns end `interrupted`; locks are released. */
   shutdown(): void {
+    if (this.#shutDown) return;
+    this.#shutDown = true;
     for (const record of this.#threads.values()) {
       const active =
         record.activeTurnId === null ? undefined : record.turns.get(record.activeTurnId);
@@ -147,12 +153,22 @@ export class EngineConnection {
     }
     this.releaseLocks();
     this.#closed = true;
+    this.#rl?.close();
+  }
+
+  /** stdout is gone: nothing can be answered any more, so stop and clean up (same path as EOF). */
+  #onOutputFailure(): void {
+    this.#closed = true;
+    // Closing readline emits "close", which runs shutdown(); before run() there is none.
+    if (this.#rl === null) this.shutdown();
+    else this.#rl.close();
   }
 
   releaseLocks(): void {
-    for (const record of this.#threads.values()) {
+    const handles = [...[...this.#threads.values()].map((r) => r.lock), ...this.#strayLocks];
+    for (const handle of handles) {
       try {
-        releaseThreadLock(record.lock);
+        releaseThreadLock(handle);
       } catch {
         // best effort; a dead-pid lock is reclaimed by the next engine
       }
@@ -160,6 +176,7 @@ export class EngineConnection {
   }
 
   handleLine(line: string): void {
+    if (this.#closed) return; // no dispatch after shutdown / output failure
     const msg = parseLine(line);
     if (msg === null) return;
     if (msg.kind === "invalid") {
@@ -289,8 +306,15 @@ export class EngineConnection {
     if (!lock.ok) throw turnAlreadyActive(threadId, null, lock.holderPid ?? undefined);
 
     // A2 thread store is in-memory per engine process; the durable JSONL-backed load lands in A4
-    // (seat pin §4). Nothing to load → release the lock we just took and report not found.
-    releaseThreadLock(lock.handle);
+    // (seat pin §4). Nothing to load → release the lock we just took and report not found. If it
+    // cannot be released now, keep the handle so shutdown releases it (never orphan our own lock).
+    let released = false;
+    try {
+      released = releaseThreadLock(lock.handle);
+    } catch {
+      released = false;
+    }
+    if (!released && holdsThreadLock(lock.handle)) this.#strayLocks.push(lock.handle);
     throw threadNotFound(threadId);
   }
 
@@ -519,7 +543,7 @@ export class EngineConnection {
     try {
       this.#opts.output.write(encodeMessage(message));
     } catch {
-      this.#closed = true;
+      this.#onOutputFailure();
     }
   }
 
