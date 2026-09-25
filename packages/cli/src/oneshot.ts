@@ -10,7 +10,9 @@ import {
   type EngineClient,
   EngineExitedError,
   EngineRpcError,
+  ITEM_KINDS,
   type Item,
+  type ItemStatus,
   PROTOCOL_VERSION,
   spawnEngine,
   type Turn,
@@ -84,12 +86,17 @@ function finalText(items: readonly Item[]): string {
  * Runtime shape check of one wire item (Copilot r4108764755): the fields the CLI reads must have
  * their pinned types, so nothing malformed reaches the renderers.
  */
+const ITEM_STATUSES: readonly ItemStatus[] = ["inProgress", "completed", "failed"];
+
 function isItemShape(i: unknown): i is Item {
   if (i === null || typeof i !== "object") return false;
   const r = i as Record<string, unknown>;
   if (typeof r.id !== "string" || typeof r.kind !== "string" || typeof r.status !== "string") {
     return false;
   }
+  // Copilot r4109396318: `kind` and `status` must be members of the pinned unions.
+  if (!(ITEM_KINDS as readonly string[]).includes(r.kind)) return false;
+  if (!(ITEM_STATUSES as readonly string[]).includes(r.status)) return false;
   if (r.kind === "agentMessage") return typeof r.text === "string";
   if (r.kind === "servedModel") {
     return (
@@ -156,6 +163,14 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
   let engineExit: number | null | undefined;
   let violationTimer: ReturnType<typeof setInterval> | undefined;
   let malformedItem = false;
+  const pendingDeltas: Array<{ turnId: string; delta: string }> = [];
+  const renderDelta = (delta: string) => {
+    if (stream) {
+      clearStatus();
+      io.stdout.write(delta);
+    }
+    streamed += delta;
+  };
   const itemTurnIds = new Set<string>();
   let streamed = "";
   const stream = io.stdoutIsTTY && !opts.json;
@@ -292,14 +307,14 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
             typeof params.delta !== "string"
           ) {
             malformedItem = true;
+          } else if (turnId === null) {
+            // Bugbot 4109381360: before `turn/start` has answered, hold the delta; it is rendered
+            // only once its turn id is known to be this turn's (never foreign text on stdout).
+            pendingDeltas.push({ turnId: params.turnId, delta: params.delta });
+          } else if (params.turnId !== turnId) {
+            malformedItem = true;
           } else {
-            itemTurnIds.add(params.turnId);
-            const delta = params.delta;
-            if (stream) {
-              clearStatus();
-              io.stdout.write(delta);
-            }
-            streamed += delta;
+            renderDelta(params.delta);
           }
         } else if (m.method === "item/completed") {
           // Copilot r4108213460 / r4109051056: the envelope is validated too. This connection has
@@ -345,6 +360,10 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
       }
       turnId = ts.turn.id;
       turn = ts.turn;
+      for (const d of pendingDeltas.splice(0)) {
+        if (d.turnId === turnId) renderDelta(d.delta);
+        else malformedItem = true;
+      }
       if (sigintPending && !softUsed) {
         // SIGINT arrived before the turn existed: now it can be interrupted.
         softUsed = true;

@@ -15,6 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { ErrorCode } from "@madc/engine/client";
 import { CHAT_RESERVED, parseArgs } from "./args.ts";
 import {
@@ -290,6 +291,32 @@ test("A7 §3 the seat/session inspection has a hard deadline: timeout → FAIL, 
     assert.equal(code, 1, "a FAIL row fails doctor; the report was still produced");
   } finally {
     setDoctorInspectTimeoutForTests(null);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("A7 §2 on a TTY a foreign-turn delta is never rendered, only classified (Bugbot 4109381360)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "madc-a7-delta-"));
+  const saved = process.env.MADC_TEST_FAKE_SCENARIO;
+  try {
+    // Before the turn/start response (buffered, turnId unknown) and after it (turnId known).
+    for (const scenario of ["delta-early-other-turn", "delta-other-turn"]) {
+      process.env.MADC_TEST_FAKE_SCENARIO = scenario;
+      const io = fakeIO({
+        env: { MADC_HOME: join(dir, scenario, "home") },
+        stdoutIsTTY: true,
+        engineEntry: fileURLToPath(new URL("./testing/fake-engine.ts", import.meta.url)),
+      });
+      assert.equal(await main(["-p", "hi"], io), 3, scenario);
+      assert.equal(
+        io.out().includes("FOREIGN-DELTA"),
+        false,
+        `${scenario}: foreign text never reached stdout`,
+      );
+    }
+  } finally {
+    if (saved === undefined) delete process.env.MADC_TEST_FAKE_SCENARIO;
+    else process.env.MADC_TEST_FAKE_SCENARIO = saved;
     rmSync(dir, { recursive: true, force: true });
   }
 });
