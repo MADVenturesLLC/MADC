@@ -2,15 +2,19 @@
  * Seat files under `$MADC_HOME/seats/` (seat pin §1–§3): the seed writer (shared with
  * `madc doctor --init`, A7) and the confined, validated loader used by `thread/start`.
  */
+import { randomBytes } from "node:crypto";
 import {
   closeSync,
   constants,
+  fsyncSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   realpathSync,
   statSync,
+  unlinkSync,
   writeSync,
 } from "node:fs";
 import { dirname, join } from "node:path";
@@ -69,6 +73,37 @@ export function serializeSeat(seat: EngineSeat): string {
   return `${JSON.stringify(ordered, null, 2)}\n`;
 }
 
+/** `link` errors meaning "this filesystem has no hard links" (fall back to an in-place create). */
+const NO_HARD_LINKS = new Set(["EPERM", "ENOTSUP", "EOPNOTSUPP", "ENOSYS", "EXDEV"]);
+
+/**
+ * Create `path` exclusively (0600, no-follow), write all of `bytes`, fsync. If anything after the
+ * create fails, the partial file is removed and the error rethrown.
+ */
+function writeNewFile(path: string, bytes: Buffer): void {
+  const fd = openSync(
+    path,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+    0o600,
+  );
+  try {
+    try {
+      let off = 0;
+      while (off < bytes.length) off += writeSync(fd, bytes, off, bytes.length - off);
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch (err) {
+    try {
+      unlinkSync(path);
+    } catch {
+      // Already gone.
+    }
+    throw err;
+  }
+}
+
 function errCode(err: unknown): string | undefined {
   return err !== null && typeof err === "object" && "code" in err
     ? String((err as { code: unknown }).code)
@@ -84,8 +119,11 @@ export type SeedResult = {
 /**
  * Create `$MADC_HOME` with `seats/`, `sessions/`, `memory/` (0700) and write
  * `seats/madc-default.json` (0600) with exactly `MADC_DEFAULT_SEAT` if it does not exist yet.
- * The file is created with `O_EXCL`, so an existing file (or a concurrent seeder) is never
- * overwritten. One source of seed content: the engine start and `madc doctor --init` both call this.
+ * The bytes go to a private temp file first (O_EXCL, fsync), which is then hard-linked into
+ * place: `link` never replaces an existing file (an operator's file or a concurrent seeder wins),
+ * and a failed or interrupted write can never leave a partial seat file behind. The temp name
+ * starts with "." so it can never be loaded as a seat. One source of seed content: the engine
+ * start and `madc doctor --init` both call this.
  */
 export function seedDefaultSeat(home: string): SeedResult {
   mkdirSync(home, { recursive: true, mode: 0o700 });
@@ -104,25 +142,43 @@ export function seedDefaultSeat(home: string): SeedResult {
     enforcePrivateDir(dir);
   }
   const path = seatFilePath(home, MADC_DEFAULT_SEAT.id);
-  let fd: number;
   try {
-    fd = openSync(
-      path,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
-      0o600,
-    );
+    lstatSync(path);
+    return { path, created: false };
   } catch (err) {
-    if (errCode(err) === "EEXIST") return { path, created: false };
-    throw err;
+    if (errCode(err) !== "ENOENT") throw err;
   }
+  const bytes = Buffer.from(serializeSeat(MADC_DEFAULT_SEAT), "utf8");
+  const tmp = join(
+    home,
+    "seats",
+    `.${MADC_DEFAULT_SEAT.id}.json.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
+  );
+  writeNewFile(tmp, bytes);
   try {
-    const bytes = Buffer.from(serializeSeat(MADC_DEFAULT_SEAT), "utf8");
-    let off = 0;
-    while (off < bytes.length) off += writeSync(fd, bytes, off, bytes.length - off);
+    try {
+      linkSync(tmp, path);
+    } catch (err) {
+      const code = errCode(err);
+      if (code === "EEXIST") return { path, created: false };
+      if (!NO_HARD_LINKS.has(code ?? "")) throw err;
+      // Filesystem without hard links: exclusive create in place; a failed write removes
+      // the partial file before rethrowing.
+      try {
+        writeNewFile(path, bytes);
+      } catch (werr) {
+        if (errCode(werr) === "EEXIST") return { path, created: false };
+        throw werr;
+      }
+    }
+    return { path, created: true };
   } finally {
-    closeSync(fd);
+    try {
+      unlinkSync(tmp);
+    } catch {
+      // Best effort: a leftover dot-temp file is never read as a seat.
+    }
   }
-  return { path, created: true };
 }
 
 function seatNotFound(seatId: string, path: string): RpcError {

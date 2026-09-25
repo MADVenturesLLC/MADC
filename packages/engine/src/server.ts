@@ -430,7 +430,14 @@ export class EngineConnection {
       () => this.#secrets(this.#threads.get(threadId)?.lock ?? handle),
     );
     for (const turnId of rebuilt.danglingTurnIds) {
-      session.append("turn.end", { turnId, status: "interrupted", error: null });
+      // Same ts as the rebuilt turn's completedAt; the thread's updatedAt covers the close.
+      const closedAt = rebuilt.turns.find((t) => t.id === turnId)?.completedAt ?? Date.now();
+      const event = session.append(
+        "turn.end",
+        { turnId, status: "interrupted", error: null },
+        closedAt,
+      );
+      rebuilt.thread.updatedAt = Math.max(rebuilt.thread.updatedAt, event.ts);
     }
     const turns = new Map<string, TurnRecord>();
     for (const turn of rebuilt.turns) {
