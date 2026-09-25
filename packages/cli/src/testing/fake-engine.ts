@@ -149,6 +149,11 @@ rl.on("line", (line) => {
         scenario === "delta-only"
           ? []
           : [{ id: "item_a1", kind: "agentMessage", status: "completed", text: "fake reply" }];
+      if (scenario === "bad-turn") {
+        // "bad-turn": turn/completed names the thread but carries no items array.
+        send({ method: "turn/completed", params: { turn: { threadId, status: "completed" } } });
+        return;
+      }
       send({
         method: "turn/completed",
         params: {
