@@ -9,6 +9,7 @@ import {
   constants,
   fstatSync,
   ftruncateSync,
+  lstatSync,
   openSync,
   readFileSync,
   unlinkSync,
@@ -159,11 +160,37 @@ export function sessionWriteFailed(threadId: string, path: string, seq: number):
 
 // O_NOFOLLOW: a symlink at the path fails (ELOOP). O_NONBLOCK: a FIFO planted at the path fails
 // (ENXIO) or opens without blocking; the fd is then fstat-checked to be a regular file.
-const APPEND_FLAGS =
-  constants.O_WRONLY |
-  constants.O_APPEND |
-  (constants.O_NOFOLLOW ?? 0) |
-  (constants.O_NONBLOCK ?? 0);
+const APPEND_BASE_FLAGS = constants.O_WRONLY | constants.O_APPEND | (constants.O_NONBLOCK ?? 0);
+const APPEND_FLAGS = APPEND_BASE_FLAGS | (constants.O_NOFOLLOW ?? 0);
+const HAS_APPEND_NOFOLLOW = constants.O_NOFOLLOW !== undefined;
+
+let appendOpenOpts: OpenNoFollowOptions = {};
+
+/** Test seam: force the no-O_NOFOLLOW append path / inject a swap after lstat (null resets). Internal. */
+export function setSessionAppendOpenForTests(opts: OpenNoFollowOptions | null): void {
+  appendOpenOpts = opts ?? {};
+}
+
+/**
+ * Open the session file for appending without following a symlink. With O_NOFOLLOW this is one
+ * open. Without it (e.g. Windows) it is lstat → open → fstat, and the fd is used only if it is the
+ * very file lstat saw (same dev + inode), as lock.ts `openNoFollow` does for reads: a symlink, or a
+ * swap to one between lstat and open, is refused before a byte is written.
+ */
+function openForAppend(path: string): number {
+  const noFollowFlag = appendOpenOpts.noFollowFlag ?? HAS_APPEND_NOFOLLOW;
+  if (noFollowFlag) return openSync(path, APPEND_FLAGS);
+  const seen = lstatSync(path, { bigint: true });
+  if (seen.isSymbolicLink()) throw new Error("session file is a symlink");
+  appendOpenOpts.afterLstat?.();
+  const fd = openSync(path, APPEND_BASE_FLAGS);
+  const opened = fstatSync(fd, { bigint: true });
+  if (opened.dev !== seen.dev || opened.ino !== seen.ino) {
+    closeSync(fd);
+    throw new Error("session file changed while it was being opened");
+  }
+  return fd;
+}
 
 type WriteChunk = (fd: number, buf: Buffer, off: number, len: number) => number;
 let writeChunk: WriteChunk = (fd, buf, off, len) => writeSync(fd, buf, off, len);
@@ -301,7 +328,7 @@ export class SessionWriter {
     const text = events.map((e) => `${JSON.stringify(e)}\n`).join("");
     const bytes = Buffer.from(text, "utf8");
     try {
-      const fd = openSync(this.path, APPEND_FLAGS);
+      const fd = openForAppend(this.path);
       try {
         const st = fstatSync(fd);
         if (!st.isFile()) throw new Error("session file is not a regular file");
@@ -455,7 +482,7 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
   switch (type) {
     case "session.open":
       return (p.cwd === null || isStr(p.cwd)) &&
-        isStr(p.backing) &&
+        SERVED_BACKINGS.includes(p.backing) &&
         isStr(p.providerId) &&
         isStr(p.pinnedModel)
         ? null
@@ -468,7 +495,7 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
       return isValidId(p.turnId) &&
         isStr(p.requestedModel) &&
         isStr(p.servedModel) &&
-        isStr(p.backing) &&
+        SERVED_BACKINGS.includes(p.backing) &&
         isStr(p.providerId)
         ? null
         : "malformed servedModel payload";
