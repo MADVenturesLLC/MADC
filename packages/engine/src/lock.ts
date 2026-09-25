@@ -1,30 +1,47 @@
-import { randomUUID } from "node:crypto";
-import { linkSync, lstatSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomBytes } from "node:crypto";
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  linkSync,
+  lstatSync,
+  openSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { confinedPath } from "./home.ts";
 
-/** Contents of `sessions/<threadId>.lock` (protocol pin §3.3 — exactly `{ pid, startedAt }`). */
-export type LockInfo = { pid: number; startedAt: number };
+/**
+ * Contents of `sessions/<threadId>.lock` — exactly `{ pid, startedAt, token }` (protocol pin §3.3,
+ * Amendment 1). `token` is 128 random bits as 32 lowercase hex chars, fresh on every acquisition.
+ * The token is private to the holder: it never goes on the wire, into logs, or into session JSONL.
+ */
+export type LockInfo = { pid: number; startedAt: number; token: string };
 
-export type LockState =
-  | { state: "missing" }
-  | { state: "corrupt" }
-  | { state: "held"; info: LockInfo };
-
-/** Device + inode of a lock file (the file itself, never a symlink target). */
-export type FileId = { dev: bigint; ino: bigint };
+export const LOCK_TOKEN_PATTERN = /^[0-9a-f]{32}$/;
 
 /**
- * Per-acquisition ownership token. The pin fixes the lock body to `{ pid, startedAt }`, so the token
- * is that body plus the device/inode of the exact file this acquisition created (inode numbers are
- * reused after deletion, so body and inode must both match).
+ * What is on disk at a lock path.
+ * - `held`: a parseable body with a positive integer pid. `token` is null when it is missing or does
+ *   not match `LOCK_TOKEN_PATTERN` (legacy / corrupt body, pin §3.3 (c)).
+ * - `corrupt`: unreadable, not JSON, no usable pid, or a symlink (never followed). Nobody can be
+ *   shown to hold it, so it is treated like a dead holder.
  */
-export type LockHandle = {
-  path: string;
-  pid: number;
-  startedAt: number;
-  dev: bigint;
-  ino: bigint;
-};
+export type LockState =
+  | { state: "missing" }
+  | { state: "corrupt"; fingerprint: string }
+  | {
+      state: "held";
+      pid: number;
+      startedAt: unknown;
+      token: string | null;
+      fingerprint: string;
+    };
+
+/** The holder's private record of one acquisition. */
+export type LockHandle = { path: string; pid: number; startedAt: number; token: string };
 
 export type AcquireResult =
   | { ok: true; path: string; handle: LockHandle }
@@ -34,38 +51,115 @@ export function threadLockPath(home: string, threadId: string): string {
   return confinedPath(home, "sessions", threadId, ".lock");
 }
 
+export function newLockToken(): string {
+  return randomBytes(16).toString("hex");
+}
+
 function errCode(err: unknown): string | undefined {
   return err !== null && typeof err === "object" && "code" in err
     ? String((err as { code: unknown }).code)
     : undefined;
 }
 
-export function readLock(path: string): LockState {
-  let text: string;
+function removeQuietly(path: string): void {
   try {
-    // A symlink planted at the lock path is never followed.
-    if (lstatSync(path).isSymbolicLink()) return { state: "corrupt" };
-    text = readFileSync(path, "utf8");
+    unlinkSync(path);
   } catch (err) {
-    if (errCode(err) === "ENOENT") return { state: "missing" };
+    if (errCode(err) !== "ENOENT") throw err;
+  }
+}
+
+// Every lock read goes through one fd opened with O_NOFOLLOW (a symlink at the path fails with
+// ELOOP instead of being followed) and O_NONBLOCK (a FIFO planted there cannot block the engine);
+// the fd is then checked with fstat to be a regular file.
+const HAS_NOFOLLOW = typeof constants.O_NOFOLLOW === "number";
+const OPEN_READ_NOFOLLOW =
+  constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+
+/** Test seams for `openNoFollow`. */
+export type OpenNoFollowOptions = { noFollowFlag?: boolean; afterLstat?: () => void };
+
+/**
+ * Open `path` for reading without following a symlink. Null if missing; "symlink" if it is one (or
+ * if the path changed while it was opened). Without O_NOFOLLOW (e.g. Windows) the check is
+ * lstat → open → fstat, and the fd is accepted only if it is the very file lstat saw (same dev +
+ * inode): a swap to a symlink between lstat and open yields a different inode and is refused, so a
+ * symlink target is never read or trusted. Internal; exported for tests.
+ */
+export function openNoFollow(
+  path: string,
+  opts: OpenNoFollowOptions = {},
+): number | null | "symlink" {
+  const noFollowFlag = opts.noFollowFlag ?? HAS_NOFOLLOW;
+  try {
+    if (noFollowFlag) return openSync(path, OPEN_READ_NOFOLLOW);
+    const seen = lstatSync(path, { bigint: true });
+    if (seen.isSymbolicLink()) return "symlink";
+    opts.afterLstat?.();
+    const fd = openSync(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+    const opened = fstatSync(fd, { bigint: true });
+    if (opened.dev !== seen.dev || opened.ino !== seen.ino) {
+      closeSync(fd);
+      return "symlink";
+    }
+    return fd;
+  } catch (err) {
+    const code = errCode(err);
+    if (code === "ENOENT") return null;
+    if (code === "ELOOP") return "symlink";
     throw err;
   }
-  try {
-    const parsed: unknown = JSON.parse(text);
-    if (
-      parsed !== null &&
-      typeof parsed === "object" &&
-      Number.isInteger((parsed as LockInfo).pid) &&
-      (parsed as LockInfo).pid > 0 &&
-      typeof (parsed as LockInfo).startedAt === "number"
-    ) {
-      const { pid, startedAt } = parsed as LockInfo;
-      return { state: "held", info: { pid, startedAt } };
-    }
-  } catch {
-    // fall through
+}
+
+export class LockPathNotAFileError extends Error {
+  constructor(path: string) {
+    super(`lock path is not a regular file: ${path}`);
+    this.name = "LockPathNotAFileError";
   }
-  return { state: "corrupt" };
+}
+
+/** Classify a body. `fingerprint` is the exact bytes seen (pin §3.3 (b) compares pid+startedAt+token). */
+export function parseLockBody(text: string): LockState {
+  const fingerprint = `file:${text}`;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    return { state: "corrupt", fingerprint };
+  }
+  if (parsed === null || typeof parsed !== "object") return { state: "corrupt", fingerprint };
+  const body = parsed as Record<string, unknown>;
+  const pid = body.pid;
+  if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) {
+    return { state: "corrupt", fingerprint };
+  }
+  // A token only counts on a well-formed body: exactly { pid, startedAt, token } with a finite
+  // startedAt. Anything else is a legacy/corrupt body (pin §3.3 (c)): locked while its pid lives.
+  const wellFormed =
+    Object.keys(body).length === 3 &&
+    typeof body.startedAt === "number" &&
+    Number.isFinite(body.startedAt) &&
+    typeof body.token === "string" &&
+    LOCK_TOKEN_PATTERN.test(body.token);
+  const token = wellFormed ? (body.token as string) : null;
+  return { state: "held", pid, startedAt: body.startedAt, token, fingerprint };
+}
+
+/**
+ * Read the lock at `path` through a single no-follow fd (never re-opening the path after a check).
+ * A symlink is `corrupt` and never trusted; any other non-regular file (directory, FIFO, device) is
+ * refused with `LockPathNotAFileError` rather than reclaimed.
+ */
+export function readLock(path: string): LockState {
+  const fd = openNoFollow(path);
+  if (fd === null) return { state: "missing" };
+  if (fd === "symlink") return { state: "corrupt", fingerprint: "symlink" };
+  try {
+    if (!fstatSync(fd).isFile()) throw new LockPathNotAFileError(path);
+    return parseLockBody(readFileSync(fd, "utf8"));
+  } finally {
+    closeSync(fd);
+  }
 }
 
 /** `kill(pid, 0)`: ESRCH → dead; EPERM (exists, not ours) or anything else → treat as alive. */
@@ -79,58 +173,19 @@ export function isPidAlive(pid: number): boolean {
   }
 }
 
-export function fileId(path: string): FileId | null {
-  try {
-    const st = lstatSync(path, { bigint: true });
-    return { dev: st.dev, ino: st.ino };
-  } catch (err) {
-    if (errCode(err) === "ENOENT") return null;
-    throw err;
-  }
-}
-
-function sameId(a: FileId | null, b: FileId): boolean {
-  return a !== null && a.dev === b.dev && a.ino === b.ino;
-}
-
-function sameLockState(a: LockState, b: LockState): boolean {
-  if (a.state === "held" && b.state === "held") {
-    return a.info.pid === b.info.pid && a.info.startedAt === b.info.startedAt;
-  }
-  return a.state === b.state;
-}
-
-/** True iff `path` is the handle's file: same dev/inode AND same `{ pid, startedAt }` body. */
-function isHandleFile(path: string, h: LockHandle): boolean {
-  if (!sameId(fileId(path), h)) return false;
-  const body = readLock(path);
-  return body.state === "held" && body.info.pid === h.pid && body.info.startedAt === h.startedAt;
-}
-
-function removeQuietly(path: string): void {
-  try {
-    unlinkSync(path);
-  } catch (err) {
-    if (errCode(err) !== "ENOENT") throw err;
-  }
-}
-
 /**
- * Exclusive create: the complete body goes to a private temp file which is hard-linked into place.
- * `link` fails with EEXIST if the lock exists (same semantics as O_EXCL), and readers never see a
- * half-written body (an empty file would otherwise look corrupt and be reclaimed).
+ * Exclusive create with a fresh token: the complete body goes to a private temp file which is
+ * hard-linked into place. `link` fails with EEXIST if the lock exists (same semantics as O_EXCL),
+ * and readers never see a half-written body (an empty file would look corrupt and be reclaimed).
  */
 function createExclusive(path: string, pid: number): LockHandle | null {
-  const startedAt = Date.now();
-  const tmp = `${path}.${pid}.${randomUUID()}.tmp`;
-  writeFileSync(tmp, JSON.stringify({ pid, startedAt } satisfies LockInfo), {
-    flag: "wx",
-    mode: 0o600,
-  });
+  const handle: LockHandle = { path, pid, startedAt: Date.now(), token: newLockToken() };
+  const tmp = `${path}.tmp-${newLockToken()}`;
+  const body: LockInfo = { pid, startedAt: handle.startedAt, token: handle.token };
+  writeFileSync(tmp, JSON.stringify(body), { flag: "wx", mode: 0o600 });
   try {
     linkSync(tmp, path);
-    const id = fileId(tmp); // same inode as `path` until tmp is unlinked below
-    return id === null ? null : { path, pid, startedAt, ...id };
+    return handle;
   } catch (err) {
     if (errCode(err) !== "EEXIST") throw err;
     return null;
@@ -139,41 +194,52 @@ function createExclusive(path: string, pid: number): LockHandle | null {
   }
 }
 
+export type ReclaimOutcome =
+  /** The observed dead/corrupt lock was deleted. */
+  | { outcome: "reclaimed" }
+  /** Nothing at the path any more (another reclaimer or the holder removed it). */
+  | { outcome: "gone" }
+  /** The file changed after it was judged; it was put back (or left aside) and never deleted. */
+  | { outcome: "restored"; holderPid: number | null };
+
 /**
- * Remove a lock that was judged dead/corrupt. `rename` to a unique per-attempt name is atomic, so of
- * several reclaimers exactly one moves the file; the moved file is then checked against what was
- * judged (dev/inode + body) and deleted only if it matches. If it does not match (a fresh lock was
- * installed between the judgement and the rename), it is linked back into place and the caller
- * retries; if yet another lock already took the path, the moved file is left alone — a lock that was
- * not judged dead is never deleted. Returns true iff the judged lock was removed.
- * Internal; exported for tests.
+ * Pin §3.3 (b): remove a lock that was judged dead/corrupt. Rename it aside to a name unique to
+ * this attempt (atomic: of several reclaimers exactly one moves the file), re-read the moved body,
+ * and delete it only if it is byte-for-byte what was judged (same pid + startedAt + token, or the
+ * same missing/invalid token for a (c) body). Otherwise link it back to the lock path and report the
+ * thread as locked; if the path was taken meanwhile, the moved file is left in place — a lock that
+ * was not judged dead is never deleted. Internal; exported for tests.
  */
-export function reclaimIfUnchanged(path: string, seenId: FileId, seen: LockState): boolean {
-  const moved = `${path}.${process.pid}.${randomUUID()}.stale`;
+export function reclaimIfUnchanged(
+  path: string,
+  observedFingerprint: string,
+  reclaimerToken: string = newLockToken(),
+): ReclaimOutcome {
+  const aside = `${path}.reclaim-${reclaimerToken}`;
   try {
-    renameSync(path, moved);
+    renameSync(path, aside);
   } catch (err) {
-    if (errCode(err) === "ENOENT") return false; // another reclaimer won the rename
+    if (errCode(err) === "ENOENT") return { outcome: "gone" };
     throw err;
   }
-  if (sameId(fileId(moved), seenId) && sameLockState(readLock(moved), seen)) {
-    removeQuietly(moved);
-    return true;
+  const moved = readLock(aside);
+  if (moved.state !== "missing" && moved.fingerprint === observedFingerprint) {
+    removeQuietly(aside);
+    return { outcome: "reclaimed" };
   }
-  // Not the judged file: put it back. On success `moved` is a second name for the same inode and
-  // is dropped; on EEXIST a newer lock owns the path and `moved` is left as-is (never deleted).
   try {
-    linkSync(moved, path);
-    removeQuietly(moved);
+    linkSync(aside, path);
+    removeQuietly(aside); // `aside` was a second name for the restored lock
   } catch (err) {
     if (errCode(err) !== "EEXIST") throw err;
   }
-  return false;
+  return { outcome: "restored", holderPid: moved.state === "held" ? moved.pid : null };
 }
 
 /**
- * Take `sessions/<threadId>.lock`. Live foreign holder → refused with its pid. Dead holder or
- * unreadable body → reclaimed (see `reclaimIfUnchanged`) and creation retried.
+ * Take `sessions/<threadId>.lock` with a fresh token. A holder whose pid is alive — including this
+ * process under a different token — refuses with its pid (-32004 upstream). A dead pid, or a body
+ * with no usable pid, is reclaimed per `reclaimIfUnchanged` and creation retried.
  */
 export function acquireThreadLock(
   home: string,
@@ -186,38 +252,88 @@ export function acquireThreadLock(
     const created = createExclusive(path, pid);
     if (created !== null) return { ok: true, path, handle: created };
 
-    const seenId = fileId(path);
     const current = readLock(path);
-    if (seenId === null || current.state === "missing") continue;
+    if (current.state === "missing") continue;
     if (current.state === "held") {
-      if (current.info.pid === pid) {
-        // Re-entrant: this process already holds it; adopt the on-disk file as our handle.
-        if (sameId(fileId(path), seenId)) {
-          return { ok: true, path, handle: { path, ...current.info, ...seenId } };
-        }
-        continue;
-      }
-      lastHolder = current.info.pid;
-      if (isPidAlive(current.info.pid)) return { ok: false, path, holderPid: current.info.pid };
+      lastHolder = current.pid;
+      // Live pid → locked, whatever the token (pin §3.3 (c)); ownership is never adopted.
+      if (isPidAlive(current.pid)) return { ok: false, path, holderPid: current.pid };
     }
-    reclaimIfUnchanged(path, seenId, current);
+    const result = reclaimIfUnchanged(path, current.fingerprint);
+    if (result.outcome === "restored") {
+      return { ok: false, path, holderPid: result.holderPid ?? lastHolder };
+    }
   }
   return { ok: false, path, holderPid: lastHolder };
 }
 
 /**
- * Release only this acquisition's lock: read identity (dev/inode + body), unlink only on a match.
- * Residual (documented): the check and the unlink are two syscalls; a replacement can only appear
- * in between if our lock was already removed by someone else in that same instant.
- * Returns true iff our lock was removed.
+ * Read the lock through an open fd and report whether it carries `handle.token`. The fd pins the
+ * inode, so `sameFile()` below can tell whether the path still names the file that was read.
  */
-export function releaseThreadLock(handle: LockHandle): boolean {
-  if (!isHandleFile(handle.path, handle)) return false;
-  removeQuietly(handle.path);
-  return true;
+function withOpenLock<T>(
+  handle: LockHandle,
+  fn: (body: LockState, pinned: { dev: bigint; ino: bigint }) => T,
+): T | null {
+  const fd = openNoFollow(handle.path);
+  if (fd === null || fd === "symlink") return null;
+  try {
+    const st = fstatSync(fd, { bigint: true });
+    if (!st.isFile()) return null;
+    const body = parseLockBody(readFileSync(fd, "utf8"));
+    return fn(body, { dev: st.dev, ino: st.ino });
+  } finally {
+    closeSync(fd);
+  }
 }
 
-/** True iff the lock on disk is this acquisition's file (dev/inode + `{ pid, startedAt }`). */
+function carriesToken(body: LockState, handle: LockHandle): boolean {
+  return body.state === "held" && body.token !== null && body.token === handle.token;
+}
+
+/** True iff `path` (not following symlinks) is still the pinned file. */
+function sameFile(path: string, pinned: { dev: bigint; ino: bigint }): boolean {
+  try {
+    const now = lstatSync(path, { bigint: true });
+    return now.dev === pinned.dev && now.ino === pinned.ino;
+  } catch (err) {
+    if (errCode(err) === "ENOENT") return false;
+    throw err;
+  }
+}
+
+/** Test seam: runs between the token check and the unlink (lets tests swap the file there). */
+export type ReleaseHooks = { beforeUnlink?: () => void };
+
+/**
+ * Pin §3.3 (a): unlink the lock only if the on-disk token is this holder's token, and only if the
+ * path still names the file whose body was checked (`lstat` vs `fstat` dev + inode; the open fd pins
+ * the inode so it cannot be reused while we look). POSIX has no compare-and-unlink: a replacement
+ * installed after the `lstat` would need our live lock to have been removed by someone else, which
+ * (b) never does for a live pid. Returns true iff our lock was removed.
+ */
+export function releaseThreadLock(handle: LockHandle, hooks: ReleaseHooks = {}): boolean {
+  return (
+    withOpenLock(handle, (body, pinned) => {
+      if (!carriesToken(body, handle)) return false;
+      hooks.beforeUnlink?.();
+      if (!sameFile(handle.path, pinned)) return false;
+      try {
+        unlinkSync(handle.path);
+      } catch (err) {
+        if (errCode(err) === "ENOENT") return false;
+        throw err;
+      }
+      return true;
+    }) ?? false
+  );
+}
+
+/** True iff the lock on disk carries this acquisition's token. */
 export function holdsThreadLock(handle: LockHandle): boolean {
-  return isHandleFile(handle.path, handle);
+  return (
+    withOpenLock(handle, (body, pinned) => {
+      return carriesToken(body, handle) && sameFile(handle.path, pinned);
+    }) ?? false
+  );
 }

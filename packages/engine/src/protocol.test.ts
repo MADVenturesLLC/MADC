@@ -4,7 +4,15 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
 import { EngineExitedError, spawnEngine } from "./client.ts";
@@ -19,6 +27,7 @@ import {
   handshake,
   makeHome,
   startEngine,
+  startEngineCapturingStderr,
   withEngine,
 } from "./testing/harness.ts";
 
@@ -62,11 +71,13 @@ test("§8.2 round trip: thread/start → turn/start → userMessage + agentMessa
     const started = await client.waitForNotification("thread/started");
     assert.equal(started.thread.id, thread.id);
 
-    // Cross-process ownership: lock file { pid, startedAt } held by this engine.
+    // Cross-process ownership: lock file { pid, startedAt, token } held by this engine (§3.3).
     const lockPath = join(home, "sessions", `${thread.id}.lock`);
     const lock = JSON.parse(readFileSync(lockPath, "utf8"));
+    assert.deepEqual(Object.keys(lock).sort(), ["pid", "startedAt", "token"]);
     assert.equal(lock.pid, client.pid);
     assert.equal(typeof lock.startedAt, "number");
+    assert.match(lock.token, /^[0-9a-f]{32}$/);
 
     const { turn } = await client.request("turn/start", {
       threadId: thread.id,
@@ -535,4 +546,92 @@ test("thread/list paginates with an opaque cursor", async () => {
     const bad = await expectRpcError(client.request("thread/list", { cursor: "thr_unknown" }));
     assert.equal(bad.code, -32602);
   });
+});
+
+/** Every regular file under `dir` (recursive). */
+function filesUnder(dir: string): string[] {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir).flatMap((name) => {
+    const p = join(dir, name);
+    return statSync(p).isDirectory() ? filesUnder(p) : [p];
+  });
+}
+
+test("§8.9 lock token never appears on the wire, on stderr, or in session JSONL (two engines)", async () => {
+  const { home, cleanup } = makeHome();
+  const a = startEngineCapturingStderr(home, FAILING_ENGINE);
+  const b = startEngineCapturingStderr(home);
+  try {
+    await handshake(a.client);
+    await handshake(b.client);
+    const { thread } = await a.client.request("thread/start", {});
+    const lockPath = join(home, "sessions", `${thread.id}.lock`);
+    const token: string = JSON.parse(readFileSync(lockPath, "utf8")).token;
+    assert.match(token, /^[0-9a-f]{32}$/);
+
+    const { turn } = await a.client.request("turn/start", {
+      threadId: thread.id,
+      input: [{ type: "text", text: "x" }],
+    });
+    await a.client.waitForNotification("turn/completed", (p) => p.turn.id === turn.id);
+    await a.client.request("thread/resume", { threadId: thread.id });
+    await a.client.request("thread/list", {});
+    // The other engine is refused with lockHolderPid only (§3.3 (d)).
+    const refused = await expectRpcError(
+      b.client.request("thread/resume", { threadId: thread.id }),
+    );
+    assert.deepEqual(refused.data, {
+      threadId: thread.id,
+      activeTurnId: null,
+      lockHolderPid: a.client.pid,
+    });
+
+    // Files other than the lock itself (session JSONL included, whenever it exists) never carry it.
+    for (const file of filesUnder(home).filter((f) => f !== lockPath)) {
+      assert.equal(readFileSync(file, "utf8").includes(token), false, file);
+    }
+    const jsonl = filesUnder(home).filter((f) => f.endsWith(".jsonl"));
+    for (const file of jsonl) assert.equal(readFileSync(file, "utf8").includes(token), false);
+
+    await a.client.close();
+    await b.client.close();
+    const stderr = a.stderr() + b.stderr();
+    assert.ok(stderr.includes("agent error"), "stderr capture is live (failing agent logged)");
+    assert.equal(stderr.includes(token), false, "not on stderr");
+    const wire = JSON.stringify([...a.client.messages, ...b.client.messages]);
+    assert.equal(wire.includes(token), false, "not on the wire");
+    assert.deepEqual([...a.client.protocolViolations, ...b.client.protocolViolations], []);
+  } finally {
+    await a.client.close();
+    await b.client.close();
+    cleanup();
+  }
+});
+
+test("F1: SIGTERM mid-turn still delivers turn/completed(interrupted); exit code 143", async () => {
+  if (process.platform === "win32") return; // POSIX signals only
+  const { home, cleanup } = makeHome();
+  const client = startEngine(home, HANG_ENGINE);
+  try {
+    await handshake(client);
+    const { thread } = await client.request("thread/start", {});
+    const { turn } = await client.request("turn/start", {
+      threadId: thread.id,
+      input: [{ type: "text", text: "x" }],
+    });
+    await client.waitForNotification("item/agentMessage/delta", (p) => p.turnId === turn.id);
+    process.kill(client.pid, "SIGTERM");
+    const code = await client.exited;
+    assert.equal(code, 143);
+    const done = await client.waitForNotification(
+      "turn/completed",
+      (p) => p.turn.id === turn.id,
+      1000,
+    );
+    assert.equal(done.turn.status, "interrupted");
+    assert.equal(existsSync(join(home, "sessions", `${thread.id}.lock`)), false, "lock released");
+  } finally {
+    await client.close();
+    cleanup();
+  }
 });
