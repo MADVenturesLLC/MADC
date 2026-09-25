@@ -141,6 +141,18 @@ rl.on("line", (line) => {
         const error = failed ? { code: -32603, message: "Agent failed" } : null;
         append("turn.end", { turnId, status: failed ? "failed" : "completed", error });
       }
+      if (scenario === "delta-other-turn" || scenario === "delta-non-string") {
+        // A delta for another turn of this thread, or with a non-string delta.
+        send({
+          method: "item/agentMessage/delta",
+          params: {
+            threadId,
+            turnId: scenario === "delta-other-turn" ? "turn_other" : turnId,
+            itemId: "item_a1",
+            delta: scenario === "delta-other-turn" ? "x" : 42,
+          },
+        });
+      }
       if (scenario === "item-other-turn") {
         // "item-other-turn": a well-formed item/completed bound to another turn id.
         send({

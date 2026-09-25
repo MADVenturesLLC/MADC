@@ -279,13 +279,28 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
       // Observe every message from here on, in order (deltas are display only).
       const done = c.waitFor((m: WireMessage) => {
         const params = m.params as Record<string, unknown> | undefined;
-        if (m.method === "item/agentMessage/delta" && params?.threadId === tid) {
-          const delta = String(params.delta ?? "");
-          if (stream) {
-            clearStatus();
-            io.stdout.write(delta);
+        if (m.method === "item/agentMessage/delta") {
+          // Copilot r4109335573: the delta envelope is validated like item/completed; a malformed
+          // or foreign-turn delta is never rendered and is a protocol violation (exit 3).
+          if (
+            params === undefined ||
+            params === null ||
+            typeof params !== "object" ||
+            params.threadId !== tid ||
+            !isDomainId(params.turnId) ||
+            !isDomainId(params.itemId) ||
+            typeof params.delta !== "string"
+          ) {
+            malformedItem = true;
+          } else {
+            itemTurnIds.add(params.turnId);
+            const delta = params.delta;
+            if (stream) {
+              clearStatus();
+              io.stdout.write(delta);
+            }
+            streamed += delta;
           }
-          streamed += delta;
         } else if (m.method === "item/completed") {
           // Copilot r4108213460 / r4109051056: the envelope is validated too. This connection has
           // exactly one thread, so an item/completed without a well-formed { threadId: <this>,
