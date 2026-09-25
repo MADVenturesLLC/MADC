@@ -339,7 +339,8 @@ test("A7 §7.3a locks: dead pid → WARN not visible, orphaned reclaim → WARN,
       JSON.stringify({ pid: 4_194_301, startedAt: Date.now(), token }),
     );
     writeFileSync(
-      join(sessions, `thr_gone.lock.reclaim-${"e".repeat(32)}`),
+      // The orphan suffix IS a lock token (Copilot r4107601226): it must be redacted.
+      join(sessions, `thr_gone.lock.reclaim-${token}`),
       JSON.stringify({ pid: 1, startedAt: 1, token }),
     );
     // Alive here, but it started long after this lock claims to have been taken.
@@ -358,7 +359,8 @@ test("A7 §7.3a locks: dead pid → WARN not visible, orphaned reclaim → WARN,
       locks.summary,
       /thr_dead · pid 4194301 · age \d+s: pid 4194301 not visible in this PID namespace: dead here, or live in another container\. M0 supports one PID namespace per MADC_HOME \(Amendment 2 §1\)/,
     );
-    assert.match(locks.summary, /orphaned thr_gone\.lock\.reclaim-e{32}/);
+    assert.match(locks.summary, /orphaned thr_gone\.lock\.reclaim-<redacted>/);
+    assert.match(text.stdout, /orphaned thr_gone\.lock\.reclaim-<redacted>/);
     if (process.platform === "linux") {
       assert.match(
         locks.summary,
@@ -648,6 +650,67 @@ test("A7 §7.5 exit 130: SIGINT sends turn/interrupt, prints the receipt, exits 
     } finally {
       sb2.cleanup();
     }
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("A7 §2 a first SIGINT while turn/start is in flight still sends turn/interrupt (Bugbot 4107608856)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    const mark = join(sb.root, "fake-mark");
+    const r = await runCli(sb, ["-p", "hi", "--json"], {
+      engine: FAKE,
+      env: { MADC_TEST_FAKE_SCENARIO: "slow-start", MADC_TEST_FAKE_MARK: mark },
+      onSpawn: (child) => {
+        const poll = setInterval(() => {
+          if (existsSync(mark)) {
+            clearInterval(poll);
+            child.kill("SIGINT");
+          }
+        }, 20);
+        // Never hang the suite: a CLI that ignores the held SIGINT is killed and fails the test.
+        setTimeout(() => {
+          clearInterval(poll);
+          child.kill("SIGKILL");
+        }, 20_000).unref();
+      },
+    });
+    assert.equal(r.code, 130, r.stdout + r.stderr);
+    assert.match(
+      readFileSync(mark, "utf8"),
+      /turn\/interrupt/,
+      "turn/interrupt reached the engine",
+    );
+    const out = JSON.parse(r.stdout) as { turn: { status: string }; session: { chain: string } };
+    assert.equal(out.turn.status, "interrupted");
+    assert.equal(out.session.chain, "verified");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("A7 §4 exit 3: the turn completed but the engine exited non-zero on close (Copilot r4107601276)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    const r = await runCli(sb, ["-p", "hi", "--json"], {
+      engine: FAKE,
+      env: { MADC_TEST_FAKE_SCENARIO: "exit-nonzero" },
+    });
+    assert.equal(r.code, 3, r.stdout + r.stderr);
+    const out = JSON.parse(r.stdout) as {
+      ok: boolean;
+      turn: { status: string };
+      error: { class: string; message: string };
+    };
+    assert.equal(out.ok, false);
+    assert.equal(out.turn.status, "completed", "status printed verbatim");
+    assert.equal(out.error.class, "engine");
+    assert.match(out.error.message, /code 7/);
   } finally {
     sb.cleanup();
   }
