@@ -14,8 +14,9 @@ export type ClientIdentity = "honest-ua-required" | "default";
 /**
  * Pure config entry for one subscription / access path.
  * No secrets, no I/O — quotes cite docs/plan sources.
+ * Readonly so typed callers cannot mutate fail-closed policy fields.
  */
-export type ProviderEntry = {
+export type ProviderEntry = Readonly<{
   id: string;
   status: ProviderStatus;
   sourceQuote: string;
@@ -24,7 +25,7 @@ export type ProviderEntry = {
   wired: boolean;
   wire?: WireFormat;
   clientIdentity?: ClientIdentity;
-};
+}>;
 
 /** Caller intent presented to assertAllowed (fail-closed). */
 export type RunMode = "headless" | "interactive";
