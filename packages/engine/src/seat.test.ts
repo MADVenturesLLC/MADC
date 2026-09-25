@@ -1,0 +1,312 @@
+/**
+ * M0-A4 seat files (seat pin §1–§3, §6 items 1, 2, 7). Network-free: echo fixture engine.
+ */
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, symlinkSync } from "node:fs";
+import { join } from "node:path";
+import { test } from "node:test";
+import { DEFAULT_SEAT_ID } from "./protocol/types.ts";
+import { MADC_DEFAULT_SEAT, memoryPathIssue, validateSeat } from "./seat.ts";
+import { loadSeat, seedDefaultSeat } from "./seat-store.ts";
+import {
+  expectRpcError,
+  handshake,
+  makeHome,
+  startEngine,
+  withEngine,
+  writeSeatFile,
+} from "./testing/harness.ts";
+
+/** Seat pin §3, copied literally (independent of MADC_DEFAULT_SEAT on purpose). */
+const PIN_MADC_DEFAULT = {
+  id: "madc-default",
+  version: 1,
+  role: "general builder",
+  standingInstructions:
+    "You are madc-default, the built-in MAD seat. Prefer concrete edits and verified commands. Obey registry and tool deny rules. Record honest model identity.",
+  pinnedModel: "kimi-coding/kimi-for-coding",
+  preferredBacking: "kimi-code",
+  memory: { mode: "file", path: "memory/madc-default.md" },
+  tools: { deny: [] },
+  policy: { headlessOk: true },
+  handoffs: { enabled: false, targets: [] },
+};
+
+const POSIX = process.platform !== "win32";
+
+function mode(path: string): number {
+  return statSync(path).mode & 0o777;
+}
+
+test("honesty §6.1: first engine start seeds seats/madc-default.json exactly as pin §3 (0600 in 0700 dirs)", async () => {
+  const { home, cleanup } = makeHome();
+  const first = startEngine(home);
+  try {
+    await handshake(first);
+    const path = join(home, "seats", "madc-default.json");
+    const seeded = JSON.parse(readFileSync(path, "utf8"));
+    assert.deepEqual(seeded, PIN_MADC_DEFAULT, "seed content is pin §3");
+    assert.deepEqual(seeded, JSON.parse(JSON.stringify(MADC_DEFAULT_SEAT)), "seed == built-in");
+    assert.deepEqual(Object.keys(seeded), Object.keys(PIN_MADC_DEFAULT), "pin key order");
+    for (const sub of ["seats", "sessions", "memory"]) {
+      assert.ok(statSync(join(home, sub)).isDirectory(), sub);
+      if (POSIX) assert.equal(mode(join(home, sub)), 0o700, sub);
+    }
+    if (POSIX) {
+      assert.equal(mode(home), 0o700);
+      assert.equal(mode(path), 0o600);
+    }
+    // The seeded seat is the one thread/start loads by default.
+    const { thread } = await first.request("thread/start", {});
+    assert.equal(thread.seatId, DEFAULT_SEAT_ID);
+    await first.close();
+
+    const bytes = readFileSync(path);
+    const mtime = statSync(path).mtimeMs;
+    const second = startEngine(home);
+    try {
+      await handshake(second);
+      await second.request("thread/list", {});
+      assert.deepEqual(readFileSync(path), bytes, "second start: byte-identical");
+      assert.equal(statSync(path).mtimeMs, mtime, "second start: not rewritten");
+    } finally {
+      await second.close();
+    }
+  } finally {
+    await first.close();
+    cleanup();
+  }
+});
+
+test("honesty §6.1: an existing madc-default.json is never overwritten (operator edits win)", async () => {
+  const { home, cleanup } = makeHome();
+  const custom = { ...PIN_MADC_DEFAULT, role: "operator-edited role" };
+  const path = writeSeatFile(home, custom);
+  const before = readFileSync(path, "utf8");
+  const client = startEngine(home);
+  try {
+    await handshake(client);
+    await client.request("thread/start", {});
+    assert.equal(readFileSync(path, "utf8"), before);
+    assert.equal(loadSeat(home, "madc-default").seat.role, "operator-edited role");
+  } finally {
+    await client.close();
+    cleanup();
+  }
+});
+
+test("seedDefaultSeat (shared with doctor --init): creates once, then reports existing, same bytes", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const a = seedDefaultSeat(home);
+    assert.equal(a.created, true);
+    const bytes = readFileSync(a.path);
+    const b = seedDefaultSeat(home);
+    assert.deepEqual(b, { path: a.path, created: false });
+    assert.deepEqual(readFileSync(a.path), bytes);
+    assert.deepEqual(loadSeat(home, "madc-default").seat, MADC_DEFAULT_SEAT);
+    assert.equal(
+      existsSync(join(home, "memory", "madc-default.md")),
+      false,
+      "memory file not seeded",
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+/** Each case: seat file body (or raw text) → the exact -32006 issue list. */
+const BAD_SEATS: Array<{
+  name: string;
+  seat?: Record<string, unknown>;
+  raw?: string;
+  issues: string[];
+}> = [
+  { name: "unparseable", raw: "{ not json", issues: ["seat file is not valid JSON"] },
+  { name: "array", raw: "[]", issues: ["seat file must be a JSON object"] },
+  {
+    name: "id-mismatch",
+    seat: { id: "someone-else" },
+    issues: ['id "someone-else" must equal the filename stem "id-mismatch"'],
+  },
+  { name: "version-2", seat: { version: 2 }, issues: ["version must be 1"] },
+  {
+    name: "ollama",
+    seat: { preferredBacking: "ollama-cloud" },
+    issues: ["preferredBacking must be one of kimi-code, claude-code, codex"],
+  },
+  {
+    name: "handoffs-on",
+    seat: { handoffs: { enabled: true, targets: [] } },
+    issues: ["handoffs.enabled must be false in M0"],
+  },
+  {
+    name: "handoffs-targets",
+    seat: { handoffs: { enabled: false, targets: ["madc-default"] } },
+    issues: ["handoffs.targets must be [] in M0"],
+  },
+  {
+    name: "mem-nopath",
+    seat: { memory: { mode: "file" } },
+    issues: ['memory.path is required when memory.mode is "file"'],
+  },
+  {
+    name: "mem-passwd",
+    seat: { memory: { mode: "file", path: "../../etc/passwd" } },
+    issues: ['memory.path must not contain ".."'],
+  },
+  {
+    name: "mem-absolute",
+    seat: { memory: { mode: "file", path: "/etc/memory/x.md" } },
+    issues: ["memory.path must be relative"],
+  },
+  {
+    name: "mem-dotdot-inner",
+    seat: { memory: { mode: "file", path: "memory/../seats/x.md" } },
+    issues: ['memory.path must not contain ".."'],
+  },
+  {
+    name: "mem-outside",
+    seat: { memory: { mode: "file", path: "notes/x.md" } },
+    issues: ['memory.path must be under "memory/"'],
+  },
+  {
+    name: "mem-ext",
+    seat: { memory: { mode: "file", path: "memory/x.txt" } },
+    issues: ['memory.path must end in ".md"'],
+  },
+  {
+    name: "mem-unnormalized",
+    seat: { memory: { mode: "file", path: "memory//x.md" } },
+    issues: ["memory.path must be normalized"],
+  },
+  {
+    name: "mem-backslash",
+    seat: { memory: { mode: "file", path: "memory\\x.md" } },
+    issues: ["memory.path must use forward slashes"],
+  },
+  {
+    name: "in-session-path",
+    seat: { memory: { mode: "in-session", path: "memory/x.md" } },
+    issues: ['memory.path is not allowed when memory.mode is "in-session"'],
+  },
+  {
+    name: "mem-mode",
+    seat: { memory: { mode: "cloud" } },
+    issues: ['memory.mode must be "file" or "in-session"'],
+  },
+  {
+    name: "tools-deny",
+    seat: { tools: { deny: ["bash", 3] } },
+    issues: ["tools.deny must be an array of strings"],
+  },
+  {
+    name: "tools-allow",
+    seat: { tools: { deny: [], allow: "bash" } },
+    issues: ["tools.allow must be an array of strings"],
+  },
+  {
+    name: "policy",
+    seat: { policy: { headlessOk: "yes" } },
+    issues: ["policy.headlessOk must be a boolean"],
+  },
+  { name: "unknown-key", seat: { extra: true }, issues: ["extra is not a seat field"] },
+  { name: "empty-role", seat: { role: " " }, issues: ["role must be a non-empty string"] },
+  {
+    name: "no-model",
+    seat: { pinnedModel: undefined },
+    issues: ["pinnedModel must be a non-empty string"],
+  },
+];
+
+test("honesty §6.2 / §6.7: schema failures → -32006 {seatId, path, issues} at thread/start; nothing written", async () => {
+  await withEngine(async (client, home) => {
+    await handshake(client);
+    for (const c of BAD_SEATS) {
+      const body = { ...PIN_MADC_DEFAULT, id: c.name, ...c.seat };
+      const path = writeSeatFile(home, { ...body, id: c.name }, c.raw ?? JSON.stringify(body));
+      const err = await expectRpcError(client.request("thread/start", { seatId: c.name }));
+      assert.equal(err.code, -32006, c.name);
+      assert.deepEqual(err.data, { seatId: c.name, path, issues: c.issues }, c.name);
+    }
+    const sessions = existsSync(join(home, "sessions")) ? readdirSync(join(home, "sessions")) : [];
+    assert.deepEqual(sessions, [], "no lock or session file for a refused seat");
+    assert.ok(!client.notifications.some((n) => n.method === "thread/started"));
+  });
+});
+
+test('§6.7: seatId "../x" → -32602 before any path join', async () => {
+  await withEngine(async (client, home) => {
+    await handshake(client);
+    for (const seatId of ["../x", "..", "a/b", ".hidden", ""]) {
+      const err = await expectRpcError(client.request("thread/start", { seatId }));
+      assert.equal(err.code, -32602, JSON.stringify(seatId));
+    }
+    assert.throws(
+      () => loadSeat(home, "../x"),
+      (e: { code?: number }) => e.code === -32602,
+    );
+  });
+});
+
+test("valid variants load: in-session memory, tools.allow, a second named seat", async () => {
+  await withEngine(async (client, home) => {
+    await handshake(client);
+    writeSeatFile(home, {
+      ...PIN_MADC_DEFAULT,
+      id: "reviewer",
+      role: "reviewer",
+      memory: { mode: "in-session" },
+      tools: { deny: ["bash"], allow: ["read:*"] },
+    });
+    const { thread } = await client.request("thread/start", { seatId: "reviewer" });
+    assert.equal(thread.seatId, "reviewer");
+    assert.deepEqual(loadSeat(home, "reviewer").seat.tools, { deny: ["bash"], allow: ["read:*"] });
+  });
+});
+
+test("confinement: a seat file or memory dir resolving outside MADC_HOME → -32006", async () => {
+  if (!POSIX) return; // symlink creation needs privileges on Windows
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside");
+  try {
+    seedDefaultSeat(home);
+    mkdirSync(outside, { recursive: true });
+    writeSeatFile(outside, { ...PIN_MADC_DEFAULT, id: "ext" });
+    symlinkSync(join(outside, "seats", "ext.json"), join(home, "seats", "ext.json"));
+    assert.throws(
+      () => loadSeat(home, "ext"),
+      (e: { code?: number; data?: { issues?: string[] } }) =>
+        e.code === -32006 && e.data?.issues?.[0] === "seat file resolves outside MADC_HOME",
+    );
+    // memory/ itself symlinked outside the home: a file-mode seat is refused.
+    const { home: home2, cleanup: cleanup2 } = makeHome();
+    try {
+      mkdirSync(home2, { recursive: true });
+      symlinkSync(outside, join(home2, "memory"));
+      writeSeatFile(home2, { ...PIN_MADC_DEFAULT });
+      assert.throws(
+        () => loadSeat(home2, "madc-default"),
+        (e: { code?: number; data?: { issues?: string[] } }) =>
+          e.code === -32006 && e.data?.issues?.[0] === "memory.path resolves outside MADC_HOME",
+      );
+    } finally {
+      cleanup2();
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test("validateSeat / memoryPathIssue units: the built-in seat is valid; lexical path rules", () => {
+  assert.deepEqual(validateSeat(PIN_MADC_DEFAULT, "madc-default"), {
+    ok: true,
+    seat: MADC_DEFAULT_SEAT,
+  });
+  assert.equal(memoryPathIssue("memory/madc-default.md"), null);
+  assert.equal(memoryPathIssue("memory/sub/notes.md"), null);
+  assert.notEqual(memoryPathIssue("memory/.md"), null);
+  assert.notEqual(memoryPathIssue("memory/"), null);
+  assert.notEqual(memoryPathIssue("C:/memory/x.md"), null);
+  assert.notEqual(memoryPathIssue("./memory/x.md"), null);
+});
