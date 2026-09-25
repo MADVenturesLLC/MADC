@@ -43,6 +43,7 @@ import {
   type SessionEventType,
   type SessionPayloads,
   SessionWriter,
+  sessionWriteFailed,
   verifySessionFile,
 } from "./session-store.ts";
 
@@ -560,6 +561,9 @@ export class EngineConnection {
     const record = this.#threads.get(threadId);
     if (record === undefined) throw threadNotFound(threadId);
     if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
+    // A broken session writer is permanent: -32009 before any preflight (never a later refusal).
+    const session = record.session;
+    if (session.broken) throw sessionWriteFailed(threadId, session.path, session.nextSeq);
     // Seat / registry / credential refusals are response errors before any turn exists (§4.2).
     const ctx = this.#turnContext(record, input);
     this.#opts.agent.preflight?.(ctx);
