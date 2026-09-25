@@ -1,14 +1,23 @@
 /** A7 unit tests: argument grammar (CLI pin §1), exit-code table (§4), colour rules (§3). */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { ErrorCode } from "@madc/engine/client";
 import { CHAT_RESERVED, parseArgs } from "./args.ts";
-import { sha256OrNull } from "./doctor.ts";
+import { confinedSeatSha, setDoctorSwapHookForTests, sha256OrNull } from "./doctor.ts";
 import { classifyCode, EXIT } from "./exit-codes.ts";
 import { type CliIO, colorEnabled } from "./io.ts";
 import { main } from "./main.ts";
@@ -217,6 +226,43 @@ test("A7 §1 a dangling MADC_HOME symlink → exit 2 before anything spawns (Cop
     assert.equal(report.checks.find((c) => c.id === "engine")?.status, "skip", "nothing spawned");
     assert.equal(existsSync(join(dir, "gone")), false, "the symlink target was never created");
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("A7 §3 a seats/ or sessions/ swapped during doctor's read discards the result (Copilot r4108570448, r4108570535)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "madc-a7-swap-"));
+  try {
+    const home = join(dir, "home");
+    mkdirSync(join(home, "seats"), { recursive: true });
+    mkdirSync(join(home, "sessions"));
+    writeFileSync(join(home, "seats", "madc-default.json"), "{}");
+    const outside = join(dir, "outside");
+    mkdirSync(outside);
+    writeFileSync(join(outside, "madc-default.json"), "{}");
+    assert.match(confinedSeatSha(home, "madc-default.json") ?? "", /^[0-9a-f]{64}$/);
+    setDoctorSwapHookForTests((d) => {
+      if (d !== "seats") return;
+      renameSync(join(home, "seats"), join(home, "seats.old"));
+      symlinkSync(outside, join(home, "seats"));
+    });
+    assert.equal(confinedSeatSha(home, "madc-default.json"), null, "swapped parent: no hash");
+
+    setDoctorSwapHookForTests((d) => {
+      if (d !== "sessions") return;
+      renameSync(join(home, "sessions"), join(home, "sessions.old"));
+      mkdirSync(join(home, "sessions"));
+    });
+    const doc = fakeIO({ env: { MADC_HOME: home, PATH: "" } });
+    await main(["doctor", "--json"], doc);
+    const report = JSON.parse(doc.out()) as {
+      checks: Array<{ id: string; status: string; summary: string }>;
+    };
+    const locks = report.checks.find((c) => c.id === "locks");
+    assert.equal(locks?.status, "warn");
+    assert.match(locks?.summary ?? "", /changed during the survey: not inspected/);
+  } finally {
+    setDoctorSwapHookForTests(null);
     rmSync(dir, { recursive: true, force: true });
   }
 });

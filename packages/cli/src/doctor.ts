@@ -96,15 +96,43 @@ export function sha256OrNull(path: string): string | null {
  * resolves to `<real home>/seats` (Copilot r4108455655: a symlinked parent is never followed).
  */
 export function confinedSeatSha(home: string, file: string): string | null {
-  const dir = join(home, "seats");
+  // Copilot r4108570448: the parent's identity is pinned before the open and re-checked after
+  // the hash; a `seats/` swapped in between discards the result.
+  const before = confinedDirId(home, "seats");
+  if (before === null) return null;
+  const sha = sha256OrNull(join(home, "seats", file));
+  swapHookForTests?.("seats");
+  return sameDirId(before, confinedDirId(home, "seats")) ? sha : null;
+}
+
+type DirId = { readonly dev: number; readonly ino: number };
+
+/** Test seam: runs between the confinement check and the re-check (simulates a concurrent swap). */
+let swapHookForTests: ((dir: "seats" | "sessions") => void) | null = null;
+export function setDoctorSwapHookForTests(
+  hook: ((dir: "seats" | "sessions") => void) | null,
+): void {
+  swapHookForTests = hook;
+}
+
+/**
+ * Identity of `<home>/<name>` when it is a real directory (never a symlink) that resolves to
+ * `<real home>/<name>`; `null` otherwise (absent, symlink, non-directory, outside, unreadable).
+ */
+export function confinedDirId(home: string, name: string): DirId | null {
+  const dir = join(home, name);
   try {
     const st = lstatSync(dir);
     if (st.isSymbolicLink() || !st.isDirectory()) return null;
-    if (realpathSync(dir) !== join(realpathSync(home), "seats")) return null;
+    if (realpathSync(dir) !== join(realpathSync(home), name)) return null;
+    return { dev: st.dev, ino: st.ino };
   } catch {
     return null;
   }
-  return sha256OrNull(join(dir, file));
+}
+
+function sameDirId(a: DirId | null, b: DirId | null): boolean {
+  return a !== null && b !== null && a.dev === b.dev && a.ino === b.ino;
 }
 
 /** True when something (even a dangling symlink) exists at `path`, without following it. */
@@ -388,6 +416,7 @@ function checkLocks(home: HomeState): Check {
     return { id: "locks", status: "pass", summary: "no locks", evidence: { locks: [] } };
   const dir = join(home.path, "sessions");
   let names: string[];
+  let pinned: DirId | null = null;
   try {
     // Copilot r4107805223 / r4107905013, Bugbot 4107900653: same confinement as the engine's
     // inspection. `lstat` first (no follow): any `sessions` symlink, dangling or not, and any
@@ -411,7 +440,9 @@ function checkLocks(home: HomeState): Check {
         evidence: { path: dir, confined: false },
       };
     }
+    pinned = { dev: st.dev, ino: st.ino };
     names = readdirSync(dir).sort();
+    swapHookForTests?.("sessions");
   } catch (err) {
     // `sessions/` exists (lstat above) but could not be resolved or listed: never a healthy PASS
     // (Copilot review 5322024643, "previously missed").
@@ -485,6 +516,16 @@ function checkLocks(home: HomeState): Check {
       continue;
     }
     held.push(entry);
+  }
+  // Copilot r4108570535: the survey counts only if `sessions/` is still the same confined
+  // directory that was checked before enumeration; a swap during the survey discards everything.
+  if (!sameDirId(pinned, confinedDirId(home.path, "sessions"))) {
+    return {
+      id: "locks",
+      status: "warn",
+      summary: `${dir} changed during the survey: not inspected`,
+      evidence: { path: dir, confined: false },
+    };
   }
   if (warnings.length > 0) {
     return {
