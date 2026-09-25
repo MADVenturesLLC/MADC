@@ -279,22 +279,36 @@ export class SessionWriter {
     ts: number = Date.now(),
     home?: string,
   ): SessionWriter {
-    let fd: number;
+    let created: { dev: bigint; ino: bigint };
     try {
-      fd = openSync(path, APPEND_FLAGS | constants.O_CREAT | constants.O_EXCL, 0o600);
-      closeSync(fd);
+      const fd = openSync(path, APPEND_FLAGS | constants.O_CREAT | constants.O_EXCL, 0o600);
+      try {
+        const st = fstatSync(fd, { bigint: true });
+        created = { dev: st.dev, ino: st.ino };
+      } finally {
+        closeSync(fd);
+      }
     } catch {
       throw sessionWriteFailed(threadId, path, 0);
     }
+    // Cleanup only removes the file this call created, and only while `path` still resolves to it
+    // inside the home: after a parent swap an unrelated file of the same name is never deleted.
+    const removeCreated = (): void => {
+      try {
+        const real = realpathSync(path);
+        const st = lstatSync(real, { bigint: true });
+        if (resolvesUnderHome(real, home) && st.dev === created.dev && st.ino === created.ino) {
+          unlinkSync(real);
+        }
+      } catch {
+        // best effort: a leftover empty file under the thread lock is harmless
+      }
+    };
     let realPath: string;
     try {
       realPath = realpathSync(path);
     } catch {
-      try {
-        unlinkSync(path);
-      } catch {
-        // best effort: the file was created by this call under the thread lock
-      }
+      removeCreated();
       throw sessionWriteFailed(threadId, path, 0);
     }
     if (!resolvesUnderHome(realPath, home)) {
@@ -305,11 +319,7 @@ export class SessionWriter {
     try {
       writer.append("session.open", open, ts);
     } catch (err) {
-      try {
-        unlinkSync(path);
-      } catch {
-        // best effort: the file was created by this call under the thread lock
-      }
+      removeCreated();
       throw err;
     }
     return writer;
