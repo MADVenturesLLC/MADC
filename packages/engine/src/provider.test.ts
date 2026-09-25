@@ -5,8 +5,9 @@
  */
 import assert from "node:assert/strict";
 import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, relative, sep } from "node:path";
 import { test } from "node:test";
+import { fileURLToPath } from "node:url";
 import type { FakeKimiReply, FakeKimiRequest } from "@madc/adapters/testing";
 import { ENGINE_ENTRY, type EngineClient } from "./client.ts";
 import type { Item, Turn } from "./protocol/types.ts";
@@ -361,20 +362,29 @@ test("production engine entry defaults to the Kimi agent: no key → -32008 no-c
   }
 });
 
+/** Static `from`, side-effect `import "…"`, dynamic `import(…)`, and `require(…)` of any pi-ai entry. */
+const PI_AI_IMPORT = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)["']@earendil-works\/pi-ai/;
+
 test("plan §6: only packages/adapters imports @earendil-works/pi-ai, and only kimi-code.ts there", () => {
   const packagesDir = new URL("../../", import.meta.url);
+  const packagesPath = fileURLToPath(packagesDir);
   const offenders: string[] = [];
+  let scanned = 0;
   for (const pkg of readdirSync(packagesDir)) {
     const src = new URL(`${pkg}/src/`, packagesDir);
     if (!existsSync(src)) continue;
+    // Test sources count too: nothing but kimi-code.ts may import pi-ai directly.
     for (const file of readdirSync(src, { recursive: true, withFileTypes: true })) {
-      if (!file.isFile() || !file.name.endsWith(".ts") || file.name.endsWith(".test.ts")) continue;
+      if (!file.isFile() || !file.name.endsWith(".ts")) continue;
       const path = join(file.parentPath, file.name);
-      if (!/from\s+["']@earendil-works\/pi-ai/.test(readFileSync(path, "utf8"))) continue;
-      const rel = path.slice(path.indexOf("packages/"));
-      if (rel !== "packages/adapters/src/kimi-code.ts") offenders.push(rel);
+      scanned++;
+      if (!PI_AI_IMPORT.test(readFileSync(path, "utf8"))) continue;
+      // Platform-independent: compare POSIX-style paths relative to packages/ (Windows uses `\`).
+      const rel = relative(packagesPath, path).split(sep).join("/");
+      if (rel !== "adapters/src/kimi-code.ts") offenders.push(rel);
     }
   }
+  assert.ok(scanned > 20, `importer scan saw only ${scanned} files`);
   assert.deepEqual(offenders, []);
   for (const pkg of ["core", "engine", "registry", "cli"]) {
     const manifest = readFileSync(new URL(`${pkg}/package.json`, packagesDir), "utf8");
