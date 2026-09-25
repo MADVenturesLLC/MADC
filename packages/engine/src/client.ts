@@ -33,6 +33,18 @@ export class EngineRpcError extends Error {
   }
 }
 
+/** Transport error: the engine child exited before answering a request. */
+export class EngineExitedError extends Error {
+  readonly exitCode: number | null;
+  readonly signal: NodeJS.Signals | null;
+  constructor(exitCode: number | null, signal: NodeJS.Signals | null) {
+    super(`engine exited (code ${exitCode}, signal ${signal}) before responding`);
+    this.name = "EngineExitedError";
+    this.exitCode = exitCode;
+    this.signal = signal;
+  }
+}
+
 export type WireMessage = Record<string, unknown>;
 export type Notification = { method: string; params: unknown };
 
@@ -62,7 +74,13 @@ export class EngineClient {
       this.#onLine(line),
     );
     this.exited = new Promise((resolve) => {
-      child.once("exit", (code) => resolve(code));
+      child.once("exit", (code, signal) => {
+        // A response that never arrived will never arrive: fail every pending request.
+        const err = new EngineExitedError(code, signal);
+        for (const pending of this.#pending.values()) pending.reject(err);
+        this.#pending.clear();
+        resolve(code);
+      });
     });
   }
 
@@ -119,6 +137,10 @@ export class EngineClient {
     const id = this.#nextId++;
     const msg = params === undefined ? { id, method } : { id, method, params };
     return new Promise((resolve, reject) => {
+      if (this.child.exitCode !== null || this.child.signalCode !== null) {
+        reject(new EngineExitedError(this.child.exitCode, this.child.signalCode));
+        return;
+      }
       this.#pending.set(id, { resolve, reject });
       this.sendRaw(JSON.stringify(msg));
     });
