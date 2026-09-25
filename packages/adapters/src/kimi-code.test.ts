@@ -92,6 +92,11 @@ test("credentials: missing / blank / Claude OAuth token shapes are refused", () 
     ok: false,
     reason: "oauth-token-refused",
   });
+  // Mirrors pi-ai's substring rule: it would switch to Claude Code identity for this value too.
+  assert.deepEqual(readKimiCredential({ [KIMI_API_KEY_ENV]: "prefix-sk-ant-oat01-abc" }), {
+    ok: false,
+    reason: "oauth-token-refused",
+  });
   assert.deepEqual(readKimiCredential({ [KIMI_API_KEY_ENV]: ` ${KEY} ` }), {
     ok: true,
     apiKey: KEY,
@@ -101,6 +106,10 @@ test("credentials: missing / blank / Claude OAuth token shapes are refused", () 
 test("honesty: the port refuses OAuth-shaped keys and non-madc User-Agents", () => {
   assert.throws(
     () => createKimiCodePort({ apiKey: "sk-ant-oat01-x", userAgent: honestUserAgent("0.0.0") }),
+    ProviderCallError,
+  );
+  assert.throws(
+    () => createKimiCodePort({ apiKey: "x-sk-ant-oat01-y", userAgent: honestUserAgent("0.0.0") }),
     ProviderCallError,
   );
   assert.throws(

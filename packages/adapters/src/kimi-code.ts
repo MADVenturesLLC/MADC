@@ -76,7 +76,12 @@ export type KimiCredential =
   | { readonly ok: true; readonly apiKey: string }
   | { readonly ok: false; readonly reason: "missing" | "oauth-token-refused" };
 
-/** Claude subscription OAuth tokens: pi-ai switches to Claude Code identity headers for these. */
+/**
+ * Claude subscription OAuth tokens: pi-ai switches to Claude Code identity headers for these.
+ * Deliberately a substring match, not a prefix match: pi-ai 0.87.1 decides OAuth mode with
+ * `apiKey.includes("sk-ant-oat")` (dist/api/anthropic-messages.js), so any value it would treat as
+ * OAuth must be refused here too, or a key with that text anywhere would be sent with vendor identity.
+ */
 function isRefusedTokenShape(value: string): boolean {
   return value.includes("sk-ant-oat");
 }
