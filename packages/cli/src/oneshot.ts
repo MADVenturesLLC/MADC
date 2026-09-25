@@ -106,6 +106,12 @@ function isItemShape(i: unknown): i is Item {
 const DOMAIN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const isDomainId = (v: unknown): v is string => typeof v === "string" && DOMAIN_ID.test(v);
 
+function isErrorBody(e: unknown): boolean {
+  if (e === null || typeof e !== "object") return false;
+  const r = e as Record<string, unknown>;
+  return Number.isInteger(r.code) && typeof r.message === "string";
+}
+
 /** Minimal runtime shape check of a `Turn` from the wire (fields the CLI reads). */
 function isTurnShape(t: unknown): t is Turn {
   if (t === null || typeof t !== "object") return false;
@@ -117,7 +123,10 @@ function isTurnShape(t: unknown): t is Turn {
     Array.isArray(r.items) &&
     r.items.every(isItemShape) &&
     typeof r.startedAt === "number" &&
-    (r.completedAt === null || typeof r.completedAt === "number")
+    (r.completedAt === null || typeof r.completedAt === "number") &&
+    // Copilot r4108941737: `error` is required, and is null or an RPC error body.
+    Object.hasOwn(r, "error") &&
+    (r.error === null || isErrorBody(r.error))
   );
 }
 
