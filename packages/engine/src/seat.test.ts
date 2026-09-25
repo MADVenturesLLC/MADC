@@ -136,6 +136,11 @@ test("seed is atomic: a partial seat file never appears; an existing file (even 
     assert.equal(a.created, true);
     assert.equal(readFileSync(a.path, "utf8"), serializeSeat(MADC_DEFAULT_SEAT));
     if (POSIX) assert.equal(mode(a.path), 0o600);
+    // The leftover is left alone; the writer's own temp file is removed.
+    assert.deepEqual(readdirSync(join(home, "seats")).sort(), [
+      ".madc-default.json.1.abc.tmp",
+      "madc-default.json",
+    ]);
     // Operator-owned content wins, whatever it is.
     writeFileSync(a.path, "");
     assert.deepEqual(seedDefaultSeat(home), { path: a.path, created: false });
