@@ -2,6 +2,7 @@
  * `madc` entry logic (CLI pin §1). Talks to the engine only through `@madc/engine/client`
  * (spawned child, stdio JSONL). M0 surface: --version, --help, doctor, headless -p. No chat.
  */
+import { statSync } from "node:fs";
 import { MADC_VERSION } from "@madc/core";
 import { PROTOCOL_VERSION, resolveMadcHome } from "@madc/engine/client";
 import { CHAT_RESERVED, parseArgs, USAGE } from "./args.ts";
@@ -66,6 +67,15 @@ async function oneShot(
     home = resolveMadcHome(io.env as NodeJS.ProcessEnv);
   } catch (err) {
     return usageFailure(io, json, err instanceof Error ? err.message : String(err));
+  }
+  // An existing non-directory MADC_HOME is a config error too (same rule as doctor; Copilot
+  // review 5321817948 "previously missed"): exit 2 before anything spawns.
+  try {
+    if (!statSync(home).isDirectory()) {
+      return usageFailure(io, json, `MADC_HOME ${home} exists but is not a directory`);
+    }
+  } catch {
+    // absent: the engine creates and seeds it
   }
   let prompt: string | null;
   if (promptArg === "-") {
