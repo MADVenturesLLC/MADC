@@ -149,6 +149,12 @@ rl.on("line", (line) => {
         scenario === "delta-only"
           ? []
           : [{ id: "item_a1", kind: "agentMessage", status: "completed", text: "fake reply" }];
+      if (scenario === "no-error-field") {
+        // "no-error-field": turn/completed omits the required `error` field.
+        const { error: _omit, ...rest } = { ...turn, status: "completed", completedAt: 2 };
+        send({ method: "turn/completed", params: { turn: rest } });
+        return;
+      }
       if (scenario === "wrong-turn-id") {
         // "wrong-turn-id": a well-formed turn/completed for another turn of the same thread.
         send({
