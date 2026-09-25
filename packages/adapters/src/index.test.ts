@@ -1,7 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { ADAPTERS_PLACEHOLDER } from "./index.ts";
+import * as adapters from "./index.ts";
 
-test("adapters placeholder export resolves", () => {
-  assert.equal(ADAPTERS_PLACEHOLDER, "adapters");
+test("adapters export the provider seam and the Kimi Code backing (A3)", () => {
+  assert.equal(adapters.KIMI_CODE_PROVIDER_ID, "kimi-code");
+  assert.equal(adapters.KIMI_PI_PROVIDER, "kimi-coding");
+  assert.equal(typeof adapters.createKimiCodePort, "function");
+  assert.equal(typeof adapters.ProviderCallError, "function");
+  assert.ok(!("ADAPTERS_PLACEHOLDER" in adapters));
 });
