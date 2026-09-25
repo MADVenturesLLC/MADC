@@ -4,6 +4,7 @@
  * home (the engine's own seed writer). Every PASS carries evidence; WARN and SKIP never fail.
  * Never prints a credential value or a lock token; never execs a vendor binary.
  */
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   accessSync,
@@ -21,16 +22,16 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { MADC_VERSION } from "@madc/core";
 import {
-  inspectMadcHome,
+  type inspectMadcHome,
   isPidAlive,
   listCatalog,
   PROTOCOL_VERSION,
   readLock,
   resolveMadcHome,
   spawnEngine,
-  verifySessionFile,
 } from "@madc/engine/client";
 import { EXIT } from "./exit-codes.ts";
 import { type CliIO, colorEnabled, paint, TimeoutError, withTimeout } from "./io.ts";
@@ -297,7 +298,61 @@ function checkHome(home: HomeState): Check {
   }
 }
 
-function checkSeat(home: HomeState): Check {
+/** CLI pin §3: every check has a hard timeout; the seat/session inspection gets this budget. */
+const INSPECT_TIMEOUT_MS = 5_000;
+let inspectTimeoutMs = INSPECT_TIMEOUT_MS;
+/** Test seam: shrink the inspection deadline to force the timeout path. `null` restores it. */
+export function setDoctorInspectTimeoutForTests(ms: number | null): void {
+  inspectTimeoutMs = ms ?? INSPECT_TIMEOUT_MS;
+}
+
+type SeatInfo = ReturnType<typeof inspectMadcHome>["seat"];
+type Inspection =
+  | {
+      readonly ok: true;
+      readonly seat: SeatInfo;
+      readonly lastSession: { readonly threadId: string; readonly path: string } | null;
+      readonly verify:
+        | { readonly ok: true; readonly events: number; readonly lastHash: string }
+        | {
+            readonly ok: false;
+            readonly line: number;
+            readonly reason: string;
+            readonly kind: string;
+          }
+        | null;
+    }
+  | { readonly ok: false; readonly reason: string };
+
+const INSPECT_CHILD = fileURLToPath(new URL("./inspect-child.ts", import.meta.url));
+
+/**
+ * Run `inspectMadcHome` + `verifySessionFile` in a child killed at the deadline (Copilot
+ * r4109051001): a huge or stalled session file can no longer hang doctor.
+ */
+function inspectBounded(home: string): Inspection {
+  const flags = process.versions.bun !== undefined ? [] : ["--disable-warning=ExperimentalWarning"];
+  const r = spawnSync(process.execPath, [...flags, INSPECT_CHILD, home, DEFAULT_SEAT], {
+    timeout: inspectTimeoutMs,
+    killSignal: "SIGKILL",
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "pipe"],
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (r.error !== undefined && (r.error as NodeJS.ErrnoException).code === "ETIMEDOUT") {
+    return { ok: false, reason: `timeout ${inspectTimeoutMs}ms` };
+  }
+  if (r.signal !== null) return { ok: false, reason: `timeout ${inspectTimeoutMs}ms` };
+  if (r.status !== 0) return { ok: false, reason: `inspection failed (exit ${String(r.status)})` };
+  try {
+    const parsed = JSON.parse(r.stdout) as Omit<Extract<Inspection, { ok: true }>, "ok">;
+    return { ok: true, ...parsed };
+  } catch {
+    return { ok: false, reason: "inspection returned malformed output" };
+  }
+}
+
+function checkSeat(home: HomeState, insp: Inspection | null): Check {
   if (home.kind === "invalid") return skip("seat", "MADC_HOME is invalid");
   const path = join(home.path, "seats", `${DEFAULT_SEAT}.json`);
   if (home.kind === "missing") {
@@ -308,7 +363,11 @@ function checkSeat(home: HomeState): Check {
       evidence: { path },
     };
   }
-  const seat = inspectMadcHome(home.path, DEFAULT_SEAT).seat;
+  if (insp === null || !insp.ok) {
+    const reason = insp === null ? "not inspected" : insp.reason;
+    return { id: "seat", status: "fail", summary: reason, evidence: { path } };
+  }
+  const seat = insp.seat;
   if (seat.ok) {
     const sha = confinedSeatSha(home.path, `${DEFAULT_SEAT}.json`);
     if (sha !== null) {
@@ -342,20 +401,24 @@ function checkSeat(home: HomeState): Check {
   };
 }
 
-function checkSession(home: HomeState): Check {
+function checkSession(home: HomeState, insp: Inspection | null): Check {
   if (home.kind !== "present") return skip("session", "no sessions yet");
-  const last = inspectMadcHome(home.path, DEFAULT_SEAT).lastSession;
-  if (last === null) return skip("session", "no sessions yet");
-  const v = verifySessionFile(last.path, last.threadId, {}, home.path);
+  if (insp === null || !insp.ok) {
+    const reason = insp === null ? "not inspected" : insp.reason;
+    return { id: "session", status: "fail", summary: reason, evidence: {} };
+  }
+  const last = insp.lastSession;
+  const v = insp.verify;
+  if (last === null || v === null) return skip("session", "no sessions yet");
   if (v.ok) {
     return {
       id: "session",
       status: "pass",
-      summary: `${last.threadId} · ${v.events.length} events · head ${v.lastHash.slice(0, 12)}`,
+      summary: `${last.threadId} · ${v.events} events · head ${v.lastHash.slice(0, 12)}`,
       evidence: {
         threadId: last.threadId,
         path: last.path,
-        events: v.events.length,
+        events: v.events,
         headHash: v.lastHash,
       },
     };
@@ -717,8 +780,9 @@ export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number>
     homeInvalid ? skip("engine", "MADC_HOME is invalid: nothing spawned") : await checkEngine(io),
   );
   emit(checkHome(home));
-  emit(checkSeat(home));
-  emit(checkSession(home));
+  const insp = home.kind === "present" ? inspectBounded(home.path) : null;
+  emit(checkSeat(home, insp));
+  emit(checkSession(home, insp));
   emit(home.kind === "invalid" ? skip("locks", "MADC_HOME is invalid") : checkLocks(home));
   emit(checkRegistry());
   emit(checkKimiCredential(io));

@@ -153,6 +153,7 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
   let engineExit: number | null | undefined;
   let violationTimer: ReturnType<typeof setInterval> | undefined;
   let malformedItem = false;
+  const itemTurnIds = new Set<string>();
   let streamed = "";
   const stream = io.stdoutIsTTY && !opts.json;
   const seatId = opts.seatId ?? DEFAULT_SEAT;
@@ -282,11 +283,22 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
             io.stdout.write(delta);
           }
           streamed += delta;
-        } else if (m.method === "item/completed" && params?.threadId === tid) {
-          // Copilot r4108213460: a malformed item never throws inside the client's reader; it is
-          // a protocol violation (exit 3) through the normal result path.
-          if (!isItemShape(params.item)) malformedItem = true;
-          else {
+        } else if (m.method === "item/completed") {
+          // Copilot r4108213460 / r4109051056: the envelope is validated too. This connection has
+          // exactly one thread, so an item/completed without a well-formed { threadId: <this>,
+          // turnId, item } is a protocol violation (exit 3), never silently ignored. The turnId
+          // is bound to this turn once `turn/start` has answered (it can arrive first).
+          if (
+            params === undefined ||
+            params === null ||
+            typeof params !== "object" ||
+            params.threadId !== tid ||
+            !isDomainId(params.turnId) ||
+            !isItemShape(params.item)
+          ) {
+            malformedItem = true;
+          } else {
+            itemTurnIds.add(params.turnId);
             const s = servedModelOf(params.item);
             if (s !== null) served = s;
           }
@@ -340,6 +352,7 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
         // Copilot r4108865790: it must be THIS turn (id from turn/start, same thread).
         if (isTurnShape(t) && t.id === turnId && t.threadId === tid) turn = t;
         else malformedItem = true;
+        for (const id of itemTurnIds) if (id !== turnId) malformedItem = true;
       }
     } catch (err) {
       if (err instanceof Forced) {
