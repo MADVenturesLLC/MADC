@@ -704,7 +704,10 @@ export function rebuildSession(events: readonly SessionEvent[], now = Date.now()
       const turn = turns.get(p.turnId);
       if (turn !== undefined) {
         turn.status = p.status;
-        turn.error = p.status === "failed" ? (p.error as RpcErrorBody | null) : null;
+        // Only {code, message} is rebuilt (ruling item 8), whatever extra fields a line carries.
+        const err = p.error as RpcErrorBody | null;
+        turn.error =
+          p.status === "failed" && err !== null ? { code: err.code, message: err.message } : null;
         turn.completedAt = e.ts;
       }
     }
