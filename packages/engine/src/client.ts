@@ -33,7 +33,7 @@ export class EngineRpcError extends Error {
   }
 }
 
-/** Transport error: the engine child exited before answering a request. */
+/** Transport error: the engine child exited (or never started) before answering a request. */
 export class EngineExitedError extends Error {
   readonly exitCode: number | null;
   readonly signal: NodeJS.Signals | null;
@@ -63,6 +63,7 @@ export class EngineClient {
   readonly protocolViolations: string[] = [];
   readonly exited: Promise<number | null>;
   #nextId = 1;
+  #terminated = false;
   readonly #pending = new Map<RequestId, Pending>();
   #waiters: Waiter[] = [];
 
@@ -73,13 +74,23 @@ export class EngineClient {
     createInterface({ input: stdout, crlfDelay: Number.POSITIVE_INFINITY }).on("line", (line) =>
       this.#onLine(line),
     );
+    // Writes to a dead or never-started child fail asynchronously; the terminal path below settles
+    // every caller, so stdin write errors carry no extra information.
+    child.stdin?.on("error", () => undefined);
     this.exited = new Promise((resolve) => {
-      child.once("exit", (code, signal) => {
+      const finish = (code: number | null, signal: NodeJS.Signals | null) => {
+        if (this.#terminated) return;
+        this.#terminated = true;
         // A response that never arrived will never arrive: fail every pending request.
         const err = new EngineExitedError(code, signal);
         for (const pending of this.#pending.values()) pending.reject(err);
         this.#pending.clear();
         resolve(code);
+      };
+      child.once("exit", (code, signal) => finish(code, signal));
+      // A failed spawn (bad runtime or entry) emits `error` and never `exit`.
+      child.on("error", () => {
+        if (child.pid === undefined) finish(null, null);
       });
     });
   }
@@ -137,7 +148,7 @@ export class EngineClient {
     const id = this.#nextId++;
     const msg = params === undefined ? { id, method } : { id, method, params };
     return new Promise((resolve, reject) => {
-      if (this.child.exitCode !== null || this.child.signalCode !== null) {
+      if (this.#terminated || this.child.exitCode !== null || this.child.signalCode !== null) {
         reject(new EngineExitedError(this.child.exitCode, this.child.signalCode));
         return;
       }

@@ -41,15 +41,13 @@ export function enforcePrivateDir(dir: string): void {
  * Resolve `$MADC_HOME/<subdir>/<id><ext>` with confinement:
  * 1. `id` must match the protocol id grammar — checked FIRST, before any path join or mkdir (→ -32602).
  * 2. The real path of `<subdir>` (after symlinks) must stay under the real path of `$MADC_HOME`.
- * Dirs are created `0700` (best effort on Windows).
+ * 3. Only then are the verified real dirs tightened to `0700` (best effort on Windows).
  */
 export function confinedPath(home: string, subdir: HomeSubdir, id: string, ext: string): string {
   if (!isValidId(id)) {
     throw invalidParams([`${subdir} id must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`]);
   }
   mkdirSync(join(home, subdir), { recursive: true, mode: 0o700 });
-  enforcePrivateDir(home);
-  enforcePrivateDir(join(home, subdir));
   const realHome = realpathSync(home);
   const realDir = realpathSync(join(home, subdir));
   const target = join(realDir, `${id}${ext}`);
@@ -57,5 +55,8 @@ export function confinedPath(home: string, subdir: HomeSubdir, id: string, ext: 
     // Session / lock paths have no dedicated code in §4.1; seat/memory escapes are A4 (-32006).
     throw internalError("Resolved path escapes MADC_HOME");
   }
+  // Never chmod before confinement: a symlinked subdir must not get an outside dir tightened.
+  enforcePrivateDir(realHome);
+  enforcePrivateDir(realDir);
   return target;
 }

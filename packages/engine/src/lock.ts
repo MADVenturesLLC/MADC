@@ -10,6 +10,9 @@ export type LockState =
   | { state: "corrupt" }
   | { state: "held"; info: LockInfo };
 
+/** Device + inode of a lock file (the file itself, never a symlink target). */
+export type FileId = { dev: bigint; ino: bigint };
+
 /**
  * Per-acquisition ownership token: the device + inode of the exact lock file this acquisition
  * linked into place, plus its pinned `{ pid, startedAt }` body. Inode numbers can be reused as soon
@@ -76,7 +79,7 @@ export function isPidAlive(pid: number): boolean {
   }
 }
 
-function fileId(path: string): { dev: bigint; ino: bigint } | null {
+export function fileId(path: string): FileId | null {
   try {
     const st = lstatSync(path, { bigint: true });
     return { dev: st.dev, ino: st.ino };
@@ -102,6 +105,13 @@ function handleFor(path: string, pid: number): LockHandle | null {
   return { path, pid, startedAt: body.info.startedAt, ...id };
 }
 
+function sameLockState(a: LockState, b: LockState): boolean {
+  if (a.state === "held" && b.state === "held") {
+    return a.info.pid === b.info.pid && a.info.startedAt === b.info.startedAt;
+  }
+  return a.state === b.state;
+}
+
 function removeQuietly(path: string): void {
   try {
     unlinkSync(path);
@@ -111,9 +121,44 @@ function removeQuietly(path: string): void {
 }
 
 /**
+ * Reclaim a lock judged dead/corrupt only if `path` still holds exactly that file (same dev/inode
+ * and body). The lock is first atomically renamed aside; if it changed in the meantime (another
+ * engine reclaimed it and installed its own), it is linked back and left alone. Returns true iff
+ * the observed lock was removed. Internal; exported for tests.
+ */
+export function reclaimIfUnchanged(
+  path: string,
+  seenId: FileId,
+  seen: LockState,
+  pid: number = process.pid,
+): boolean {
+  const aside = `${path}.${pid}.${randomUUID()}.reclaim`;
+  try {
+    renameSync(path, aside);
+  } catch (err) {
+    if (errCode(err) === "ENOENT") return false;
+    throw err;
+  }
+  try {
+    const id = fileId(aside);
+    const sameFile = id !== null && id.dev === seenId.dev && id.ino === seenId.ino;
+    if (sameFile && sameLockState(readLock(aside), seen)) return true;
+    try {
+      linkSync(aside, path);
+    } catch (err) {
+      if (errCode(err) !== "EEXIST") throw err;
+    }
+    return false;
+  } finally {
+    removeQuietly(aside);
+  }
+}
+
+/**
  * Create-exclusive lock. The full `{ pid, startedAt }` body is written to a private temp file and
  * hard-linked into place (`link` fails with EEXIST if the lock exists), so readers never observe a
- * half-written lock. A lock whose pid is dead (or whose body is unreadable) is reclaimed.
+ * half-written lock. A lock whose pid is dead (or whose body is unreadable) is reclaimed — but only
+ * if it is still the very file that was judged (see `reclaimIfUnchanged`).
  */
 export function acquireThreadLock(
   home: string,
@@ -141,8 +186,9 @@ export function acquireThreadLock(
     }
     if (handle !== null) return { ok: true, path, handle: { ...handle, path } };
 
+    const seenId = fileId(path);
     const current = readLock(path);
-    if (current.state === "missing") continue;
+    if (current.state === "missing" || seenId === null) continue;
     if (current.state === "held") {
       if (current.info.pid === pid) {
         // Re-entrant: this process already holds it; adopt the on-disk file as our handle.
@@ -155,8 +201,8 @@ export function acquireThreadLock(
         return { ok: false, path, holderPid: current.info.pid };
       }
     }
-    // Dead holder or corrupt body → reclaim and retry.
-    removeQuietly(path);
+    // Dead holder or corrupt body → reclaim only the file we judged, then retry.
+    reclaimIfUnchanged(path, seenId, current, pid);
   }
   return { ok: false, path, holderPid: lastHolder };
 }
