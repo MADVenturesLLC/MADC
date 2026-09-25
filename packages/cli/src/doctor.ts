@@ -91,6 +91,22 @@ export function sha256OrNull(path: string): string | null {
   }
 }
 
+/**
+ * sha256 of `<home>/seats/<file>` only when `seats/` is a real directory (not a symlink) that
+ * resolves to `<real home>/seats` (Copilot r4108455655: a symlinked parent is never followed).
+ */
+export function confinedSeatSha(home: string, file: string): string | null {
+  const dir = join(home, "seats");
+  try {
+    const st = lstatSync(dir);
+    if (st.isSymbolicLink() || !st.isDirectory()) return null;
+    if (realpathSync(dir) !== join(realpathSync(home), "seats")) return null;
+  } catch {
+    return null;
+  }
+  return sha256OrNull(join(dir, file));
+}
+
 /** True when something (even a dangling symlink) exists at `path`, without following it. */
 export function existsNoFollow(path: string): boolean {
   try {
@@ -266,7 +282,7 @@ function checkSeat(home: HomeState): Check {
   }
   const seat = inspectMadcHome(home.path, DEFAULT_SEAT).seat;
   if (seat.ok) {
-    const sha = sha256OrNull(seat.path);
+    const sha = confinedSeatSha(home.path, `${DEFAULT_SEAT}.json`);
     if (sha !== null) {
       return {
         id: "seat",
@@ -571,7 +587,7 @@ function skip(id: string, why: string): Check {
 /** `--init`: seed via the engine against the real home (seat pin §1 same writer). Never writes seat bytes itself. */
 async function runInit(io: CliIO, home: string): Promise<Check> {
   const seatPath = join(home, "seats", `${DEFAULT_SEAT}.json`);
-  const before = sha256OrNull(seatPath);
+  const before = confinedSeatSha(home, `${DEFAULT_SEAT}.json`);
   const r = await runProbe(io, home, INIT_TIMEOUT_MS);
   if (!r.ok)
     return {
@@ -580,7 +596,7 @@ async function runInit(io: CliIO, home: string): Promise<Check> {
       summary: `engine ${r.reason}`,
       evidence: { path: seatPath },
     };
-  const after = sha256OrNull(seatPath);
+  const after = confinedSeatSha(home, `${DEFAULT_SEAT}.json`);
   if (after === null) {
     return {
       id: "init",
