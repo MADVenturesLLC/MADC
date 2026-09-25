@@ -1,9 +1,10 @@
 /** Shared test helpers: temp MADC_HOME + engine spawn. Not a test file itself. */
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type EngineClient, spawnEngine } from "../client.ts";
+import { ENGINE_ENTRY, EngineClient, spawnEngine } from "../client.ts";
 import type { InitializeResult } from "../protocol/types.ts";
 
 export const HANG_ENGINE = fileURLToPath(new URL("./hang-agent-engine.ts", import.meta.url));
@@ -20,6 +21,28 @@ export function startEngine(home: string, entry?: string): EngineClient {
   return spawnEngine(
     entry === undefined ? { env: { MADC_HOME: home } } : { env: { MADC_HOME: home }, entry },
   );
+}
+
+/**
+ * Like `startEngine`, but stderr is piped and captured (tests that assert what reaches the logs).
+ * Production spawns keep stderr inherited (protocol pin §2).
+ */
+export function startEngineCapturingStderr(
+  home: string,
+  entry: string = ENGINE_ENTRY,
+): { client: EngineClient; stderr: () => string } {
+  const args =
+    process.versions.bun !== undefined ? [entry] : ["--disable-warning=ExperimentalWarning", entry];
+  const child = spawn(process.execPath, args, {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ...process.env, MADC_HOME: home },
+  });
+  let captured = "";
+  child.stderr.setEncoding("utf8");
+  child.stderr.on("data", (chunk: string) => {
+    captured += chunk;
+  });
+  return { client: new EngineClient(child), stderr: () => captured };
 }
 
 export async function handshake(client: EngineClient): Promise<InitializeResult> {
