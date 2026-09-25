@@ -297,14 +297,24 @@ export function seedDefaultSeat(home: string): SeedResult {
       }
     } catch (err) {
       const code = errCode(err);
-      if (code === "EEXIST") return { path, created: false };
+      // An existing file only counts as "already seeded" in the pinned seats/: an EEXIST from a
+      // link that resolved through a swapped directory fails closed (r4106539531).
+      if (code === "EEXIST") {
+        if (!seatsPinned()) throw linkChanged();
+        return { path, created: false };
+      }
       if (!NO_HARD_LINKS.has(code ?? "")) throw err;
       // Filesystem without hard links: exclusive create in place; a failed write removes
       // the partial file before rethrowing.
       try {
         writeNewFile(path, bytes, isAt, seatsPinned);
       } catch (werr) {
-        if (errCode(werr) === "EEXIST") return { path, created: false };
+        if (errCode(werr) === "EEXIST") {
+          if (!seatsPinned()) {
+            throw new Error("seats/ under MADC_HOME changed while the seed was being written");
+          }
+          return { path, created: false };
+        }
         throw werr;
       }
     }

@@ -16,7 +16,8 @@
  * Copilot review 5319307067 (r4105871146): the seed re-pins seats/ (dev + inode, real path) right
  * before its path-based open and link, so a swap before either creates or links nothing; a swap in
  * the remaining check-to-syscall gap is detected and the seed's own stray name removed. An existing
- * owner-unreadable (0300) home subdir no longer fails the seed.
+ * owner-unreadable (0300) home subdir no longer fails the seed. Copilot review 5320085540
+ * (r4106539531): an EEXIST from a link through a swapped seats/ fails closed, not "already seeded".
  * Network-free: in-process engines only.
  */
 import assert from "node:assert/strict";
@@ -845,6 +846,19 @@ test("R-seed-link-swap: the seed never leaves a hard link in a seats/ swapped ar
     });
     assert.throws(() => seedDefaultSeat(home), /changed while the seed was being linked/);
     assert.equal(existsSync(stray), false, "stray hard link removed from outside");
+    decoyIntact();
+    // Swapped in the gap to a directory that already has a madc-default.json: link fails with
+    // EEXIST, which is not "already seeded" outside the pinned seats/ (r4106539531).
+    reset();
+    writeFileSync(stray, "operator seat\n");
+    setSeedHooksForTests({
+      beforeLink: (tmp) => {
+        name = basename(tmp);
+      },
+      afterPinCheck: (step) => (step === "link" ? swapWithDecoy() : undefined),
+    });
+    assert.throws(() => seedDefaultSeat(home), /changed while the seed was being linked/);
+    assert.equal(readFileSync(stray, "utf8"), "operator seat\n", "outside seat file untouched");
     decoyIntact();
     // A normal seed still works and leaves only the seat file.
     reset();
