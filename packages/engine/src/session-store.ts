@@ -157,7 +157,13 @@ export function sessionWriteFailed(threadId: string, path: string, seq: number):
   } satisfies SessionWriteFailedData);
 }
 
-const APPEND_FLAGS = constants.O_WRONLY | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0);
+// O_NOFOLLOW: a symlink at the path fails (ELOOP). O_NONBLOCK: a FIFO planted at the path fails
+// (ENXIO) or opens without blocking; the fd is then fstat-checked to be a regular file.
+const APPEND_FLAGS =
+  constants.O_WRONLY |
+  constants.O_APPEND |
+  (constants.O_NOFOLLOW ?? 0) |
+  (constants.O_NONBLOCK ?? 0);
 
 type WriteChunk = (fd: number, buf: Buffer, off: number, len: number) => number;
 let writeChunk: WriteChunk = (fd, buf, off, len) => writeSync(fd, buf, off, len);
@@ -297,7 +303,9 @@ export class SessionWriter {
     try {
       const fd = openSync(this.path, APPEND_FLAGS);
       try {
-        const sizeBefore = fstatSync(fd).size;
+        const st = fstatSync(fd);
+        if (!st.isFile()) throw new Error("session file is not a regular file");
+        const sizeBefore = st.size;
         try {
           let off = 0;
           while (off < bytes.length) off += writeChunk(fd, bytes, off, bytes.length - off);
@@ -397,6 +405,47 @@ export function verifySessionText(text: string, expectedThreadId?: string): Sess
 const isStr = (v: unknown): v is string => typeof v === "string";
 const TURN_END_STATUSES: readonly unknown[] = ["completed", "interrupted", "failed"];
 
+const ITEM_STATUSES: readonly unknown[] = ["inProgress", "completed", "failed"];
+const SERVED_BACKINGS: readonly unknown[] = ["kimi-code", "claude-code", "codex"];
+
+/** Each M0 `Item` variant (protocol/types.ts) with its required fields. Extra fields are allowed. */
+function isM0Item(item: unknown): boolean {
+  if (!isPlainRecord(item) || !isStr(item.id) || !ITEM_STATUSES.includes(item.status)) {
+    return false;
+  }
+  switch (item.kind) {
+    case "userMessage":
+      return (
+        Array.isArray(item.content) &&
+        item.content.every(
+          (part: unknown) => isPlainRecord(part) && part.type === "text" && isStr(part.text),
+        )
+      );
+    case "agentMessage":
+      return isStr(item.text);
+    case "toolCall":
+      return isStr(item.name) && Object.hasOwn(item, "arguments");
+    case "toolResult":
+      return (
+        isStr(item.callId) &&
+        isStr(item.name) &&
+        isStr(item.output) &&
+        typeof item.isError === "boolean"
+      );
+    case "error":
+      return isStr(item.message) && (item.code === undefined || typeof item.code === "number");
+    case "servedModel":
+      return (
+        isStr(item.requestedModel) &&
+        isStr(item.servedModel) &&
+        SERVED_BACKINGS.includes(item.backing) &&
+        isStr(item.providerId)
+      );
+    default:
+      return false;
+  }
+}
+
 /**
  * Shape of each M0 event payload (what `rebuildSession` reads). Extra fields are allowed. A
  * hash-valid line with a malformed payload makes `rebuildSession` throw, so a crafted file is
@@ -413,22 +462,8 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
         : "malformed session.open payload";
     case "turn.start":
       return isValidId(p.turnId) && isStr(p.inputText) ? null : "malformed turn.start payload";
-    case "item": {
-      const item = p.item;
-      if (!isValidId(p.turnId) || !isPlainRecord(item) || !isStr(item.id) || !isStr(item.kind)) {
-        return "malformed item payload";
-      }
-      if (
-        item.kind === "userMessage" &&
-        !(
-          Array.isArray(item.content) &&
-          item.content.every((part: unknown) => isPlainRecord(part) && isStr(part.text))
-        )
-      ) {
-        return "malformed item payload";
-      }
-      return null;
-    }
+    case "item":
+      return isValidId(p.turnId) && isM0Item(p.item) ? null : "malformed item payload";
     case "servedModel":
       return isValidId(p.turnId) &&
         isStr(p.requestedModel) &&
