@@ -173,6 +173,18 @@ test("§6.3 / §6.4: a seat run writes session.open → turn.start → items →
       ],
     );
     for (const line of lines) {
+      // Envelope is exactly the seat pin §4 line (v:1): no fields beyond the M0 pin.
+      assert.deepEqual(Object.keys(line).sort(), [
+        "hash",
+        "payload",
+        "prevHash",
+        "seatId",
+        "seq",
+        "threadId",
+        "ts",
+        "type",
+        "v",
+      ]);
       assert.equal(line.v, 1);
       assert.equal(line.threadId, thread.id);
       assert.equal(line.seatId, "madc-default");
