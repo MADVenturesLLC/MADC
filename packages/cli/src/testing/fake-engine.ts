@@ -141,6 +141,17 @@ rl.on("line", (line) => {
         const error = failed ? { code: -32603, message: "Agent failed" } : null;
         append("turn.end", { turnId, status: failed ? "failed" : "completed", error });
       }
+      if (scenario === "item-other-turn") {
+        // "item-other-turn": a well-formed item/completed bound to another turn id.
+        send({
+          method: "item/completed",
+          params: {
+            threadId,
+            turnId: "turn_other",
+            item: { id: "item_x", kind: "agentMessage", status: "completed", text: "x" },
+          },
+        });
+      }
       if (scenario === "bad-item") {
         // "bad-item": valid JSON, but an item/completed notification without an item.
         send({ method: "item/completed", params: { threadId, turnId } });

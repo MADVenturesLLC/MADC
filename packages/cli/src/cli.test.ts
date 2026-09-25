@@ -898,7 +898,12 @@ test("A7 §4 exit 3: a turn/completed without items is a protocol violation, one
     assert.equal(h.code, 3, h.stdout + h.stderr);
     // Another turn's completion, and a path-like thread id, are protocol errors (Copilot
     // r4108865790, review 5322990263).
-    for (const scenario of ["wrong-turn-id", "bad-thread-id", "no-error-field"]) {
+    for (const scenario of [
+      "wrong-turn-id",
+      "bad-thread-id",
+      "no-error-field",
+      "item-other-turn",
+    ]) {
       const sb4 = sandbox();
       const w = await runCli(sb4, ["-p", "hi", "--json"], {
         engine: FAKE,

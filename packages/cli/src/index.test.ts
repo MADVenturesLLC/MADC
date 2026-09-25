@@ -17,7 +17,12 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { ErrorCode } from "@madc/engine/client";
 import { CHAT_RESERVED, parseArgs } from "./args.ts";
-import { confinedSeatSha, setDoctorSwapHookForTests, sha256OrNull } from "./doctor.ts";
+import {
+  confinedSeatSha,
+  setDoctorInspectTimeoutForTests,
+  setDoctorSwapHookForTests,
+  sha256OrNull,
+} from "./doctor.ts";
 import { classifyCode, EXIT } from "./exit-codes.ts";
 import { type CliIO, colorEnabled } from "./io.ts";
 import { main } from "./main.ts";
@@ -263,6 +268,29 @@ test("A7 §3 a seats/ or sessions/ swapped during doctor's read discards the res
     assert.match(locks?.summary ?? "", /changed during the survey: not inspected/);
   } finally {
     setDoctorSwapHookForTests(null);
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("A7 §3 the seat/session inspection has a hard deadline: timeout → FAIL, doctor still reports (Copilot r4109051001)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "madc-a7-deadline-"));
+  try {
+    const home = join(dir, "home");
+    mkdirSync(join(home, "sessions"), { recursive: true });
+    setDoctorInspectTimeoutForTests(1);
+    const doc = fakeIO({ env: { MADC_HOME: home, PATH: "" } });
+    const code = await main(["doctor", "--json"], doc);
+    const report = JSON.parse(doc.out()) as {
+      checks: Array<{ id: string; status: string; summary: string }>;
+    };
+    for (const id of ["seat", "session"]) {
+      const row = report.checks.find((c) => c.id === id);
+      assert.equal(row?.status, "fail", id);
+      assert.equal(row?.summary, "timeout 1ms", id);
+    }
+    assert.equal(code, 1, "a FAIL row fails doctor; the report was still produced");
+  } finally {
+    setDoctorInspectTimeoutForTests(null);
     rmSync(dir, { recursive: true, force: true });
   }
 });
