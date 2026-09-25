@@ -35,7 +35,7 @@ Standing rules carried from M0: venue only `MADVenturesLLC/MADC`; merges are Fou
 | **E** | Seat roster: `daedalus`, `hephaestus`, `prometheus`, `surface-architect` (plus `madc-default`) seeded, loadable, selectable (`madc -s <id>`), each with its own backing, pinned model, memory file, tool deny list and `headlessOk`. |
 | **F** | Every model or vendor invocation writes a `servedModel` receipt (protocol item + JSONL event) that names the lane, and marks `fallbackFrom` or `vendorReported: false` honestly. |
 | **G** | Keys live in the OS keychain (macOS, Linux). `madc auth` stores and removes them through the engine. The redaction test covers every new provider's key shape. |
-| **H** | `madc providers ls` and `madc doctor` show each lane, whether credentials or binary are present, and terms freshness (warn at more than 30 days). Node 22.19 + Bun CI green. M1 runbook in-repo. |
+| **H** | `madc providers ls` and `madc doctor` show each lane, whether credentials or binary are present, and terms freshness. An allow entry whose `verifiedAt` is more than 30 days old **denies** until it is re-verified or carries an explicit per-entry Founder override. Node 22.19 + Bun CI green. M1 runbook in-repo. |
 
 ## 3. Non-goals (M1)
 
@@ -55,7 +55,7 @@ Standing rules carried from M0: venue only `MADVenturesLLC/MADC`; merges are Fou
 | [Agent Client Protocol](https://agentclientprotocol.com/overview/introduction); Grok Build [`grok agent stdio`](https://docs.x.ai/build/cli/headless-scripting.md); [Copilot ACP server](https://docs.github.com/en/copilot/reference/copilot-cli-reference/acp-server) | Vendor agents that speak ACP over stdio JSON-RPC | One **ACP client adapter** in `packages/adapters` maps `session/update` chunks to MAD items. Adding a future ACP agent is a registry entry plus a spawn spec, not new adapter code. Every spawn passes `assertAllowed` first. |
 | pi-ai built-ins (`mistral`, `deepseek`, `google`, `xai`, `minimax`, `qwen-token-plan*`) + `createProvider` OpenAI-compat (pi-check §1) | Many providers behind one stream API | A **generic direct-key `ProviderPort`** driven by registry data (wire, base URL, identity header policy). Ollama Cloud uses the custom OpenAI-compat path. Model lists come live from the provider where possible (Ollama `/api/tags`), labelled `listed` or `reachable`, never hard-coded. |
 | Alibaba `sk-sp-` vs `sk-` keys; planning record ruling 12 | Credential class tied to usage mode | **Engine-verified presence, not a client claim:** for interactive-only lanes the engine itself opens the controlling terminal (`/dev/tty`) and requires a human keypress confirmation there. It re-checks the terminal on **every** interactive-only turn; a lost terminal voids the confirmation. No controlling terminal or no confirmation means fail closed. Plan keys and PAYG keys are separate registry ids, so the credential class is picked by registry entry and never by a flag. |
-| ADR-0003 + subscription-lanes brief | Terms as data | **Terms with a freshness clock:** `verifiedAt` + `termsUrl` per entry, and a doctor warning after 30 days. `forbidden` never relaxes on staleness. |
+| ADR-0003 + subscription-lanes brief | Terms as data | **Terms with a freshness clock:** `verifiedAt` + `termsUrl` per entry. After 30 days a stale allow entry fails closed (deny) until someone re-verifies it or the Founder records a per-entry override. `forbidden` never relaxes on staleness. |
 | MadBridge-style hash chain (seat pin §4) | Append-only receipts | Receipts now carry `lane` and `fallbackFrom`, so the chain proves which lane served each turn and that no hop crossed into a denied lane. |
 
 ## 5. Package layout and blast radius
@@ -64,7 +64,7 @@ No new packages. Import rules from M0 §6 stand (`cli` imports protocol types an
 
 | Package | M1 changes |
 | --- | --- |
-| `packages/registry` | Catalog v2 (roadmap §3 rows + forbidden sub-paths); `verifiedAt`, `termsUrl`; new `DenyReason` values `repo-not-allowed`; `credentialClass`; pure `lanesFor(mode)` helper. Still no I/O. |
+| `packages/registry` | Catalog v2 (roadmap §3 rows + forbidden sub-paths); `verifiedAt`, `termsUrl`; new `DenyReason` values `repo-not-allowed`, `terms-stale`; `credentialClass`; pure `lanesFor(mode)` helper. Still no I/O. |
 | `packages/adapters` | Generic direct-key `ProviderPort` over pinned pi-ai; Ollama Cloud custom provider; ACP client adapter; Grok Build spawn spec. |
 | `packages/engine` | Seat schema v2 + roster seeds; `mode` handling; per-repo data policy (`$MADC_HOME/policy.json`); ordered fallbacks; keychain-backed credential store; `seat/list`, `provider/list`, `auth/*` methods (after pin amendment). |
 | `packages/cli` | `madc -s <seat>`, `madc seats ls`, `madc providers ls`, `madc auth set\|rm\|status <provider>`, TTY-based mode claim, doctor lanes report. |
@@ -80,7 +80,7 @@ Model ids are **not** invented here. Each `pinnedModel` is locked in M1-A7 again
 | `daedalus` | Architect: research-first plans, docs, D-tables. No code. | `claude-code` (vendor agent) | Long-form planning on the Founder's Max plan, through the only lane Anthropic allows | `true` | deny writes outside `docs/**`; deny `git push` to `main` | `kimi-code` |
 | `hephaestus` | Builder: acts, tests, PRs. Never merges. | `codex` (vendor agent, app-server) | Codex sandbox and approvals; ChatGPT plan through the official embed path | `true` | deny `git push` to `main`; deny branch-protection APIs | `claude-code` |
 | `prometheus` | Idea and research: sources, ledgers, verdicts. | `kimi-code` (direct) | MAD loop with honest UA; receipts from `responseModel` | `true` | deny writes outside `docs/**` and scratch | `ollama-cloud` |
-| `surface-architect` | Contracts and pins: protocol, seat format, UX system. | `ollama-cloud` (direct) | First new M1 lane; exercises the generic port on real work | `true` if D-M1-3 allows Ollama headless, else `false` | deny writes outside `docs/plan/PIN-*` and `docs/**` | `kimi-code` |
+| `surface-architect` | Contracts and pins: protocol, seat format, UX system. | `ollama-cloud` (direct) | First new M1 lane; exercises the generic port on real work | `false` by default (D-M1-3: Ollama headless denied until the Founder records permission) | deny writes outside `docs/plan/PIN-*` and `docs/**` | `kimi-code` |
 | `madc-default` | General builder (M0, unchanged) | `kimi-code` | M0 pin §3 | `true` | `[]` | none |
 
 Fallback rule: a fallback is tried only if it is in the seat's list, passes `assertAllowed` for the turn's `mode`, and has credentials or a binary present. Every hop writes a receipt with `fallbackFrom`. Fallbacks never move into `forbidden`, never into `interactive-only` on a turn that failed the presence check, and never into a repo-denied provider. A headless seat that wants MiniMax or Alibaba must list the PAYG id (`minimax-payg`, `alibaba-model-studio-payg`) explicitly.
@@ -98,9 +98,9 @@ Each act is its own PR (stacked is fine) based on current `main`. Founder merges
 
 ### M1-A1 — Registry v2 (pure)
 
-- **Scope:** Catalog v2 with every roadmap §3 row and sub-path; `termsUrl`, `verifiedAt` (ISO date), `credentialClass` (`plan-interactive` | `payg` | `vendor-session`); new ids `xai-api` (`allowed-direct`), `grok-build` (`allowed-via-vendor-agent`), `xai-consumer-signin` (`forbidden`), `minimax-payg` and `alibaba-model-studio-payg` (`allowed-direct` **only once A1 cites a PAYG terms source**; until then `wired: false`, because I did not re-verify PAYG terms on 2026-09-24), keep `gemini-api-key`, `gemini-antigravity-signin`, `zai-glm-coding-plan`, etc.; `DenyReason` gains `repo-not-allowed`; pure `isStale(entry, now, days)`.
+- **Scope:** Catalog v2 with every roadmap §3 row and sub-path; `termsUrl`, `verifiedAt` (ISO date), `credentialClass` (`plan-interactive` | `payg` | `vendor-session`); new ids `xai-api` (`allowed-direct`), `grok-build` (`allowed-via-vendor-agent`), `xai-consumer-signin` (`forbidden`), `minimax-payg` and `alibaba-model-studio-payg` (`allowed-direct` **only once A1 cites a PAYG terms source**; until then `wired: false`, because I did not re-verify PAYG terms on 2026-09-24), keep `gemini-api-key`, `gemini-antigravity-signin`, `zai-glm-coding-plan`, etc.; `DenyReason` gains `repo-not-allowed` and `terms-stale`; pure `isStale(entry, now, days)`; a stale allow entry resolves as denied (`DenyReason` `terms-stale`) unless the entry carries `founderOverride: { by, date, note }`. `ollama-cloud` ships with headless denied (it behaves as `interactive-only` for headless turns) until D-M1-3 records permission.
 - **Files:** `packages/registry/src/{catalog,types,assert,index}.ts`, tests.
-- **Acceptance:** tests: every id resolves; forbidden ids throw for both modes and both connects; `interactive-only` throws `interactive-only-headless` on headless; `xai-consumer-signin` throws `forbidden`; staleness never flips `forbidden`; catalog stays deep-frozen (M0 PR #5 test pattern); `sourceQuote` equals the text quoted in roadmap §3.
+- **Acceptance:** tests: every id resolves; forbidden ids throw for both modes and both connects; `interactive-only` throws `interactive-only-headless` on headless; `xai-consumer-signin` throws `forbidden`; staleness never flips `forbidden`; a stale allow entry denies with `terms-stale`, and a `founderOverride` lets it through; `ollama-cloud` refuses headless by default; catalog stays deep-frozen (M0 PR #5 test pattern); `sourceQuote` equals the text quoted in roadmap §3.
 - **Forbidden:** network, keychain, file I/O in `registry`; changing a lane without a cited source.
 
 ### M1-A2 — Credential store (keychain) + `auth/*`
@@ -147,9 +147,9 @@ Each act is its own PR (stacked is fine) based on current `main`. Founder merges
 
 ### M1-A8 — CLI surfaces + doctor lanes report
 
-- **Scope:** `madc -s <seat>`, `madc seats ls`, `madc providers ls [--json]`, `madc auth …`. Doctor adds a lanes table: id, status, wired, credentials/binary present, `verifiedAt`, stale warning at more than 30 days, mode it can serve.
+- **Scope:** `madc -s <seat>`, `madc seats ls`, `madc providers ls [--json]`, `madc auth …`. Doctor adds a lanes table: id, status, wired, credentials/binary present, `verifiedAt`, stale (more than 30 days, shown as denied unless overridden), mode it can serve.
 - **Files:** `packages/cli/src/*`, `provider/list` handler in engine, tests.
-- **Acceptance:** `providers ls --json` schema test; doctor exits 0 with warnings on stale terms and non-zero on a broken chain or unreadable seat; `cli` still imports no loop, tools or adapters (import-rule test).
+- **Acceptance:** `providers ls --json` schema test; doctor exits 0 with a warning listing stale (denied) entries and non-zero on a broken chain or unreadable seat; `cli` still imports no loop, tools or adapters (import-rule test).
 - **Forbidden:** agent logic in `cli`; printing any credential value.
 
 ### M1-A9 — Conformance, runbook, freeze
@@ -165,7 +165,7 @@ Each act is its own PR (stacked is fine) based on current `main`. Founder merges
 | Risk | Mitigation |
 | --- | --- |
 | Terms drift (for example MiniMax's interactive clause not re-found today; Grok Build is an early beta) | `verifiedAt` + doctor staleness; fail-closed defaults; lane changes need a cited source in the PR. |
-| Ollama "automated means … without permission" read against headless | Founder rules (D-M1-3); seat `headlessOk` for `surface-architect` follows the ruling. |
+| Ollama "automated means … without permission" read against headless | Headless Ollama is **denied by default** until the Founder records permission (D-M1-3). `surface-architect` ships `headlessOk: false`. |
 | Mode claim can be spoofed by a local client | The claim is never trusted alone. The engine's own `/dev/tty` presence check plus a keypress is required for interactive-only lanes, and anything without a controlling terminal fails closed. A process inside the Founder's own terminal could still fake a keypress; that residual risk is recorded in the runbook. M3's desktop needs its own engine-owned confirmation prompt (a pin amendment) before it can use these lanes. |
 | pi-ai 0.x churn across six more providers | Exact pin; generic port isolates it; upgrade is its own PR with the pi-check smoke. |
 | ACP spec or Grok Build CLI changes | Adapter versioned; fake agent in CI; live step optional. |
@@ -183,7 +183,7 @@ Surface Architect owns the pins. These are proposals for M1-A0. Numbering: P = p
 - **P2** `ServedModelItem.backing`: widen from the 3-literal union to `string`, meaning a registry id with `wired: true`. Add `lane: ProviderStatus`, `mode: "interactive" | "headless"`, `fallbackFrom: string | null`, `vendorReported: boolean`.
 - **P3** `turn/start` params: optional `mode: "interactive" | "headless"`. If absent, the engine uses `headless` (fail-closed). The claim is advisory; interactive-only lanes also need the engine-side presence check (M1-A5), whose result is recorded as `presence: "verified" | "absent"`.
 - **P4** New requests: `seat/list` → `{ data: SeatSummary[] }`; `provider/list` → `{ data: ProviderSummary[] }` (id, status, wired, `verifiedAt`, stale, `credentialsPresent` | `binaryPresent`; never values); `auth/remove`; `auth/status`. **No `auth/set` over JSONL:** secrets are set only by the one-shot `madc-engine auth-set` subcommand (separate process, own no-echo TTY prompt, not a JSONL session), so no secret ever crosses the protocol stream or its error path.
-- **P5** `-32007 ProviderDenied` `reason` gains `repo-not-allowed`. `-32008 ProviderUnavailable` `reason` gains `quota-or-unreachable` (from 429/502-style signals).
+- **P5** `-32007 ProviderDenied` `reason` gains `repo-not-allowed` and `terms-stale`. `-32008 ProviderUnavailable` `reason` gains `quota-or-unreachable` (from 429/502-style signals).
 - **P6** `-32601` list: M1 still has no WS/HTTP listener. The desktop transport is an M3 amendment.
 
 **Seat pin (`PIN-madc-M0-seat-format.md`):**
@@ -192,13 +192,13 @@ Surface Architect owns the pins. These are proposals for M1-A0. Numbering: P = p
 - **S2** Seat `version: 2` adds `fallbacks: string[]` (ordered, each validated like `preferredBacking`) and `displayName: string`. v1 files load as v2 in memory with `fallbacks: []` and are never rewritten.
 - **S3** Seeding: the same writer seeds `daedalus`, `hephaestus`, `prometheus`, `surface-architect` and `madc-default`, and never overwrites.
 - **S4** JSONL payloads (additive; envelope stays `v: 1`): `turn.start` adds `mode` and `presence`; `servedModel` adds `lane`, `mode`, `fallbackFrom`, `vendorReported`; `session.open.backing` widened like S1.
-- **S5** New file `$MADC_HOME/policy.json` (same confinement and permissions rules): `{ "version": 1, "repoAllow": { "<providerId>": ["<repo remote URL or absolute path>"] } }`. Providers listed there are denied for repos not in their list.
+- **S5** New file `$MADC_HOME/policy.json` (same confinement and permissions rules): `{ "version": 1, "repoAllow": { "<providerId>": ["<repo remote URL or absolute path>"] } }`. **Repo-gated providers** (`deepseek`, `minimax-token-plan`, `minimax-payg`) are denied for any repo not in their list, and a **missing or empty entry means deny everywhere** (fail-closed). A clean `{}` therefore denies all three. Providers that are not repo-gated ignore this file.
 - **S6** Redaction list adds the key shapes of every new provider (for example `xai-…`, `sk-sp-…`).
 
 ## 10. Verify bullets (Definition of Done)
 
 - [ ] Pin amendments merged by the Founder (M1-A0) and cited by SHA in A1+.
-- [ ] Registry v2 tests: allow / forbid / interactive-only / repo-deny / stale-never-relaxes-forbidden.
+- [ ] Registry v2 tests: allow / forbid / interactive-only / repo-deny (including an absent entry = deny) / stale allow = deny / stale-never-relaxes-forbidden.
 - [ ] Ollama Cloud live-capable (mock in CI; optional live in runbook).
 - [ ] Mistral, DeepSeek, Gemini auth key, xAI API: L1 mock conformance each.
 - [ ] MiniMax and Alibaba refuse headless before any network call.
@@ -227,10 +227,10 @@ Surface Architect owns the pins. These are proposals for M1-A0. Numbering: P = p
 | --- | --- | --- |
 | D-M1-1 | Accept this M1 plan as commissionable (after M0 A9)? | Plan stays draft until accepted; Hephaestus does not build. |
 | D-M1-2 | Ollama Cloud as the first new live lane (M1-A3)? | **Yes**: the Founder named it first, it is already `allowed-direct`, and its key API needs no local install. |
-| D-M1-3 | Ollama Cloud headless use, given the Terms line "Use automated means to access our services without permission"? | **Allow headless with the Founder's API key.** Ollama's own docs present the key-authenticated API for use "from your apps or terminal". The Founder can restrict it to interactive with one registry change. |
+| D-M1-3 | Ollama Cloud headless use, given the Terms line "Use automated means to access our services without permission"? | **Deny headless until the Founder records permission.** The Terms bar automated access "without permission", and the API docs only establish key authentication, not permission. Interactive use with the key stays allowed. If the Founder obtains or records permission, allowing headless is one registry change that cites that record. |
 | D-M1-4 | Seat roster backings (§6)? | daedalus → claude-code, hephaestus → codex, prometheus → kimi-code, surface-architect → ollama-cloud. |
 | D-M1-5 | Keychain-only credentials in M1 (env only with `MADC_DEV_ENV_KEYS=1`)? | **Yes.** |
-| D-M1-6 | Stale-terms policy? | Warn after 30 days, still allow; `forbidden` never relaxes; the Founder can make stale allow-entries block. |
+| D-M1-6 | Stale-terms policy? | **Stale allow entries deny** after 30 days until re-verified; the Founder can grant a per-entry override (recorded with name, date, note); `forbidden` never relaxes. |
 | D-M1-7 | Cross-provider fallbacks? | **On**, but only within each seat's list, never into denied lanes, every hop receipted. |
 | D-M1-8 | DeepSeek repo allowlist? | **Empty** (DeepSeek denied everywhere) until the Founder names repos. |
 | D-M1-9 | MiniMax repo allowlist (ruling 13: non-sensitive only)? | **Empty** until the Founder names repos. |
