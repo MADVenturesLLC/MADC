@@ -4,6 +4,8 @@
 
 *Amendment 1 (2026-09-24): lock token, fixes A2 Copilot W1 (PR #7), Founder-authorized.*
 
+*Amended by `PIN-madc-M0-amendment-2-session-integrity.md` (2026-09-25): session integrity, additive.*
+
 **Authority:**
 
 - `docs/plan/PLAN-madc-M0-build-plan.md` — Founder-accepted; on `main` via PR #2, merge commit `9c71afd5c99d44443eecce2a0b4678e90dea6cb0`.
