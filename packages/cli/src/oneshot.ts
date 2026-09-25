@@ -80,6 +80,28 @@ function finalText(items: readonly Item[]): string {
   return text;
 }
 
+/**
+ * Runtime shape check of one wire item (Copilot r4108764755): the fields the CLI reads must have
+ * their pinned types, so nothing malformed reaches the renderers.
+ */
+function isItemShape(i: unknown): i is Item {
+  if (i === null || typeof i !== "object") return false;
+  const r = i as Record<string, unknown>;
+  if (typeof r.id !== "string" || typeof r.kind !== "string" || typeof r.status !== "string") {
+    return false;
+  }
+  if (r.kind === "agentMessage") return typeof r.text === "string";
+  if (r.kind === "servedModel") {
+    return (
+      typeof r.requestedModel === "string" &&
+      typeof r.servedModel === "string" &&
+      typeof r.backing === "string" &&
+      typeof r.providerId === "string"
+    );
+  }
+  return true;
+}
+
 /** Minimal runtime shape check of a `Turn` from the wire (fields the CLI reads). */
 function isTurnShape(t: unknown): t is Turn {
   if (t === null || typeof t !== "object") return false;
@@ -89,6 +111,7 @@ function isTurnShape(t: unknown): t is Turn {
     typeof r.threadId === "string" &&
     typeof r.status === "string" &&
     Array.isArray(r.items) &&
+    r.items.every(isItemShape) &&
     typeof r.startedAt === "number" &&
     (r.completedAt === null || typeof r.completedAt === "number")
   );
@@ -241,9 +264,11 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
         } else if (m.method === "item/completed" && params?.threadId === tid) {
           // Copilot r4108213460: a malformed item never throws inside the client's reader; it is
           // a protocol violation (exit 3) through the normal result path.
-          if (params.item === null || typeof params.item !== "object") malformedItem = true;
-          const s = servedModelOf(params.item as Item | null | undefined);
-          if (s !== null) served = s;
+          if (!isItemShape(params.item)) malformedItem = true;
+          else {
+            const s = servedModelOf(params.item);
+            if (s !== null) served = s;
+          }
         }
         // One turn per thread in a one-shot: match on the thread, since `turn/completed` can be
         // read in the same chunk as the `turn/start` response, before `turnId` is known here.
