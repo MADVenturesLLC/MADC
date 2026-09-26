@@ -81,9 +81,23 @@ Test: a failed turn (-32603, and -32008 `no-credentials`) followed by engine exi
 
 **Ruling.** A server notification whose `method` is not listed in CLI pin §3 **MUST be ignored**: no exit, no stdout output, and no change to any state the CLI tracks. This keeps an older CLI working when the engine adds a notification.
 
-- Ignoring it **MUST NOT** extend or reset any timeout; the request timeout keeps its original deadline. The turn wait has no timeout by design (it ends on `turn/completed`, engine exit, a protocol violation or a signal), and unknown notifications do not add a terminal condition to it or remove one from it.
+- Ignoring it **MUST NOT** extend or reset any timeout; the request timeout keeps its original deadline. The turn wait's idle deadline (§3c) is also neither extended nor reset by an unknown notification.
 - This applies only to an unknown **method name**. A listed notification (for example `thread/started`, `turn/started`, `item/started`, `turn/completed`) that fails its protocol-pin shape check stays a protocol violation (exit 3), as does a message that is not valid JSON-RPC, a response whose `id` matches no pending request, and a notification without a `method` string.
 - Test: send one unknown notification between `turn/started` and `turn/completed`. The exit code and stdout are unchanged from the same run without it. Send only unknown notifications while an `initialize` or `turn/start` request is pending: the request timeout fires on its original deadline. Mutations: treat an unknown method as exit 3; reset the timeout on any inbound message. Both must be killed.
+
+## 3c. The turn wait gets an idle deadline (answers Argus on the A7 follow-up)
+
+**Gap.** CLI pin §3 gives the turn wait no limit, and CLI pin §6 (exit 3 covers "timeouts") names none. An engine that stays alive and sends nothing, or sends only unknown notifications (§3b), would keep a non-interactive CLI waiting forever. The quality gate requires a timeout or terminal condition on every wait, so this pins one. It is an idle deadline, not a total one, because a legitimate turn can run for many minutes.
+
+**Rule.**
+
+1. While waiting for `turn/completed`, the CLI tracks the time since the last **listed** message from the engine: any notification listed in CLI pin §3 that passes its shape check, or a response to a pending request. Unknown notifications (§3b), stderr output and invalid messages do not count.
+2. The deadline is 300 000 ms by default. `MADC_TURN_IDLE_MS` overrides it. It must be a base-10 positive integer no larger than 86 400 000; any other value is a usage error (exit 2) before the engine is spawned.
+3. When the deadline passes, the CLI does what a first SIGINT does (CLI pin §2, line 109): it sends `turn/interrupt` and waits up to 2 s for `turn/completed`. It then prints the receipt if it has one, closes stdin, kills the engine child if it is still running after 1 s, and **exits 3**. Stderr gets `timeout: no engine message for <ms> ms`.
+4. Exit 3 wins over whatever the turn reports during the grace period (`interrupted`, `failed` or `completed`), because the CLI ended the turn. A signal received during the grace period follows CLI pin §2 (130 or 143).
+5. The request timeout (5 s) for `initialize` and `turn/start` is separate and unchanged.
+
+**Tests.** With `MADC_TURN_IDLE_MS=500`, a fake engine that sends `turn/started` and then nothing → exit 3 with the stderr line, within the deadline plus the grace periods. The same with only unknown notifications every 100 ms → still exit 3 on the original deadline. A fake engine that sends a listed delta every 300 ms for 2 s and then `turn/completed` → exit 0. `MADC_TURN_IDLE_MS=0`, `-5` or `abc` → exit 2 with nothing spawned. Mutations: count unknown notifications as activity; remove the deadline; exit 130 instead of 3. All must be killed.
 
 ## 4. Not changed here
 
