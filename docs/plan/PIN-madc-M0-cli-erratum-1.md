@@ -92,7 +92,7 @@ Test: a failed turn (-32603, and -32008 `no-credentials`) followed by engine exi
 **Rule.**
 
 1. While waiting for `turn/completed`, the CLI tracks the time since the last **listed** message from the engine: any notification listed in CLI pin §3 that passes its shape check, or a response to a pending request. Unknown notifications (§3b), stderr output and invalid messages do not count.
-2. The deadline is 300 000 ms by default. `MADC_TURN_IDLE_MS` overrides it. It must be a base-10 positive integer no larger than 86 400 000; any other value is a usage error (exit 2) before the engine is spawned.
+2. The deadline is 600 000 ms by default (Founder choice, 2026-09-26). `MADC_TURN_IDLE_MS` overrides it. It must be a base-10 positive integer no larger than 86 400 000; any other value is a usage error (exit 2) before the engine is spawned.
 3. When the deadline passes, the CLI does what a first SIGINT does (CLI pin §2, line 109): it sends `turn/interrupt` and waits up to 2 s for `turn/completed`. It then prints the receipt if it has one, closes stdin, kills the engine child if it is still running after 1 s, and **exits 3**. Stderr gets `timeout: no engine message for <ms> ms`.
 4. Exit 3 wins over whatever the turn reports during the grace period (`interrupted`, `failed` or `completed`), because the CLI ended the turn. A signal received during the grace period follows CLI pin §2 (130 or 143).
 5. The request timeout (5 s) for `initialize` and `turn/start` is separate and unchanged.
