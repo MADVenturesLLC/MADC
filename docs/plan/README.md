@@ -20,6 +20,7 @@ Planning documents behind madc. Edit rule, keyed to each file's status line:
 | `PIN-madc-M0-seat-format.md` | Present (Surface build pin, 2026-09-24: `madc-default` seat file, session JSONL hash chain; Act M0-A4) |
 | `PIN-madc-M0-amendment-2-session-integrity.md` | Present (Surface M0 Amendment 2, 2026-09-25: single-writer append checks, fsync, torn-tail detection; additive) |
 | `PIN-madc-M0-cli.md` | Present (Surface build pin, 2026-09-25: `madc doctor` + headless one-shot; gates Act M0-A7) |
+| `PIN-madc-M0-cli-erratum-1.md` | Present (Surface erratum to the CLI pin, 2026-09-25: `locks` row start-time rule and orphan-name redaction, pointer placement, interpretations D-160..D-164 and D-168..D-174 for Founder confirmation) |
 | `ROADMAP-madc-post-M0.md` | Present (Daedalus post-M0 roadmap M1–M5, 2026-09-24: order, 11-row subscription lane table re-verified 2026-09-24, innovation per milestone — proposed, not a build authorization; Founder rulings D-R1–D-R6 recorded 2026-09-25) |
 | `PLAN-madc-M1-build-plan.md` | Present (Daedalus M1 commissionable build plan, 2026-09-24: every lane lit + named roster; acts M1-A0..A9; proposed pin amendments — draft until Founder accept; Founder rulings D-M1-1–D-M1-11 and the engine-owned repo-identity rule recorded 2026-09-25) |
 

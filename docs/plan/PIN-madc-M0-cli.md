@@ -2,6 +2,8 @@
 
 *Surface Architect · 2026-09-25 · Venue: `MADVenturesLLC/MADC` · Status: **build pin** for Hephaestus Act M0-A7. Docs only.*
 
+*Amended by `PIN-madc-M0-cli-erratum-1.md` (2026-09-25): `locks` row start-time rule, interpretations for Founder confirmation.*
+
 **Authority:**
 
 - `docs/plan/PLAN-madc-M0-build-plan.md` §10 Act M0-A7, Criterion B, and §6 import rule. The plan was Founder-accepted and merged via PR #2 (head `bdf45f42b0b27ee07dcdc30fbc24485de2219417`).
