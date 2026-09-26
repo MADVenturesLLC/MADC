@@ -202,7 +202,7 @@ A turn-level **2** (`-32005`/`-32006` as `turn.error.code`) is left as 2: a chai
 
 ## 4. Not changed here
 
-- The check-then-write window in Amendment 2 §2/§6 (Copilot High [r4107161928](https://github.com/MADVenturesLLC/MADC/pull/16#discussion_r4107161928), ledger D-153) still needs a fix or a Founder-named waiver under `docs/policy/CODE-ADVISORIES.md`. This erratum does not waive it.
+- The check-then-write window in Amendment 2 §2/§6 (Copilot High [r4107161928](https://github.com/MADVenturesLLC/MADC/pull/16#discussion_r4107161928), ledger D-153) is waived for M0 by the Founder under `docs/policy/CODE-ADVISORIES.md` in [PR #20 comment 5844721811](https://github.com/MADVenturesLLC/MADC/pull/20#issuecomment-5844721811) ("D-133, D-134, D-153, D-156: waived for M0."). This erratum neither adds to nor changes that waiver.
 - Lease/heartbeat liveness and torn-tail repair stay deferred to M1-A0 (Amendment 2 §7).
 - Argus pr-19.md F4 (three `turn/start` shape sub-checks with no killing test) is for the A7 follow-up; §3b rule 2 keeps those checks at exit 3.
 
