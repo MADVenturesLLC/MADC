@@ -9,6 +9,9 @@ import type { InitializeResult } from "../protocol/types.ts";
 
 export const ECHO_ENGINE = fileURLToPath(new URL("./echo-engine.ts", import.meta.url));
 export const KIMI_FAKE_ENGINE = fileURLToPath(new URL("./kimi-fake-engine.ts", import.meta.url));
+export const CLAUDE_FAKE_ENGINE = fileURLToPath(
+  new URL("./claude-fake-engine.ts", import.meta.url),
+);
 export const HANG_ENGINE = fileURLToPath(new URL("./hang-agent-engine.ts", import.meta.url));
 export const FAILING_ENGINE = fileURLToPath(new URL("./failing-agent-engine.ts", import.meta.url));
 export const EXIT_ENGINE = fileURLToPath(new URL("./exit-engine.ts", import.meta.url));

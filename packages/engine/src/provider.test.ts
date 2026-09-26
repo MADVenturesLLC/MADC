@@ -204,7 +204,11 @@ function seatJson(id: string, overrides: Record<string, unknown> = {}): Record<s
 }
 
 /** In-process preflight of the provider agent for a seat built in code (bypasses seat files). */
-function preflightFor(seat: EngineSeat, key: string | undefined = KEY): RpcError | null {
+function preflightFor(
+  seat: EngineSeat,
+  key: string | undefined = KEY,
+  claudeBinary: string | null = null,
+): RpcError | null {
   let created = 0;
   const agent = createProviderAgent({
     credential: readKimiCredential(key === undefined ? {} : { KIMI_API_KEY: key }),
@@ -215,6 +219,14 @@ function preflightFor(seat: EngineSeat, key: string | undefined = KEY): RpcError
         streamTurn: () => Promise.reject(new Error("preflight never streams")),
       };
     },
+    createClaudePort: () => {
+      created++;
+      return {
+        providerId: "claude-code",
+        streamTurn: () => Promise.reject(new Error("preflight never streams")),
+      };
+    },
+    detectClaudeBinary: () => claudeBinary,
   });
   try {
     agent.preflight?.({
@@ -260,7 +272,9 @@ test("defense in depth: the agent's registry check still refuses seats built in 
         reason: "interactive-only-headless",
       },
     ],
-    ["claude-code", -32008, { providerId: "claude-code", reason: "unwired" }],
+    ["codex", -32008, { providerId: "codex", reason: "unwired" }],
+    // A5: the adapter is in this build (preflightFor wires it) but no binary is detected.
+    ["claude-code", -32008, { providerId: "claude-code", reason: "binary-missing" }],
   ];
   for (const [backing, code, data] of cases) {
     const err = preflightFor({ ...MADC_DEFAULT_SEAT, preferredBacking: backing });
@@ -268,6 +282,25 @@ test("defense in depth: the agent's registry check still refuses seats built in 
     assert.deepEqual(err?.data, data, backing);
   }
   assert.equal(preflightFor(MADC_DEFAULT_SEAT), null, "the built-in seat passes preflight");
+  // The kimi-only build path (adapter absent) → unwired is covered end to end below via
+  // KIMI_FAKE_ENGINE; with a detected binary the claude-code seat passes preflight.
+  assert.equal(
+    preflightFor(
+      { ...MADC_DEFAULT_SEAT, preferredBacking: "claude-code", pinnedModel: "claude-sonnet-4-5" },
+      KEY,
+      "/fake/bin/claude",
+    ),
+    null,
+    "a claude-code seat with a detected binary passes preflight",
+  );
+  // A blank vendor model name is a seat error, not a provider refusal.
+  const blankModel = preflightFor(
+    { ...MADC_DEFAULT_SEAT, preferredBacking: "claude-code", pinnedModel: "  " },
+    KEY,
+    "/fake/bin/claude",
+  );
+  assert.equal(blankModel?.code, -32006);
+  assert.deepEqual(blankModel?.data?.issues, ["pinnedModel must be a non-empty vendor model name"]);
 });
 
 test("A4: a seat file with a non-M0 backing (ollama-cloud, forbidden, unknown) → -32006 at thread/start", async () => {
