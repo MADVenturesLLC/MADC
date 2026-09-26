@@ -2,7 +2,7 @@
 
 *Surface Architect · 2026-09-25 (rev. 2026-09-26) · Venue: `MADVenturesLLC/MADC` · Status: **Accepted** build pin amendment (additive), binding from Founder merge; item 3: Option A (note 6 rejected). Docs only.*
 
-*How this amendment takes effect: the Founder ticks exactly one item 3 box and, **in the same edit**, the status line above changes to **Accepted**. That edit is two lines (this status line and the item 3 decision line), committed on the PR branch before the final Copilot/Bugbot review of the head that is merged. The amendment binds from that merge. Until then it binds nothing.*
+*How this amendment takes effect: the Founder ticked Option A for item 3 and the status line changed to **Accepted** in the same edit (revision 1, `3aa4dc0`). The amendment binds from the Founder's merge of this PR. Until then it binds nothing.*
 
 **Authority and base files** (all read at `main` @ `c55e4ba710700d12059a1023ca804e2999a59c66`, PR #17 merge):
 
@@ -22,15 +22,18 @@
 
 1. A batch that the writer refused with `-32009` **MUST never reappear as session history** after a process crash, an OS crash or power loss, provided the storage honours fsync, **except** for the named residual R-1 below.
 2. When **any write or the fsync** of a batch fails after bytes may have been written (including a short or partial write, for example `ENOSPC` partway through a multi-line batch), the writer **MUST** `ftruncate` the file back to the **pre-batch offset** (the size checked in Amendment 2 §2) **and then `fsync` the file** before it returns `-32009`. (Answers Copilot r4110040586.)
-3. **Poisoned writer.** If that truncate or that second `fsync` fails, the thread's writer is **poisoned**: it **MUST** refuse every later append (writing nothing, `-32009`) **for the life of the engine process**. Neither `thread/resume` nor a lock re-take nor any other reload may clear it (rule 5). The engine **MUST** log once to stderr `session <threadId>: rollback failed; refused seq <first>..<last> may persist on disk` (no payload bytes). The engine keeps the thread lock until it exits, so no other engine resumes the file while the refused lines may be on it; the lock is released at shutdown as usual. Recovery requires an engine restart.
-4. The existing rules stand: the writer is broken after any failed append (Amendment 2 §4 line 55), and the turn ends `failed` with `-32009` (Amendment 2 §2 line 37).
-5. **Which request clears a broken writer.** A broken writer is cleared only by a reload from disk through the Amendment 2 §3 cold-resume path (verify, rebuild, close dangling turns, new writer), and only by the request named here:
+3. **Poisoned writer.** If that truncate or that second `fsync` fails, the thread's writer is **poisoned**: it **MUST** refuse every later append (writing nothing, `-32009`) **for the life of the engine process**. Neither `thread/resume` nor a lock re-take nor any other reload may clear it (rule 6). The engine **MUST** log once to stderr `session <threadId>: rollback failed; refused seq <first>..<last> may persist on disk` (no payload bytes). The engine keeps the thread lock until it exits, so no other engine resumes the file while the refused lines may be on it; the lock is released at shutdown as usual. Recovery requires an engine restart.
+4. **Close after a durable batch.** Once the batch's `fsync` has returned successfully, the batch **counts**. A failure of the `close` that follows (`session-store.ts:545-546`) **MUST NOT** change the outcome: the append succeeds, the writer is **not** broken, its offset and chain advance as for any successful batch, and the engine logs once to stderr `session <threadId>: close failed after a durable append (<code>)`. The fd is not retried (POSIX leaves it closed or unspecified after a failed `close`; retrying can close an fd another thread just opened). When `close` fails on the error path (after a failed write or fsync), the rule 2 and rule 3 outcome stands and the close error is ignored.
+5. The existing rules stand: the writer is broken after any failed append (Amendment 2 §4 line 55), and the turn ends `failed` with `-32009` (Amendment 2 §2 line 37).
+6. **Which request clears a broken writer.** A broken writer is cleared only by a reload from disk through the Amendment 2 §3 cold-resume path (verify, rebuild, close dangling turns, new writer), and only by the request named here:
 
 | Cause of the break | File state | Cleared by | Until then |
 | --- | --- | --- | --- |
-| **(a) Failed append, rollback durable** (a §2 position check failure, or a write/fsync failure whose truncate + fsync succeeded) | Nothing from the refused batch (pre-batch bytes; after a position failure, whatever the other writer left) | **`thread/resume`** on that thread. It **MUST** reload from disk even while this engine still holds the lock (the lock is kept, not released). `turn/start` does **not** reload | `turn/start` → `-32009` |
-| **(b) Rollback failed** (rule 3: poisoned) | May still hold the refused lines | **Nothing in this process.** Only an engine restart (then residual R-1 applies) | `turn/start` → `-32009`; `thread/resume` → `-32009` (no reload, no re-take; a lock taken for the attempt is released) |
+| **(a) Failed append, rollback durable** (a §2 position check failure, or a write/fsync failure whose truncate + fsync succeeded) | Nothing from the refused batch (pre-batch bytes; after a position failure, whatever the other writer left) | **`thread/resume`** on that thread. It **MUST** reload from disk even while this engine still holds the lock (the lock is kept, not released). If that reload fails, see "Reload failure" below. `turn/start` does **not** reload | `turn/start` → `-32009` |
+| **(b) Rollback failed** (rule 3: poisoned) | May still hold the refused lines | **Nothing in this process.** Only an engine restart. Another engine that takes the lock also loads the file (residual R-1 applies to both) | `turn/start` → `-32009`; `thread/resume` → `-32009` (no reload, and no lock is acquired: the poisoned check runs before any lock step, C4). A lock this engine still holds stays held until exit (rule 3) |
 | **(c) Lock lost** (the §2 ownership check failed, or `holdsThreadLock` is false at the next request) | Untouched by this writer | **`turn/start`** (Amendment 2 §3 MUST re-take, line 43) and **`thread/resume`**: both re-take the lock and reload | A foreign live holder → `-32004`; a failed reload → `-32603` (Amendment 2 §3) |
+
+**Reload failure (row (a) under the held lock, and rows (a) and (c) after a re-take).** If the reload through `#loadColdThread` throws, the engine **MUST** behave exactly as a failed cold resume does today (`server.ts:398-403`) and as `#ensureLock` does after a re-take (`:583-588`): it removes the thread's record from memory, releases the lock (or keeps it for shutdown if it cannot be released now, `#releaseOrKeep`), and answers with the reload's own error, unchanged: `-32603` for a file that fails verification (including a torn tail, item 2), `-32002` if the session file is gone, and the pinned seat error for a seat that fails to load. Nothing is appended. The next request for that thread takes the ordinary cold path. A poisoned thread never reaches a reload.
 
 Precedence when causes combine: (b) beats (c) beats (a). A poisoned thread is never re-taken; a lost lock is re-taken even if the old writer was also broken by (a).
 
@@ -44,10 +47,18 @@ Required change (named so test 1b has one target):
 
 - **C1.** `SessionWriter.append` (`session-store.ts:532-544`): the catch covers the write loop and the fsync, truncates to `sizeBefore`, then fsyncs. If either of those throws, set `writer.poisoned = true` in addition to `broken`.
 - **C2.** The server keeps a process-lifetime `#poisoned: Set<threadId>`, filled when an append leaves its writer poisoned. It survives `#threads.delete` in `#ensureLock` (`server.ts:583`).
-- **C3.** `#turnStart` (`server.ts:607-613`): first `#poisoned.has(threadId)` → `-32009`; then, if `holdsThreadLock(record.lock)` is false, `#ensureLock` (re-take + reload); only then `session.broken` → `-32009`. Preflight order is otherwise unchanged (preflight runs again after a reload, as at `:614-619`).
-- **C4.** `#threadResume` (`server.ts:384-389` and the cold branch `:392-405`): poisoned → `-32009` without acquiring or reloading. Otherwise, a known record whose writer is broken is reloaded from disk through `#loadColdThread` under the lock it already holds, replacing the record. An active turn still → `-32004`.
+- **C3.** `#turnStart` (`server.ts:604-619`). Parameter validation, `-32002` and `-32004` (`:598-606`) stay first and unchanged. The steps after them run in this order:
+  1. If `#poisoned.has(threadId)`, answer `-32009`.
+  2. If `holdsThreadLock(record.lock)` is false, run `#ensureLock` (re-take and reload) and replace `record` with the reloaded one.
+  3. If `record.session.broken`, answer `-32009`.
+  4. Run seat, registry and credential **preflight** (`#turnContext` plus `agent.preflight`, today at `:611-612`) against `record`, so against the reloaded record after a re-take.
+  5. Only after that, append `turn.start` (`:621` onward).
 
-**Residual R-1 (named, not closed).** If the truncate itself did not reach disk, the refused lines can still be on disk when the engine restarts (rule 3 only protects the running process). A restart verifies and rebuilds them as history: complete, chained lines verify (PROBE-H, `{ ok: true, nextSeq: 2 }`), and a partial last line is a torn tail and fails closed (item 2). Reload cannot refuse such a file reliably: nothing on disk marks the refused offset, and adding a marker (a sidecar file or an in-file event) would be a new on-disk format, which this amendment excludes (Scope). The stderr line in rule 3 is the operator's only signal. Repair and a persistent refusal marker are deferred to M1-A0 (Amendment 2 §7).
+  Preflight MUST run on every `turn/start` that reaches step 4, before any append, and exactly once. It runs on the record that will append, which collapses today's two passes (`:611-612` and `:614-619`) into one without dropping either. D-162, that preflight is taken against the reloaded seat after a re-take, still holds. What changes from today: a broken writer now answers `-32009` before preflight even after a re-take, and a preflight refusal after a re-take leaves the re-taken lock held by this process, as any refused `turn/start` does. Test **1b-p**: an ordinary `turn/start` with a seat that fails preflight (missing credential) answers the preflight error and appends nothing, and the same holds after a re-take (mutation: delete step 4).
+- **C4.** `#threadResume` (`server.ts:384-389` and the cold branch `:392-405`): poisoned → `-32009`, checked first, without acquiring, releasing or reloading. Otherwise, a known record whose writer is broken is reloaded from disk through `#loadColdThread` under the lock it already holds, replacing the record; a failed reload follows "Reload failure" above. An active turn still → `-32004`.
+- **C5.** `SessionWriter.append` (`session-store.ts:545-550`): a `closeSync` failure after a successful fsync does not reach the `catch` that sets `broken` (rule 4).
+
+**Residual R-1 (named, not closed).** If the truncate itself did not reach disk, the refused lines can still be on disk. Rule 3 protects only the poisoned process. **Any other load of the file** rebuilds them as history: an engine restart, or a different engine process that takes the thread's lock, for example after the poisoned engine's lock is lost or judged stale (Amendment 2 §3), and then cold-resumes or re-takes. No restart of the poisoned engine is needed for this. Such a load verifies and rebuilds them: complete, chained lines verify (PROBE-H, `{ ok: true, nextSeq: 2 }`), and a partial last line is a torn tail and fails closed (item 2). Reload cannot refuse such a file reliably: nothing on disk marks the refused offset, and adding a marker (a sidecar file or an in-file event) would be a new on-disk format, which this amendment excludes (Scope). The stderr line in rule 3 is the operator's only signal. Repair and a persistent refusal marker are deferred to M1-A0 (Amendment 2 §7).
 
 **Rationale.** Today the rollback is `ftruncateSync(fd, sizeBefore)` with no fsync after it (`packages/engine/src/session-store.ts:537-543`; the data write and fsync are at `:534-536`). If the machine crashes before the truncate reaches disk, the failed batch's complete, newline-terminated and correctly chained lines can persist. After restart `rebuildSession` accepts them, so an event the client was told failed comes back as history (for example, a turn as `interrupted` or a user message). Amendment 2 §4 says what "durable before it counts" means. It says nothing about the reverse case, "refused, so it must not count".
 
@@ -66,13 +77,16 @@ Required change (named so test 1b has one target):
 
 - **1a.** Inject a failure into the batch fsync (the existing test seam). Assert that the file is truncated to the prior size, that a **second fsync** runs after the truncate (fsync call count 2 for that batch), that the response is `-32009`, and that the file's bytes equal the pre-batch bytes.
 - **1a-w.** Partial write: a three-event batch (for example the dangling-turn close batch, or a test batch), with a `writeChunk` seam that writes the first line and then throws `ENOSPC`. Assert truncate to the pre-batch offset, then an fsync after the truncate, `-32009`, and file bytes equal the pre-batch bytes.
-- **1b.** Recovery per cause (rule 5), one engine process each:
+- **1b.** Recovery per cause (rule 6), one engine process each:
   - (a) batch fsync fails, rollback succeeds → `turn/start` answers `-32009` and writes nothing; `thread/resume` (lock still held) reloads; the next `turn/start` appends and the chain verifies.
   - (b) batch fsync fails **and** the rollback fsync fails → poisoned: the next append, `turn/start` and `thread/resume` all answer `-32009` and write nothing (size and sha256 unchanged); after the lock is stolen and released, `thread/resume` and `turn/start` still answer `-32009` (no re-take). The rule 3 stderr line appears once. A **new engine process** then resumes and appends, and the chain verifies.
-  - (c) the lock is stolen and released after an append → the next `turn/start` re-takes, reloads and appends (Argus PROBE-D).
-- **1b-t.** Residual R-1 is real: inject a failure into the rollback **truncate** after a two-line batch whose bytes were fully written. The engine is poisoned and logs the seq range. A new engine process resumes with `nextSeq` past the refused lines (this asserts the documented residual; a future M1 fix flips it).
+  - (c) the writer is **forced broken by a lost lock** first: a foreign holder steals the lock during an active turn, so the turn's next append fails the §2 ownership check (assert that the turn ends `failed` with `-32009`, which by rule 5 breaks the writer). The foreign holder then releases the lock. The next `turn/start` re-takes, reloads and appends, and the chain verifies (Argus PROBE-D).
+  - (a-f) reload failure: after a row (a) break, corrupt a mid-file line, then `thread/resume` → `-32603`; the lock file is gone (released), a second `thread/resume` takes the cold path and also answers `-32603`, and the file's sha256 is unchanged.
+- **1b-p.** Preflight is kept (change C3 step 4): on an ordinary `turn/start`, a seat that fails preflight (missing credential) gets the preflight error and nothing is appended. The same happens after a re-take (row c). Mutation: delete step 4.
+- **1e.** Close after a durable batch (rule 4): a `closeSync` seam throws after a successful batch fsync → the request succeeds (no `-32009`), the stderr line appears once, the next `turn/start` appends, and the chain verifies. Mutation: treat a close failure like a write failure (broken writer); it must be killed by 1e.
+- **1b-t.** Residual R-1 is real: inject a failure into the rollback **truncate** after a two-line batch whose bytes were fully written. The engine is poisoned and logs the seq range. A new engine process, whether a restart or a second engine that takes the lock after the first one's lock is released, resumes with `nextSeq` past the refused lines (this asserts the documented residual; a future M1 fix flips it).
 - **1c.** Mutation: remove the rollback fsync. It must be killed by 1a and by 1a-w. Mutation: roll back only on fsync failure, not on write failure. It must be killed by 1a-w.
-- **1d.** Mutations, each killed by 1b: let `thread/resume` clear a poisoned thread; keep the `session.broken` check before `#ensureLock` in `turn/start` (kills row (c)); make `thread/resume` return the in-memory record while the lock is held (kills row (a)).
+- **1d.** Mutations, each killed by 1b: let `thread/resume` clear a poisoned thread; keep the `session.broken` check before `#ensureLock` in `turn/start` (killed by row (c), whose setup guarantees a broken writer); keep the record in memory after a failed reload (killed by (a-f)); make `thread/resume` return the in-memory record while the lock is held (kills row (a)).
 
 ## 2. Amendment 2 §5: crash-residue classification
 
@@ -123,7 +137,7 @@ The rest of Amendment 2 §5 stands:
 - **2c.** Doctor prints the torn-tail row text (CLI pin §3 `session` row) for every 2a case.
 - **2d.** Mutations: "empty → integrity" (17-M reversed), "NUL/whitespace-only terminated tail → integrity" (killed by the trailing-blank-line case among others), and "any NUL in `R` → torn" (killed by the last 2b case). All must be killed.
 
-## 3. Amendment 2 §2: where the writer guard lives (Founder decision required: accept or reject #17 Founder note 6, ledger D-184)
+## 3. Amendment 2 §2: where the writer guard lives (Founder decided: Option A, #17 Founder note 6 rejected, ledger D-184)
 
 **Background.**
 
@@ -161,7 +175,7 @@ The rest of Amendment 2 §5 stands:
 
 **Founder decision (item 3):** ☑ Option A (reject note 6) · ☐ Option B (accept note 6)
 
-Tick exactly one box, in the same edit as the status-line change to Accepted (see the header). If neither box is ticked at merge, the Option A / Option B rules do not take effect and note 6 stays an unconfirmed interpretation; 3a and 3b still apply.
+The Founder ticked Option A in revision 1 (`3aa4dc0`), with the status change to Accepted. The Option A rules and tests 3c–3e bind from the merge, together with the unconditional 3a and 3b. Option B is kept above as the record of what was declined.
 
 **Finding answered.** #17 Founder note 6 (ledger D-184); Argus PR #17 F2 (Medium, test gap) with its note for Surface item 3; Argus PR #20 M5 (3a/3b were conditional), L1 (status line), and the fairness notes in pr-20.md §D.
 
@@ -182,7 +196,7 @@ Tick exactly one box, in the same edit as the status-line change to Accepted (se
    - **`nlink == 1`**;
    - `path` resolves strictly under realpath(`$MADC_HOME`), inside the pinned `seats/`.
 3. **Failure is an error.** Any failed or impossible check (symlink, directory, FIFO, a hard-linked file, a path that has vanished after `EEXIST`, a `seats/` that is no longer pinned) **MUST** return an error, **never** `created:false`.
-4. **Same checks on the write path.** Before writing any seed byte, the seed **MUST** check `nlink == 1` on the opened temp fd, in addition to the existing dev/inode check. The temp fd **MUST stay open through the link and the temp unlink** (today it is closed right after the fsync, `seat-store.ts:131-133`). After the link, `fstat` **on that fd** **MUST** show `nlink == 2` and `lstat(path)` the same dev/inode; after the temp unlink, `fstat` on the fd **MUST** show `nlink == 1`. The counts are read from the fd, not the path, because a path can be swapped. Any mismatch is an error, and the seed's own names are removed best effort (as today).
+4. **Same checks on the write path.** Before writing any seed byte, the seed **MUST** check `nlink == 1` on the opened temp fd, in addition to the existing dev/inode check. The temp fd **MUST stay open through the link and the temp unlink** (today it is closed right after the fsync, `seat-store.ts:131-133`). After the link, `fstat` **on that fd** **MUST** show `nlink == 2` and `lstat(path)` the same dev/inode; after the temp unlink, `fstat` on the fd **MUST** show `nlink == 1`. The counts are read from the fd, not the path. While the dev/inode comparison is also made, a read from the path gives the same count (same inode, same `nlink`) or is caught by that comparison, so the fd read is defence in depth and no test is required to tell the two reads apart. Any mismatch is an error, and the seed's own names are removed best effort (as today).
 5. **Consequence: benign states become a logged, non-fatal seed failure.** `nlink == 1` turns two states that are not attacks into seed errors: two concurrent first seeds on a fresh home (two engines, or an engine and `madc doctor --init`: while seeder A's temp and final names both exist, seeder B's `EEXIST` proof sees `nlink == 2`), and an operator's hard link to `madc-default.json`. On engine start the seed error is only logged (`seed failed: …`) and the engine continues (`server.ts:164-173`, the doc comment at `:166` says so); `thread/start` then loads the seat normally, because `loadSeat` does not check `nlink`. `doctor --init` reports the seed error on its init row. No retry is required in M0.
 
 **Rationale.**
@@ -217,18 +231,19 @@ Under CODE-ADVISORIES a High finding's residual needs a fix, a follow-up or a Fo
 - **4c.** A test seam makes the link answer `EEXIST` while `path` is absent from the pinned `seats/` (r4107279162, D-182) → an error, never `created:false`.
 - **4d.** A seam between the temp open and the check adds a second hard link to the temp inode (r4107279105, D-181) → an error, no seed byte written into that inode, and the seed's own temp name removed.
 - **4e.** Two seeders: two processes seed the same fresh home at once (a barrier seam releases both before the link). Exactly one returns `created:true`; the other returns `created:false` or an error, never `created:true`. The final `madc-default.json` has the default bytes and `nlink == 1`, no temp file is left, and an engine started over the result logs at most `seed failed` and serves `thread/start`.
-- **4f.** Post-link counts are read from the still-open temp fd: a seam swaps the path for another file with `nlink == 2` between link and check → an error.
-- **4g.** Mutations: drop the `nlink` check on the temp fd (killed by 4d); return `created:false` on `EEXIST` without the fd proof (killed by 4c); restore the bare-`lstat` early exit (killed by 4b); read the post-link `nlink` from the path instead of the fd (killed by 4f); make a seed error fatal to engine start (killed by 4e).
+- **4f.** Post-link path swap: a seam swaps the path for another file with `nlink == 2` between the link and the check → an error, and no seed byte is written. This pins the dev/inode check on the write path; it does not claim to tell a path `nlink` read from an fd read (rule 4).
+- **4g.** Mutations: drop the `nlink` check on the temp fd (killed by 4d); return `created:false` on `EEXIST` without the fd proof (killed by 4c); restore the bare-`lstat` early exit (killed by 4b); drop the post-link dev/inode comparison (killed by 4f); make a seed error fatal to engine start (killed by 4e).
 
 ## 5. Amendment 2 §4: `sessions/` permissions (0300 unsupported in M0)
 
 **Rule.**
 
 1. In M0 the `sessions/` directory **MUST** grant its owner read, write and search. The engine creates it `0700`, and M0 assumes `0700`.
-2. A `sessions/` directory that lacks **owner read** (for example `0300`) is **unsupported in M0** on POSIX. The Amendment 2 §4 directory fsync after file creation **stays** (it needs owner read: `open(dir, O_RDONLY|O_DIRECTORY)` fails `EACCES`, and `O_PATH` + `fsync` fails `EBADF`, Argus pr-20.md M4).
+2. A `sessions/` directory that lacks **owner read** (for example `0300` or `0000`) is **unsupported in M0** on POSIX. The Amendment 2 §4 directory fsync after file creation **stays** (it needs owner read: `open(dir, O_RDONLY|O_DIRECTORY)` fails `EACCES`, and `O_PATH` + `fsync` fails `EBADF`, Argus pr-20.md M4).
 3. `thread/start` on such a directory **MUST** fail with `-32009` (`data` as pinned: `{ threadId, path, seq }`) **before creating the session file**, with a `message` that names the cause, for example `sessions/ is not readable by its owner (mode 0300 is unsupported in M0; use 0700)`. No 0-byte file is left behind.
-4. `madc doctor` **MUST** WARN on such a directory: `sessions/ mode 0300: unsupported in M0 (needs owner read for directory fsync)`.
-5. On Windows the directory fsync is a best-effort no-op (Amendment 2 §4) and this item does not apply.
+4. `madc doctor` **MUST** WARN on such a directory **on the `locks` row** (CLI pin §3, line 130) with the summary `sessions/ mode <mode>: unsupported in M0 (needs owner read for directory fsync)`, where `<mode>` is the four-digit octal permission (for example `0300`). This summary replaces the row's existing `sessions unreadable (EACCES): not inspected` text (`doctor.ts:601`) whenever the detection rule below matches; any other unreadable case keeps the existing text. The follow-up PR updates the assertion at `packages/cli/src/cli.test.ts:733` (chmod `0000`) to the new text. If the directory can still be listed (running as root), the per-lock evidence follows as usual.
+6. **Detection rule (engine and doctor alike).** "Lacks owner read" means the owner-read bit is clear in the mode from `lstat` of the pinned `sessions/` directory: `(st_mode & 0o400) == 0`. It is decided from the mode bits, not from whether an `open` or `readdir` succeeds, so the result is the same when running as root (root could open the directory, but the mode is still unsupported in M0 and still fails `thread/start`).
+7. On Windows the directory fsync is a best-effort no-op (Amendment 2 §4) and this item does not apply.
 
 **D-158 stands.** `home.ts` `enforcePrivateDirAt` classifies an unchanged `0300` directory as **private** (PR #15). That is about privacy. It does not make `0300` usable for session writes.
 
@@ -238,14 +253,14 @@ Under CODE-ADVISORIES a High finding's residual needs a fix, a follow-up or a Fo
 
 **Acceptance (Hephaestus must add).**
 
-- **5a.** `sessions/` chmod `0300` (POSIX; skipped with a logged reason on Windows and when running as root) → `thread/start` answers `-32009`, the message names mode `0300`, and `sessions/` gains no file.
-- **5b.** Doctor on the same home WARNs with the rule 4 text and changes nothing.
+- **5a.** `sessions/` chmod `0300` (POSIX; skipped with a logged reason on Windows; it also runs as root, because detection uses the mode bits) → `thread/start` answers `-32009`, the message names mode `0300`, and `sessions/` gains no file.
+- **5b.** Doctor on the same home WARNs on the `locks` row with the rule 4 text (`mode 0300`) and changes nothing; with chmod `0000` it prints `mode 0000`.
 - **5c.** Mutations: create the file before the permission check (killed by 5a: a file appears); drop the doctor warning (killed by 5b).
 
 ---
 
 ## Note (non-normative): existing requirements, not changed here
 
-Amendment 2 §3 (line 43) already says that `turn/start` after `holdsThreadLock` returned false MUST re-take the lock and reload from disk. So after a lock loss, `turn/start` must re-take and recover rather than keep answering `-32009`. On `main` it does not: the `session.broken` check (`packages/engine/src/server.ts:609`) runs before `#ensureLock` (`:613`), so every later `turn/start` in that engine answers `-32009` even when the lock is free (Argus PR #17 F4, PROBE-D). That is a **defect for the follow-up PR after #19**, not a new rule. Item 1 rule 5 row (c) and change C3 restate the same requirement and name the code change; a poisoned thread (row (b)) is the only exception.
+Amendment 2 §3 (line 43) already says that `turn/start` after `holdsThreadLock` returned false MUST re-take the lock and reload from disk. So after a lock loss, `turn/start` must re-take and recover rather than keep answering `-32009`. On `main` it does not: the `session.broken` check (`packages/engine/src/server.ts:609`) runs before `#ensureLock` (`:613`), so every later `turn/start` in that engine answers `-32009` even when the lock is free (Argus PR #17 F4, PROBE-D). That is a **defect for the follow-up PR after #19**, not a new rule. Item 1 rule 6 row (c) and change C3 restate the same requirement and name the code change; a poisoned thread (row (b)) is the only exception.
 
 *End of Amendment 3.*
