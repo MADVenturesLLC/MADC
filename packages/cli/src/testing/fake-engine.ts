@@ -17,7 +17,7 @@ const home = process.env.MADC_HOME ?? "";
 const send = (m: unknown) => process.stdout.write(`${JSON.stringify(m)}\n`);
 /** One write (one chunk): the lines arrive at the CLI together. */
 const sendChunk = (...messages: unknown[]) =>
-  process.stdout.write(messages.map((m) => JSON.stringify(m)).join("\n") + "\n");
+  process.stdout.write(`${messages.map((m) => JSON.stringify(m)).join("\n")}\n`);
 const threadId = scenario === "bad-thread-id" ? "../escape" : "thr_fake0001";
 const turnId = "turn_fake0001";
 const sessionFile = () => join(home, "sessions", `${threadId}.jsonl`);
@@ -147,7 +147,8 @@ rl.on("line", (line) => {
       if (scenario === "unmatched-storm-init") {
         // Unmatched well-formed responses while initialize is pending: the request timeout must
         // still fire on its original deadline (§3b rules 1/3).
-        setInterval(() => send({ id: "zz-unmatched", result: {} }), 100);
+        const storm = setInterval(() => send({ id: "zz-unmatched", result: {} }), 100);
+        rl.on("close", () => clearInterval(storm));
         return;
       }
       if (scenario === "e1-init-null") {
@@ -232,7 +233,8 @@ rl.on("line", (line) => {
       if (scenario === "never-answer-turn") return;
       if (scenario === "unmatched-storm-turn-pending") {
         // Unmatched well-formed responses while turn/start is pending (§3b rule 3: no reset).
-        setInterval(() => send({ id: "zz-unmatched", result: {} }), 100);
+        const storm = setInterval(() => send({ id: "zz-unmatched", result: {} }), 100);
+        rl.on("close", () => clearInterval(storm));
         return;
       }
       if (scenario === "n2-pending") {
@@ -342,6 +344,29 @@ rl.on("line", (line) => {
         append("turn.start", { turnId, inputText: "hi" });
         send({ id: msg.id, result: { turn: inProgress() } });
         keepAlive();
+        return;
+      }
+      if (scenario === "interrupt-then-hang") {
+        // §3e E2: the turn runs until interrupted; after answering the interrupt the engine
+        // ignores EOF (the CLI kills it 1 s after the grace, before the session re-read).
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        keepAlive();
+        return;
+      }
+      if (scenario === "interrupt-completes" || scenario === "interrupt-fails-provider") {
+        // §3c test 6: the turn runs silent until the idle deadline makes the CLI interrupt.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        return;
+      }
+      if (scenario === "turn-inprogress" || scenario === "turn-bogus-status") {
+        // §3e E16 F-59/F-60: turn/completed with a non-terminal status → 3, printed verbatim.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        const t =
+          scenario === "turn-inprogress" ? inProgress() : { ...inProgress(), status: "bogus" };
+        send({ method: "turn/completed", params: { turn: t } });
         return;
       }
       if (scenario === "unknown-storm-turn" || scenario === "unmatched-storm-turn") {
@@ -980,6 +1005,16 @@ rl.on("line", (line) => {
     }
     case "turn/interrupt": {
       record("turn/interrupt");
+      if (scenario === "interrupt-then-hang") {
+        append("turn.end", { turnId, status: "interrupted", error: null });
+        send({ id: msg.id, result: {} });
+        send({
+          method: "turn/completed",
+          params: { turn: { ...inProgress(), status: "interrupted", completedAt: 2 } },
+        });
+        keepAlive();
+        return;
+      }
       if (scenario === "silent-turn" || scenario === "silent-turn-rm") {
         // §3c tests 1/7/8/11: the interrupt is received but never answered; the engine never
         // exits on EOF either (the CLI kills it after 1 s).

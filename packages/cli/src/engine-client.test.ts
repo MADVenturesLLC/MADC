@@ -21,7 +21,10 @@ const FAKE = fileURLToPath(new URL("./testing/fake-engine.ts", import.meta.url))
 
 function sandbox(): { home: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), "madc-a7e1-"));
-  return { home: join(root, "home"), cleanup: () => rmSync(root, { recursive: true, force: true }) };
+  return {
+    home: join(root, "home"),
+    cleanup: () => rmSync(root, { recursive: true, force: true }),
+  };
 }
 
 async function withFakeClient(

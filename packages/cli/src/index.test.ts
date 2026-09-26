@@ -17,7 +17,7 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { ErrorCode } from "@madc/engine/client";
-import { CHAT_RESERVED, parseArgs } from "./args.ts";
+import { CHAT_RESERVED, hasJsonFlag, parseArgs } from "./args.ts";
 import {
   confinedSeatSha,
   localRows,
@@ -341,4 +341,25 @@ test("A7 §3 locks: /proc starttime is clock ticks since boot, converted via bti
   assert.equal(startedAfterLock(startMs, startMs + 60_000), false, "started before the lock");
   assert.equal(startedAfterLock(null, startMs - 60_000), false, "unknown start → skip");
   assert.equal(startedAfterLock(startMs, null), false, "unknown startedAt → skip");
+  // Erratum §1 acceptance: the exact 2 s boundary in the pinned form — startedAt + 2000 passes,
+  // startedAt + 2001 warns (a mutation that drops the slack flips the first; one that compares
+  // ticks as milliseconds breaks the conversion assertions above).
+  const startedAt = 1_700_000_000_000;
+  assert.equal(startedAfterLock(startedAt + 2_000, startedAt), false, "startedAt + 2000 passes");
+  assert.equal(startedAfterLock(startedAt + 2_001, startedAt), true, "startedAt + 2001 warns");
+  // Every skip case: unknown start time or unknown startedAt skips the check, never WARN, never FAIL.
+  assert.equal(startedAfterLock(null, startedAt), false, "unreadable /proc → skip");
+  assert.equal(startedAfterLock(startedAt + 60_000, null), false, "startedAt not a number → skip");
+});
+
+test("E8 hasJsonFlag: --json counts as a flag token only under the parser's own rules", () => {
+  assert.equal(hasJsonFlag(["--nope", "--json"]), true, "seen even after the error token");
+  assert.equal(hasJsonFlag(["-p", "hi", "--json", "--nope"]), true);
+  assert.equal(hasJsonFlag(["doctor", "--json", "extra"]), true);
+  assert.equal(hasJsonFlag(["-p", "--json"]), false, "consumed as the -p value");
+  assert.equal(hasJsonFlag(["-s", "--json", "-p", "x"]), false, "consumed as the -s value");
+  assert.equal(hasJsonFlag(["--", "--json"]), false, "after -- it is a positional");
+  assert.equal(hasJsonFlag(["-p", "x", "--", "--json"]), false);
+  assert.equal(hasJsonFlag(["--json"]), true);
+  assert.equal(hasJsonFlag([]), false);
 });
