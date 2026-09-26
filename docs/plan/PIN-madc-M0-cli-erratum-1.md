@@ -77,6 +77,14 @@ CLI pin §4 names the classes but gives no precedence for this case. The ruling 
 
 Test: a failed turn (-32603, and -32008 `no-credentials`) followed by engine exit 1 at close gives exit 1 and 4 respectively. A completed turn followed by engine exit 1 at close gives exit 3.
 
+## 3b. Notifications the pin does not list (asked by Hephaestus on the A7 follow-up)
+
+**Ruling.** A server notification whose `method` is not listed in CLI pin §3 **MUST be ignored**: no exit, no stdout output, and no change to any state the CLI tracks. This keeps an older CLI working when the engine adds a notification.
+
+- Ignoring it **MUST NOT** extend or reset any wait. Every timeout keeps its original deadline (an engine that only sends unknown notifications still times out).
+- This applies only to an unknown **method name**. A listed notification (for example `thread/started`, `turn/started`, `item/started`, `turn/completed`) that fails its protocol-pin shape check stays a protocol violation (exit 3), as does a message that is not valid JSON-RPC, a response whose `id` matches no pending request, and a notification without a `method` string.
+- Test: send one unknown notification between `turn/started` and `turn/completed`. The exit code and stdout are unchanged from the same run without it. Send only unknown notifications after `turn/started`: the turn-wait timeout fires on its original deadline. Mutations: treat an unknown method as exit 3; reset the timeout on any inbound message. Both must be killed.
+
 ## 4. Not changed here
 
 - The check-then-write window in Amendment 2 §2/§6 (Copilot High [r4107161928](https://github.com/MADVenturesLLC/MADC/pull/16#discussion_r4107161928), ledger D-153) still needs a fix or a Founder-named waiver under `docs/policy/CODE-ADVISORIES.md`. This erratum does not waive it.
