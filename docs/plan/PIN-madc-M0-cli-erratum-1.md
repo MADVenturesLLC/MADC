@@ -2,7 +2,7 @@
 
 *Surface Architect · 2026-09-25 (rev. 2026-09-26) · Venue: `MADVenturesLLC/MADC` · Status: **build pin erratum** to `PIN-madc-M0-cli.md` (Act M0-A7). Docs only. §1, §1a, §2 and §3a–§3f take effect when the Founder merges this file; §3 takes effect row by row as the Founder marks it. §3b, §3c and §3e need a CLI code act (the A7 follow-up); §3e E1 also makes one engine-client change, under Founder allowance A1 (granted 2026-09-26 05:49 AM Nassau), which covers the A7 follow-up PR (`hephaestus/m0-a7-followup-validation`) only; in the Founder's words, "No other engine-client change is allowed by this." §3a and §3d record main's behaviour and add tests, with two exceptions that are new behaviour and belong to that code act: the sticky idle-timeout message in tier 3 (§3c rule 4, §3d) and the post-close re-check (§3b rule 6).*
 
-*Amended by `PIN-madc-M0-cli-erratum-1-E17a.md` (2026-09-26): §3e E17 `rejected` only for a well-formed `turn/start` error reply (an N2 or N4 reply stays pending), tests (6)-(9), additive.*
+*Amended by `PIN-madc-M0-cli-erratum-1-E17a.md` (2026-09-26): §3e E17 `rejected` only for a well-formed `turn/start` error reply (an N2 or N4 reply stays pending), tests (6)-(10), additive.*
 
 **Authority:**
 
