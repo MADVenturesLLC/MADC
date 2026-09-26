@@ -2,9 +2,9 @@
 
 *Surface Architect · 2026-09-24 · Venue: `MADVenturesLLC/MADC` · Status: **build pin** — gates Hephaestus Act M0-A2. Docs only.*
 
-*Amendment 1 (2026-09-24): lock token, fixes A2 Copilot W1 (PR #7), Founder-authorized.*
-
 *Amended by `PIN-madc-M0-amendment-2-session-integrity.md` (2026-09-25): session integrity, additive.*
+
+*Amendment 1 (2026-09-24): lock token, fixes A2 Copilot W1 (PR #7), Founder-authorized.*
 
 **Authority:**
 
