@@ -203,6 +203,12 @@ export type ReclaimOutcome =
   | { outcome: "restored"; holderPid: number | null };
 
 /**
+ * Test seam: runs right after the lock was renamed aside (lets tests reproduce the Amendment 2 §6
+ * three-engine race, where another engine creates a lock before the link-back). Internal.
+ */
+export type ReclaimHooks = { afterRename?: () => void };
+
+/**
  * Pin §3.3 (b): remove a lock that was judged dead/corrupt. Rename it aside to a name unique to
  * this attempt (atomic: of several reclaimers exactly one moves the file), re-read the moved body,
  * and delete it only if it is byte-for-byte what was judged (same pid + startedAt + token, or the
@@ -214,6 +220,7 @@ export function reclaimIfUnchanged(
   path: string,
   observedFingerprint: string,
   reclaimerToken: string = newLockToken(),
+  hooks: ReclaimHooks = {},
 ): ReclaimOutcome {
   const aside = `${path}.reclaim-${reclaimerToken}`;
   try {
@@ -222,6 +229,7 @@ export function reclaimIfUnchanged(
     if (errCode(err) === "ENOENT") return { outcome: "gone" };
     throw err;
   }
+  hooks.afterRename?.();
   const moved = readLock(aside);
   if (moved.state !== "missing" && moved.fingerprint === observedFingerprint) {
     removeQuietly(aside);
