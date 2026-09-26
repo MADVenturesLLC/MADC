@@ -170,7 +170,7 @@ The rest of Amendment 2 §5 stands:
 **Option A: accept this item, reject note 6 (guard stays in the writer).**
 
 - `create` and `resume` **MUST** require a `holdsLock` guard (and `resume` **MUST** require `expectedSize`, the verified size), with no default. This prevents an unguarded writer **by omission**; a caller can still pass `() => true` explicitly, and Option A does not claim otherwise.
-- Any unguarded mode (for unit tests and fixtures) **MUST** be an explicit opt-in with a name that says so, for example `SessionWriter.unguardedForTests(...)`, and **MUST NOT** be exported from the package entry (`packages/engine/src/index.ts`) or from `@madc/engine/client`. `testing/fifo-append-probe.ts` imports `../session-store.ts` directly (line 9), so it can still reach the opt-in.
+- Any unguarded mode (for unit tests and fixtures) **MUST** be an explicit opt-in with a name that says so, for example a module-only helper such as `unguardedSessionWriterForTests(...)` in `session-store.ts`, and **MUST NOT** be a static member of the public `SessionWriter` class or be exported from the package entry (`packages/engine/src/index.ts`) or from `@madc/engine/client`. `testing/fifo-append-probe.ts` imports `../session-store.ts` directly (line 9), so it can still reach the opt-in there.
 - The engine's behaviour does not change.
 - **Cost:** 22 test call sites of `SessionWriter.create`/`resume` (`session-hardening.test.ts` 11, `session-integrity.test.ts` 6, `session.test.ts` 5) plus the FIFO fixture must pass guards or switch to the opt-in.
 

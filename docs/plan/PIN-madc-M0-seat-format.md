@@ -4,6 +4,8 @@
 
 *Amended by `PIN-madc-M0-amendment-2-session-integrity.md` (2026-09-25): session integrity, additive.*
 
+*Amended by `PIN-madc-M0-amendment-3.md` (2026-09-25): seed `created:false` proof/result contract, additive.*
+
 **Authority:**
 
 - `docs/plan/PLAN-madc-M0-build-plan.md` §9 — Founder-accepted; on `main` via PR #2, merge commit `9c71afd5c99d44443eecce2a0b4678e90dea6cb0`.
