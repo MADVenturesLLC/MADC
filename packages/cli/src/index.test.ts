@@ -21,9 +21,11 @@ import { CHAT_RESERVED, parseArgs } from "./args.ts";
 import {
   confinedSeatSha,
   localRows,
+  procStartMs,
   setDoctorInspectTimeoutForTests,
   setDoctorSwapHookForTests,
   sha256OrNull,
+  startedAfterLock,
 } from "./doctor.ts";
 import { classifyCode, EXIT } from "./exit-codes.ts";
 import { type CliIO, colorEnabled } from "./io.ts";
@@ -319,4 +321,24 @@ test("A7 §2 on a TTY a foreign-turn delta is never rendered, only classified (B
     else process.env.MADC_TEST_FAKE_SCENARIO = saved;
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("A7 §3 locks: /proc starttime is clock ticks since boot, converted via btime + USER_HZ before the 2 s rule (Founder correction to CLI pin locks row per PR #16 r4107161992)", () => {
+  // Fixed fixture: comm with spaces and parentheses; field 22 (starttime) = 12345 ticks.
+  const pidStat =
+    "1234 (my (odd) proc) S 1 1234 1234 0 -1 4194560 100 0 0 0 5 3 0 0 20 0 1 0 12345 1000000 200\n";
+  const procStat = "cpu  1 2 3 4\nintr 5\nbtime 1700000000\nprocesses 99\n";
+  const startMs = 1_700_000_000 * 1000 + (12_345 * 1000) / 100; // 1700000123450
+  assert.equal(procStartMs(pidStat, procStat), startMs);
+  // Parse failures → null (the reuse check is skipped, never a FAIL).
+  assert.equal(procStartMs("1234 (x) S 1 2 3\n", procStat), null, "truncated stat");
+  assert.equal(procStartMs(pidStat, "cpu 1 2 3\n"), null, "no btime line");
+  assert.equal(procStartMs(pidStat.replace(" 12345 ", " 12x45 "), procStat), null, "bad ticks");
+  assert.equal(procStartMs("garbage", procStat), null, "no comm");
+  // The rule: WARN only when startMs > startedAt + 2000.
+  assert.equal(startedAfterLock(startMs, startMs - 2000), false, "within slack");
+  assert.equal(startedAfterLock(startMs, startMs - 2001), true, "started after the lock");
+  assert.equal(startedAfterLock(startMs, startMs + 60_000), false, "started before the lock");
+  assert.equal(startedAfterLock(null, startMs - 60_000), false, "unknown start → skip");
+  assert.equal(startedAfterLock(startMs, null), false, "unknown startedAt → skip");
 });

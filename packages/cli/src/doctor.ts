@@ -50,7 +50,10 @@ const ENGINE_PROBE_MS = 5_000;
 const INIT_TIMEOUT_MS = 30_000;
 const FLOOR = { node: "22.19.0", bun: "1.2.0" } as const;
 const DEFAULT_SEAT = "madc-default";
-/** Linux reports /proc/<pid>/stat start times in USER_HZ, which is 100 on every Linux ABI. */
+/**
+ * Clock ticks per second for /proc/<pid>/stat `starttime`: Linux USER_HZ, ASSUMED to be 100 (the
+ * value on every mainstream Linux ABI; not read from sysconf at runtime).
+ */
 const USER_HZ = 100;
 const LOCK_START_SLACK_MS = 2_000;
 
@@ -506,19 +509,41 @@ function checkSession(home: HomeState, insp: Inspection | null): Check {
   };
 }
 
-/** Linux: process start time (unix ms) from /proc/<pid>/stat + /proc/stat btime; else null. */
+/**
+ * Process start time in Unix ms, from the text of `/proc/<pid>/stat` and `/proc/stat` (Founder
+ * correction to the CLI pin `locks` row, PR #16 r4107161992). Field 22 (`starttime`) is in clock
+ * ticks since boot, NOT Unix ms: startMs = btime * 1000 + starttimeTicks * 1000 / USER_HZ, where
+ * `btime` (the `btime` line of /proc/stat) is boot time in seconds since the epoch. Anything that
+ * does not parse → null (the reuse check is then skipped; it never FAILs).
+ */
+export function procStartMs(pidStat: string, procStat: string): number | null {
+  const close = pidStat.lastIndexOf(")"); // comm may contain spaces and parentheses
+  if (close < 0) return null;
+  const fields = pidStat.slice(close + 2).split(" ");
+  const ticks = fields[19]; // field 22 (starttime); fields[0] is field 3 (state)
+  const btime = /^btime (\d+)$/m.exec(procStat)?.[1];
+  if (ticks === undefined || !/^\d+$/.test(ticks) || btime === undefined) return null;
+  return Number(btime) * 1000 + (Number(ticks) * 1000) / USER_HZ;
+}
+
+/**
+ * The pid-reuse rule: WARN "started after the lock" only when the start time is known and later
+ * than `startedAt` + 2 s slack. An unknown start time (no /proc, parse failure) skips the check.
+ */
+export function startedAfterLock(startMs: number | null, lockStartedAt: number | null): boolean {
+  return (
+    startMs !== null && lockStartedAt !== null && startMs > lockStartedAt + LOCK_START_SLACK_MS
+  );
+}
+
+/** Linux: process start time (Unix ms) via {@link procStartMs}; unreadable /proc or non-Linux → null. */
 function processStartMs(pid: number): number | null {
   if (process.platform !== "linux") return null;
   try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
-    const startTicks = Number(fields[19]); // field 22 (starttime); fields[0] is field 3
-    const btimeLine = readFileSync("/proc/stat", "utf8")
-      .split("\n")
-      .find((l) => l.startsWith("btime "));
-    const btime = Number(btimeLine?.split(/\s+/)[1]);
-    if (!Number.isFinite(startTicks) || !Number.isFinite(btime)) return null;
-    return (btime + startTicks / USER_HZ) * 1000;
+    return procStartMs(
+      readFileSync(`/proc/${pid}/stat`, "utf8"),
+      readFileSync("/proc/stat", "utf8"),
+    );
   } catch {
     return null;
   }
@@ -640,8 +665,7 @@ function checkLocks(home: HomeState): Check {
       );
       continue;
     }
-    const started = processStartMs(lock.pid);
-    if (started !== null && startedAt !== null && started > startedAt + LOCK_START_SLACK_MS) {
+    if (startedAfterLock(processStartMs(lock.pid), startedAt)) {
       warnings.push(`${entry}: pid ${lock.pid} started after the lock: pid reused or foreign`);
       continue;
     }

@@ -88,12 +88,18 @@ function finalText(items: readonly Item[]): string {
  */
 const ITEM_STATUSES: readonly ItemStatus[] = ["inProgress", "completed", "failed"];
 
+/** Protocol pin §1 "IDs": domain ids are opaque strings of this grammar before any path join. */
+const DOMAIN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const isDomainId = (v: unknown): v is string => typeof v === "string" && DOMAIN_ID.test(v);
+
 function isItemShape(i: unknown): i is Item {
   if (i === null || typeof i !== "object") return false;
   const r = i as Record<string, unknown>;
   if (typeof r.id !== "string" || typeof r.kind !== "string" || typeof r.status !== "string") {
     return false;
   }
+  // Item.id is a domain id (protocol pin §1 "IDs"): `../x` and friends are protocol violations.
+  if (!isDomainId(r.id)) return false;
   // Copilot r4109396318: `kind` and `status` must be members of the pinned unions.
   if (!(ITEM_KINDS as readonly string[]).includes(r.kind)) return false;
   if (!(ITEM_STATUSES as readonly string[]).includes(r.status)) return false;
@@ -108,10 +114,6 @@ function isItemShape(i: unknown): i is Item {
   }
   return true;
 }
-
-/** Protocol pin §1 "IDs": domain ids are opaque strings of this grammar before any path join. */
-const DOMAIN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const isDomainId = (v: unknown): v is string => typeof v === "string" && DOMAIN_ID.test(v);
 
 function isErrorBody(e: unknown): boolean {
   if (e === null || typeof e !== "object") return false;
@@ -148,6 +150,16 @@ function servedModelOf(item: Item | null | undefined): ServedModel | null {
     backing: item.backing,
     providerId: item.providerId,
   };
+}
+
+function sameServed(a: ServedModel | null, b: ServedModel | null): boolean {
+  if (a === null || b === null) return a === b;
+  return (
+    a.requestedModel === b.requestedModel &&
+    a.servedModel === b.servedModel &&
+    a.backing === b.backing &&
+    a.providerId === b.providerId
+  );
 }
 
 export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<number> {
@@ -358,6 +370,18 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
       if (!isTurnShape(ts?.turn) || !isDomainId(ts.turn.id) || ts.turn.threadId !== tid) {
         throw new ProtocolMismatch("protocol violation: turn/start returned an invalid turn");
       }
+      // Copilot r4109466190: `turn/start` returns the turn as just started. A completed or
+      // pre-populated start result would never be followed by `turn/completed`, so it is a
+      // protocol violation (exit 3) before any wait, never a hang.
+      if (
+        ts.turn.status !== "inProgress" ||
+        ts.turn.items.length !== 0 ||
+        ts.turn.completedAt !== null
+      ) {
+        throw new ProtocolMismatch(
+          "protocol violation: turn/start returned a turn that is not just started",
+        );
+      }
       turnId = ts.turn.id;
       turn = ts.turn;
       for (const d of pendingDeltas.splice(0)) {
@@ -387,8 +411,16 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
         // a protocol violation (exit 3) and never reaches the receipt / JSON renderers.
         const t = (completed.params as { turn?: unknown } | undefined)?.turn;
         // Copilot r4108865790: it must be THIS turn (id from turn/start, same thread).
-        if (isTurnShape(t) && t.id === turnId && t.threadId === tid) turn = t;
-        else malformedItem = true;
+        if (isTurnShape(t) && t.id === turnId && t.threadId === tid) {
+          turn = t;
+          // `turn/completed.items` is authoritative: the served-model receipt is taken from the
+          // snapshot too, and must agree with any `item/completed` notification (Copilot review
+          // 5323681723). At most one receipt per turn.
+          const snap = t.items.map(servedModelOf).filter((x): x is ServedModel => x !== null);
+          if (snap.length > 1) malformedItem = true;
+          else if (snap.length === 1 && served === null) served = snap[0] ?? null;
+          else if (!sameServed(served, snap[0] ?? null)) malformedItem = true;
+        } else malformedItem = true;
         for (const id of itemTurnIds) if (id !== turnId) malformedItem = true;
       }
     } catch (err) {

@@ -125,6 +125,22 @@ rl.on("line", (line) => {
         startedAt: 1,
         completedAt: null,
       };
+      if (scenario === "start-completed") {
+        // "start-completed": turn/start answers an already completed, populated turn and no
+        // turn/completed ever follows (a CLI that waits would hang).
+        send({
+          id: msg.id,
+          result: {
+            turn: {
+              ...turn,
+              status: "completed",
+              items: [{ id: "item_a1", kind: "agentMessage", status: "completed", text: "x" }],
+              completedAt: 2,
+            },
+          },
+        });
+        return;
+      }
       if (scenario === "delta-early-other-turn") {
         // A foreign-turn delta that arrives before the turn/start response (turnId not yet known).
         send({
@@ -202,6 +218,52 @@ rl.on("line", (line) => {
               ...turn,
               status: "completed",
               items: [{ id: "item_a1", kind: "agentMessage", status: "completed" }],
+              completedAt: 2,
+            },
+          },
+        });
+        return;
+      }
+      if (scenario === "bad-item-id") {
+        // "bad-item-id": a well-formed agentMessage item whose id breaks the domain-id grammar.
+        send({
+          method: "turn/completed",
+          params: {
+            turn: {
+              ...turn,
+              status: "completed",
+              items: [{ id: "../x", kind: "agentMessage", status: "completed", text: "x" }],
+              completedAt: 2,
+            },
+          },
+        });
+        return;
+      }
+      if (scenario === "served-snapshot-only" || scenario === "served-mismatch") {
+        // The served-model receipt only in the turn/completed snapshot, or a notification that
+        // disagrees with the snapshot.
+        const receipt = (servedModel: string) => ({
+          id: "item_s1",
+          kind: "servedModel",
+          status: "completed",
+          requestedModel: "kimi-for-coding",
+          servedModel,
+          backing: "kimi-code",
+          providerId: "kimi-code",
+        });
+        if (scenario === "served-mismatch") {
+          send({
+            method: "item/completed",
+            params: { threadId, turnId, item: receipt("model-a") },
+          });
+        }
+        send({
+          method: "turn/completed",
+          params: {
+            turn: {
+              ...turn,
+              status: "completed",
+              items: [...items, receipt("model-b")],
               completedAt: 2,
             },
           },

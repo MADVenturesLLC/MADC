@@ -908,6 +908,9 @@ test("A7 §4 exit 3: a turn/completed without items is a protocol violation, one
       "delta-other-turn",
       "delta-non-string",
       "unknown-kind",
+      "start-completed",
+      "bad-item-id",
+      "served-mismatch",
     ]) {
       const sb4 = sandbox();
       const w = await runCli(sb4, ["-p", "hi", "--json"], {
@@ -916,10 +919,10 @@ test("A7 §4 exit 3: a turn/completed without items is a protocol violation, one
       });
       sb4.cleanup();
       assert.equal(w.code, 3, `${scenario}: ${w.stdout}${w.stderr}`);
-      assert.match(
-        (JSON.parse(w.stdout) as { error: { message: string } }).error.message,
-        /protocol violation/,
-      );
+      const parsed = JSON.parse(w.stdout) as { turn: unknown; error: { message: string } };
+      assert.match(parsed.error.message, /protocol violation/);
+      // Copilot r4109466190: a start result that is not just started → the turn is NOT STARTED.
+      if (scenario === "start-completed") assert.equal(parsed.turn, null);
     }
     // Items are validated too (Copilot r4108764755): an agentMessage without text → 3, in both modes.
     for (const json of [true, false]) {
@@ -932,6 +935,28 @@ test("A7 §4 exit 3: a turn/completed without items is a protocol violation, one
       assert.equal(i.code, 3, i.stdout + i.stderr);
       if (json) assert.equal(i.stdout.trim().split("\n").length, 1, "exactly one JSON object");
     }
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("A7 §4 servedModel is taken from the authoritative turn/completed.items snapshot too (Copilot review 5323681723)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    const r = await runCli(sb, ["-p", "hi", "--json"], {
+      engine: FAKE,
+      env: { MADC_TEST_FAKE_SCENARIO: "served-snapshot-only" },
+    });
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    const out = JSON.parse(r.stdout) as { servedModel: unknown };
+    assert.deepEqual(out.servedModel, {
+      requestedModel: "kimi-for-coding",
+      servedModel: "model-b",
+      backing: "kimi-code",
+      providerId: "kimi-code",
+    });
   } finally {
     sb.cleanup();
   }
