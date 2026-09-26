@@ -1,17 +1,57 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { processIO } from "./io.ts";
+import { type CliIO, processIO } from "./io.ts";
 import { main } from "./main.ts";
 
 /**
- * Resolves once everything written to `stream` so far has been flushed: write callbacks run in
- * order, so an empty write's callback fires after all earlier writes (Copilot r4107805267: no
- * dependence on a `drain` event that may never come).
+ * §3e E12: a write error (EPIPE included) on the CLI's own stdout or stderr stops further writes
+ * to that stream and is never printed; the process exits with the run's exit code as computed
+ * (the exit code reports the run, not delivery). Without a listener Node would die with an
+ * unhandled `error` event (exit 1 with a stack) after the receipt already said `exit 0`.
  */
-function flushed(stream: NodeJS.WriteStream): Promise<void> {
+function guardStream(stream: NodeJS.WriteStream): {
+  out: { write(chunk: string): unknown };
+  dead: () => boolean;
+} {
+  let dead = false;
+  stream.on("error", () => {
+    dead = true;
+  });
+  return {
+    out: {
+      write(chunk: string) {
+        if (dead) return false;
+        try {
+          return stream.write(chunk);
+        } catch {
+          dead = true;
+          return false;
+        }
+      },
+    },
+    dead: () => dead,
+  };
+}
+
+/**
+ * Resolves once everything written to `stream` so far has been flushed: `end()` flushes every
+ * queued write on Node and on Bun. (§3e E13, ledger D-016: on Bun the callback of a later write
+ * can fire while a large earlier write is still buffered, so the old empty-write-callback flush
+ * truncated piped stdout at 64 KiB.) A stream that has errored resolves at once (E12).
+ */
+function flushed(stream: NodeJS.WriteStream, dead: () => boolean): Promise<void> {
   return new Promise((resolve) => {
-    stream.write("", () => resolve());
+    if (dead()) {
+      resolve();
+      return;
+    }
+    stream.once("error", () => resolve());
+    try {
+      stream.end(() => resolve());
+    } catch {
+      resolve();
+    }
   });
 }
 
@@ -20,9 +60,25 @@ function flushed(stream: NodeJS.WriteStream): Promise<void> {
  * receipt) have flushed (Copilot r4107601166: never exit with the receipt still buffered).
  */
 export async function runBin(engineEntry?: string): Promise<void> {
-  const code = await main(process.argv.slice(2), processIO(engineEntry));
+  const stdout = guardStream(process.stdout);
+  const stderr = guardStream(process.stderr);
+  const base = processIO(engineEntry);
+  const io: CliIO = {
+    stdout: stdout.out,
+    stderr: stderr.out,
+    stdin: base.stdin,
+    env: base.env,
+    stdoutIsTTY: base.stdoutIsTTY,
+    stderrIsTTY: base.stderrIsTTY,
+    // F-130: lazy on purpose — only the one-shot reads cwd, and a deleted cwd must not throw here.
+    get cwd() {
+      return base.cwd;
+    },
+    ...(base.engineEntry !== undefined ? { engineEntry: base.engineEntry } : {}),
+  };
+  const code = await main(process.argv.slice(2), io);
   process.exitCode = code;
-  await Promise.all([flushed(process.stdout), flushed(process.stderr)]);
+  await Promise.all([flushed(process.stdout, stdout.dead), flushed(process.stderr, stderr.dead)]);
   process.exit(code);
 }
 
