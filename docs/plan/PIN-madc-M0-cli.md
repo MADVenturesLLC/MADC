@@ -2,7 +2,7 @@
 
 *Surface Architect · 2026-09-25 · Venue: `MADVenturesLLC/MADC` · Status: **build pin** for Hephaestus Act M0-A7. Docs only.*
 
-*Amended by `PIN-madc-M0-cli-erratum-1.md` (2026-09-25): `locks` row start-time rule, interpretations for Founder confirmation.*
+*Amended by `PIN-madc-M0-cli-erratum-1.md` (2026-09-25, rev. 2026-09-26): `locks` row start-time rule; interpretations for Founder confirmation; §3a–§3d one-shot close exit, notification and shape checks, turn idle deadline (`MADC_TURN_IDLE_MS`), and exit precedence for CLI §4.*
 
 **Authority:**
 
