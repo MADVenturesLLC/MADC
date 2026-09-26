@@ -1,23 +1,24 @@
-# PIN: M0 CLI pin, Erratum 1 (`locks` row start-time rule, pointer placement, interpretations for Founder confirmation, one-shot close exit, unknown notifications, exit precedence, turn idle deadline)
+# PIN: M0 CLI pin, Erratum 1 (`locks` row start-time rule, pointer placement, interpretations for Founder confirmation, one-shot close exit, engine messages, turn idle deadline, exit precedence, failure inventory)
 
-*Surface Architect · 2026-09-25 (rev. 2026-09-26) · Venue: `MADVenturesLLC/MADC` · Status: **build pin erratum** to `PIN-madc-M0-cli.md` (Act M0-A7). Docs only. §1, §1a, §2 and §3a–§3d take effect when the Founder merges this file; §3 takes effect row by row as the Founder marks it. §3b and §3c need a CLI code act (the A7 follow-up); §3a and §3d record main's behaviour and add tests.*
+*Surface Architect · 2026-09-25 (rev. 2026-09-26) · Venue: `MADVenturesLLC/MADC` · Status: **build pin erratum** to `PIN-madc-M0-cli.md` (Act M0-A7). Docs only. §1, §1a, §2 and §3a–§3f take effect when the Founder merges this file; §3 takes effect row by row as the Founder marks it. §3b, §3c and §3e need a CLI code act (the A7 follow-up). §3a and §3d record main's behaviour and add tests, with two exceptions that are new behaviour and belong to that code act: the sticky idle-timeout message in tier 3 (§3c rule 4, §3d) and the post-close re-check (§3b rule 6).*
 
 **Authority:**
 
 - `docs/plan/PIN-madc-M0-cli.md` (build pin for Act M0-A7, merged via PR #16), read at `main` @ `343da29124f0aea74cbef120fd254f214e64ab00` (PR #19 merge; its head `b6ff3f5` has the same tree). `CLI:n` below means that file at `343da29`.
 - `docs/plan/PIN-madc-M0-protocol-messages.md` (`PROTO:n`), `docs/plan/PIN-madc-M0-seat-format.md` (frozen) and `docs/plan/PIN-madc-M0-amendment-2-session-integrity.md` (M0 Amendment 2), read at the same commit. No docs changed on `main` between `c55e4ba` and `343da29`.
-- Code citations (`oneshot.ts:n` etc.) are `packages/cli/src/*` and `packages/engine/src/*` at `343da29`.
+- Code citations (`oneshot.ts:n`, `main.ts:n`, `bin.ts:n`, `io.ts:n`, `args.ts:n`, `exit-codes.ts:n`, `doctor.ts:n`, `cli.test.ts:n` are `packages/cli/src/*`; `client.ts:n` is `packages/engine/src/client.ts`; `engine main.ts:n` and `engine home.ts:n` are `packages/engine/src/*`) are all read at `343da29` with `git show 343da29:<path>`.
 - `docs/plan/README.md` status-keyed edit rule (PR #16): accepted and frozen docs change only by one `Amended by <file>` pointer line directly under the status line; errata are new files.
-- Findings: Copilot Medium [r4107161992](https://github.com/MADVenturesLLC/MADC/pull/16#discussion_r4107161992) and Copilot Low [r4107162048](https://github.com/MADVenturesLLC/MADC/pull/16#discussion_r4107162048) on PR #16, both merged with no reply (ledger D-154, D-155); Argus post-merge review of PR #19 (`/workspace/madc-reviews/pr-19.md`, F4, F5); Argus pre-check of this erratum at `0950b0c` (`/workspace/madc-reviews/precheck-cli-erratum-1-0950b0c.md`, H1–H3, M1–M10, L1–L10, I1–I5).
+- Findings: Copilot Medium [r4107161992](https://github.com/MADVenturesLLC/MADC/pull/16#discussion_r4107161992) and Copilot Low [r4107162048](https://github.com/MADVenturesLLC/MADC/pull/16#discussion_r4107162048) on PR #16, both merged with no reply (ledger D-154, D-155); Argus post-merge review of PR #19 (`/workspace/madc-reviews/pr-19.md`, F4, F5); Argus pre-checks of this erratum at `0950b0c` (H1–H3, M1–M10, L1–L10, I1–I5) and at `d5abf8c` (`/workspace/madc-reviews/precheck-cli-erratum-1-d5abf8c.md`: NH1–NH2, NM1–NM6, NL1–NL7); Hephaestus's failure inventory at `343da29` (`/workspace/madc/A7-failure-inventory-343da29.md`, ids `F-01`..`F-158`); Hephaestus's local follow-up branch `hephaestus/m0-a7-followup-validation` @ `30caa0a` (read for N5–N7 wording only; not on `main`).
 
 **Scope.** This erratum:
 
 - corrects the CLI pin's `locks` row (§1 start-time rule, §1a orphan-name redaction);
 - fixes pointer placement (§2);
 - lists builder interpretations for the Founder to accept or reject (§3);
-- rules on the one-shot (CLI §2) and exit codes (CLI §4) in §3a–§3d.
+- rules on the one-shot (CLI §2), exit codes (CLI §4) and doctor's failure paths (CLI §3) in §3a–§3f;
+- pins or triages every unpinned and code-vs-pin case in Hephaestus's inventory (§3e, §3f).
 
-It adds **no** protocol method, notification, error code, lock body field, seat field, JSONL event type, doctor row or exit code. It **adds** one environment variable, `MADC_TURN_IDLE_MS` (§3c), read only by the one-shot, and new exit-3 conditions inside the existing exit-3 class (CLI:189). Where this file and `PIN-madc-M0-cli.md` disagree, this file wins for the `locks` row (§1, §1a), for the one-shot flow and output in CLI §2 (§3a–§3d), and for exit-code precedence in CLI §4 (§3a, §3d). Everything else in the CLI pin stands.
+It adds **no** protocol method, notification, error code, lock body field, seat field, JSONL event type, doctor row or exit code. It **adds** one environment variable, `MADC_TURN_IDLE_MS` (§3c), read only by the one-shot, and new exit-3 conditions inside the existing exit-3 class (CLI:189). **One exception to CLI:189:** in M0 a well-formed response whose id matches no request the CLI still awaits (§3b rule 3) is **not** a "protocol violation" in the sense of CLI:189; it is ignored. Where this file and `PIN-madc-M0-cli.md` disagree, this file wins for the `locks` row (§1, §1a), for the one-shot flow, interrupt and output rules in CLI §2 (CLI:44-111; §3a–§3e), for doctor's engine row and signal handling (CLI:126, CLI:182; §3e), for what counts as a protocol violation under CLI:189 (§3b), and for exit-code precedence and sources in CLI §4 (CLI:184-195; §3a, §3d, §3e). Everything else in the CLI pin stands.
 
 **Who decided what.**
 
@@ -25,10 +26,11 @@ It adds **no** protocol method, notification, error code, lock body field, seat 
 | --- | --- |
 | §1, §1a, §2 | Surface correction (D-154, D-155; §1 matches the Founder correction recorded as D-185) |
 | §3 rows | Founder, row by row (column blank on purpose) |
-| §3a | Founder: Option A (as relayed by the planner on 2026-09-26; ledger id pending (Clio)) |
-| §3b | Surface ruling |
-| §3c | Surface ruling; the 600 000 ms default is the Founder's choice (PR Issues room, 2026-09-26 5:09 AM Nassau; ledger id pending (Clio)) |
-| §3d | Surface clarification of main's existing ladder (Argus pr-19.md F5; ledger D-187 for the 5-over-4 part) |
+| §3a | Founder: Option A (as relayed by the planner on 2026-09-26; no time or link is on record; ledger id pending (Clio): `ledger.json` generated 2026-09-26 has no entry for it) |
+| §3b | Surface ruling (ledger id pending (Clio): no entry in `ledger.json`) |
+| §3c | Surface ruling; the 600 000 ms default is the Founder's choice (PR Issues room, 2026-09-26 5:09 AM Nassau; ledger id pending (Clio): no entry in `ledger.json`) |
+| §3d | Surface clarification of main's ladder (Argus pr-19.md F5 and pre-check NM1; ledger D-187 for the 5-over-4 part). The sticky idle message is new (§3c). |
+| §3e, §3f | Surface rulings. The Founder asked on 2026-09-26 (5:29 AM Nassau) for Hephaestus's inventory to be pinned in this revision; the content of each ruling is Surface's. |
 
 ---
 
@@ -98,72 +100,93 @@ Wording is the ledger's (`/workspace/madc-ledger/LEDGER.md`), which follows the 
 
 **Tests.** Existing at `343da29` (stays): a completed turn followed by a non-zero engine exit at close gives exit 3, class `engine`, turn status printed verbatim (`cli.test.ts:1036-1058`, fake scenario `exit-nonzero`). New in the code act (Argus pre-check I5 confirms these expectations match `oneshot.ts:482-510`; no test covers them yet): (a) a failed turn with `-32603` followed by engine exit 1 at close gives exit 1; (b) a failed turn with `-32008` `no-credentials` followed by engine exit 1 at close gives exit 4; (c) a completed turn whose engine must be killed at close gives exit 3 with the `:506-507` message. Mutation checks: applying the close rule to every base breaks (a) and (b); dropping the kill branch breaks (c).
 
-## 3b. Notifications, responses and shape checks while the one-shot runs (Surface ruling)
+## 3b. Messages from the engine while the one-shot runs (Surface ruling)
 
 **Source.** The engine-side mirror is A2 interpretation 5 (D-035: the engine ignores unknown notifications). The CLI-side question has no GitHub or ledger source; ledger id pending (Clio).
 
-**Listed notifications** are exactly the six the protocol pin defines: `thread/started` (PROTO:68), `turn/started` and `turn/completed` (PROTO:78-79), `item/started`, `item/completed` and `item/agentMessage/delta` (PROTO:94-96). "Valid JSON-RPC" means the PROTO:25 shapes: a response `{ id, result }` or `{ id, error }`, or a notification `{ method, params }` with no `id` (the `jsonrpc` field is optional, PROTO:26).
+**Listed notifications** are exactly the six the protocol pin defines: `thread/started` (PROTO:68), `turn/started` and `turn/completed` (PROTO:78-79), `item/started`, `item/completed` and `item/agentMessage/delta` (PROTO:94-96).
+
+**Well-formed message** (PROTO:25, :26, :28, :104, :159). The client records every line that parses as a JSON object in `client.messages` (`client.ts:61`, pushed at `:122`). An object there is well formed if it is one of:
+
+- a **notification**: `method` is a string and there is no own `id` key;
+- a **response**: an own `id` that is a number or a string (PROTO:28), or `null` together with `error` (PROTO:104); no own `method` key; exactly one of own `result` and own `error`; and an `error` is an object whose `code` is an integer and whose `message` is a string (PROTO:104, :159).
+
+Anything else in `client.messages` is **malformed** (N2–N4 below). The `jsonrpc` field is neither required nor checked (PROTO:26).
 
 **Ruling.**
 
-1. **Unknown notification.** A notification (`method` string, no `id`) whose method is not one of the six **MUST be ignored**: no exit, no stdout output, and no change to any state the CLI tracks. The engine client's own message log (`client.ts:122`, scanned by `waitFor` at `:166`) is exempt; recording a message there is not a state change. Ignoring it **MUST NOT** extend or reset any timeout: the request timeout keeps its original deadline, and the §3c idle clock is neither reset nor extended.
-2. **Every protocol-violation check in the CLI at `343da29` stays exit 3.** Non-exhaustive list: a non-JSON line and a JSON line that is not an object (`client.ts:111-119`, polled at `oneshot.ts:266-273`, overriding at `:513-519`); `protocolVersion` mismatch (`oneshot.ts:297-299`, CLI:47); `thread/start` id grammar (`:313-318`); `turn/start` result shape and "just started" (`:389-403`); malformed or foreign-thread/turn deltas and items (`:328-346`, `:352-363`, `:406-412`, `:446`); `turn/completed` must be this turn (`:436`, `:445`); duplicate or disagreeing `servedModel` (`:441-444`).
-3. **NEW exit-3 checks** (main does not do these today; each needs the CLI code act, a test and a killed mutation, below):
-   - **(N1) Unmatched response: not an exit-3 check in M0 (residual).** A message with an `id` and no `method` whose `id` is not a request this CLI sent and still awaits. The CLI cannot tell this today: the pending-id map is private to the engine client (`packages/engine/src/client.ts:67`, matched at `:123-129`), and CLI:201-204 allows no change in `packages/engine` beyond the read-only `sdk.ts` re-exports. So in M0 an unmatched response **MUST be ignored** exactly as in rule 1: no exit, no stdout, and it **MUST NOT** reset or extend the request timeout or the §3c idle clock. It therefore cannot cause a hang; the wait it sits in still ends on its own deadline (exit 3). Detecting it needs a read-only engine-client accessor, which is a separate Founder allowance and is recorded as a follow-up, not built here.
-   - **(N2) Message with both an `id` and a `method`.** The protocol has no server-to-client requests, so any such object is a violation. The CLI detects it by scanning the client's public message log (`client.ts:61`, pushed at `:122`) the way it already polls `protocolViolations` (`oneshot.ts:266-273`); no engine change.
-   - **(N3) No method, no id.** An object with neither a `method` string nor an `id`.
-   - **(N4) Other non-JSON-RPC objects.** Any other object that is not one of the PROTO:25 shapes (for example `method` present but not a string, or both `result` and `error`).
-   - **(N5) Shape checks on `thread/started`, `turn/started` and `item/started`** (main never inspects them; it checks only deltas, `item/completed` and `turn/completed`, `oneshot.ts:323-375`):
-     - `thread/started`: `params.thread` is an object whose `id` equals this connection's thread id.
-     - `turn/started`: `params.turn` passes the existing `isTurnShape` (`oneshot.ts:125`) with `threadId` equal to this thread; its `id` is bound to this turn's id when that is known, and checked when `turn/start` answers if it arrived first (as items are at `:406-412`).
-     - `item/started`: the same envelope and item checks as `item/completed` (`:352-363`), bound to this turn the same way.
-   - **(N6) D-188 fix.** The item shape check (`isItemShape`, `oneshot.ts:95-116`) requires a `servedModel` item's `backing` to be one of PROTO:220's three values, `"kimi-code" | "claude-code" | "codex"` (main accepts any string, `:111`). This applies to `item/started`, `item/completed` and the `turn/completed` snapshot. **This is the fix for D-188 (Copilot High r4110012309), carried by the A7 follow-up**; it is not a waiver.
-4. **Where.** These checks live in `packages/cli` (CLI:199-206 allows no engine behaviour change). N2–N6 need only the public message log and the CLI's own state. Each ends the wait at once as a protocol violation (exit 3), the way `violate()` does today (`oneshot.ts:178-192`), never a later hang.
+1. **Unknown notification.** A notification whose method is not one of the six **MUST be ignored**: no exit, no stdout output, and no change to any state the CLI tracks. The client's own message log is exempt; recording a message there is not a state change. Ignoring it **MUST NOT** extend or reset any timeout: the request timeout keeps its original deadline, and the §3c idle clock is neither reset nor extended. (Inventory F-70.)
+2. **Every protocol-violation check in the CLI at `343da29` stays exit 3.** Non-exhaustive list: a non-JSON line, including a blank line, and a JSON line that is not an object (`client.ts:111-120`, polled at `oneshot.ts:266-274`, overriding at `:513-519`; inventory F-72, F-73, F-74); `protocolVersion` mismatch (`oneshot.ts:297-299`, CLI:47); `thread/start` id grammar (`:313-318`); `turn/start` result shape and "just started" (`:389-403`); malformed or foreign-thread/turn deltas and items (`:328-346`, `:352-363`, `:406-412`, `:446`); `turn/completed` must be this turn (`:436`, `:445`); a `servedModel` notification that disagrees with the snapshot (`:444`; §3e E3 replaces only the "more than one" part of `:441-444`).
+3. **Unmatched response: ignored in M0 (residual; not a protocol violation).** A **well-formed** response whose `id` is not a request the CLI still awaits: an unknown, late or duplicate id, `id: null`, or an id of the wrong type such as `"1"` for request `1` (inventory F-22, F-23, F-24). The client stores it and settles nothing (`client.ts:122-129`). In M0 it **MUST be ignored** exactly as in rule 1: no exit, no stdout, and it **MUST NOT** reset or extend the request timeout or the §3c idle clock. It cannot hang the run: every wait it sits in still ends on its own deadline or terminal state (a request still pending ends on its 30 000 ms timeout, exit 3, §3c rule 6). **Deferred by choice for M0.** The CLI could detect it inside `packages/cli` by sending its own requests with its own ids through the public `sendRaw` (`client.ts:138-140`) and matching responses through the public `waitFor` and `messages` (`:165-182`, `:61`), which would replace `EngineClient.request()` (`:147-158`) in the one-shot. That needs no engine change (CLI:200 allows only the D-A7-2 read-only `sdk.ts` re-exports, ledger D-151; CLI:206, no engine behaviour change). M0 does not build it because an unmatched response cannot hang or mislead the run. **Exception to CLI:189** (see Scope): in M0 this is not a protocol violation.
+4. **NEW exit-3 checks** (main does not do these today; each needs the CLI code act, a test and a killed mutation, below). Each is a protocol violation, exit 3, class `engine`, `code: null`.
+   - **(N2) Message with both an `id` and a `method`.** The protocol has no server-to-client requests in M0 (PROTO:242, "approvals as server-requests" are out). This includes an id-carrying `turn/completed` (rule 7, inventory F-76) and an id-carrying message whose id matches a pending request: the client settles that request anyway, whatever `method` says (`client.ts:124-128`), so only rule 6 can be sure to catch it. Message `protocol violation: engine message with both id and method`.
+   - **(N3) No method, no id** (for example `{"params":{}}` or `{"jsonrpc":"2.0"}`; inventory F-71). Message `protocol violation: engine message with neither method nor id`.
+   - **(N4) Any other malformed object:** `method` present but not a string; both `result` and `error` (inventory F-13; the client lets `error` win, `client.ts:127`); neither; an `id` that is not a number, a string or `null`; or an `error` that is not an object with an integer `code` and a string `message` (inventory F-21; `error: null` is F-20, §3e E1). Message `protocol violation: malformed engine message` (for a bad `error` body: `protocol violation: malformed error response`).
+   - **(N5) Shape checks on `thread/started`, `turn/started` and `item/started`** (main never inspects them; it checks only deltas, `item/completed` and `turn/completed`, `oneshot.ts:323-375`; inventory F-36, F-37, F-38). The wording matches `30caa0a`'s implementation:
+     - `thread/started`: `params.thread` passes the full `Thread` shape (PROTO:145-153: `id` and `seatId` in the id grammar, `seatId` equal to the seat the CLI asked for, `madc-default` by default (CLI:34), `cwd` a string or `null`, `createdAt` and `updatedAt` numbers, `status` one of PROTO:143's `"idle" | "active" | "closed"`, `preview` a string) and its `id` equals this connection's thread id.
+     - `turn/started`: `params.turn` passes the existing `isTurnShape` (`oneshot.ts:125-143`), its `id` is in the id grammar, its `threadId` is this thread, and its `status` is `inProgress` (PROTO:78, the turn has just started). Its `id` is bound to this turn's id when that is known, and checked when `turn/start` answers if it arrived first (as items are at `:406-412`).
+     - `item/started`: the same envelope and item checks as `item/completed` (`:352-363`), plus the item's `status` is `inProgress` (PROTO:233, item lifecycle), bound to this turn the same way.
+   - **(N6) D-188 fix.** The item shape check (`isItemShape`, `oneshot.ts:95-116`) requires a `servedModel` item's `backing` to be one of PROTO:220's three values, `"kimi-code" | "claude-code" | "codex"` (main accepts any string, `:111`; inventory F-45). This applies to `item/started`, `item/completed` and the `turn/completed` snapshot. `30caa0a` implements it as a local list checked against the engine's `ServedModelBacking` type. **This is the fix for D-188 (Copilot High r4110012309), carried by the A7 follow-up**; it is not a waiver. (`providerId == backing`, PROTO:221, is a comment in the protocol type, not a checked rule; the CLI does not add it in M0.)
+   - **(N7) Handshake and `thread/start` result** (as in `30caa0a`, plus inventory F-26). The `initialize` result must be an object whose `protocolVersion` is `"madc-m0/1"` (the existing check, `oneshot.ts:297-299`) and whose `serverInfo` is `{ name: "madc-engine", version: <string> }` (PROTO:58). A missing or non-object result is a protocol violation with the message `protocol violation: initialize returned an invalid result`, not the raw `TypeError` main gives today (`:297` reads `init.protocolVersion` of `undefined`). The `thread/start` result's `thread` must pass the full `Thread` shape of N5, with `seatId` equal to the seat asked for, in addition to the id check at `:313-318` (inventory F-28).
+5. **Live detection.** N2–N4 are checked on each new entry of `client.messages` while the one-shot waits, by the same kind of 100 ms poll as `oneshot.ts:266-274` or on arrival. A hit ends the current step at once, as `violate()` does (`:189-192`), never a later hang. N5–N7 run where the message or result is handled.
+6. **Post-close re-check (Argus NH1).** The live check can lose a race: `client.ts:124-128` settles a pending request for any message with that id, synchronously, and the turn wait ends on any `turn/completed` today (`oneshot.ts:374`). So, **directly after the non-JSON override at `oneshot.ts:513-519`** and before chain verify (`:528-544`), the CLI **MUST** scan every entry of `client.messages` with the classifier above. Any malformed message (N2–N4) calls `fail({ exit: 3, class: "engine" }, null, <the N2–N4 message>)`, guarded by `signalExit === null` like `:513` and `:520`. It overrides any exit so far, including 2, 4 and 5 (§3d). It runs even if the live check already fired.
+7. **The turn wait ends only on the notification.** The matcher's end condition at `oneshot.ts:374` becomes `m.method === "turn/completed" && !Object.hasOwn(m, "id")`. The rest of the matcher (`:323-373`) is unchanged. An id-carrying `turn/completed` is N2 (rules 5 and 6), never the end of the turn.
+8. **Where.** All of this lives in `packages/cli` (CLI:199-206 allows no engine behaviour change). It needs only the public `messages` log, the public `protocolViolations` list and the CLI's own state.
 
-**Tests** (each kills the mutation named):
+**Tests** (each kills the mutation named; the fake echoes the id of the request it is answering, because the client numbers requests itself, `client.ts:65`, `:148`):
 
 - One unknown notification between `turn/started` and `turn/completed`: exit code and stdout equal those of the same run without it. *Mutation:* treat an unknown method as exit 3.
-- Only unknown notifications while `initialize`, `thread/start` or `turn/start` is pending: the request timeout fires on its original deadline (with an injected short timeout, §3c rule 6). *Mutation:* reset the timeout on any inbound message.
-- N1: while `turn/start` is pending (injected short request timeout), a response with an id the CLI never used arrives every 100 ms; the request timeout still fires on its original deadline and exits 3. During the turn, the same stream does not delay the §3c idle deadline. *Mutation:* treat any inbound message as activity.
-- N2: `{ id: 99, method: "server/ask" }` → exit 3. *Mutation:* ignore messages with an id and a method.
-- N3: `{ params: {} }` → exit 3. *Mutation:* ignore objects with no method and no id.
-- N4: `{ method: 7 }` and `{ id: 1, result: {}, error: {…} }` → exit 3. *Mutation:* accept any object with a `method` key.
-- N5: one malformed `thread/started`, one `turn/started` for another thread, one `item/started` with item id `../x` → exit 3 each. *Mutation:* remove each shape check (three mutations).
-- N6: a `servedModel` item with `backing: "ollama-cloud"` in `item/completed` and in the snapshot → exit 3. *Mutation:* accept any string for `backing`.
+- Only unknown notifications while `initialize`, `thread/start` or `turn/start` is pending: the request timeout fires on its original deadline (with an injected short timeout, §3c rule 8). *Mutation:* reset the timeout on any inbound message.
+- **N1, positive (NM6):** mid-turn, `{"id":"zz-unmatched","result":{}}`, then `turn/completed` `completed` → exit **0**, with stdout byte-equal to the same run without it. The string id can never equal one of the client's numeric ids. *Mutation:* treat an unmatched response as exit 3.
+- **N1, no reset:** while `turn/start` is pending (injected short request timeout), `{"id":"zz-unmatched","result":{}}` every 100 ms; the request timeout still fires on its original deadline and exits 3. During the turn the same stream does not delay the §3c idle deadline. *Mutation:* treat any inbound message as activity.
+- **N2:** (a) mid-turn `{"id":99,"method":"server/ask"}` → exit 3. (b) **Pending id:** while `turn/start` is pending, `{"id":<turn/start's id>,"method":"x","error":{"code":-32008,"message":"m"}}` → exit **3**, not 4. (c) Mid-turn `{"id":9,"method":"turn/completed","params":{"turn":<valid, this turn, completed>}}`, then silence → exit 3 and JSON `turn.status` is `inProgress` (the `turn/start` snapshot; the id-carrying message never becomes the turn). *Mutations:* ignore messages with an id and a method (killed by a); poll only, with no post-close re-check (killed by b, which then exits 4); end the turn wait on any `turn/completed` (killed by c, which then shows `completed`).
+- **N3:** `{"params":{}}` and `{"jsonrpc":"2.0"}` → exit 3. *Mutation:* ignore objects with no method and no id.
+- **N4:** `{"method":7}` → 3; while `turn/start` is pending, `{"id":<its id>,"result":{},"error":{"code":-32008,"message":"m"}}` → 3, not 4; `{"id":<pending id>,"error":"boom"}` → 3 with JSON `error.code` `null` (a key that is present). *Mutations:* accept any object with a `method` key; drop the error-body check.
+- **N5:** a malformed `thread/started`, a `thread/started` for another seat, a `turn/started` for another thread, a `turn/started` with `status` `completed`, an `item/started` with item id `../x`, an `item/started` whose item `status` is `completed`, and an `item/started` for another turn → exit 3 each. *Mutation:* remove each check (one mutation per check).
+- **N6:** a `servedModel` item with `backing: "ollama-cloud"` in `item/completed` and in the snapshot → exit 3, and `servedModel` is `null` in JSON. *Mutation:* accept any string for `backing`.
+- **N7:** `serverInfo` missing or with another `name`; a `thread/start` result with a bad `Thread` field or another seat; `{"id":<initialize id>}` with no `result` → exit 3 each, the last with the message `protocol violation: initialize returned an invalid result`, never `Cannot read properties`. *Mutation:* drop each check.
 
 ## 3c. The turn wait gets an idle deadline (Surface ruling; default 600 000 ms, Founder choice)
 
-**Gap.** CLI §2 gives the turn wait no limit (CLI:50, CLI:107-111), and CLI §4 (CLI:189, exit 3 covers "timeouts") names none. Main waits up to `NO_TIMEOUT_MS = 2 147 483 647` ms (about 24.8 days, `oneshot.ts:37`, used at `:375`), then goes down the generic exit-3 path. An engine that stays alive and sends nothing, or sends only unknown notifications (§3b), keeps a non-interactive CLI waiting that long. COPILOT-PATTERNS pattern 1 (a wait needs a timeout or a terminal state; `/workspace/madc-reviews/COPILOT-PATTERNS.md`) applies, so this pins a limit. It is an idle deadline, not a total one, because a legitimate turn can run for many minutes.
+**Gap.** CLI §2 gives the turn wait no limit (CLI:50, CLI:107-111), and CLI §4 (CLI:189, exit 3 covers "timeouts") names none. Main waits up to `NO_TIMEOUT_MS = 2 147 483 647` ms (about 24.8 days, `oneshot.ts:37`, used at `:375`), then goes down the generic exit-3 path (inventory F-05). An engine that stays alive and sends nothing, or sends only unknown notifications (§3b), keeps a non-interactive CLI waiting that long. COPILOT-PATTERNS pattern 1 (a wait needs a timeout or a terminal state; `/workspace/madc-reviews/COPILOT-PATTERNS.md`) applies, so this pins a limit. It is an idle deadline, not a total one, because a legitimate turn can run for many minutes.
 
 **Rule.**
 
 1. **Clock.** A monotonic clock (for example a timer re-armed on activity, or `performance.now()`), never `Date.now()`.
-2. **Start, reset, stop.** The idle clock starts when the `turn/start` response has passed its checks (after `oneshot.ts:389-403`, where `turnId` is set at `:404`). Before that only the request timeout (rule 6) applies, so the deadline can never fire before the turn id is known. The clock resets on each **listed** notification (§3b) that passes its shape check, `item/agentMessage/delta` and `item/started` included. It stops when `turn/completed` arrives, when the deadline fires, or when a Ctrl-C grace begins. A listed notification that fails its shape check is a protocol violation (exit 3), not activity. Unknown notifications, stderr output and invalid messages never reset it. The `turn/interrupt` response does not count, because the clock has already stopped.
+2. **Start, reset, stop.** The idle clock starts when the `turn/start` response has passed its checks (after `oneshot.ts:389-403`; `turnId` is set at `:404`). Before that only the request timeout (rule 6) applies, so the deadline can never fire before the turn id is known. The clock resets on each **listed** notification (§3b) that passes its checks, `item/agentMessage/delta` and `item/started` included. It stops when `turn/completed` arrives, when the deadline fires, or when a Ctrl-C grace begins. A listed notification that fails its checks is a protocol violation (exit 3), not activity. Unknown notifications, unmatched responses, stderr output and malformed messages never reset it. The `turn/interrupt` response does not count, because the clock has already stopped.
 3. **Default and override.** 600 000 ms. `MADC_TURN_IDLE_MS` overrides it (rule 7).
-4. **When the deadline fires,** the CLI records the timeout as the run's error (`{ code: null, message: "timeout: no engine message for <ms> ms", class: "engine" }`, where `<ms>` is the configured value, not the measured one) and then reuses main's first-Ctrl-C path step by step:
+4. **When the deadline fires,** it ends the outcome race at `oneshot.ts:418-420` the way `soft` does, and the CLI records the timeout as the run's error with `fail()` (`{ code: null, message: "timeout: no engine message for <ms> ms", class: "engine" }`, where `<ms>` is the configured value, not the measured one). It marks the soft interrupt as used (so a later SIGINT counts as the second one, `:215-230`). Then it runs main's first-Ctrl-C path. Every step of that path, in order (pattern 19):
    1. send `turn/interrupt` fire-and-forget (`oneshot.ts:423`);
    2. race up to 2 s (`INTERRUPT_GRACE_MS`, `:34`) for `turn/completed`; an engine that exits during the grace is swallowed to "no completed turn" (`:424-429`);
-   3. in `finally`, close stdin and kill the engine if it is still running after `KILL_AFTER_MS = 1 000` (`:35`, `:474`);
-   4. turn-outcome mapping, the close rule and the protocol overrides (`:480-526`), which do not replace the recorded timeout (§3d tier 2);
-   5. re-read and verify the session after the engine has exited (`:528-544`, as CLI:77 requires); the receipt's `session` line prints as usual, `chain FAILED` included;
-   6. JSON or text output, then the receipt (`:562-596`).
+   3. validate a `turn/completed` that arrived during the grace: this turn, served-model agreement, foreign item ids; a failure sets `malformedItem` (`:431-447`; §3e E3 changes only the servedModel part);
+   4. the catch for a step that throws (`:448-466`) and the spawn catch (`:467-468`), unchanged;
+   5. `finally` (`:469-478`): clear the status line (`:470`) and the violation timer (`:471`); close stdin and wait for the engine (`:472-475`); remove the signal listeners (`:476-477`);
+   6. turn-outcome mapping (`:480-499`), skipped because an error is recorded (`:482`);
+   7. the close rule (`:500-510`), which does not apply because the exit is 3, not 0 (`:502`);
+   8. the protocol overrides (`:511-526`, plus §3b rule 6 after `:513-519`); they keep exit 3;
+   9. re-read and verify the session after the engine has exited (`:528-544`, as CLI:77 requires); the receipt's `session` line prints as usual, `chain FAILED` included; chain FAILED never upgrades 3 (`:536`);
+   10. the signal override (`:545-553`);
+   11. final text and duration (`:555-560`);
+   12. JSON output (`:562-581`) or text and receipt (`:583-597`).
 
-   Nothing is dropped. **The only step whose behaviour changes is 3:** the condition at `:474` becomes "a signal was received **or** the idle deadline fired", so the timeout path also kills after 1 s instead of `CLOSE_TIMEOUT_MS = 5 000` (`:36`). The other change is the "first recorded cause wins" guard in tier 2 of §3d, so that a later `fail()` (the catch at `:448-466`, the overrides at `:513-526`) does not replace the timeout's message.
+   **Nothing is dropped.** Two things change. (a) Step 5: the condition at `:474` becomes "a signal was received **or** the idle deadline fired", so the timeout path kills after `KILL_AFTER_MS = 1 000` (`:35`) instead of `CLOSE_TIMEOUT_MS = 5 000` (`:36`). (b) **The idle-timeout message is sticky (new behaviour):** once recorded, a later `fail()` in steps 4 and 8 keeps exit 3 but does **not** replace the timeout's message. **All other exit-3 messages keep main's order, which is last-writer-wins:** for example `violate()`'s `ProtocolMismatch` message (`:185`) is replaced by `:520-525`'s, and a `TimeoutError` message by `:513-518`'s. This revision adds no general "first cause wins" rule (Argus NM2).
 5. **Exit and output.** The exit is **3** (§3d tier 2), whatever the turn reports during the grace (`interrupted`, `failed` or `completed`).
    - It outranks chain FAILED 5, and the `chain FAILED` line still prints.
    - A protocol violation or an engine exit during the grace keeps 3 and the timeout's message.
-   - A SIGINT or SIGTERM during the timeout grace counts as the **second** signal: immediate force, exit 130 / 143 (the implementation marks the soft interrupt as used when the deadline fires, `:215-230`). If a signal and the deadline land at the same moment, the signal wins.
-   - Deltas already streamed stay on stdout. The final text and the receipt follow main's interrupt path unchanged (`:555-596`: a non-TTY run prints the final text if a `turn/completed` arrived during the grace), except that the exit is 3.
+   - A SIGINT or SIGTERM during the timeout grace counts as the **second** signal: immediate force, exit 130 / 143 (the soft interrupt is marked used when the deadline fires, rule 4). If a signal and the deadline land at the same moment, the signal wins. The signal override keeps the recorded message with class `interrupted` (`:545-553`).
+   - Deltas already streamed stay on stdout. The final text and the receipt follow main's interrupt path unchanged (`:555-597`: a non-TTY run prints the final text if a `turn/completed` arrived during the grace), except that the exit is 3.
    - **`--json`:** one object with `ok: false`, `exitCode: 3`, `turn` as last known with its status verbatim, `session` as verified, and `error` = `{ "code": null, "message": "timeout: no engine message for <ms> ms", "class": "engine" }`. This is main's existing exit-3 error shape (`oneshot.ts:238-241`, `:461-462`, `:562-579`). Nothing is written to stderr: CLI:63 would allow a fatal diagnostic, but the message is already in `error`.
    - **Human mode:** the message appears once on stderr, as the receipt's `error` line (` error    engine: timeout: no engine message for <ms> ms`, `:668-671`). It replaces that line rather than adding a second one.
    - The timeout path returns through `runOneShot`, so `bin.ts:22-27` flushes stdout and stderr before `process.exit` (pattern 10). It never exits from a timer.
-6. **Request timeout.** The existing `RESPONSE_TIMEOUT_MS = 30 000` ms (`oneshot.ts:33`) covers `initialize`, `thread/start` and `turn/start` (`:291-296`, `:302-310`, `:383-388`) and is unchanged. It **MUST** become injectable for tests (a test seam in `runOneShot`'s options, not an env var or flag). The idle clock does not run while it applies.
+6. **Request timeout.** The existing `RESPONSE_TIMEOUT_MS = 30 000` ms (`oneshot.ts:33`) covers `initialize`, `thread/start` and `turn/start` (`:291-296`, `:302-310`, `:383-388`) and is unchanged; its message is `timeout 30000ms` (`io.ts:51`), exit 3 (`:461-462`). After a `turn/start` timeout the receipt prints `NOT STARTED` and `UNVERIFIED: no turn was started` (D-170; inventory F-01, F-02, F-03). The idle clock does not run while it applies.
 7. **`MADC_TURN_IDLE_MS`.**
    - Read only by the one-shot (`madc -p`). `doctor`, `--version` and `--help` ignore it.
-   - Unset or `""` (empty) means the default, matching `MADC_HOME` at `doctor.ts:255`.
+   - Unset or `""` (empty) means the default, matching `MADC_HOME` at `doctor.ts:255` and `engine home.ts:24`.
    - Otherwise it must match `^[1-9][0-9]*$` and be at most `86400000`. Anything else (`0`, `-5`, `+5`, `0500`, ` 500`, `500 `, `1e3`, `500.0`, `0x10`, `abc`, `86400001`) is a usage error, **exit 2 before anything spawns**. It is checked right after the `MADC_HOME` checks (`main.ts:64-83`) and before the prompt is read (`:84-94`), so an invalid `MADC_HOME` is reported first.
    - Message (human, stderr): `madc: MADC_TURN_IDLE_MS must be an integer from 1 to 86400000 (milliseconds)`. The value itself is never echoed (CLI:105: no env values on stderr or in JSON).
    - `--json`: `usageFailure`'s shape (`main.ts:35-55`): `{ "ok": false, "exitCode": 2, "madcVersion": …, "protocolVersion": "madc-m0/1", "seatId": null, "threadId": null, "turn": null, "text": "", "servedModel": null, "session": null, "error": { "code": null, "message": "MADC_TURN_IDLE_MS must be an integer from 1 to 86400000 (milliseconds)", "class": "usage" } }`.
+8. **Test hooks (Argus NL5).** `main.ts` exports a pure `parseTurnIdleMs(env)` that returns the deadline in ms (600 000 when unset or `""`) or the usage error. `OneShotOptions` (`oneshot.ts:54-59`) gains a **required** `turnIdleMs: number`, which `main.ts` fills from that parser, so `oneshot.ts` has no second default. It also gains an optional, test-only `responseTimeoutMs?: number` (default `RESPONSE_TIMEOUT_MS`). Neither is an env var or a flag. Tests reach them through the parser and through an in-process `runOneShot` call with a fake engine entry (`io.engineEntry`, `io.ts` `CliIO`).
+9. **`NO_TIMEOUT_MS` stays** as the turn wait's own `waitFor` timeout (`oneshot.ts:37`, `:375`), as a backstop. The idle deadline is at most 86 400 000 ms, below 2 147 483 647, so it always fires first (Argus I4).
 
 **Tests** (fake engines as in `packages/cli/src/testing/`; each kills the mutation named):
 
@@ -171,39 +194,224 @@ Wording is the ledger's (`/workspace/madc-ledger/LEDGER.md`), which follows the 
 2. The same, with only unknown notifications every 100 ms → exit 3 on the original deadline. *Mutation:* count unknown notifications as activity.
 3. A listed delta every 300 ms for 2 s, then `turn/completed` `completed` → exit 0. *Mutation:* measure from turn start instead of the last activity.
 4. `item/started` every 300 ms (no deltas) for 2 s, then `turn/completed` → exit 0. *Mutation:* only deltas count.
-5. A shape-failing listed notification (for example an `item/started` for another turn) followed by silence → exit 3 with the protocol-violation message, promptly and not on the idle deadline. *Mutation:* treat a shape-failing notification as activity (or ignore it).
+5. A listed notification that fails its checks (for example an `item/started` for another turn) followed by silence → exit 3 with the protocol-violation message, promptly and not on the idle deadline. *Mutation:* treat a failing notification as activity (or ignore it).
 6. **Turn outcome must not win:** on `turn/interrupt` the fake answers `turn/completed` `completed` during the grace → exit 3; the same with `failed` `-32008` → exit 3. *Mutation:* map the grace outcome as for a user interrupt (exit 0 / 4).
 7. **Interrupt sent:** the fake records that it received `turn/interrupt` after the deadline. *Mutation:* skip the interrupt.
 8. **Engine ignores the interrupt and never exits:** it is killed after 1 s; total time is at most deadline + 2 000 + 1 000 ms + 1 s slack. *Mutations:* no kill; the 5 s close timeout (condition at `:474` unchanged).
-9. **SIGINT / SIGTERM during the timeout grace** → 130 / 143 immediately. *Mutation:* the first SIGINT after the deadline starts a new soft interrupt.
+9. **SIGINT / SIGTERM during the timeout grace** → 130 / 143 **within 1 500 ms of the signal**. *Mutation:* the first SIGINT after the deadline starts a new soft interrupt (it then waits out a fresh 2 s grace, killed by the bound).
 10. **`--json` on timeout** → exactly one object with `exitCode: 3`, `ok: false` and the `error` object above, and nothing on stderr from the CLI. *Mutation:* print the timeout line to stderr in `--json` mode.
 11. **3 beats 5 on timeout:** a timeout run whose session file is removed → exit 3, `chain FAILED` printed. *Mutation:* let chain FAILED upgrade 3.
-12. **Idle clock not before `turn/start` answers:** `MADC_TURN_IDLE_MS=1`, and the fake delays the `turn/start` response by 300 ms, then streams and completes → exit 0. *Mutation:* start the clock before the `turn/start` response.
-13. **Env forms:** `86400000` accepted (with the idle clock injected so the test is fast); `86400001`, `0`, `-5`, `+5`, `0500`, ` 500`, `500 `, `1e3`, `500.0`, `0x10`, `abc` → exit 2, nothing spawned, the exact message, and the `--json` shape above; `""` behaves as unset (the default applies); `doctor` and `--version` with `MADC_TURN_IDLE_MS=abc` exit as without it. *Mutations:* `Number(v) > 0` instead of the regex; `<` instead of `≤` 86 400 000; validate in `doctor`.
-14. **Default:** with the variable unset, the configured deadline is 600 000 ms (asserted through the test seam, not by waiting). *Mutation:* a different default.
-15. **Request timeout injectable:** with the seam set to 200 ms, a fake that never answers `thread/start` → exit 3 (`timeout 200ms`, `io.ts:51`). *Mutation:* ignore the seam (fixed 30 000 ms).
+12. **Idle clock not before `turn/start` answers (Argus NM4):** `MADC_TURN_IDLE_MS=300`; the fake delays the `turn/start` response by 800 ms, then sends `turn/completed` `completed` within 50 ms of it → exit 0. *Mutation:* start the clock when `turn/start` is sent (or at spawn); it fires at about 300 ms and gives 3.
+13. **Env forms:** `parseTurnIdleMs` accepts `86400000` (no waiting); `86400001`, `0`, `-5`, `+5`, `0500`, ` 500`, `500 `, `1e3`, `500.0`, `0x10`, `abc` → end to end, exit 2, nothing spawned, the exact message, and the `--json` shape above; `""` behaves as unset; `doctor` and `--version` with `MADC_TURN_IDLE_MS=abc` exit as without it. *Mutations:* `Number(v) > 0` instead of the regex; `<` instead of `≤` 86 400 000; validate in `doctor`.
+14. **Default:** `parseTurnIdleMs({})` and `parseTurnIdleMs({ MADC_TURN_IDLE_MS: "" })` return 600 000; `turnIdleMs` is a required option, so the one-shot cannot fall back to another default. *Mutation:* a different default.
+15. **Request timeout injectable:** with `responseTimeoutMs: 200`, a fake that never answers `initialize`, one that never answers `thread/start` (both: no receipt, `threadId: null`), and one that never answers `turn/start` (receipt `NOT STARTED`, `UNVERIFIED: no turn was started`) → exit 3, `timeout 200ms` each. *Mutation:* ignore the option (fixed 30 000 ms).
+16. **Sticky idle message, others last-writer (Argus NM2):** a timeout followed by a non-JSON line during the grace → exit 3 with the **timeout** message; a run with no timeout where a malformed item is followed by a non-JSON line → exit 3 with `:520-525`'s message, as today. *Mutations:* no stickiness (killed by the first); a general first-cause-wins guard (killed by the second).
 
-## 3d. Exit precedence (clarification of CLI §4, CLI:189; records main)
+## 3d. Exit precedence (clarification of CLI §4, CLI:184-195)
 
-CLI §4 (CLI:184-195) gives classes but no precedence when two apply. Main applies them in this order (`oneshot.ts`, in source order: turn outcome `:480-499`; close rule `:502-510`; protocol-violation overrides `:513-526`; chain verify `:532-543`, which upgrades only 0, 1 or 4 to 5 at `:534-537`; signal `:545-553`). The effective ladder, highest first:
+CLI §4 gives classes and sources but no precedence when two apply. Main decides the exit at these sites, in source order (all `oneshot.ts` at `343da29`):
 
-1. **Signal:** 130 (SIGINT) / 143 (SIGTERM).
-2. **3 (engine / protocol).** Within this tier the §3c idle timeout comes first: once recorded, its message is kept even if another exit-3 cause follows (a protocol violation, an engine exit, a kill at close). Other exit-3 causes (spawn failure, unexpected engine exit, `protocolVersion` mismatch, protocol violations, request timeouts, unknown codes, a non-zero exit at close after a completed turn) follow.
-3. **5 (session):** `-32009` as a turn error, or a post-turn chain verify `failed`.
-4. **4 (provider):** `-32007` / `-32008`.
-5. **1 (turn failure):** a known unclassed code, a failed turn with no code, or `interrupted`.
-6. **0 (ok).**
+- **Inside the run, the first error wins**, because the catch calls `fail()` once (`:448-466`): an RPC error → `classifyCode(code, site)` (`:451-452`; 2 for `-32602` on `thread/start` and for `-32005`/`-32006`, `exit-codes.ts:50-53`; 4 for `-32007`/`-32008`, `:54-56`; 5 for `-32009`, `:57-58`; 3 otherwise, `:39-48`, `:59-60`); an engine exit → 2 if its code is 2, else 3 (`:453-460`; §3e E5 narrows the 2); a request timeout or `ProtocolMismatch` → 3 (`:461-462`); anything else → 3 (`:463-464`); a synchronous spawn failure → 3 (`:467-468`). A forced signal records nothing here (`:449-450`).
+- **Turn outcome**, only if no error was recorded (`:480-499`): `completed` → 0, `failed` → `classifyCode(code, "turn")` (`:485-489`), `interrupted` → 1 (`:490-491`), any other status → 3 (`:492-497`).
+- **Close rule**, only over 0 and only with no signal (`:500-510`, §3a).
+- **Protocol overrides**, over **any** exit, unless a signal arrived: a non-JSON line (`:513-519`), the §3b rule 6 re-check (new, directly after it), a malformed item or turn (`:520-526`).
+- **Chain verify** `failed`, which upgrades only 0, 1 and 4 to 5 (`:534-537`); 2 and 3 are kept.
+- **Signal**, over everything (`:545-553`); the `:502`, `:513` and `:520` sites are already guarded by `signalExit === null`.
 
-In one line: **signal (130/143) > 3 > 5 > 4 > 1 > 0**, with the idle timeout first inside tier 3.
+The effective ladder, highest first:
 
-A turn-level **2** (`-32005`/`-32006` as `turn.error.code`) is left as 2: a chain FAILED does not replace it (`:536`). In main, 4 and 1 never compete in one run; "4 before 1" means a provider code in a failed turn gives 4, never 1 (`exit-codes.ts:54-56`). 3 beating 5 comes from `:534-537` not upgrading 3. Argus pr-19.md F5 found no test for it.
+1. **Signal:** 130 (SIGINT) / 143 (SIGTERM). Once a SIGTERM has arrived the exit is 143 whatever the order (`:221`, `:232`; inventory F-100).
+2. **3 (engine / protocol).** A protocol override (`:513-526`, §3b rule 6) beats every exit below. Within this tier the §3c idle timeout's **message** is sticky (new, §3c rule 4); every other exit-3 message follows main's last-writer order. The other exit-3 sources (spawn failure, unexpected engine exit, `protocolVersion` mismatch, request timeouts, unknown or unclassed codes at a request site, a non-`completed`/`failed`/`interrupted` status) are first-error-wins inside the run, so they never meet a 2, 4 or 5 from the same run. The close-rule 3 (§3a) applies **only over 0**, so it never replaces 1, 2, 4 or 5.
+3. **2 (usage / config):** `-32602` on `thread/start`, `-32005`/`-32006` as an RPC error or as `turn.error.code`, an engine exit 2 before `initialize` answers (§3e E5). It is kept over chain FAILED (`:536`) and replaced by a protocol override or a signal. A 2 never meets a turn-level 4, 1 or 5: one turn outcome gives one class.
+4. **5 (session):** `-32009` as an RPC error at a request site (`exit-codes.ts:57-58`, CLI:191) or as `turn.error.code`, or a post-turn chain verify `failed` (`:534-543`).
+5. **4 (provider):** `-32007` / `-32008`, as an RPC error or as `turn.error.code` (`exit-codes.ts:54-56`).
+6. **1 (turn failure):** a known unclassed code in a failed turn (`exit-codes.ts:37`), a failed turn with no code, or an `interrupted` turn the CLI did not ask for (§3e E4).
+7. **0 (ok).**
 
-**Tests:** (a) **3 beats 5:** a turn whose run has a protocol violation (a non-JSON line) and whose session file is then removed → exit 3, `chain FAILED` still printed. *Mutation:* add `EXIT.engine` to the upgrade set at `:536`. (b) **4 beats 1:** a failed turn with `-32008` → 4, not 1. *Mutation:* classify turn-site provider codes as the turn class. (c) 5 beats 4 (existing: `cli.test.ts:1000-1023`, M153). (d) Turn-level 2 plus a removed session file → 2. *Mutation:* add `EXIT.usage` to the upgrade set. (e) **Signal beats 3:** SIGINT during a run that has already recorded a protocol violation → 130, class `interrupted`. *Mutation:* move the signal block (`:545-553`) above the protocol overrides. Existing §4 signal tests (`cli.test.ts:~756`) cover a signal alone, not this pairing.
+In one line: **signal (130/143) > 3 > 2 > 5 > 4 > 1 > 0**, with the idle-timeout message sticky inside tier 3.
+
+In main, 4 and 1 never compete in one run; "4 before 1" means a provider code in a failed turn gives 4, never 1 (`exit-codes.ts:54-56`). 3 beats 5 in two ways: a protocol override replaces a 5 (`:513-526`), and chain FAILED does not upgrade 3 (`:536`). Argus pr-19.md F5 found no test for either.
+
+**Tests:**
+
+- (a) **3 beats 5:** a turn whose run has a protocol violation (a non-JSON line) and whose session file is then removed → exit 3, `chain FAILED` still printed. *Mutation:* add `EXIT.engine` to the upgrade set at `:536`.
+- (b) **4 beats 1:** a failed turn with `-32008` → 4, not 1. *Mutation:* classify turn-site provider codes as the turn class.
+- (c) 5 beats 4 (existing: `cli.test.ts:1000-1023`, M153).
+- (d) **2 beats 5:** a turn-level 2 plus a removed session file → 2. *Mutation:* add `EXIT.usage` to the upgrade set at `:536`.
+- (e) **Signal beats everything (Argus NM5):** the fake sends a valid `turn/completed` `completed`, then ignores EOF, so the CLI sits in `close(5000)` (`:474`) with its signal listeners still attached (they are removed only at `:476-477`). Send SIGINT there → exit 130, class `interrupted`. *Mutation:* delete the signal block `:545-553` (the run then exits 0). Existing signal tests (`cli.test.ts:607`, SIGINT and SIGTERM mid-turn; `:748`, SIGINT while `turn/start` is in flight) cover a signal during the turn, not this.
+- (f) **3 beats 2 (Argus NM1):** a turn that ends `failed` with `-32005`, plus a non-JSON line → exit 3. *Mutation:* exempt 2 from the overrides at `:513-526`.
+- (g) **SIGTERM wins over SIGINT:** SIGINT then SIGTERM mid-turn → 143; SIGTERM then SIGINT → 143. *Mutation:* let the later signal decide.
+
+## 3e. Failure inventory: pinned behaviours (Surface rulings)
+
+Each item names the inventory id, main's behaviour at `343da29` (read from the code, cited), the pinned behaviour and exit, and a test with a killed mutation. Where an item narrows, reorders or replaces main, it lists what it keeps and names anything it drops, with the reason.
+
+**E1. Malformed error response (F-20, F-21).**
+- *Main.* `client.ts:127` builds `new EngineRpcError(m.error)`, and the constructor reads `body.message` (`client.ts:29`). So `{"id":<pending>,"error":null}` throws a `TypeError` inside the readline `line` listener (`client.ts:74-76`). That is an uncaught exception: Node prints a stack and exits 1, with no JSON and no receipt. The pending entry was already deleted (`client.ts:126`) and never settles. Doctor's probe (`doctor.ts:198-201`) crashes the same way and never reaches its `rmSync` (`doctor.ts:243-245`), so `/tmp/madc-doctor-*` is left behind. With `"error":"boom"` nothing crashes, but `EngineRpcError.code` is `undefined`, so the catch at `oneshot.ts:451-452` gives class `engine` and a JSON `error` with no `code` key (CLI:103 requires the engine code or `null`).
+- *Pinned (CLI containment, no engine change).* One-shot: an error response whose `error` is not an object with an integer `code` and a string `message` (PROTO:104) is a protocol violation: exit 3, class `engine`, `code: null`, message `protocol violation: malformed error response`, one JSON object in `--json`, the receipt as usual once a thread exists. Never a stack trace, never exit 1. Doctor: the `engine` row FAILs with `protocol violation` (a CLI:126 reason) within the probe budget, the temp dir is removed, the other rows run, and doctor exits 1.
+- *Mechanism* (`packages/cli` only; the code act picks one): (a) while an engine client is alive (one-shot: from `spawnEngine` at `oneshot.ts:254` to the end of the close at `:475`; doctor: `doctor.ts:192-227`), a scoped `process.on("uncaughtException")` listener that, when the last entry of `client.messages` has an own `error` that is not an object, records this violation and ends the current step (one-shot: as `violate()` does, `oneshot.ts:189-192`; doctor: kill the probe child). Any other uncaught exception keeps today's outcome (stack on stderr, exit 1). The listener is removed with the signal listeners (`oneshot.ts:476-477`). Or (b) CLI-side request ids over `sendRaw`/`waitFor` (§3b rule 3), so the client's pending map never holds a CLI request and `client.ts:124-128` never runs for one. For `"error":"boom"` the catch at `oneshot.ts:451-452` treats an `EngineRpcError` whose `code` is not an integer as this violation, and §3b rule 6 catches both forms after close.
+- *Tests.* `{"id":<initialize id>,"error":null}` and the same while `turn/start` is pending → exit 3, one JSON object, no `TypeError` and no stack on stderr. `{"id":<pending id>,"error":"boom"}` → exit 3 with JSON `error.code` `null`. Doctor against the first fake, with `TMPDIR` set to a sandbox dir → `engine` FAIL `protocol violation`, a `RESULT` line, exit 1, and no `madc-doctor-*` left. *Mutations:* remove the containment (exit 1, killed); send a non-integer code through `classifyCode` (JSON lacks `code`, killed); skip the temp-dir removal on this path (killed).
+- The real fix is in the engine client and is **not** pinned: see "Needs Founder allowance" A1.
+
+**E2. Close order after a signal (F-09).**
+- *Main.* Every signal path closes stdin and kills the engine after 1 s (`oneshot.ts:474`, `KILL_AFTER_MS` at `:35`) **before** the session is re-read (`:528-544`) and the receipt is printed (`:583-597`). CLI:109 lists "print the receipt, EOF, then exit 130", and CLI:110-111 name the 1 s kill only for a second SIGINT, grace expiry or SIGTERM.
+- *Pinned (main's order; corrects CLI:109-111).* After a first SIGINT: send `turn/interrupt`, wait up to 2 s for `turn/completed`, then EOF and kill the engine if it is still running 1 s later, then re-read and verify the session, then print the receipt, then exit 130. The 1 s kill applies on **every** signal path. Reason: CLI:77 requires the `session` line to come from re-reading the file **after the engine exits**, which CLI:109's order would break. Kept: every step of main's path (`:422-430`, `:469-478`, `:528-597`); nothing dropped.
+- *Test.* First SIGINT; the fake answers `turn/completed` `interrupted` within the grace, then ignores EOF → exit 130, receipt `INTERRUPTED`, and exit within 1 000 ms plus 1 000 ms slack after the fake's `turn/completed`. *Mutation:* use `CLOSE_TIMEOUT_MS` (5 s) on the first-SIGINT path (killed by the bound).
+
+**E3. Several `servedModel` items in a turn (F-46, F-47).**
+- *Main.* More than one `servedModel` item in the `turn/completed` snapshot sets `malformedItem` (exit 3, `oneshot.ts:442`). A notified `servedModel` is kept as the last one seen (`:366-367`) and compared with the single snapshot item (`:443-444`). PROTO:215 says servedModel is "One per model invocation in the turn", so several are legal.
+- *Pinned.* Kept: the snapshot is authoritative (CLI:55); a notified `servedModel` that disagrees with the snapshot is exit 3 (the `served-mismatch` scenario, `cli.test.ts:914`, stays green); a notified `servedModel` missing from the snapshot is exit 3 (F-47). New: each `servedModel` `item/completed` notification is matched to the snapshot item with the **same item id** and must be equal to it; the one-shot's `servedModel` (JSON, CLI:101) and the receipt's `model` line (CLI:76) use the **last** `servedModel` item in snapshot order. **Dropped:** "more than one in the snapshot is a violation" (`:442`), because PROTO:215 allows several; and "the last notification wins before the comparison" (`:367`), replaced by the per-id match.
+- *Tests.* A snapshot with two `servedModel` items (ids `a`, `b`) and matching notifications → exit 0, JSON `servedModel` equals `b`; a notification for item id `c` that is not in the snapshot → exit 3; `served-mismatch` stays 3. *Mutations:* keep `:442` (two → 3, killed); use the first item (killed); compare only the last notification (killed by a mismatching notification for `a` followed by a matching one for `b`).
+
+**E4. A turn the engine interrupts on its own (F-61).**
+- *Main.* `turn/completed` `interrupted` with no CLI signal → exit 1, class `interrupted`, message `turn interrupted` (`oneshot.ts:490-491`); with a CLI signal the signal override gives 130/143 (`:545-553`).
+- *Pinned (records main).* Clarifies CLI:187 (exit 1 also covers an `interrupted` turn the CLI did not ask for) and CLI:192 (130/143 only when the CLI itself received the signal).
+- *Test.* The fake sends `turn/completed` `interrupted` unprompted → exit 1, class `interrupted`. *Mutation:* map it to 0 or to 130.
+
+**E5. Engine exit code 2 (F-83).**
+- *Main.* Any `EngineExitedError` with exit code 2, at any stage, gives exit 2, class `usage` (`oneshot.ts:453-457`). The engine exits 2 only when its `MADC_HOME` resolver throws at start-up, before it reads stdin (`engine main.ts:34-40`).
+- *Pinned (narrows).* Exit 2 only when the engine exits with code 2 **before the `initialize` response has been received** (the engine's `MADC_HOME` case that CLI:188 means by "also engine exit 2"). After that, an engine exit with code 2 is an unexpected engine exit, exit 3, class `engine`. Kept: the message `engine exited (code 2, signal null)` and every other early-exit mapping (`:458-459`). **Dropped:** exit 2 for an engine that exits 2 after `initialize` has answered, because the engine never exits 2 by design at that point, so it is an unexpected exit (CLI:189).
+- *Tests.* The fake exits 2 before answering `initialize` → 2, class `usage`; the fake exits 2 mid-turn → 3, class `engine`. *Mutation:* keep 2 at every stage.
+
+**E6. A signal before the one-shot installs its handlers (F-93).**
+- *Main.* `main.ts:14-95` installs no signal handler; the one-shot's listeners are installed only inside `runOneShot` (`oneshot.ts:235-236`). A SIGINT or SIGTERM during argument parsing, the `MADC_HOME` checks or the `-p -` stdin read gets default handling: the process dies by signal, with no JSON even with `--json`.
+- *Pinned.* The one-shot installs its SIGINT/SIGTERM listeners at the start of `oneShot` (`main.ts:58`), before the `MADC_HOME` checks (`:64-83`), the `MADC_TURN_IDLE_MS` check (§3c rule 7) and the prompt read (`:84-94`), and `runOneShot` keeps the same listeners and semantics (`oneshot.ts:219-234`). A signal before `runOneShot` has spawned the engine: nothing is spawned, the stdin read is abandoned at once, exit 130/143. `--json`: one object in `usageFailure`'s shape (`main.ts:35-55`) with `exitCode` 130/143 and `error: { code: null, message: "interrupted by signal", class: "interrupted" }`. Human: `madc: interrupted by signal` on stderr. Kept: `runOneShot`'s signal semantics unchanged. Residual: a signal during module load, before `main` runs (`bin.ts:22-23`), keeps default handling.
+- *Test.* `madc -p - --json` with a stdin pipe that stays open, SIGTERM after 300 ms → exit 143 within 1 000 ms, one JSON object with class `interrupted`, and the fake's spawn marker absent. *Mutation:* install the listeners only in `runOneShot`.
+
+**E7. Doctor and signals (F-104).**
+- *Main.* `runDoctor` (`doctor.ts:852-903`) installs no signal handler. A SIGINT or SIGTERM kills doctor by signal: no JSON with `--json`, and the probe's temp dir (`doctor.ts:232`) is left behind because the `finally` at `:243-245` never runs.
+- *Pinned.* Doctor installs SIGINT/SIGTERM listeners for its whole run and removes them before it returns. On a signal it kills the probe engine if one is running (no EOF wait), still removes the temp dir, runs no further rows, and exits 130/143 (CLI:192, "both commands"). Human: the rows so far, then `RESULT  <f> FAIL · <w> WARN · <s> SKIP · <ms> ms   exit 130` (or 143). `--json`: one object in CLI:172-178's shape with `ok: false`, `exitCode` 130/143, the checks so far and their counts. A signal during a local row takes effect when that row's child returns, because the child runs under `spawnSync` with its own timeout (`doctor.ts:379-380`). Kept: every row and its order (CLI:121-134) when no signal arrives.
+- *Test.* `doctor --json` with a fake that never answers `initialize` and `TMPDIR` set to a sandbox dir; SIGTERM at 300 ms → exit 143 within 1 500 ms, one JSON object with `exitCode: 143`, and no `madc-doctor-*` left. *Mutations:* no listener (dies by signal, killed); skip the temp-dir removal (killed).
+
+**E8. Parse-level usage errors with `--json` (F-119).**
+- *Main.* A usage error from `parseArgs` prints a plain stderr line and nothing on stdout, even with `--json` (`main.ts:23-27`). Only the later checks use `usageFailure`'s JSON (`main.ts:65-94`). The parser can return before it reaches a later `--json` (`args.ts:70`, `:73`, `:76`, `:82`).
+- *Pinned.* If `--json` appears in argv as a flag token (scanned with the parser's own rules: not after `--`, and not consumed as the value of `-p` or `-s`, `args.ts:43-84`), every parse-level usage failure prints one JSON object in `usageFailure`'s shape (`main.ts:35-55`), with `error.message` equal to the parser's message (for example `unknown flag --nope`), and nothing on stderr; exit 2. This applies to `doctor` too, because a parse error comes before any command's own output shape. Kept: the human-mode lines at `main.ts:24-26` when `--json` is absent; `--help` and `--version` still win and print text (`args.ts:85-86`).
+- *Test.* `madc --nope --json`, `madc -p hi --json --nope` and `madc doctor --json extra` → stdout is one JSON object with `exitCode: 2` and class `usage`, stderr is empty; `madc --nope` is unchanged. *Mutation:* emit JSON only when the parser saw `--json` before the error (killed by the first case).
+
+**E9. Engine stderr in `--json` mode (F-131).**
+- *Main.* The engine's stderr is inherited (`client.ts:229`, as CLI:46 pins), so engine log lines can appear on the CLI's stderr in `--json` mode. The one-shot itself writes nothing to stderr in `--json` mode (`oneshot.ts:562-581`).
+- *Pinned (records main; tied to row D-171).* CLI:63's "nothing but fatal diagnostics" governs what the CLI writes. Engine log lines may pass through (PROTO:27: stderr is logs only). If the Founder rejects D-171, this item falls with it, and silencing engine stderr would need a change to `spawnEngine`'s stdio in the engine client (`client.ts:228-231`), which needs an allowance.
+- *Test.* The fake writes `[fake] log` to stderr in `--json` mode → stdout is exactly one JSON object, and stderr contains the fake's line and nothing the CLI wrote. *Mutation:* the CLI writes its receipt to stderr in `--json` mode.
+
+**E10. Doctor: RPC error on `initialize` (F-136).**
+- *Main.* `runProbe`'s catch (`doctor.ts:203-207`) reports `exit <client.child.exitCode>` for any non-timeout error. An engine that answers `initialize` with an error and then exits 0 on EOF shows FAIL `exit 0`. (The row is FAIL and doctor exits 1; the row text reads "exit 0".)
+- *Pinned.* An RPC error answer to `initialize` → FAIL `protocol violation: initialize answered error <code>`, with evidence `{ reason, code }` (a CLI:126 reason; the code is printed only if it is an integer, and E1's malformed bodies give plain `protocol violation`). Kept: a timeout still gives `timeout <ms>ms` (`:206`); an engine that exits before answering still gives `exit <n>` (`:207`).
+- *Test.* The fake answers `initialize` with `{ "code": -32603, "message": "x" }`, then exits 0 on EOF → `engine` FAIL whose summary starts with `protocol violation` and contains `-32603`; doctor exits 1. *Mutation:* keep `exit <n>` for RPC errors.
+
+**E11. Control characters from the engine (F-55).**
+- *Main.* Deltas go to a TTY raw (`oneshot.ts:194-200`), and the final text goes to non-TTY stdout raw (`:586-587`). Engine-supplied strings in the receipt and the one-line error are printed raw (`:633-675`, `:593-595`).
+- *Pinned.* In human mode (not `--json`), text that comes from the engine and is written to stdout or stderr (deltas, the final text, and engine-supplied fields in the receipt and the one-line error) has every C0 control character except TAB (U+0009) and LF (U+000A), plus DEL (U+007F) and the C1 range U+0080–U+009F, replaced with U+FFFD. Reason: CLI:62 (no ANSI codes on non-TTY stdout); on a TTY, a raw ESC from a model is terminal-escape injection. Kept: `--json` carries `text` verbatim (`JSON.stringify` escapes controls, `:579`); the CLI's own status line and colours (`:249`, `io.ts` `paint`) are CLI-generated and TTY-only, and are unchanged.
+- *Tests.* The final text `"a\u001b[31mb\u0007c\r\n"` on non-TTY stdout → `"a\uFFFD[31mb\uFFFDc\uFFFD\n"`; the same run with `--json` → `text` byte-equal to the engine's; a TTY delta (in-process, `stdoutIsTTY: true`) is replaced the same way. *Mutations:* no replacement (killed); replace in `--json` too (killed).
+
+**E12. Write errors on the CLI's own stdout or stderr (F-105, F-106).**
+- *Main.* `runBin` (`bin.ts:22-27`) adds no `error` listener to `process.stdout`/`process.stderr`. On Node an EPIPE is an unhandled `error` event: exit 1 with a stack, after the receipt already said `exit 0`. On Bun it is silent with exit 0.
+- *Pinned.* `runBin` adds `error` listeners to both streams before `main` runs. A write error (EPIPE included) on a stream stops further writes to that stream and is never printed, and the process exits with the run's exit code as computed. `flushed()` (`bin.ts:12-16`) resolves at once for a stream that has errored. The same holds on Node and Bun. Kept: the flush-then-exit order (`bin.ts:25-26`).
+- *Test.* On Node and Bun, `madc -p hi` with a long final text and stdout piped to a reader that closes at once → the exit equals the run's code (0), and stderr (captured separately) has no `EPIPE` and no stack. *Mutation:* no listener (Node exits 1, killed).
+
+**E13. Piped stdout on Bun must be complete (F-11, ledger D-016 open).**
+- *Main.* On Bun 1.4.2, piped stdout is cut at 65 536 bytes with exit 0, in text and `--json` modes (inventory, observed); Node writes everything. The flush is `bin.ts:12-16`, `:25-26`.
+- *Pinned.* On both runtimes, the final text and the `--json` object arrive in full on a pipe before the process exits. The mechanism is the code act's. `30caa0a` adds only a unit test that `flushed()` resolves after earlier write callbacks; it does not change this behaviour (read from its diff).
+- *Test.* On Node and Bun, a 200 001-byte final text piped (text mode: all bytes arrive; `--json`: the object parses). *Mutation:* today's exit right after the empty-write callback (killed on Bun).
+
+**E14. `turn/start` shape checks, one test each (F-29..F-34; Argus pr-19.md F4).** The three checks at `oneshot.ts:389` (`isTurnShape`, the id grammar of `turn.id`, `turn.threadId`) and the three just-started checks at `:396-398` (`status`, `items.length`, `completedAt`) each get their own fake scenario → exit 3, `turn: null`. *Mutation:* delete each sub-check (six mutations). Main covers the three just-started checks only together (the `start-completed` scenario, `cli.test.ts:912`), and `30caa0a` adds none of these six (read from its test list).
+
+**E15. First SIGINT before `turn/start` is sent (F-94).**
+- *Main.* A first SIGINT during `initialize` or `thread/start` is held (`sigintPending`, `oneshot.ts:225-226`), and the pending request keeps waiting, up to 30 s. Then `Forced` is thrown at `:382` and `turn/start` is never sent.
+- *Pinned.* A first SIGINT **before `turn/start` has been sent** forces at once, as a second SIGINT does (`:227-228`): EOF, kill after 1 s, exit 130, `turn/start` never sent. Kept: the held SIGINT while `turn/start` is in flight, which interrupts the turn once its id is known (`:413-417`; `cli.test.ts:748` stays green). Changed: `sigintPending` is set only once `turn/start` has been sent.
+- *Test.* The fake delays its `initialize` answer by 10 s; SIGINT at 300 ms → exit 130 within 1 500 ms, and the fake never receives `turn/start`. *Mutation:* hold it (the run waits for the answer, killed by the bound).
+
+**E16. Smaller pins (records main unless marked; one test each).**
+
+| Id | Pinned behaviour | Code at `343da29` | Test / killed mutation |
+| --- | --- | --- | --- |
+| F-59, F-60 | `turn/completed` with status `inProgress` or a status outside `TurnStatus` → exit 3 `turn did not complete (<status>)`, status printed verbatim (§3a rule 1) | `oneshot.ts:492-497` | status `inProgress` → 3 / map any non-terminal status to 0 |
+| F-69 | `turn/completed` may arrive before the `turn/start` response; it ends the wait and is validated once the turn id is known | `oneshot.ts:370-374`, `:431-447` | early `turn/completed` for this turn → 0; for another turn → 3 / validate before the turn id is known |
+| F-73 | A blank line on engine stdout is a non-JSON line → exit 3 (PROTO:24) | `client.ts:111-116` | blank line mid-turn → 3 / skip blank lines |
+| F-89 | An engine killed by an outside signal after a completed turn: exit 3 with `engine was killed by <signal> after the turn` when the close returned before its own timeout; the existing kill message only when the CLI's close timeout killed it. **Changed:** the message at `:506-507` is chosen by who killed the engine | `oneshot.ts:502-510`, `client.ts:200-208` | fake SIGTERMs itself after `turn/completed` → 3, message names `SIGTERM` / always the kill message |
+| F-100 | SIGTERM wins over SIGINT in either order → 143 | `oneshot.ts:221`, `:232` | §3d test (g) |
+| F-110 | A read error on the `-p -` stdin → exit 2 via `usageFailure`, message `cannot read prompt from stdin (<code>)`; no stack. **Changed:** today the rejection escapes `main` (`oneshot.ts:68`, `bin.ts:23`) | `main.ts:84-87` | in-process `main` with an `io.stdin` that emits an error → 2 / let it throw |
+| F-114 | `-p` takes the next argv element verbatim as the prompt, even one that looks like a flag (`madc -p --json` runs a turn with the prompt `--json`) | `args.ts:67-71` | `madc -p --json` → text output, not JSON / reject flag-like values |
+| F-126 | `MADC_HOME=""` means unset (`~/.madc`) | `engine home.ts:24` | empty value → default home / treat `""` as relative (exit 2) |
+| F-129 | JSON `seatId` is the requested seat (`-s` or `madc-default`) from the moment the one-shot starts, and `null` only in usage failures before it | `oneshot.ts:204`, `main.ts:43` | an engine error before `thread/start` → `seatId` `madc-default` / print `null` |
+| F-130 | A deleted current directory: the one-shot exits 2 with `madc: current directory is not accessible (<code>)`; `--version`, `--help`, usage errors and doctor are unaffected. **Changed:** today `processIO` reads `process.cwd()` for every command and throws (`io.ts:29`, `bin.ts:23`) | `io.ts:29`, CLI:37 | POSIX: `--version` in a deleted cwd → 0; `-p hi` → 2 / read cwd eagerly |
+| F-140 | `mkdtempSync` failing in doctor → `engine` row FAIL `temp home: <code>`; the other rows run and doctor exits 1. **Changed:** today the throw escapes `runDoctor` | `doctor.ts:232` | `TMPDIR` set to a non-writable dir → `RESULT` line, exit 1 / let it throw |
+| F-152 | Before `thread/start` succeeds, human mode prints one line `madc: <class> error[ <code>]: <message>` then `exit <n>` on stderr, no receipt | `oneshot.ts:589-596` | human-mode `-32004` on `thread/start` → that line / print a receipt |
+
+## 3f. Failure inventory: triage of every unpinned (U) and code-vs-pin (M) case
+
+The inventory lists 56 U and 15 M cases (71 ids, no overlap). Each is **pinned** (where), **carried** (to whom, why) or **out of scope** (why). Covered by `30caa0a` means the wording above matches that branch's code; the pin still binds whatever lands.
+
+| Id | Flag | Disposition |
+| --- | --- | --- |
+| F-01, F-02, F-03 | U | Pinned: §3c rule 6 (30 000 ms, `timeout 30000ms`, exit 3; receipts per D-170); §3c test 15 |
+| F-05 | U | Pinned: §3c (idle deadline) |
+| F-08 | U | Pinned: records main; close waits `CLOSE_TIMEOUT_MS = 5 000` then kills (`oneshot.ts:36`, `:474`), and a completed turn then exits 3 with the kill message (§3a rule 2); §3a test (c) |
+| F-09 | M | Pinned: §3e E2 |
+| F-10 | U | Out of scope, named residual: `flushed()` waits with no bound (`bin.ts:12-16`) when a reader holds the pipe open without reading. A bound would truncate output (the D-016 failure); blocking on a stalled reader is normal pipe back-pressure |
+| F-11 | M | Pinned: §3e E13 (D-016 open) |
+| F-13 | U | Pinned: §3b N4 and rule 6 (both `result` and `error` → 3) |
+| F-20, F-21 | M | Pinned: §3e E1 (CLI containment); real fix: allowance A1 |
+| F-22, F-23, F-24 | U | Pinned: §3b rule 3 (unmatched response ignored; a pending request ends on its timeout) |
+| F-28 | U | Pinned: §3b N7 (full `Thread` shape; as in `30caa0a`) |
+| F-35 | U | Carried to the A7 follow-up (cosmetic): the exit is correctly 3; only the JSON `turn` (`null`) and the receipt word (`NOT STARTED`) are affected when a violation shares a chunk with the `turn/start` response (`oneshot.ts:181-192`, `:276-287`, `:404`) |
+| F-36, F-37, F-38 | U | Pinned: §3b N5 (as in `30caa0a`) |
+| F-44 | U | Out of scope: item fields the CLI never reads or renders (`isItemShape` returns true after the fields it reads, `oneshot.ts:115`) cannot change output or exit. Checking them is the engine's and the protocol tests' job (pattern 2 covers fields the code reads) |
+| F-45 | M | Pinned: §3b N6 (D-188; as in `30caa0a`) |
+| F-46, F-47 | M, U | Pinned: §3e E3 |
+| F-55 | M | Pinned: §3e E11 |
+| F-59 | U | Pinned: §3e E16 |
+| F-61 | M | Pinned: §3e E4 |
+| F-67 | U | Out of scope: unreachable. `isTurnShape` requires `error` iff `failed` and an integer code (`oneshot.ts:118-122`, `:136-141`), so the `code === null` branch (`:486-488`) is dead; no behaviour to pin |
+| F-68 | U | Partly pinned: §3b rule 6 scans the whole log, including messages after `turn/completed`, for N2–N4. Validating **listed** notifications that arrive after `turn/completed` is carried to the A7 follow-up: no defect is reported, the turn is over, and the snapshot is authoritative (CLI:55) |
+| F-69 | U | Pinned: §3e E16 |
+| F-70 | U | Pinned: §3b rule 1 |
+| F-71 | M | Pinned: §3b N3 |
+| F-73 | U | Pinned: §3b rule 2 and §3e E16 |
+| F-76 | U | Pinned: §3b N2 and rule 7 (an id-carrying `turn/completed` never ends the turn; an id-carrying message on a pending id is caught by rule 6) |
+| F-77 | U | Carried (not requested): no line-length cap in the client's reader (`client.ts:74-76`). A cap is an engine-client change outside D-151 (CLI:200, CLI:206); the engine is a local child the operator runs |
+| F-78 | U | Carried to an engine follow-up: the **engine's** last stdout line cut on Bun is engine-side stdout flushing, which CLI:206 keeps out of A7. It is the engine analogue of D-016. `30caa0a` does not address it (read from its diff) |
+| F-83 | M | Pinned: §3e E5 |
+| F-88 | U | Pinned: §3a rule 2 (a non-zero close exit changes only a base of 0) |
+| F-89 | U | Pinned: §3e E16 |
+| F-90 | U | Carried (not requested): `exited` resolves on the child's `exit`, not `close` (`client.ts:90`), so a last line could in theory be missed. Not reproduced in 30 runs (inventory). A fix is an engine-client change outside D-151 |
+| F-91 | U | Pinned (records main): stdin write errors to the engine are ignored (`client.ts:79`); the outcome comes from the exit path (`oneshot.ts:453-460`). No extra test: the early-exit tests cover it |
+| F-93 | M | Pinned: §3e E6 |
+| F-94 | U | Pinned: §3e E15 |
+| F-100 | U | Pinned: §3d ladder item 1, §3d test (g) |
+| F-101 | U | Pinned (records main): a signal during the close wait wins (§3d), and the close keeps the bound it was called with (`oneshot.ts:474`); §3d test (e) |
+| F-102 | U | Out of scope, named residual: a signal after the listeners are removed (`oneshot.ts:476-477`) and before `process.exit` (`bin.ts:27`) gets default handling. The window is the session verify plus the output writes; ignoring signals there could make a process that is blocked in a flush (F-10) impossible to stop |
+| F-103 | U | Out of scope: a terminal Ctrl-C also reaches the engine's own SIGINT handler (`engine main.ts:49-54`); the observed outcome (130, `INTERRUPTED`, chain `VERIFIED`) matches CLI:109 and E2 |
+| F-104 | M | Pinned: §3e E7 |
+| F-105, F-106 | U | Pinned: §3e E12 |
+| F-109 | U | Partly pinned (records main): invalid UTF-8 on `-p -` becomes U+FFFD (`oneshot.ts:74`, `toString("utf8")`). A hint when stdin is a TTY is out of scope (M1 interactive UX, CLI:38) |
+| F-110 | U | Pinned: §3e E16 |
+| F-114 | U | Pinned: §3e E16 |
+| F-119 | M | Pinned: §3e E8 |
+| F-123, F-124, F-125 | U | Carried to row D-174 (Founder accept/reject, §3): the non-directory, dangling-symlink and unresolvable-`MADC_HOME` cases and their messages (`main.ts:73-83`) follow that decision |
+| F-126 | U | Pinned: §3e E16 |
+| F-129 | U | Pinned: §3e E16 |
+| F-130 | U | Pinned: §3e E16 |
+| F-131 | M | Pinned: §3e E9 (tied to D-171) |
+| F-134 | U | Carried to row D-174: doctor's `home` row reporting a non-`ENOENT` stat error as "not initialized" (`doctor.ts:263-272`) uses the same classification and is decided with it |
+| F-136 | M | Pinned: §3e E10 |
+| F-140 | U | Pinned: §3e E16 |
+| F-150 | U | Pinned: §3d (2 and 3 are kept over chain FAILED) |
+| F-152 | U | Pinned: §3e E16 |
+| F-153, F-154, F-155, F-156, F-157 | U | Pinned: §3d |
+| F-158 | U | Out of scope: turn timestamps are the engine's evidence, printed as received (`oneshot.ts:557-560`). A negative duration shows the engine's own inconsistency; the CLI adds no timestamp check in M0 |
+
+Count: 56 U + 15 M = 71 ids, all listed above. Also pinned from the untested list: F-26 (§3b N7) and F-29..F-34 (§3e E14).
+
+## Needs Founder allowance
+
+**A1. Engine client: never throw on a malformed error response (F-20).** *Not pinned; needs a Founder allowance.*
+- **Exact change.** In `packages/engine/src/client.ts`, `#onLine` (`:124-128`): before settling a pending request, check the response. If it has an own `error` that is not an object with an integer `code` and a string `message` (PROTO:104, PROTO:159), reject the pending request with a new exported `EngineProtocolError("malformed error response")` (or push the line to `protocolViolations` and reject), instead of calling `new EngineRpcError(m.error)`. Also make the `EngineRpcError` constructor (`:28-33`) unable to throw on a non-object body. Add a client unit test for `error: null`, `error: "boom"` and `error: {}`.
+- **Why it needs an allowance.** The crash is inside the engine client that every user of `@madc/engine/client` shares (the one-shot, doctor, and later M1 callers). §3e E1's containment protects only the CLI's two call sites, and it needs a process-wide exception listener. CLI:200 (Founder allowance D-A7-2, ledger D-151) allows only additive read-only re-exports in `sdk.ts` and "nothing else in `packages/engine`", and CLI:206 allows no engine behaviour change. Until this is granted, E1 is the M0 behaviour.
 
 ## 4. Not changed here
 
 - The check-then-write window in Amendment 2 §2/§6 (Copilot High [r4107161928](https://github.com/MADVenturesLLC/MADC/pull/16#discussion_r4107161928), ledger D-153) is waived for M0 by the Founder under `docs/policy/CODE-ADVISORIES.md` in [PR #20 comment 5844721811](https://github.com/MADVenturesLLC/MADC/pull/20#issuecomment-5844721811) ("D-133, D-134, D-153, D-156: waived for M0."). This erratum neither adds to nor changes that waiver.
 - Lease/heartbeat liveness and torn-tail repair stay deferred to M1-A0 (Amendment 2 §7).
-- Argus pr-19.md F4 (three `turn/start` shape sub-checks with no killing test) is for the A7 follow-up; §3b rule 2 keeps those checks at exit 3.
+- Argus pr-19.md F4 (the `turn/start` shape sub-checks with no killing test) is now pinned as §3e E14; §3b rule 2 keeps those checks at exit 3.
 
 *End of Erratum 1.*
