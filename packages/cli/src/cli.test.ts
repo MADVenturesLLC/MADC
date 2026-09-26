@@ -4,7 +4,7 @@
  * every run sets MADC_HOME and HOME to temp dirs), hermetic env (no ambient credentials).
  */
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   chmodSync,
@@ -14,6 +14,7 @@ import {
   readdirSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -960,6 +961,76 @@ test("A7 §4 servedModel is taken from the authoritative turn/completed.items sn
   } finally {
     sb.cleanup();
   }
+});
+
+test("A7 §4 a malformed or foreign item/delta followed by silence fails closed: exit 3, no hang (Copilot r4109541728, Bugbot 4109544363)", {
+  timeout: 120_000,
+}, async () => {
+  for (const scenario of [
+    "bad-item-quiet",
+    "foreign-item-quiet",
+    "early-foreign-item-quiet",
+    "bad-delta-quiet",
+  ]) {
+    const sb = sandbox();
+    try {
+      const t0 = Date.now();
+      let killer: ReturnType<typeof setTimeout> | undefined;
+      const r = await runCli(sb, ["-p", "hi", "--json"], {
+        engine: FAKE,
+        env: { MADC_TEST_FAKE_SCENARIO: scenario },
+        // A hanging CLI is killed after 15 s so the assertion fails instead of the suite hanging.
+        onSpawn: (child) => {
+          killer = setTimeout(() => child.kill("SIGKILL"), 15_000);
+        },
+      });
+      clearTimeout(killer);
+      assert.equal(r.signal, null, `${scenario}: the CLI hung and had to be killed`);
+      assert.equal(r.code, 3, `${scenario}: ${r.stdout}${r.stderr}`);
+      assert.ok(Date.now() - t0 < 15_000, `${scenario}: took ${Date.now() - t0} ms`);
+      const out = JSON.parse(r.stdout) as { error: { class: string; message: string } };
+      assert.equal(out.error.class, "engine");
+      assert.match(out.error.message, /protocol violation/);
+    } finally {
+      sb.cleanup();
+    }
+  }
+});
+
+test("A7 §4 a provider failure followed by a missing session file exits 5 (chain FAILED), not 4 (Copilot r4109541743)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    const r = await runCli(sb, ["-p", "hi", "--json"], {
+      engine: FAKE,
+      env: { MADC_TEST_FAKE_SCENARIO: "provider-failed-no-session" },
+    });
+    assert.equal(r.code, 5, r.stdout + r.stderr);
+    const out = JSON.parse(r.stdout) as {
+      turn: { status: string; error: { code: number } };
+      session: { chain: string };
+      error: { class: string; message: string };
+    };
+    assert.equal(out.turn.status, "failed");
+    assert.equal(out.turn.error.code, -32008);
+    assert.equal(out.session.chain, "failed");
+    assert.equal(out.error.class, "session");
+    assert.match(out.error.message, /chain FAILED/);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("A7 D-015 bin.ts is committed executable (mode 100755) and carries a node shebang", () => {
+  const bin = fileURLToPath(new URL("./bin.ts", import.meta.url));
+  assert.equal(readFileSync(bin, "utf8").startsWith("#!/usr/bin/env node\n"), true);
+  if (process.platform !== "win32") {
+    assert.equal(statSync(bin).mode & 0o111, 0o111, "bin.ts has the execute bits on disk");
+  }
+  // The committed mode, when running from a git checkout (CI and local).
+  const ls = spawnSync("git", ["ls-files", "-s", "--", bin], { encoding: "utf8" });
+  if (ls.status === 0 && ls.stdout !== "") assert.match(ls.stdout, /^100755 /, ls.stdout);
 });
 
 test("A7 §4 exit 3: the turn completed but the engine exited non-zero on close (Copilot r4107601276)", {

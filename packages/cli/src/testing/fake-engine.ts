@@ -7,7 +7,7 @@
  * - `turn-failed-internal`: the turn ends `failed` with -32603 (agent failure, exit 1).
  */
 import { createHash } from "node:crypto";
-import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
 
@@ -148,9 +148,28 @@ rl.on("line", (line) => {
           params: { threadId, turnId: "turn_other", itemId: "item_a1", delta: "FOREIGN-DELTA" },
         });
       }
+      const quietItem = (forTurn: string, item: unknown) =>
+        send({ method: "item/completed", params: { threadId, turnId: forTurn, item } });
+      const okItem = { id: "item_q1", kind: "agentMessage", status: "completed", text: "q" };
+      // "early-foreign-item-quiet": a well-formed item for another turn BEFORE the response.
+      if (scenario === "early-foreign-item-quiet") quietItem("turn_other", okItem);
       send({ id: msg.id, result: { turn } });
+      // "*-quiet": one malformed or foreign item/delta, then silence (no turn/completed ever).
+      if (scenario.endsWith("-quiet")) {
+        if (scenario === "bad-item-quiet")
+          quietItem(turnId, { id: "item_q1", kind: "agentMessage" });
+        if (scenario === "foreign-item-quiet") quietItem("turn_other", okItem);
+        if (scenario === "bad-delta-quiet") {
+          send({
+            method: "item/agentMessage/delta",
+            params: { threadId, turnId, itemId: "item_q1", delta: 42 },
+          });
+        }
+        return;
+      }
       // "junk-failed": a non-JSON line, then the turn fails -32603 (the violation must win: 3).
       const failed = scenario === "turn-failed-internal" || scenario === "junk-failed";
+      const providerFailed = scenario === "provider-failed-no-session";
       if (scenario === "junk-failed") process.stdout.write("this is not json\n");
       // "delta-only": a delta is streamed but the completed turn carries no agentMessage item.
       if (scenario === "delta-only") {
@@ -308,6 +327,24 @@ rl.on("line", (line) => {
       if (scenario === "bad-turn") {
         // "bad-turn": turn/completed names the thread but carries no items array.
         send({ method: "turn/completed", params: { turn: { threadId, status: "completed" } } });
+        return;
+      }
+      if (providerFailed) {
+        // "provider-failed-no-session": the turn fails -32008 and the session file is gone
+        // afterwards, so the post-turn chain verify fails (exit 5 outranks provider 4).
+        unlinkSync(sessionFile());
+        send({
+          method: "turn/completed",
+          params: {
+            turn: {
+              ...turn,
+              status: "failed",
+              items: [],
+              error: { code: -32008, message: "no-credentials" },
+              completedAt: 2,
+            },
+          },
+        });
         return;
       }
       send({

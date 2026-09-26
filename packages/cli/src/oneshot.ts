@@ -175,6 +175,21 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
   let engineExit: number | null | undefined;
   let violationTimer: ReturnType<typeof setInterval> | undefined;
   let malformedItem = false;
+  // Copilot r4109541728 / Bugbot 4109544363: a malformed or foreign item/delta must END the wait
+  // (fail closed, exit 3), not just be remembered: an engine that then goes quiet would otherwise
+  // leave the unbounded turn wait hanging forever. `violate()` records it and rejects every step.
+  let violateNow: () => void = () => {};
+  const itemViolated = new Promise<never>((_, reject) => {
+    violateNow = () =>
+      reject(
+        new ProtocolMismatch("protocol violation: malformed or foreign item/completed or delta"),
+      );
+  });
+  itemViolated.catch(() => undefined);
+  const violate = () => {
+    malformedItem = true;
+    violateNow();
+  };
   const pendingDeltas: Array<{ turnId: string; delta: string }> = [];
   const renderDelta = (delta: string) => {
     if (stream) {
@@ -264,6 +279,7 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
         p,
         exited,
         violated,
+        itemViolated,
         forced.then(() => {
           throw new Forced();
         }),
@@ -318,13 +334,13 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
             !isDomainId(params.itemId) ||
             typeof params.delta !== "string"
           ) {
-            malformedItem = true;
+            violate();
           } else if (turnId === null) {
             // Bugbot 4109381360: before `turn/start` has answered, hold the delta; it is rendered
             // only once its turn id is known to be this turn's (never foreign text on stdout).
             pendingDeltas.push({ turnId: params.turnId, delta: params.delta });
           } else if (params.turnId !== turnId) {
-            malformedItem = true;
+            violate();
           } else {
             renderDelta(params.delta);
           }
@@ -341,7 +357,10 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
             !isDomainId(params.turnId) ||
             !isItemShape(params.item)
           ) {
-            malformedItem = true;
+            violate();
+          } else if (turnId !== null && params.turnId !== turnId) {
+            // Once this turn's id is known, a foreign-turn item fails closed at once.
+            violate();
           } else {
             itemTurnIds.add(params.turnId);
             const s = servedModelOf(params.item);
@@ -386,8 +405,11 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
       turn = ts.turn;
       for (const d of pendingDeltas.splice(0)) {
         if (d.turnId === turnId) renderDelta(d.delta);
-        else malformedItem = true;
+        else violate();
       }
+      // Items that arrived before `turn/start` answered are bound to this turn now, not at
+      // completion (a foreign one followed by silence must not hang).
+      for (const id of itemTurnIds) if (id !== turnId) violate();
       if (sigintPending && !softUsed) {
         // SIGINT arrived before the turn existed: now it can be interrupted.
         softUsed = true;
@@ -507,7 +529,12 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
   let session: SessionOut | null = null;
   if (threadId !== null) {
     session = verifyThread(opts.home, threadId, finalTurn?.id ?? null);
-    if (session.chain === "failed" && (exit === EXIT.ok || exit === EXIT.failure)) {
+    // CLI pin §4: a post-turn chain verify `failed` is exit 5. It outranks a turn failure (1) and
+    // a provider failure (4) (Copilot r4109541743); protocol/engine (3) and signals still win.
+    if (
+      session.chain === "failed" &&
+      (exit === EXIT.ok || exit === EXIT.failure || exit === EXIT.provider)
+    ) {
       fail(
         { exit: EXIT.session, class: "session" },
         null,
