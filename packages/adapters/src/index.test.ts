@@ -9,3 +9,11 @@ test("adapters export the provider seam and the Kimi Code backing (A3)", () => {
   assert.equal(typeof adapters.ProviderCallError, "function");
   assert.ok(!("ADAPTERS_PLACEHOLDER" in adapters));
 });
+
+test("adapters export the Claude Code vendor backing (A5)", () => {
+  assert.equal(adapters.CLAUDE_CODE_PROVIDER_ID, "claude-code");
+  assert.equal(adapters.CLAUDE_BINARY_NAME, "claude");
+  assert.equal(typeof adapters.createClaudeCodePort, "function");
+  assert.equal(typeof adapters.findClaudeBinary, "function");
+  assert.equal(typeof adapters.resolveClaudePinnedModel, "function");
+});
