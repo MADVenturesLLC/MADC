@@ -6,6 +6,12 @@ export {
   FAKE_CLAUDE_BINARY,
   FAKE_CLAUDE_ENTRY,
 } from "./fake-claude-spawn.ts";
+/** Test helpers (not for production use): fake `codex app-server` child process (A6). */
+export {
+  createFakeCodexSpawn,
+  FAKE_CODEX_BINARY,
+  FAKE_CODEX_ENTRY,
+} from "./fake-codex-spawn.ts";
 export {
   createFakeKimiTransport,
   DEFAULT_FAKE_REPLY,

@@ -17,3 +17,11 @@ test("adapters export the Claude Code vendor backing (A5)", () => {
   assert.equal(typeof adapters.findClaudeBinary, "function");
   assert.equal(typeof adapters.resolveClaudePinnedModel, "function");
 });
+
+test("adapters export the Codex vendor backing (A6)", () => {
+  assert.equal(adapters.CODEX_PROVIDER_ID, "codex");
+  assert.equal(adapters.CODEX_BINARY_NAME, "codex");
+  assert.equal(typeof adapters.createCodexCodePort, "function");
+  assert.equal(typeof adapters.findCodexBinary, "function");
+  assert.equal(typeof adapters.resolveCodexPinnedModel, "function");
+});
