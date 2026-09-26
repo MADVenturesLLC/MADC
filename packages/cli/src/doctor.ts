@@ -25,6 +25,8 @@ import { delimiter, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { MADC_VERSION } from "@madc/core";
 import {
+  EngineProtocolError,
+  EngineRpcError,
   inspectMadcHome,
   isPidAlive,
   listCatalog,
@@ -150,6 +152,40 @@ export function existsNoFollow(path: string): boolean {
   }
 }
 
+export type HomePathState =
+  | { readonly kind: "present" }
+  | { readonly kind: "not-directory" }
+  | { readonly kind: "absent" }
+  | { readonly kind: "invalid"; readonly message: string };
+
+/**
+ * §3e E18: one classifier over the `MADC_HOME` stat/lstat error codes, shared by the one-shot and
+ * doctor. Only a both-fail `ENOENT` is absent; everything else names the real reason (a dangling
+ * symlink, a symlink loop, or an unreadable path) instead of "dangling symlink" or "missing".
+ */
+export function classifyHomePath(path: string): HomePathState {
+  try {
+    return statSync(path).isDirectory() ? { kind: "present" } : { kind: "not-directory" };
+  } catch (statErr) {
+    const statCode = (statErr as NodeJS.ErrnoException).code;
+    try {
+      lstatSync(path);
+    } catch (lstatErr) {
+      const lstatCode = (lstatErr as NodeJS.ErrnoException).code;
+      if (statCode === "ENOENT" && lstatCode === "ENOENT") return { kind: "absent" };
+      return { kind: "invalid", message: `MADC_HOME ${path} cannot be read (${statCode})` };
+    }
+    // stat failed but lstat succeeded: something is there that stat cannot resolve.
+    if (statCode === "ENOENT") {
+      return { kind: "invalid", message: `MADC_HOME ${path} is a dangling symlink` };
+    }
+    if (statCode === "ELOOP") {
+      return { kind: "invalid", message: `MADC_HOME ${path} is a symlink loop` };
+    }
+    return { kind: "invalid", message: `MADC_HOME ${path} cannot be read (${statCode})` };
+  }
+}
+
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -173,7 +209,15 @@ function checkRuntime(): Check {
   };
 }
 
-type ProbeResult = { ok: true; ms: number; exitCode: number } | { ok: false; reason: string };
+type ProbeResult =
+  | { ok: true; ms: number; exitCode: number }
+  | { ok: false; reason: string; code?: number };
+
+/**
+ * §3e E7: doctor-wide signal state. `exit` is set by the SIGINT/SIGTERM listeners; `kill` kills
+ * the probe engine currently running (no EOF wait), if any.
+ */
+type DoctorSignal = { exit: number | null; kill: (() => void) | null };
 
 function finishProbe(
   violations: number,
@@ -187,12 +231,26 @@ function finishProbe(
 }
 
 /** Spawn the engine against `home`, `initialize`, EOF, and require exit 0 within `budgetMs`. */
-async function runProbe(io: CliIO, home: string, budgetMs: number): Promise<ProbeResult> {
+async function runProbe(
+  io: CliIO,
+  home: string,
+  budgetMs: number,
+  sig?: DoctorSignal,
+): Promise<ProbeResult> {
   const t0 = Date.now();
   const client = spawnEngine({
     env: { MADC_HOME: home, KIMI_API_KEY: undefined },
     ...(io.engineEntry !== undefined ? { entry: io.engineEntry } : {}),
   });
+  if (sig !== undefined) {
+    sig.kill = () => {
+      try {
+        client.child.kill("SIGKILL");
+      } catch {
+        // already gone
+      }
+    };
+  }
   let version: string;
   try {
     const init = await withTimeout(
@@ -201,11 +259,25 @@ async function runProbe(io: CliIO, home: string, budgetMs: number): Promise<Prob
     );
     version = String(init.protocolVersion);
   } catch (err) {
-    const timedOut = err instanceof TimeoutError;
+    if (sig !== undefined) sig.kill = null;
     await client.close(200);
-    if (timedOut) return { ok: false, reason: `timeout ${budgetMs}ms` };
+    if (err instanceof TimeoutError) return { ok: false, reason: `timeout ${budgetMs}ms` };
+    // §3e E1: a malformed error body on the initialize reply is a protocol violation.
+    if (err instanceof EngineProtocolError) return { ok: false, reason: "protocol violation" };
+    // §3e E10: an RPC error answer to initialize is a protocol violation too; the code is
+    // carried (and printed) only when it is an integer.
+    if (err instanceof EngineRpcError) {
+      return Number.isInteger(err.code)
+        ? {
+            ok: false,
+            reason: `protocol violation: initialize answered error ${err.code}`,
+            code: err.code,
+          }
+        : { ok: false, reason: "protocol violation" };
+    }
     return { ok: false, reason: `exit ${String(client.child.exitCode)}` };
   }
+  if (sig !== undefined) sig.kill = null;
   if (version !== PROTOCOL_VERSION) {
     await client.close(200);
     return { ok: false, reason: `version ${version}` };
@@ -227,11 +299,23 @@ async function runProbe(io: CliIO, home: string, budgetMs: number): Promise<Prob
   return finishProbe(client.protocolViolations.length, exitCode, Date.now() - t0, version);
 }
 
-async function checkEngine(io: CliIO): Promise<Check> {
+async function checkEngine(io: CliIO, sig?: DoctorSignal): Promise<Check> {
   // A throwaway temp MADC_HOME, never the real one; removed afterwards.
-  const root = mkdtempSync(join(tmpdir(), "madc-doctor-"));
+  let root: string;
   try {
-    const r = await runProbe(io, join(root, "home"), ENGINE_PROBE_MS);
+    root = mkdtempSync(join(tmpdir(), "madc-doctor-"));
+  } catch (err) {
+    // §3e E16 F-140: a failing temp home is an engine-row FAIL; the other rows still run.
+    const code = (err as NodeJS.ErrnoException).code ?? "error";
+    return {
+      id: "engine",
+      status: "fail",
+      summary: `temp home: ${code}`,
+      evidence: { reason: `temp home: ${code}` },
+    };
+  }
+  try {
+    const r = await runProbe(io, join(root, "home"), ENGINE_PROBE_MS, sig);
     return r.ok
       ? {
           id: "engine",
@@ -239,7 +323,12 @@ async function checkEngine(io: CliIO): Promise<Check> {
           summary: `${PROTOCOL_VERSION} · ${r.ms} ms · exit ${r.exitCode}`,
           evidence: { protocolVersion: PROTOCOL_VERSION, ms: r.ms, exitCode: r.exitCode },
         }
-      : { id: "engine", status: "fail", summary: r.reason, evidence: { reason: r.reason } };
+      : {
+          id: "engine",
+          status: "fail",
+          summary: r.reason,
+          evidence: { reason: r.reason, ...(r.code !== undefined ? { code: r.code } : {}) },
+        };
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
@@ -259,21 +348,20 @@ function resolveHome(io: CliIO): HomeState {
   } catch (err) {
     return { kind: "invalid", message: errText(err) };
   }
-  let st: ReturnType<typeof statSync>;
-  try {
-    st = statSync(path);
-  } catch {
-    // A dangling MADC_HOME symlink exists but is not a usable directory (Copilot r4108213385);
-    // a symlink that resolves to a directory is fine (statSync above follows it).
-    if (existsNoFollow(path)) {
-      return { kind: "invalid", message: `MADC_HOME ${path} is a dangling symlink` };
-    }
-    // missing (or unreadable): not initialized
-    return { kind: "missing", path, source };
+  // §3e E18: the same classifier the one-shot uses (a symlink that resolves to a directory is
+  // fine; only a both-fail ENOENT is "missing").
+  const state = classifyHomePath(path);
+  switch (state.kind) {
+    case "present":
+      return { kind: "present", path, source };
+    case "not-directory":
+      // Copilot (review 5321699645, "previously missed"): an existing non-directory is a config error.
+      return { kind: "invalid", message: `MADC_HOME ${path} exists but is not a directory` };
+    case "absent":
+      return { kind: "missing", path, source };
+    case "invalid":
+      return { kind: "invalid", message: state.message };
   }
-  if (st.isDirectory()) return { kind: "present", path, source };
-  // Copilot (review 5321699645, "previously missed"): an existing non-directory is a config error.
-  return { kind: "invalid", message: `MADC_HOME ${path} exists but is not a directory` };
 }
 
 function checkHome(home: HomeState): Check {
@@ -780,14 +868,14 @@ function skip(id: string, why: string): Check {
 }
 
 /** `--init`: seed via the engine against the real home (seat pin §1 same writer). Never writes seat bytes itself. */
-async function runInit(io: CliIO, home: string): Promise<Check> {
+async function runInit(io: CliIO, home: string, sig?: DoctorSignal): Promise<Check> {
   const seatPath = join(home, "seats", `${DEFAULT_SEAT}.json`);
   const pre = initSeatShaBounded(home);
   if ("reason" in pre) {
     return { id: "init", status: "fail", summary: pre.reason, evidence: { path: seatPath } };
   }
   const before = pre.sha;
-  const r = await runProbe(io, home, INIT_TIMEOUT_MS);
+  const r = await runProbe(io, home, INIT_TIMEOUT_MS, sig);
   if (!r.ok)
     return {
       id: "init",
@@ -857,30 +945,59 @@ export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number>
     checks.push(c);
     if (!opts.json) io.stdout.write(renderRow(c, color));
   };
-  if (!opts.json)
-    io.stdout.write(`madc doctor · madc ${MADC_VERSION} · protocol ${PROTOCOL_VERSION}\n`);
-
-  let home = resolveHome(io);
+  // §3e E7: doctor installs SIGINT/SIGTERM listeners for its whole run. On a signal it kills the
+  // probe engine if one is running (no EOF wait), still removes the temp dir, runs no further
+  // rows, and exits 130/143 with the rows so far.
+  const sig: DoctorSignal = { exit: null, kill: null };
+  const onSigint = () => {
+    sig.exit = sig.exit ?? EXIT.sigint;
+    sig.kill?.();
+  };
+  const onSigterm = () => {
+    sig.exit = EXIT.sigterm;
+    sig.kill?.();
+  };
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
   // MADC_HOME set but not absolute: exit-2 class, and nothing spawns (CLI pin §1).
+  let home = resolveHome(io);
   const homeInvalid = home.kind === "invalid";
-  if (opts.init && home.kind !== "invalid") {
-    emit(await runInit(io, home.path));
-    home = resolveHome(io);
+  try {
+    if (!opts.json)
+      io.stdout.write(`madc doctor · madc ${MADC_VERSION} · protocol ${PROTOCOL_VERSION}\n`);
+
+    if (opts.init && home.kind !== "invalid" && sig.exit === null) {
+      emit(await runInit(io, home.path, sig));
+      home = resolveHome(io);
+    }
+    emit(checkRuntime());
+    if (sig.exit === null) {
+      emit(
+        homeInvalid
+          ? skip("engine", "MADC_HOME is invalid: nothing spawned")
+          : await checkEngine(io, sig),
+      );
+    }
+    if (sig.exit === null) emit(checkHome(home));
+    if (sig.exit === null) {
+      for (const row of localRowsBounded(home)) emit(row);
+      // The local rows ran under a blocking spawnSync child: let a signal delivered meanwhile
+      // take effect now that the child has returned (§3e E7).
+      await new Promise((resolve) => setImmediate(resolve));
+    }
+    if (sig.exit === null) emit(checkRegistry());
+    if (sig.exit === null) emit(checkKimiCredential(io));
+    if (sig.exit === null) emit(checkBin(io, "claude", "A5"));
+    if (sig.exit === null) emit(checkBin(io, "codex", "A6"));
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
   }
-  emit(checkRuntime());
-  emit(
-    homeInvalid ? skip("engine", "MADC_HOME is invalid: nothing spawned") : await checkEngine(io),
-  );
-  emit(checkHome(home));
-  for (const row of localRowsBounded(home)) emit(row);
-  emit(checkRegistry());
-  emit(checkKimiCredential(io));
-  emit(checkBin(io, "claude", "A5"));
-  emit(checkBin(io, "codex", "A6"));
 
   const counts = { pass: 0, warn: 0, fail: 0, skip: 0 };
   for (const c of checks) if (c.status !== "init") counts[c.status]++;
-  const exitCode = homeInvalid ? EXIT.usage : counts.fail > 0 ? EXIT.failure : EXIT.ok;
+  const exitCode =
+    sig.exit ?? (homeInvalid ? EXIT.usage : counts.fail > 0 ? EXIT.failure : EXIT.ok);
   const ms = Date.now() - t0;
   if (opts.json) {
     io.stdout.write(

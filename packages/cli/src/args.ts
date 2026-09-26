@@ -31,6 +31,29 @@ export const USAGE = `usage:
 
 export const CHAT_RESERVED = 'interactive chat arrives in M1; use: madc -p "<text>"';
 
+/**
+ * §3e E8: true when `--json` appears in argv as a flag token, scanned with the parser's own
+ * rules: not after `--`, and never consumed as the value of `-p` or `-s`. Used to give every
+ * parse-level usage failure the JSON shape when the operator asked for JSON anywhere in argv.
+ */
+export function hasJsonFlag(argv: readonly string[]): boolean {
+  let flagsDone = false;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (flagsDone || arg === "-" || !arg.startsWith("-")) continue;
+    if (arg === "--") {
+      flagsDone = true;
+      continue;
+    }
+    if (arg === "-p" || arg === "-s") {
+      i++; // the value is consumed even when it looks like a flag
+      continue;
+    }
+    if (arg === "--json") return true;
+  }
+  return false;
+}
+
 export function parseArgs(argv: readonly string[]): ParsedArgs {
   let version = false;
   let help = false;

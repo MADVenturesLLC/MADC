@@ -26,7 +26,11 @@ export function processIO(engineEntry?: string): CliIO {
     env: process.env,
     stdoutIsTTY: process.stdout.isTTY === true,
     stderrIsTTY: process.stderr.isTTY === true,
-    cwd: process.cwd(),
+    // §3e E16 F-130: read lazily — only the one-shot needs cwd, and a deleted current directory
+    // must not break `--version`, `--help`, usage errors or doctor.
+    get cwd() {
+      return process.cwd();
+    },
     engineEntry,
   };
 }
