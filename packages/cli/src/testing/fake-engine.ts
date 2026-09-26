@@ -183,6 +183,18 @@ rl.on("line", (line) => {
         send({ id: msg.id, result: null });
         return;
       }
+      if (scenario === "init-then-hang") {
+        // §3e E7: initialize is answered, then the engine never exits on stdin EOF.
+        send({
+          id: msg.id,
+          result: {
+            serverInfo: { name: "madc-engine", version: "0.0.0" },
+            protocolVersion: "madc-m0/1",
+          },
+        });
+        keepAlive();
+        return;
+      }
       send({
         id: msg.id,
         result: {

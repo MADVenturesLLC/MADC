@@ -1220,6 +1220,87 @@ test("§3e E7: doctor on a signal kills the probe, removes the temp dir, exits 1
   }
 });
 
+test("§3e E7: a signal during the probe's stdin-EOF wait kills the probe at once (Bugbot: the hook must outlive initialize)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  const tmp = join(sb.root, "tmp");
+  mkdirSync(tmp);
+  try {
+    let signalledAt = 0;
+    const r = await runCli(sb, ["doctor", "--json"], {
+      engine: FAKE,
+      // The fake answers initialize, then never exits on EOF: without the kill the probe would
+      // sit out the rest of its 5 s budget.
+      env: { MADC_TEST_FAKE_SCENARIO: "init-then-hang", TMPDIR: tmp },
+      onSpawn: (child) => {
+        setTimeout(() => {
+          signalledAt = Date.now();
+          child.kill("SIGTERM");
+        }, 600);
+        setTimeout(() => child.kill("SIGKILL"), 10_000).unref();
+      },
+    });
+    assert.equal(r.code, 143, r.stdout + r.stderr);
+    assert.ok(
+      Date.now() - signalledAt < 1_500,
+      `probe killed without waiting out the 5 s budget (${Date.now() - signalledAt} ms)`,
+    );
+    const report = JSON.parse(r.stdout) as { exitCode: number };
+    assert.equal(report.exitCode, 143);
+    assert.equal(
+      readdirSync(tmp).filter((n) => n.startsWith("madc-doctor-")).length,
+      0,
+      "no madc-doctor-* left behind",
+    );
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("§3e E7: a signal during --init runs no further rows (only the rows so far are reported)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    let signalledAt = 0;
+    const r = await runCli(sb, ["doctor", "--init", "--json"], {
+      engine: FAKE,
+      // The fake answers initialize, then never exits on EOF: the init probe's budget is 30 s,
+      // so a prompt exit proves the kill, and checks == ["init"] proves no further rows ran.
+      env: { MADC_TEST_FAKE_SCENARIO: "init-then-hang" },
+      onSpawn: (child) => {
+        setTimeout(() => {
+          signalledAt = Date.now();
+          child.kill("SIGTERM");
+        }, 600);
+        setTimeout(() => child.kill("SIGKILL"), 10_000).unref();
+      },
+    });
+    assert.equal(r.code, 143, r.stdout + r.stderr);
+    assert.ok(
+      Date.now() - signalledAt < 1_500,
+      `the 30 s init budget was not waited out (${Date.now() - signalledAt} ms)`,
+    );
+    const report = JSON.parse(r.stdout) as {
+      ok: boolean;
+      exitCode: number;
+      checks: Array<{ id: string }>;
+      counts: Record<string, number>;
+    };
+    assert.equal(report.ok, false);
+    assert.equal(report.exitCode, 143);
+    assert.deepEqual(
+      report.checks.map((c) => c.id),
+      ["init"],
+      "no further rows after the signal (runtime included)",
+    );
+    assert.deepEqual(report.counts, { pass: 0, warn: 0, fail: 1, skip: 0 });
+  } finally {
+    sb.cleanup();
+  }
+});
+
 test("§3e E8: parse-level usage failures print one JSON object when --json is anywhere in argv", {
   timeout: 60_000,
 }, async () => {

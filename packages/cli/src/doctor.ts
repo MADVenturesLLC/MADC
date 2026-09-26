@@ -243,6 +243,8 @@ async function runProbe(
     ...(io.engineEntry !== undefined ? { entry: io.engineEntry } : {}),
   });
   if (sig !== undefined) {
+    // §3e E7: the hook stays armed for the WHOLE probe — a signal during the stdin-EOF wait
+    // kills the child too (no EOF wait, never the remaining budget).
     sig.kill = () => {
       try {
         client.child.kill("SIGKILL");
@@ -251,52 +253,56 @@ async function runProbe(
       }
     };
   }
-  let version: string;
   try {
-    const init = await withTimeout(
-      client.request("initialize", { clientInfo: { name: "madc-doctor", version: MADC_VERSION } }),
-      budgetMs,
-    );
-    version = String(init.protocolVersion);
-  } catch (err) {
-    if (sig !== undefined) sig.kill = null;
-    await client.close(200);
-    if (err instanceof TimeoutError) return { ok: false, reason: `timeout ${budgetMs}ms` };
-    // §3e E1: a malformed error body on the initialize reply is a protocol violation.
-    if (err instanceof EngineProtocolError) return { ok: false, reason: "protocol violation" };
-    // §3e E10: an RPC error answer to initialize is a protocol violation too; the code is
-    // carried (and printed) only when it is an integer.
-    if (err instanceof EngineRpcError) {
-      return Number.isInteger(err.code)
-        ? {
-            ok: false,
-            reason: `protocol violation: initialize answered error ${err.code}`,
-            code: err.code,
-          }
-        : { ok: false, reason: "protocol violation" };
+    let version: string;
+    try {
+      const init = await withTimeout(
+        client.request("initialize", {
+          clientInfo: { name: "madc-doctor", version: MADC_VERSION },
+        }),
+        budgetMs,
+      );
+      version = String(init.protocolVersion);
+    } catch (err) {
+      await client.close(200);
+      if (err instanceof TimeoutError) return { ok: false, reason: `timeout ${budgetMs}ms` };
+      // §3e E1: a malformed error body on the initialize reply is a protocol violation.
+      if (err instanceof EngineProtocolError) return { ok: false, reason: "protocol violation" };
+      // §3e E10: an RPC error answer to initialize is a protocol violation too; the code is
+      // carried (and printed) only when it is an integer.
+      if (err instanceof EngineRpcError) {
+        return Number.isInteger(err.code)
+          ? {
+              ok: false,
+              reason: `protocol violation: initialize answered error ${err.code}`,
+              code: err.code,
+            }
+          : { ok: false, reason: "protocol violation" };
+      }
+      return { ok: false, reason: `exit ${String(client.child.exitCode)}` };
     }
-    return { ok: false, reason: `exit ${String(client.child.exitCode)}` };
-  }
-  if (sig !== undefined) sig.kill = null;
-  if (version !== PROTOCOL_VERSION) {
-    await client.close(200);
-    return { ok: false, reason: `version ${version}` };
-  }
-  client.notify("initialized", {});
-  const remaining = Math.max(1, budgetMs - (Date.now() - t0));
-  let exitCode: number | null = null;
-  let timedOut = false;
-  const timer = setTimeout(() => {
-    timedOut = true;
-    client.child.kill("SIGKILL");
-  }, remaining);
-  try {
-    exitCode = await client.close(remaining + 1_000);
+    if (version !== PROTOCOL_VERSION) {
+      await client.close(200);
+      return { ok: false, reason: `version ${version}` };
+    }
+    client.notify("initialized", {});
+    const remaining = Math.max(1, budgetMs - (Date.now() - t0));
+    let exitCode: number | null = null;
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      client.child.kill("SIGKILL");
+    }, remaining);
+    try {
+      exitCode = await client.close(remaining + 1_000);
+    } finally {
+      clearTimeout(timer);
+    }
+    if (timedOut) return { ok: false, reason: `timeout ${budgetMs}ms` };
+    return finishProbe(client.protocolViolations.length, exitCode, Date.now() - t0, version);
   } finally {
-    clearTimeout(timer);
+    if (sig !== undefined) sig.kill = null;
   }
-  if (timedOut) return { ok: false, reason: `timeout ${budgetMs}ms` };
-  return finishProbe(client.protocolViolations.length, exitCode, Date.now() - t0, version);
 }
 
 async function checkEngine(io: CliIO, sig?: DoctorSignal): Promise<Check> {
@@ -970,7 +976,7 @@ export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number>
       emit(await runInit(io, home.path, sig));
       home = resolveHome(io);
     }
-    emit(checkRuntime());
+    if (sig.exit === null) emit(checkRuntime());
     if (sig.exit === null) {
       emit(
         homeInvalid
