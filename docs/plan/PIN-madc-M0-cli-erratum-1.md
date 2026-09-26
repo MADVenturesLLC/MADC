@@ -81,9 +81,9 @@ Test: a failed turn (-32603, and -32008 `no-credentials`) followed by engine exi
 
 **Ruling.** A server notification whose `method` is not listed in CLI pin §3 **MUST be ignored**: no exit, no stdout output, and no change to any state the CLI tracks. This keeps an older CLI working when the engine adds a notification.
 
-- Ignoring it **MUST NOT** extend or reset any wait. Every timeout keeps its original deadline (an engine that only sends unknown notifications still times out).
+- Ignoring it **MUST NOT** extend or reset any timeout; the request timeout keeps its original deadline. The turn wait has no timeout by design (it ends on `turn/completed`, engine exit, a protocol violation or a signal), and unknown notifications do not add a terminal condition to it or remove one from it.
 - This applies only to an unknown **method name**. A listed notification (for example `thread/started`, `turn/started`, `item/started`, `turn/completed`) that fails its protocol-pin shape check stays a protocol violation (exit 3), as does a message that is not valid JSON-RPC, a response whose `id` matches no pending request, and a notification without a `method` string.
-- Test: send one unknown notification between `turn/started` and `turn/completed`. The exit code and stdout are unchanged from the same run without it. Send only unknown notifications after `turn/started`: the turn-wait timeout fires on its original deadline. Mutations: treat an unknown method as exit 3; reset the timeout on any inbound message. Both must be killed.
+- Test: send one unknown notification between `turn/started` and `turn/completed`. The exit code and stdout are unchanged from the same run without it. Send only unknown notifications while an `initialize` or `turn/start` request is pending: the request timeout fires on its original deadline. Mutations: treat an unknown method as exit 3; reset the timeout on any inbound message. Both must be killed.
 
 ## 4. Not changed here
 
