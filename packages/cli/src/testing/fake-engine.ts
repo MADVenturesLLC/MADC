@@ -5,6 +5,7 @@
  * - `bad-protocol`: `initialize` reports protocolVersion `madc-m0/999`.
  * - `bad-chain`: the turn completes, but the thread's session file does not verify.
  * - `turn-failed-internal`: the turn ends `failed` with -32603 (agent failure, exit 1).
+ * The A7-follow-up scenarios (erratum §3a-§3e) are named at their branches below.
  */
 import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, unlinkSync, writeFileSync } from "node:fs";
@@ -14,6 +15,9 @@ import { createInterface } from "node:readline";
 const scenario = process.env.MADC_TEST_FAKE_SCENARIO ?? "";
 const home = process.env.MADC_HOME ?? "";
 const send = (m: unknown) => process.stdout.write(`${JSON.stringify(m)}\n`);
+/** One write (one chunk): the lines arrive at the CLI together. */
+const sendChunk = (...messages: unknown[]) =>
+  process.stdout.write(messages.map((m) => JSON.stringify(m)).join("\n") + "\n");
 const threadId = scenario === "bad-thread-id" ? "../escape" : "thr_fake0001";
 const turnId = "turn_fake0001";
 const sessionFile = () => join(home, "sessions", `${threadId}.jsonl`);
@@ -43,11 +47,21 @@ function append(type: string, payload: Record<string, unknown>): void {
   seq++;
 }
 
+/** Keep the process alive after stdin EOF (the CLI's close must kill it). */
+const keepAlive = () => setInterval(() => undefined, 1_000);
+
 const mark = process.env.MADC_TEST_FAKE_MARK;
+const record = (what: string) => {
+  if (mark !== undefined) appendFileSync(mark, `${what}\n`);
+};
+
+let answeredFirst = false;
 const rl = createInterface({ input: process.stdin });
 // "exit-nonzero": the turn completes normally, then the engine exits 7 on stdin EOF.
+// "failed-exit1" / "provider-failed-exit1" (§3a): a failed turn, then exit 1 on EOF.
 rl.on("close", () => {
   if (scenario === "exit-nonzero") process.exitCode = 7;
+  if (scenario === "failed-exit1" || scenario === "provider-failed-exit1") process.exitCode = 1;
 });
 function inProgress(): Record<string, unknown> {
   return {
@@ -60,11 +74,111 @@ function inProgress(): Record<string, unknown> {
     completedAt: null,
   };
 }
+const agentItem = (text: string) => ({
+  id: "item_a1",
+  kind: "agentMessage",
+  status: "completed",
+  text,
+});
+function completedTurn(items: unknown[], error: Record<string, unknown> | null) {
+  return {
+    id: turnId,
+    threadId,
+    status: error === null ? "completed" : "failed",
+    items,
+    error,
+    startedAt: 1,
+    completedAt: 2,
+  };
+}
+const defaultItems = () => [agentItem("fake reply")];
+const receipt = (itemId: string, servedModel: string, backing = "kimi-code") => ({
+  id: itemId,
+  kind: "servedModel",
+  status: "completed",
+  requestedModel: "kimi-for-coding",
+  servedModel,
+  backing,
+  providerId: "kimi-code",
+});
+
 rl.on("line", (line) => {
   const msg = JSON.parse(line) as { id?: number; method: string; params?: Record<string, unknown> };
   if (msg.id === undefined) return;
+  // "e1-client" (allowance A1 client tests): the FIRST request gets a malformed error body
+  // (MADC_TEST_ERROR_BODY, raw JSON), later requests a well-formed result.
+  if (scenario === "e1-client") {
+    if (!answeredFirst) {
+      answeredFirst = true;
+      process.stdout.write(
+        `{"id":${JSON.stringify(msg.id)},"error":${process.env.MADC_TEST_ERROR_BODY ?? "null"}}\n`,
+      );
+    } else {
+      send({ id: msg.id, result: { ok: true } });
+    }
+    return;
+  }
+  // "e1-client-unmatched": an error reply with no pending id is stored and ignored.
+  if (scenario === "e1-client-unmatched") {
+    process.stdout.write('{"id":999,"error":null}\n');
+    send({ id: msg.id, result: { ok: true } });
+    return;
+  }
+  // "never-answer-*": silence at one stage (request-timeout tests, doctor signal test).
+  if (scenario === "never-answer-init") return;
+  // "exit2-early" (§3e E5): exit 2 before answering initialize.
+  if (scenario === "exit2-early") process.exit(2);
+  record(msg.method);
   switch (msg.method) {
-    case "initialize":
+    case "initialize": {
+      if (scenario === "slow-init") {
+        // "slow-init" (§3e E15): the initialize answer is delayed 10 s (the test signals meanwhile).
+        setTimeout(() => {
+          send({
+            id: msg.id,
+            result: {
+              serverInfo: { name: "madc-engine", version: "0.0.0" },
+              protocolVersion: "madc-m0/1",
+            },
+          });
+        }, 10_000);
+        return;
+      }
+      if (scenario === "unmatched-storm-init") {
+        // Unmatched well-formed responses while initialize is pending: the request timeout must
+        // still fire on its original deadline (§3b rules 1/3).
+        setInterval(() => send({ id: "zz-unmatched", result: {} }), 100);
+        return;
+      }
+      if (scenario === "e1-init-null") {
+        // §3e E1: a null error body on the initialize reply.
+        process.stdout.write(`{"id":${JSON.stringify(msg.id)},"error":null}\n`);
+        return;
+      }
+      if (scenario === "init-rpc-error") {
+        // §3e E10: an RPC error answer to initialize (then exit 0 on EOF).
+        send({ id: msg.id, error: { code: -32603, message: "x" } });
+        return;
+      }
+      if (scenario === "n7-serverinfo-missing") {
+        send({ id: msg.id, result: { protocolVersion: "madc-m0/1" } });
+        return;
+      }
+      if (scenario === "n7-serverinfo-name") {
+        send({
+          id: msg.id,
+          result: {
+            serverInfo: { name: "other-engine", version: "0.0.0" },
+            protocolVersion: "madc-m0/1",
+          },
+        });
+        return;
+      }
+      if (scenario === "n7-init-null-result") {
+        // §3b N7: a well-formed frame whose initialize result is unusable.
+        send({ id: msg.id, result: null });
+        return;
+      }
       send({
         id: msg.id,
         result: {
@@ -73,16 +187,23 @@ rl.on("line", (line) => {
         },
       });
       return;
+    }
     case "thread/start": {
+      if (scenario === "never-answer-thread") return;
       if (scenario === "unknown-code") {
         send({ id: msg.id, error: { code: -32099, message: "from the future" } });
         return;
       }
+      if (scenario === "thread-start-busy") {
+        // §3e E16 F-152: an RPC error on thread/start (human-mode one-line error).
+        send({ id: msg.id, error: { code: -32004, message: "Turn already active" } });
+        return;
+      }
       const thread = {
         id: threadId,
-        seatId: "madc-default",
+        seatId: scenario === "n7-thread-seat" ? "other_seat" : "madc-default",
         cwd: null,
-        createdAt: 1,
+        createdAt: scenario === "n7-thread-bad" ? "x" : 1,
         updatedAt: 1,
         status: "idle",
         preview: "",
@@ -97,9 +218,474 @@ rl.on("line", (line) => {
           pinnedModel: "m",
         });
       send({ id: msg.id, result: { thread } });
+      if (scenario === "n5-thread-bad") {
+        // §3b N5: a thread/started that fails the Thread shape.
+        send({ method: "thread/started", params: { thread: { id: threadId } } });
+      }
+      if (scenario === "n5-thread-seat") {
+        // §3b N5: a thread/started for another seat.
+        send({ method: "thread/started", params: { thread: { ...thread, seatId: "other_seat" } } });
+      }
       return;
     }
     case "turn/start": {
+      if (scenario === "never-answer-turn") return;
+      if (scenario === "unmatched-storm-turn-pending") {
+        // Unmatched well-formed responses while turn/start is pending (§3b rule 3: no reset).
+        setInterval(() => send({ id: "zz-unmatched", result: {} }), 100);
+        return;
+      }
+      if (scenario === "n2-pending") {
+        // §3b N2 (b): both an id and a method on the pending turn/start id → exit 3, not 4.
+        send({ id: msg.id, method: "x", error: { code: -32008, message: "m" } });
+        return;
+      }
+      if (scenario === "n4-both") {
+        // §3b N4: both result and error on the pending turn/start id → exit 3, not 4.
+        send({ id: msg.id, result: {}, error: { code: -32008, message: "m" } });
+        return;
+      }
+      if (scenario === "e1-error-null-turn") {
+        process.stdout.write(`{"id":${JSON.stringify(msg.id)},"error":null}\n`);
+        return;
+      }
+      if (scenario === "e1-error-string") {
+        process.stdout.write(`{"id":${JSON.stringify(msg.id)},"error":"boom"}\n`);
+        return;
+      }
+      const foreignItem = {
+        method: "item/completed",
+        params: {
+          threadId: "thr_other000",
+          turnId: "turn_other",
+          item: { id: "item_x", kind: "agentMessage", status: "completed", text: "x" },
+        },
+      };
+      if (scenario === "e1-bad-item-first") {
+        // §3e E1 / §3e E17 (4): a bad item, then a malformed error body on the pending id, in ONE
+        // write (bad item first) → the E1 message wins and the turn stays UNKNOWN.
+        sendChunk(foreignItem, { id: msg.id, error: null });
+        return;
+      }
+      if (scenario === "e17-bad-item-then-refusal") {
+        // §3e E17 (5): a bad item, then a well-formed error reply in one write → NOT STARTED.
+        sendChunk(foreignItem, { id: msg.id, error: { code: -32004, message: "m" } });
+        return;
+      }
+      if (scenario === "e17a-n2-then-refusal") {
+        // E17a (8): an N2 frame that does not settle turn/start, then a well-formed refusal.
+        sendChunk(
+          { id: 99, method: "server/ask" },
+          { id: msg.id, error: { code: -32008, message: "m" } },
+        );
+        return;
+      }
+      if (scenario === "e17a-n2-other-error") {
+        // E17a (9): the N2 frame's error has a different code/message than the refusal.
+        sendChunk(
+          { id: 99, method: "server/ask", error: { code: -32000, message: "other" } },
+          { id: msg.id, error: { code: -32008, message: "m" } },
+        );
+        return;
+      }
+      if (scenario === "e17a-method7-then-refusal") {
+        // E17a (10): the N4 frame has no own id, so rule 4 does not match it.
+        sendChunk(
+          { method: 7, error: { code: -32008, message: "m" } },
+          { id: msg.id, error: { code: -32008, message: "m" } },
+        );
+        return;
+      }
+      if (scenario === "e17a-n4-turn") {
+        // E17a (7): both result and error on the pending id, the result a valid started turn.
+        send({
+          id: msg.id,
+          result: { turn: inProgress() },
+          error: { code: -32008, message: "m" },
+        });
+        return;
+      }
+      if (scenario === "e17-late-response") {
+        // §3e E17 (2): a foreign-threadId delta at once, the response 200 ms later, and the
+        // engine stays up past the CLI's EOF so the late reply arrives during the close.
+        send({
+          method: "item/agentMessage/delta",
+          params: { threadId: "thr_other000", turnId: "turn_x", itemId: "item_a1", delta: "F" },
+        });
+        setTimeout(() => {
+          append("turn.start", { turnId, inputText: "hi" });
+          send({ id: msg.id, result: { turn: inProgress() } });
+          setTimeout(() => process.exit(0), 100);
+        }, 200);
+        return;
+      }
+      const foreignDelta = {
+        method: "item/agentMessage/delta",
+        params: { threadId: "thr_other000", turnId: "turn_x", itemId: "item_a1", delta: "F" },
+      };
+      if (scenario === "e17-resp-then-delta" || scenario === "e17-delta-then-resp") {
+        // §3e E17 (1): the turn/start response and a foreign-threadId delta in ONE write.
+        append("turn.start", { turnId, inputText: "hi" });
+        const response = { id: msg.id, result: { turn: inProgress() } };
+        if (scenario === "e17-resp-then-delta") sendChunk(response, foreignDelta);
+        else sendChunk(foreignDelta, response);
+        return;
+      }
+      if (scenario === "silent-turn" || scenario === "silent-turn-rm") {
+        // §3c: the turn starts and nothing ever arrives again; the engine ignores EOF.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        keepAlive();
+        return;
+      }
+      if (scenario === "silent-turn-junk") {
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        keepAlive();
+        return;
+      }
+      if (scenario === "unknown-storm-turn" || scenario === "unmatched-storm-turn") {
+        // §3b rules 1/3 + §3c test 2: unknown notifications (or unmatched responses) every
+        // 100 ms are ignored and never reset the idle deadline.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        if (scenario === "unknown-storm-turn") {
+          setInterval(() => send({ method: "bogus/x", params: {} }), 100);
+        } else {
+          setInterval(() => send({ id: "zz-unmatched", result: {} }), 100);
+        }
+        keepAlive();
+        return;
+      }
+      if (scenario === "unknown-notification" || scenario === "unmatched-mid-turn") {
+        // §3b rule 1 / N1 positive: one ignored message mid-turn; the run is unchanged.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        if (scenario === "unknown-notification") send({ method: "bogus/x", params: {} });
+        else send({ id: "zz-unmatched", result: {} });
+        append("turn.end", { turnId, status: "completed", error: null });
+        send({ method: "turn/completed", params: { turn: completedTurn(defaultItems(), null) } });
+        return;
+      }
+      if (scenario === "n2-mid-turn" || scenario === "n3-params" || scenario === "n3-jsonrpc") {
+        // §3b N2 (a) / N3: one malformed object mid-turn → exit 3.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        if (scenario === "n2-mid-turn") send({ id: 99, method: "server/ask" });
+        if (scenario === "n3-params") process.stdout.write('{"params":{}}\n');
+        if (scenario === "n3-jsonrpc") process.stdout.write('{"jsonrpc":"2.0"}\n');
+        return;
+      }
+      if (scenario === "n4-method") {
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        process.stdout.write('{"method":7}\n');
+        return;
+      }
+      if (scenario === "n2-completed") {
+        // §3b N2 (c) + rule 7: an id-carrying turn/completed never ends the turn → exit 3 with
+        // the turn still the inProgress snapshot.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        send({
+          id: 9,
+          method: "turn/completed",
+          params: { turn: completedTurn(defaultItems(), null) },
+        });
+        return;
+      }
+      if (scenario === "n5-turn-thread" || scenario === "n5-turn-status") {
+        // §3b N5: a turn/started for another thread, or with a status that is not inProgress.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        if (scenario === "n5-turn-thread") {
+          send({
+            method: "turn/started",
+            params: { turn: { ...inProgress(), threadId: "thr_other000" } },
+          });
+        } else {
+          send({ method: "turn/started", params: { turn: completedTurn([], null) } });
+        }
+        return;
+      }
+      if (
+        scenario === "n5-item-id" ||
+        scenario === "n5-item-status" ||
+        scenario === "n5-item-turn"
+      ) {
+        // §3b N5: a bad item id, a completed item at started, or another turn's item.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        if (scenario === "n5-item-id") {
+          send({
+            method: "item/started",
+            params: {
+              threadId,
+              turnId,
+              item: { id: "../x", kind: "agentMessage", status: "inProgress", text: "" },
+            },
+          });
+        } else if (scenario === "n5-item-status") {
+          send({
+            method: "item/started",
+            params: { threadId, turnId, item: agentItem("x") },
+          });
+        } else {
+          send({
+            method: "item/started",
+            params: {
+              threadId,
+              turnId: "turn_other",
+              item: { id: "item_x", kind: "agentMessage", status: "inProgress", text: "" },
+            },
+          });
+        }
+        return;
+      }
+      if (scenario === "n6-backing-notify" || scenario === "n6-backing-snapshot") {
+        // §3b N6 (D-188): a servedModel backing outside the pinned three → exit 3.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        if (scenario === "n6-backing-notify") {
+          send({
+            method: "item/completed",
+            params: { threadId, turnId, item: receipt("item_s1", "model-a", "ollama-cloud") },
+          });
+          return;
+        }
+        append("turn.end", { turnId, status: "completed", error: null });
+        send({
+          method: "turn/completed",
+          params: {
+            turn: completedTurn(
+              [agentItem("q"), receipt("item_s1", "model-a", "ollama-cloud")],
+              null,
+            ),
+          },
+        });
+        return;
+      }
+      if (scenario === "served-two" || scenario === "served-extra-notify") {
+        // §3e E3: two servedModel items matched per id → 0 with the last in snapshot order; a
+        // notification missing from the snapshot → 3.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        send({
+          method: "item/completed",
+          params: { threadId, turnId, item: receipt("item_sa", "model-a") },
+        });
+        send({
+          method: "item/completed",
+          params: { threadId, turnId, item: receipt("item_sb", "model-b") },
+        });
+        if (scenario === "served-extra-notify") {
+          send({
+            method: "item/completed",
+            params: { threadId, turnId, item: receipt("item_sc", "model-c") },
+          });
+        }
+        append("turn.end", { turnId, status: "completed", error: null });
+        const snapItems =
+          scenario === "served-two"
+            ? [agentItem("q"), receipt("item_sa", "model-a"), receipt("item_sb", "model-b")]
+            : [agentItem("q"), receipt("item_sa", "model-a"), receipt("item_sb", "model-b")];
+        send({ method: "turn/completed", params: { turn: completedTurn(snapItems, null) } });
+        return;
+      }
+      if (scenario === "turn-interrupted") {
+        // §3e E4: the engine interrupts the turn on its own (no CLI signal) → exit 1.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        append("turn.end", { turnId, status: "interrupted", error: null });
+        send({
+          method: "turn/completed",
+          params: { turn: { ...inProgress(), status: "interrupted", completedAt: 2 } },
+        });
+        return;
+      }
+      if (scenario === "exit2-mid") {
+        // §3e E5: an engine exit 2 after initialize answered is an unexpected exit → 3.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        process.exit(2);
+      }
+      if (
+        scenario === "failed-exit1" ||
+        scenario === "provider-failed-exit1" ||
+        scenario === "turn-failed-provider" ||
+        scenario === "turn-failed-seat" ||
+        scenario === "turn-failed-seat-nosession" ||
+        scenario === "junk-failed-seat" ||
+        scenario === "junk-completed-nosession"
+      ) {
+        // §3a (a)/(b), §3d (b)/(d)/(f)/(a): failed turns with provider/usage codes, a non-JSON
+        // line, and/or a removed session file.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        const code =
+          scenario === "provider-failed-exit1" || scenario === "turn-failed-provider"
+            ? -32008
+            : scenario === "failed-exit1"
+              ? -32603
+              : -32005;
+        if (scenario === "junk-failed-seat" || scenario === "junk-completed-nosession") {
+          process.stdout.write("this is not json\n");
+        }
+        const error =
+          scenario === "junk-completed-nosession" ? null : { code, message: "failed turn" };
+        append("turn.end", {
+          turnId,
+          status: error === null ? "completed" : "failed",
+          error,
+        });
+        send({ method: "turn/completed", params: { turn: completedTurn(defaultItems(), error) } });
+        if (scenario === "turn-failed-seat-nosession" || scenario === "junk-completed-nosession") {
+          unlinkSync(sessionFile());
+        }
+        return;
+      }
+      if (scenario === "completed-ignore-eof") {
+        // §3a (c) / §3d (e): the turn completes; the engine ignores EOF (killed at close).
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        append("turn.end", { turnId, status: "completed", error: null });
+        send({ method: "turn/completed", params: { turn: completedTurn(defaultItems(), null) } });
+        keepAlive();
+        return;
+      }
+      if (scenario === "delta-tick" || scenario === "item-started-tick") {
+        // §3c tests 3/4: listed notifications every 300 ms reset the idle deadline → exit 0.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        let ticks = 0;
+        const timer = setInterval(() => {
+          ticks++;
+          if (scenario === "delta-tick") {
+            send({
+              method: "item/agentMessage/delta",
+              params: { threadId, turnId, itemId: "item_a1", delta: `d${ticks}` },
+            });
+          } else {
+            send({
+              method: "item/started",
+              params: {
+                threadId,
+                turnId,
+                item: {
+                  id: `item_t${ticks}`,
+                  kind: "agentMessage",
+                  status: "inProgress",
+                  text: "",
+                },
+              },
+            });
+          }
+          if (ticks >= 6) {
+            clearInterval(timer);
+            append("turn.end", { turnId, status: "completed", error: null });
+            send({
+              method: "turn/completed",
+              params: { turn: completedTurn(defaultItems(), null) },
+            });
+          }
+        }, 300);
+        return;
+      }
+      if (scenario === "bad-item-started-quiet") {
+        // §3c test 5: a listed notification that fails its checks → exit 3 promptly.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        send({
+          method: "item/started",
+          params: {
+            threadId,
+            turnId: "turn_other",
+            item: { id: "item_x", kind: "agentMessage", status: "inProgress", text: "" },
+          },
+        });
+        return;
+      }
+      if (scenario === "bad-item-junk") {
+        // §3c test 16: a malformed item followed by a non-JSON line (no idle timeout in play).
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        send({ method: "item/completed", params: { threadId, turnId } });
+        process.stdout.write("this is not json\n");
+        return;
+      }
+      if (scenario === "early-completed" || scenario === "early-completed-other") {
+        // §3e E16 F-69: turn/completed before the turn/start response; for this turn → 0, for
+        // another turn → 3.
+        append("turn.start", { turnId, inputText: "hi" });
+        const early =
+          scenario === "early-completed"
+            ? completedTurn(defaultItems(), null)
+            : { ...completedTurn(defaultItems(), null), id: "turn_other" };
+        send({ method: "turn/completed", params: { turn: early } });
+        append("turn.end", { turnId: early.id as string, status: "completed", error: null });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        return;
+      }
+      if (scenario === "blank-line") {
+        // §3e E16 F-73: a blank line on engine stdout is a non-JSON line → exit 3.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        process.stdout.write("\n");
+        return;
+      }
+      if (scenario === "self-sigterm") {
+        // §3e E16 F-89: the engine is killed by an outside signal after the completed turn.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        append("turn.end", { turnId, status: "completed", error: null });
+        send({ method: "turn/completed", params: { turn: completedTurn(defaultItems(), null) } });
+        setTimeout(() => process.kill(process.pid, "SIGTERM"), 50);
+        return;
+      }
+      if (scenario === "ctrl-text" || scenario === "ctrl-delta") {
+        // §3e E11: control characters in the final text and in a streamed delta.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        if (scenario === "ctrl-delta") {
+          send({
+            method: "item/agentMessage/delta",
+            params: { threadId, turnId, itemId: "item_a1", delta: "x\u001b[31my\u0007" },
+          });
+          append("turn.end", { turnId, status: "completed", error: null });
+          send({
+            method: "turn/completed",
+            params: { turn: completedTurn([agentItem("done")], null) },
+          });
+          return;
+        }
+        append("turn.end", { turnId, status: "completed", error: null });
+        send({
+          method: "turn/completed",
+          params: { turn: completedTurn([agentItem("a[31mbc\r\n")], null) },
+        });
+        return;
+      }
+      if (scenario === "long-text") {
+        // §3e E12/E13: a 200 001-byte final text; the engine stays alive until the CLI's EOF, so
+        // the engine-side Bun truncation (F-78) cannot mask the CLI's result.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        append("turn.end", { turnId, status: "completed", error: null });
+        send({
+          method: "turn/completed",
+          params: { turn: completedTurn([agentItem("y".repeat(200_001))], null) },
+        });
+        return;
+      }
+      if (scenario === "stderr-log") {
+        // §3e E9: engine log lines pass through the inherited stderr, also in --json mode.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        process.stderr.write("[fake] log\n");
+        append("turn.end", { turnId, status: "completed", error: null });
+        send({ method: "turn/completed", params: { turn: completedTurn(defaultItems(), null) } });
+        return;
+      }
       if (scenario === "junk-hang") {
         // "junk-hang": a non-JSON stdout line mid-turn, then the turn never completes.
         send({ id: msg.id, result: { turn: inProgress() } });
@@ -116,15 +702,51 @@ rl.on("line", (line) => {
         }, 1500);
         return;
       }
-      const turn = {
-        id: turnId,
-        threadId,
-        status: "inProgress",
-        items: [],
-        error: null,
-        startedAt: 1,
-        completedAt: null,
-      };
+      if (scenario === "slow-start-800") {
+        // §3c test 12: the turn/start response is delayed 800 ms, turn/completed within 50 ms.
+        setTimeout(() => {
+          append("turn.start", { turnId, inputText: "hi" });
+          send({ id: msg.id, result: { turn: inProgress() } });
+          setTimeout(() => {
+            append("turn.end", { turnId, status: "completed", error: null });
+            send({
+              method: "turn/completed",
+              params: { turn: completedTurn([agentItem("q")], null) },
+            });
+          }, 50);
+        }, 800);
+        return;
+      }
+      // §3e E14: one scenario per turn/start result sub-check.
+      if (scenario === "start-no-shape") {
+        const { threadId: _omit, ...noThread } = inProgress();
+        send({ id: msg.id, result: { turn: noThread } });
+        return;
+      }
+      if (scenario === "start-bad-id") {
+        send({ id: msg.id, result: { turn: { ...inProgress(), id: "../x" } } });
+        return;
+      }
+      if (scenario === "start-other-thread") {
+        send({ id: msg.id, result: { turn: { ...inProgress(), threadId: "thr_other000" } } });
+        return;
+      }
+      if (scenario === "start-status-completed") {
+        send({
+          id: msg.id,
+          result: { turn: { ...inProgress(), status: "completed", completedAt: null } },
+        });
+        return;
+      }
+      if (scenario === "start-items") {
+        send({ id: msg.id, result: { turn: { ...inProgress(), items: [agentItem("x")] } } });
+        return;
+      }
+      if (scenario === "start-completedat") {
+        send({ id: msg.id, result: { turn: { ...inProgress(), completedAt: 2 } } });
+        return;
+      }
+      const turn = inProgress();
       if (scenario === "start-completed") {
         // "start-completed": turn/start answers an already completed, populated turn and no
         // turn/completed ever follows (a CLI that waits would hang).
@@ -216,7 +838,11 @@ rl.on("line", (line) => {
           : [{ id: "item_a1", kind: "agentMessage", status: "completed", text: "fake reply" }];
       if (scenario === "no-error-field") {
         // "no-error-field": turn/completed omits the required `error` field.
-        const { error: _omit, ...rest } = { ...turn, status: "completed", completedAt: 2 };
+        const { error: _omit, ...rest } = {
+          ...turn,
+          status: "completed",
+          completedAt: 2,
+        } as Record<string, unknown>;
         send({ method: "turn/completed", params: { turn: rest } });
         return;
       }
@@ -261,19 +887,10 @@ rl.on("line", (line) => {
       if (scenario === "served-snapshot-only" || scenario === "served-mismatch") {
         // The served-model receipt only in the turn/completed snapshot, or a notification that
         // disagrees with the snapshot.
-        const receipt = (servedModel: string) => ({
-          id: "item_s1",
-          kind: "servedModel",
-          status: "completed",
-          requestedModel: "kimi-for-coding",
-          servedModel,
-          backing: "kimi-code",
-          providerId: "kimi-code",
-        });
         if (scenario === "served-mismatch") {
           send({
             method: "item/completed",
-            params: { threadId, turnId, item: receipt("model-a") },
+            params: { threadId, turnId, item: receipt("item_s1", "model-a") },
           });
         }
         send({
@@ -282,7 +899,7 @@ rl.on("line", (line) => {
             turn: {
               ...turn,
               status: "completed",
-              items: [...items, receipt("model-b")],
+              items: [...items, receipt("item_s1", "model-b")],
               completedAt: 2,
             },
           },
@@ -362,7 +979,34 @@ rl.on("line", (line) => {
       return;
     }
     case "turn/interrupt": {
-      if (mark !== undefined) appendFileSync(mark, "turn/interrupt\n");
+      record("turn/interrupt");
+      if (scenario === "silent-turn" || scenario === "silent-turn-rm") {
+        // §3c tests 1/7/8/11: the interrupt is received but never answered; the engine never
+        // exits on EOF either (the CLI kills it after 1 s).
+        if (scenario === "silent-turn-rm") unlinkSync(sessionFile());
+        keepAlive();
+        return;
+      }
+      if (scenario === "silent-turn-junk") {
+        // §3c test 16: a non-JSON line during the idle-timeout grace.
+        process.stdout.write("this is not json\n");
+        keepAlive();
+        return;
+      }
+      if (scenario === "interrupt-completes" || scenario === "interrupt-fails-provider") {
+        // §3c test 6: the grace reports a turn outcome; the idle timeout's exit 3 still wins.
+        const error =
+          scenario === "interrupt-fails-provider"
+            ? { code: -32008, message: "no-credentials" }
+            : null;
+        append("turn.end", { turnId, status: error === null ? "completed" : "failed", error });
+        send({ id: msg.id, result: {} });
+        send({
+          method: "turn/completed",
+          params: { turn: completedTurn([agentItem("late reply")], error) },
+        });
+        return;
+      }
       append("turn.end", { turnId, status: "interrupted", error: null });
       send({ id: msg.id, result: {} });
       send({

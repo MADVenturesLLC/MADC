@@ -16,6 +16,7 @@ export {
   ENGINE_ENTRY,
   EngineClient,
   EngineExitedError,
+  EngineProtocolError,
   EngineRpcError,
   type Notification,
   type SpawnEngineOptions,

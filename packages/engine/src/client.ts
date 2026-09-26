@@ -1,6 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { fileURLToPath } from "node:url";
+import { ErrorCode } from "./protocol/errors.ts";
 import type {
   ClientRequestMethod,
   ClientRequests,
@@ -26,10 +27,38 @@ export class EngineRpcError extends Error {
   readonly code: number;
   readonly data: Record<string, unknown> | undefined;
   constructor(body: RpcErrorBody) {
+    // A non-object body can no longer throw (Erratum 1 §3e E1, Founder allowance A1): it reports
+    // InternalError with the received body under `data.rawError`, so a genuine engine -32603
+    // (which has no `rawError`) is told apart from this path.
+    if (body === null || typeof body !== "object") {
+      super("malformed error response");
+      this.name = "EngineRpcError";
+      this.code = ErrorCode.InternalError;
+      this.data = { rawError: body };
+      return;
+    }
     super(body.message);
     this.name = "EngineRpcError";
     this.code = body.code;
     this.data = body.data;
+  }
+}
+
+/** An error body per the protocol pin §4 (`{ code: integer, message: string }`). */
+function isRpcErrorBody(e: unknown): e is RpcErrorBody {
+  if (e === null || typeof e !== "object" || Array.isArray(e)) return false;
+  const r = e as Record<string, unknown>;
+  return Number.isInteger(r.code) && typeof r.message === "string";
+}
+
+/**
+ * Protocol error: the engine sent a malformed error body on a reply to a pending request
+ * (Erratum 1 §3e E1, Founder allowance A1). Nothing throws inside the readline listener.
+ */
+export class EngineProtocolError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "EngineProtocolError";
   }
 }
 
@@ -124,8 +153,12 @@ export class EngineClient {
     if (id !== undefined && id !== null && this.#pending.has(id)) {
       const pending = this.#pending.get(id);
       this.#pending.delete(id);
-      if (Object.hasOwn(m, "error")) pending?.reject(new EngineRpcError(m.error as RpcErrorBody));
-      else pending?.resolve(m.result);
+      // A malformed error body rejects with EngineProtocolError (allowance A1); an EngineRpcError
+      // is only ever built from a well-formed error body, and the listener never throws.
+      if (Object.hasOwn(m, "error")) {
+        if (isRpcErrorBody(m.error)) pending?.reject(new EngineRpcError(m.error));
+        else pending?.reject(new EngineProtocolError("malformed error response"));
+      } else pending?.resolve(m.result);
     }
     const still: Waiter[] = [];
     for (const w of this.#waiters) {
