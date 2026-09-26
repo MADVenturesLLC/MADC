@@ -2,7 +2,7 @@
 
 *Surface Architect · 2026-09-25 · Venue: `MADVenturesLLC/MADC` · Status: **build pin amendment** (additive), Founder-authorized 2026-09-25. It gates the Hephaestus A4 follow-up act "session integrity", which must merge before Act M0-A7. Docs only.*
 
-*Amended by `PIN-madc-M0-amendment-3.md` (2026-09-25): §4 rollback durability, §5 crash-residue classification, §2 writer guard.*
+*Amended by `PIN-madc-M0-amendment-3.md` (2026-09-25): §4 rollback durability and `sessions/` permissions, §3 broken-writer recovery, §5 crash-residue classification, §2 writer guard.*
 
 **Authority:**
 
