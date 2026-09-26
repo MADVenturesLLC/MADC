@@ -128,7 +128,10 @@ rl.on("line", (line) => {
   if (scenario === "never-answer-init") return;
   // "exit2-early" (§3e E5): exit 2 before answering initialize.
   if (scenario === "exit2-early") process.exit(2);
-  record(msg.method);
+  // Record received methods only where a test reads them back (§3e E15). Recording for every
+  // scenario would create the mark file at `initialize`, breaking the "slow-start" marker, which
+  // must appear only when `turn/start` arrives (cli.test.ts Bugbot 4107608856).
+  if (scenario === "slow-init") record(msg.method);
   switch (msg.method) {
     case "initialize": {
       if (scenario === "slow-init") {
