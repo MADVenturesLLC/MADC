@@ -100,18 +100,21 @@ test("binary detection: PATH lookup finds an executable, misses nothing / non-ex
   });
 });
 
-// Skip reason: PATHEXT is Windows-only. Boolean `skip`: bun 1.3.11's node:test shim (CI) runs a
-// test whose `skip` is a string; a boolean is honored there and on Node.
-test("binary detection on Windows honors PATHEXT", {
-  skip: process.platform !== "win32",
-}, () => {
-  withTempDir((dir) => {
-    const bin = join(dir, "codex.EXE");
-    writeFileSync(bin, "MZ");
-    assert.equal(findCodexBinary({ PATH: dir, PATHEXT: ".EXE;.BAT" }), bin);
-    assert.equal(findCodexBinary({ PATH: dir, PATHEXT: ".BAT" }), null);
+// Skip reason on non-Windows: PATHEXT is Windows-only. Conditional `test.skip` registration —
+// bun 1.3.11's node:test shim (CI) ignores the options-object `skip` entirely (string or
+// boolean, verified against the release binary); `test.skip` is honored there and on Node.
+if (process.platform !== "win32") {
+  test.skip("binary detection on Windows honors PATHEXT");
+} else {
+  test("binary detection on Windows honors PATHEXT", () => {
+    withTempDir((dir) => {
+      const bin = join(dir, "codex.EXE");
+      writeFileSync(bin, "MZ");
+      assert.equal(findCodexBinary({ PATH: dir, PATHEXT: ".EXE;.BAT" }), bin);
+      assert.equal(findCodexBinary({ PATH: dir, PATHEXT: ".BAT" }), null);
+    });
   });
-});
+}
 
 test("pinnedModel: non-empty vendor model name passes through verbatim; blank refused", () => {
   assert.deepEqual(resolveCodexPinnedModel("gpt-5.1-codex-mini"), {
@@ -332,14 +335,7 @@ test("binary that vanishes at spawn → failed with reason binary-missing (proto
 // prompt is fixed and trivial, and the answer text is never printed.
 const LIVE_CODEX = findCodexBinary(process.env);
 const LIVE_MODEL = process.env.MADC_TEST_CODEX_LIVE_MODEL;
-// Boolean skip (bun 1.3.11's node:test shim runs a test whose `skip` is a string; a boolean is
-// honored there and on Node). Skip reasons: codex not on PATH, or MADC_TEST_CODEX_LIVE_MODEL
-// unset/blank (set it to a model your codex auth serves).
-const liveSkip = LIVE_CODEX === null || LIVE_MODEL === undefined || LIVE_MODEL.trim() === "";
-test("live: the real unmodified codex app-server answers one turn", {
-  skip: liveSkip,
-  timeout: 180_000,
-}, async () => {
+const liveAppServer = async (): Promise<void> => {
   const port = createCodexCodePort({ binaryPath: LIVE_CODEX as string });
   const { systemPrompt: _omit, ...request } = turnRequest({
     modelId: LIVE_MODEL as string,
@@ -348,4 +344,18 @@ test("live: the real unmodified codex app-server answers one turn", {
   const result = await port.streamTurn(request);
   assert.ok(result.text.length > 0, "empty result text");
   assert.ok(result.servedModel.length > 0, "no servedModel reported");
-});
+};
+// Skip reasons: codex not on PATH, or MADC_TEST_CODEX_LIVE_MODEL unset/blank (set it to a model
+// your codex auth serves). Conditional `test.skip` registration — bun 1.3.11's node:test shim
+// (CI) ignores the options-object `skip` entirely; `test.skip` is honored there and on Node.
+if (LIVE_CODEX === null || LIVE_MODEL === undefined || LIVE_MODEL.trim() === "") {
+  test.skip("live: the real unmodified codex app-server answers one turn");
+} else {
+  test(
+    "live: the real unmodified codex app-server answers one turn",
+    {
+      timeout: 180_000,
+    },
+    liveAppServer,
+  );
+}
