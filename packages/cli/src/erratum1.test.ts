@@ -24,6 +24,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { CliIO } from "./io.ts";
 import { main, parseTurnIdleMs } from "./main.ts";
+import { classifyMessage } from "./oneshot.ts";
 
 const LAUNCHER = fileURLToPath(new URL("./testing/cli-launcher.ts", import.meta.url));
 const DRIVER = fileURLToPath(new URL("./testing/oneshot-driver.ts", import.meta.url));
@@ -482,6 +483,47 @@ test("§3b N7: initialize result serverInfo and thread/start result full Thread 
     const out = parseJson(r.stdout);
     assert.equal(out.error?.message, "protocol violation: initialize returned an invalid result");
     assert.doesNotMatch(r.stdout + r.stderr, /Cannot read properties/);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("§3b classifier never throws: non-object JSON values classify as malformed; a null/[] line mid-turn → exit 3, no crash (Copilot PR #23)", {
+  timeout: 60_000,
+}, async () => {
+  // Unit: the classifier accepts unknown and treats non-object JSON values as N4-style malformed.
+  for (const value of [null, [], 7, "x"]) {
+    assert.deepEqual(classifyMessage(value), { kind: "n4", malformedError: false });
+  }
+  // End to end: the client routes a non-object line to protocolViolations; the CLI exits 3.
+  const sb = sandbox();
+  try {
+    const r = await runCli(sb, ["-p", "hi", "--json"], {
+      engine: FAKE,
+      env: { MADC_TEST_FAKE_SCENARIO: "json-null-line" },
+    });
+    assert.equal(r.code, 3, r.stdout + r.stderr);
+    assert.equal(
+      parseJson(r.stdout).error?.message,
+      "protocol violation: non-JSON line on engine stdout",
+    );
+    assert.equal(r.signal, null, "no crash");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("oneshot-driver: a non-numeric or non-positive ms knob is a clear harness error, never NaN (Copilot PR #23)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    const r = await runCli(sb, [], {
+      driver: true,
+      env: { MADC_TEST_FAKE_SCENARIO: "", MADC_TEST_TURN_IDLE_MS: "abc" },
+    });
+    assert.notEqual(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stderr, /MADC_TEST_TURN_IDLE_MS must be a positive integer/);
   } finally {
     sb.cleanup();
   }

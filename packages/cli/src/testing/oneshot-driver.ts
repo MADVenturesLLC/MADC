@@ -7,8 +7,24 @@
  */
 import { runOneShot } from "../oneshot.ts";
 
-const turnIdleMs = Number(process.env.MADC_TEST_TURN_IDLE_MS ?? "600000");
-const responseTimeoutMs = process.env.MADC_TEST_RESPONSE_TIMEOUT_MS;
+/** Positive-integer ms from a test env knob; anything else is a harness error, never NaN. */
+function readMsKnob(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(
+      `oneshot-driver: ${name} must be a positive integer (got ${JSON.stringify(raw)})`,
+    );
+  }
+  return value;
+}
+
+const turnIdleMs = readMsKnob("MADC_TEST_TURN_IDLE_MS", 600_000);
+const responseTimeoutMs =
+  process.env.MADC_TEST_RESPONSE_TIMEOUT_MS === undefined
+    ? undefined
+    : readMsKnob("MADC_TEST_RESPONSE_TIMEOUT_MS", 0);
 const code = await runOneShot(
   {
     stdout: process.stdout,
@@ -28,7 +44,7 @@ const code = await runOneShot(
     json: process.env.MADC_TEST_JSON === "1",
     home: process.env.MADC_HOME ?? "",
     turnIdleMs,
-    ...(responseTimeoutMs !== undefined ? { responseTimeoutMs: Number(responseTimeoutMs) } : {}),
+    ...(responseTimeoutMs !== undefined ? { responseTimeoutMs } : {}),
   },
 );
 process.exit(code);
