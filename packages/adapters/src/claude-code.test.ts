@@ -89,18 +89,21 @@ test("binary detection: PATH lookup finds an executable, misses nothing / non-ex
   });
 });
 
-// Skip reason: PATHEXT is Windows-only. Boolean `skip`: bun 1.3.11's node:test shim (CI) runs a
-// test whose `skip` is a string; a boolean is honored there and on Node.
-test("binary detection on Windows honors PATHEXT", {
-  skip: process.platform !== "win32",
-}, () => {
-  withTempDir((dir) => {
-    const bin = join(dir, "claude.EXE");
-    writeFileSync(bin, "MZ");
-    assert.equal(findClaudeBinary({ PATH: dir, PATHEXT: ".EXE;.BAT" }), bin);
-    assert.equal(findClaudeBinary({ PATH: dir, PATHEXT: ".BAT" }), null);
+// Skip reason on non-Windows: PATHEXT is Windows-only. Conditional `test.skip` registration —
+// bun 1.3.11's node:test shim (CI) ignores the options-object `skip` entirely (string or
+// boolean, verified against the release binary); `test.skip` is honored there and on Node.
+if (process.platform !== "win32") {
+  test.skip("binary detection on Windows honors PATHEXT");
+} else {
+  test("binary detection on Windows honors PATHEXT", () => {
+    withTempDir((dir) => {
+      const bin = join(dir, "claude.EXE");
+      writeFileSync(bin, "MZ");
+      assert.equal(findClaudeBinary({ PATH: dir, PATHEXT: ".EXE;.BAT" }), bin);
+      assert.equal(findClaudeBinary({ PATH: dir, PATHEXT: ".BAT" }), null);
+    });
   });
-});
+}
 
 test("pinnedModel: non-empty vendor model name passes through verbatim; blank refused", () => {
   assert.deepEqual(resolveClaudePinnedModel("opus"), { ok: true, modelId: "opus" });
@@ -213,12 +216,7 @@ test("binary that vanishes at spawn → failed with reason binary-missing (proto
 // this is skipped there (plan §10 A5). Nothing about the run is recorded beyond pass/fail — the
 // prompt is fixed and trivial, and the answer text is never printed.
 const LIVE_CLAUDE = findClaudeBinary(process.env);
-test("live: the real unmodified claude binary answers one headless turn", {
-  // Skip reason: claude not on PATH. Boolean `skip`: bun 1.3.11's node:test shim (CI) runs a
-  // test whose `skip` is a string; a boolean is honored there and on Node.
-  skip: LIVE_CLAUDE === null,
-  timeout: 180_000,
-}, async () => {
+const liveHeadless = async (): Promise<void> => {
   const port = createClaudeCodePort({ binaryPath: LIVE_CLAUDE as string });
   const { systemPrompt: _omit, ...request } = turnRequest({
     modelId: "sonnet",
@@ -227,4 +225,17 @@ test("live: the real unmodified claude binary answers one headless turn", {
   const result = await port.streamTurn(request);
   assert.ok(result.text.length > 0, "empty result text");
   assert.ok(result.servedModel.length > 0, "no servedModel reported");
-});
+};
+// Skip reason: claude not on PATH. Conditional `test.skip` registration — bun 1.3.11's node:test
+// shim (CI) ignores the options-object `skip` entirely; `test.skip` is honored there and on Node.
+if (LIVE_CLAUDE === null) {
+  test.skip("live: the real unmodified claude binary answers one headless turn");
+} else {
+  test(
+    "live: the real unmodified claude binary answers one headless turn",
+    {
+      timeout: 180_000,
+    },
+    liveHeadless,
+  );
+}
