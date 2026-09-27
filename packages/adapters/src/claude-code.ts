@@ -146,7 +146,6 @@ function streamClaudeTurn(
     }
     let stdout = "";
     let settled = false;
-    let spawnError: NodeJS.ErrnoException | null = null;
     // Escalation only: SIGTERM first, SIGKILL if the child outlives the grace window.
     let killTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -164,9 +163,9 @@ function streamClaudeTurn(
       killTimer.unref?.();
     };
 
-    child.on("error", (err: NodeJS.ErrnoException) => {
-      // The binary vanished between preflight detection and spawn (protocol pin §4.2).
-      spawnError = err;
+    child.on("error", () => {
+      // The binary vanished between preflight detection and spawn (protocol pin §4.2). 'close'
+      // always follows 'error', so the close handler's `settled` guard is enough below.
       fail(
         new ProviderCallError(
           "failed",
@@ -195,7 +194,6 @@ function streamClaudeTurn(
         fail(new ProviderCallError("aborted", null, "claude-code turn aborted"));
         return;
       }
-      if (spawnError !== null) return; // already reported via 'error'
       if (code !== 0) {
         fail(new ProviderCallError("failed", null, `claude-code child exited ${code ?? "null"}`));
         return;
