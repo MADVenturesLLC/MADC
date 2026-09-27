@@ -63,8 +63,9 @@ export type ClaudePinnedModelResolution =
 
 /**
  * `pinnedModel` for claude-code is the vendor model name (seat pin §2: alias like `opus` or a full
- * name like `claude-sonnet-4-5`) and is passed to the child verbatim via `--model`. M0 validates
- * shape only (non-empty); the vendor binary is the authority on which names it accepts.
+ * name like `claude-sonnet-4-5`); it is trimmed of surrounding whitespace and the trimmed value is
+ * passed to the child via `--model`. M0 validates shape only (non-empty); the vendor binary is the
+ * authority on which names it accepts.
  */
 export function resolveClaudePinnedModel(pinnedModel: string): ClaudePinnedModelResolution {
   const modelId = pinnedModel.trim();
