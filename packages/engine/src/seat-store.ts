@@ -84,21 +84,26 @@ type FileId = { readonly dev: bigint; readonly ino: bigint };
  * Create `path` exclusively (0600, no-follow), write all of `bytes`, fsync. `pinned()` (the
  * lstat-checked `seats/` is still that directory, dev + inode, at its real path) is re-checked
  * immediately before the open, so a swap before that point creates nothing anywhere. `isAt(path,
- * id)` must hold for the opened fd right after the open before a byte is written; otherwise the
- * seed fails, and the empty file it just created is removed only if `path` still names that very
- * inode (a swap in the check-to-open window can land it outside `seats/`; it never holds seed
+ * id)` must hold for the opened fd right after the open before a byte is written, and the fd must
+ * show `nlink == 1` (Amendment 3 item 4 rule 4: an inode created outside the home and hard-linked
+ * in at the temp name is refused before any seed byte reaches it, r4107279105 / D-181); otherwise
+ * the seed fails, and the empty file it just created is removed only if `path` still names that
+ * very inode (a swap in the check-to-open window can land it outside `seats/`; it never holds seed
  * bytes). If anything after that fails, the partial file is removed and the error rethrown — but
  * only while `isAt(path, id)` still holds: a `seats/` swapped after the open means the path may now
  * name an unrelated file, which is never unlinked (the orphaned dot-temp file is harmless: it is
  * never read as a seat). Node has no `openat` / `unlinkat`, so each check and the syscall after it
  * are two path operations; the window between them is the r4104462637 / r4105871146 residual.
+ *
+ * The fd stays OPEN on success (rule 4: the caller's post-link and post-unlink `nlink` counts are
+ * read from it); the caller closes it. On failure the fd is closed here.
  */
 function writeNewFile(
   path: string,
   bytes: Buffer,
   isAt: (p: string, id: FileId) => boolean,
   pinned: () => boolean,
-): FileId {
+): { id: FileId; fd: number } {
   if (!pinned()) {
     throw new Error("seats/ under MADC_HOME changed while the seed was being written");
   }
@@ -111,9 +116,12 @@ function writeNewFile(
   let id: FileId | null = null;
   let opened: FileId | null = null;
   try {
+    seedHooks.afterOpen?.(path);
     const st = fstatSync(fd, { bigint: true });
     opened = { dev: st.dev, ino: st.ino };
-    if (isAt(path, opened)) id = opened;
+    // nlink == 1 on the opened fd: a second name for this inode (hard-linked in between the open
+    // and this check) is caught before a byte is written.
+    if (st.nlink === 1n && isAt(path, opened)) id = opened;
   } catch {
     id = null;
   }
@@ -123,19 +131,16 @@ function writeNewFile(
     throw new Error("seats/ under MADC_HOME changed while the seed was being written");
   }
   try {
-    try {
-      seedHooks.beforeWrite?.(path);
-      let off = 0;
-      while (off < bytes.length) off += writeSync(fd, bytes, off, bytes.length - off);
-      fsyncSync(fd);
-    } finally {
-      closeSync(fd);
-    }
+    seedHooks.beforeWrite?.(path);
+    let off = 0;
+    while (off < bytes.length) off += writeSync(fd, bytes, off, bytes.length - off);
+    fsyncSync(fd);
   } catch (err) {
+    closeSync(fd);
     unlinkIfAt(path, id, isAt);
     throw err;
   }
-  return id;
+  return { id, fd };
 }
 
 /** Unlink `path` only if it still names the file `id` in the real `seats/` (best effort). */
@@ -183,7 +188,10 @@ function removeStrayLink(tmp: string, path: string): void {
  * Test seam (internal): hooks just before the seed's temp file is opened / written / linked, and
  * right after each home subdirectory passes its lstat check (before its mode is tightened), and
  * `afterPinCheck`: after the last `seats/` identity re-check, immediately before the path-based
- * `open` / `link` syscall (the residual window Node cannot close).
+ * `open` / `link` syscall (the residual window Node cannot close). `afterOpen` runs between the
+ * temp open and its fstat checks (Amendment 3 4d); `afterLink` runs between `link()` and the
+ * post-link checks (4f); `afterProofOpen` runs inside the `created:false` proof between the open
+ * and its lstat (F2); `link` replaces the link syscall (4c).
  */
 export type SeedTestHooks = {
   beforeOpen?: () => void;
@@ -191,6 +199,10 @@ export type SeedTestHooks = {
   beforeLink?: (tmp: string) => void;
   afterDirCheck?: (dir: string) => void;
   afterPinCheck?: (step: "open" | "link", path: string) => void;
+  afterOpen?: (path: string) => void;
+  afterLink?: (tmp: string, path: string) => void;
+  afterProofOpen?: (path: string) => void;
+  link?: (tmp: string, path: string) => void;
 };
 let seedHooks: SeedTestHooks = {};
 export function setSeedHooksForTests(hooks: SeedTestHooks | null): void {
@@ -208,6 +220,46 @@ export type SeedResult = {
   /** false when the file already existed (it is never overwritten). */
   readonly created: boolean;
 };
+
+/**
+ * Amendment 3 item 4 rules 1–3: `created:false` is returned only after every one of these checks
+ * passes on the existing file, opened without following symlinks and without blocking
+ * (`O_RDONLY|O_NOFOLLOW|O_NONBLOCK`, or the `openNoFollow` fallback): the opened fd's dev and inode
+ * equal `lstat(path)`'s, it is a regular file, `nlink == 1`, and `path` resolves strictly under
+ * realpath(`$MADC_HOME`), inside the pinned `seats/`. Any failed or impossible check (a symlink,
+ * directory, FIFO, a hard-linked file, a path that vanished after `EEXIST`, a `seats/` that is no
+ * longer pinned) is an ERROR here, never `created:false` — an `EEXIST` from the link or the
+ * exclusive create is never itself proof of an existing seat (r4107279162 / D-182).
+ */
+function proveExistingSeat(
+  path: string,
+  home: string,
+  realSeats: string,
+  seatsPinned: () => boolean,
+): void {
+  const fd = openNoFollow(path, {});
+  if (fd === null) throw new Error("seat file vanished before its existence could be proven");
+  if (fd === "symlink") throw new Error("seat file is a symlink, not an existing seat");
+  try {
+    const st = fstatSync(fd, { bigint: true });
+    if (!st.isFile()) throw new Error("seat path is not a regular file");
+    seedHooks.afterProofOpen?.(path);
+    const now = lstatSync(path, { bigint: true });
+    if (now.dev !== st.dev || now.ino !== st.ino) {
+      throw new Error("seat file changed while it was being proven");
+    }
+    if (st.nlink !== 1n) throw new Error("seat file has more than one name (nlink > 1)");
+    const real = realpathSync(path);
+    if (!isStrictlyUnder(real, realpathSync(home))) {
+      throw new Error("seat file resolves outside MADC_HOME");
+    }
+    if (dirname(real) !== realSeats || !seatsPinned()) {
+      throw new Error("seat file is not in the pinned seats/ directory");
+    }
+  } finally {
+    closeSync(fd);
+  }
+}
 
 /**
  * Create `$MADC_HOME` with `seats/`, `sessions/`, `memory/` (0700) and write
@@ -241,12 +293,6 @@ export function seedDefaultSeat(home: string): SeedResult {
     if (sub === "seats") seatsId = { dev: st.dev, ino: st.ino };
   }
   const path = seatFilePath(home, MADC_DEFAULT_SEAT.id);
-  try {
-    lstatSync(path);
-    return { path, created: false };
-  } catch (err) {
-    if (errCode(err) !== "ENOENT") throw err;
-  }
   // Every file the seed creates must sit in this real seats/ directory (the one lstat-checked
   // above, pinned by dev + inode), strictly under the real home. Node has no openat / linkat, so
   // the pin is re-checked immediately before each path-based open and link, then again on the
@@ -269,6 +315,22 @@ export function seedDefaultSeat(home: string): SeedResult {
   if (!isStrictlyUnder(realSeats, realpathSync(home)) || !seatsPinned()) {
     throw new Error("seats under MADC_HOME must be a real directory");
   }
+  // Only this first existence probe may treat ENOENT as "create" (Amendment 3 item 4 rule 3).
+  let exists = true;
+  try {
+    lstatSync(path);
+  } catch (err) {
+    if (errCode(err) !== "ENOENT") throw err;
+    exists = false;
+  }
+  if (exists) {
+    // Amendment 3 item 4 rule 1: `created:false` only after the opened-fd proof; anything else
+    // at the path (symlink, directory, FIFO, hard-linked file, not in the pinned seats/) is an
+    // error, never "already seeded" — and so is an ENOENT from a file that vanished after the
+    // probe above (rule 3: a vanished path is an error, never `created:false` and never "create").
+    proveExistingSeat(path, home, realSeats, seatsPinned);
+    return { path, created: false };
+  }
   const isAt = (p: string, id: FileId): boolean => {
     if (!seatsPinned()) return false;
     const st = lstatSync(p, { bigint: true });
@@ -280,48 +342,76 @@ export function seedDefaultSeat(home: string): SeedResult {
     `.${MADC_DEFAULT_SEAT.id}.json.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
   );
   seedHooks.beforeOpen?.();
-  const tmpId = writeNewFile(tmp, bytes, isAt, seatsPinned);
+  const written = writeNewFile(tmp, bytes, isAt, seatsPinned);
+  const tmpId = written.id;
+  const tmpFd = written.fd; // rule 4: stays open through the link and the temp unlink
   const linkChanged = () =>
     new Error("seats/ under MADC_HOME changed while the seed was being linked");
   try {
+    let created: boolean;
     try {
-      seedHooks.beforeLink?.(tmp);
-      // Re-pin immediately before the path-based link: a swap before this point links nothing.
-      if (!isAt(tmp, tmpId)) throw linkChanged();
-      seedHooks.afterPinCheck?.("link", path);
-      linkSync(tmp, path);
-      if (!isAt(path, tmpId)) {
-        // A swap in the check-to-link gap: undo the name the link just created, then fail.
-        removeStrayLink(tmp, path);
-        throw linkChanged();
+      try {
+        seedHooks.beforeLink?.(tmp);
+        // Re-pin immediately before the path-based link: a swap before this point links nothing.
+        if (!isAt(tmp, tmpId)) throw linkChanged();
+        seedHooks.afterPinCheck?.("link", path);
+        (seedHooks.link ?? linkSync)(tmp, path);
+        seedHooks.afterLink?.(tmp, path);
+        // Rule 4: on the still-open temp fd the inode now has two names, and the path names it.
+        if (fstatSync(tmpFd, { bigint: true }).nlink !== 2n || !isAt(path, tmpId)) {
+          // A swap in the check-to-link gap: undo the name the link just created, then fail.
+          removeStrayLink(tmp, path);
+          throw linkChanged();
+        }
+        created = true;
+      } catch (err) {
+        const code = errCode(err);
+        // An existing file only counts as "already seeded" after the rule 2 proof: an EEXIST is
+        // never itself proof of an existing seat (r4107279162 / D-182), and one from a link that
+        // resolved through a swapped directory fails closed (r4106539531).
+        if (code === "EEXIST") {
+          if (!seatsPinned()) throw linkChanged();
+          proveExistingSeat(path, home, realSeats, seatsPinned);
+          created = false;
+        } else {
+          if (!NO_HARD_LINKS.has(code ?? "")) throw err;
+          // Filesystem without hard links: exclusive create in place; a failed write removes
+          // the partial file before rethrowing. `created` is true ONLY on this successful
+          // in-place write — an EEXIST here means another seeder won and stays `created:false`
+          // after the proof (F3).
+          try {
+            const fallback = writeNewFile(path, bytes, isAt, seatsPinned);
+            closeSync(fallback.fd);
+            created = true;
+          } catch (werr) {
+            if (errCode(werr) === "EEXIST") {
+              if (!seatsPinned()) {
+                throw new Error("seats/ under MADC_HOME changed while the seed was being written");
+              }
+              proveExistingSeat(path, home, realSeats, seatsPinned);
+              created = false;
+            } else {
+              throw werr;
+            }
+          }
+        }
       }
     } catch (err) {
-      const code = errCode(err);
-      // An existing file only counts as "already seeded" in the pinned seats/: an EEXIST from a
-      // link that resolved through a swapped directory fails closed (r4106539531).
-      if (code === "EEXIST") {
-        if (!seatsPinned()) throw linkChanged();
-        return { path, created: false };
-      }
-      if (!NO_HARD_LINKS.has(code ?? "")) throw err;
-      // Filesystem without hard links: exclusive create in place; a failed write removes
-      // the partial file before rethrowing.
-      try {
-        writeNewFile(path, bytes, isAt, seatsPinned);
-      } catch (werr) {
-        if (errCode(werr) === "EEXIST") {
-          if (!seatsPinned()) {
-            throw new Error("seats/ under MADC_HOME changed while the seed was being written");
-          }
-          return { path, created: false };
-        }
-        throw werr;
-      }
+      // Only our own temp file, still in the real seats/ (a leftover dot-temp is never read as a seat).
+      unlinkIfAt(tmp, tmpId, isAt);
+      throw err;
     }
-    return { path, created: true };
-  } finally {
-    // Only our own temp file, still in the real seats/ (a leftover dot-temp is never read as a seat).
+    // The seed's own temp name goes best effort (as today); a created inode then shows one name
+    // again on the still-open fd (rule 4). A created:false temp inode is gone (nlink 0, unchecked).
     unlinkIfAt(tmp, tmpId, isAt);
+    if (created && fstatSync(tmpFd, { bigint: true }).nlink !== 1n) throw linkChanged();
+    return { path, created };
+  } finally {
+    try {
+      closeSync(tmpFd);
+    } catch {
+      // best effort; the counts above already ran
+    }
   }
 }
 

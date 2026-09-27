@@ -118,6 +118,25 @@ function noGroupOtherBits(
 const ESCAPES = "Resolved path escapes MADC_HOME";
 
 /**
+ * Amendment 3 item 5 rule 5 (engine and doctor alike): the four-digit octal mode of `dir` when
+ * its owner-read bit is clear, else `null`. A `sessions/` that lacks owner read is unsupported in
+ * M0: the Amendment 2 §4 directory fsync needs owner read. Decided from the `lstat` mode bits,
+ * never from whether an `open` or `readdir` succeeds, so the answer is the same when running as
+ * root. Windows: always `null` (the directory fsync is a best-effort no-op there).
+ */
+export function sessionsOwnerReadUnsupported(dir: string): string | null {
+  if (process.platform === "win32") return null;
+  let st: ReturnType<typeof lstatSync>;
+  try {
+    st = lstatSync(dir);
+  } catch {
+    return null;
+  }
+  if ((st.mode & 0o400) !== 0) return null;
+  return (st.mode & 0o7777).toString(8).padStart(4, "0");
+}
+
+/**
  * Ensure `$MADC_HOME/<subdir>` is a real directory (not a symlink) without touching anything
  * outside `$MADC_HOME`: the component is `lstat`ed first and a symlink / non-directory is rejected
  * BEFORE any mkdir or chmod; only a missing component is created (non-recursively, so an existing

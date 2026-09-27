@@ -34,10 +34,10 @@ import {
   GENESIS_HASH,
   REDACTED,
   rebuildSession,
-  SessionWriter,
   sessionEventHash,
   setSessionWriteForTests,
   sortedKeyJson,
+  unguardedSessionWriterForTests,
   verifySessionFile,
   verifySessionText,
 } from "./session-store.ts";
@@ -255,7 +255,7 @@ test("sortedKeyJson: recursive key sort, array order kept, undefined keys omitte
 function writeSampleSession(dir: string): string {
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "thr_sample.jsonl");
-  const w = SessionWriter.create(
+  const w = unguardedSessionWriterForTests.create(
     path,
     "thr_sample",
     "madc-default",
@@ -846,7 +846,7 @@ test("R-proto: a __proto__ payload key is canonicalized, hashed, and redacted as
   try {
     mkdirSync(home, { recursive: true });
     const path = join(home, "thr_proto.jsonl");
-    const w = SessionWriter.create(
+    const w = unguardedSessionWriterForTests.create(
       path,
       "thr_proto",
       "madc-default",
@@ -1058,7 +1058,7 @@ test("R-fifo: a session file swapped for a FIFO fails the append with -32009 (ne
   try {
     const path = writeSampleSession(home);
     const lines = readLines(path);
-    const w = SessionWriter.resume(
+    const w = unguardedSessionWriterForTests.resume(
       path,
       "thr_sample",
       "madc-default",
@@ -1321,7 +1321,7 @@ test("appendAll: a failed write is rolled back to the previous size and breaks t
   try {
     const path = writeSampleSession(home);
     const before = readFileSync(path, "utf8");
-    const w = SessionWriter.resume(
+    const w = unguardedSessionWriterForTests.resume(
       path,
       "thr_sample",
       "madc-default",
@@ -1347,7 +1347,7 @@ test("appendAll: a failed write is rolled back to the previous size and breaks t
     );
     assert.equal(readFileSync(path, "utf8"), before);
     // A successful batch: consecutive seqs, chained, one unit.
-    const ok = SessionWriter.resume(
+    const ok = unguardedSessionWriterForTests.resume(
       path,
       "thr_sample",
       "madc-default",

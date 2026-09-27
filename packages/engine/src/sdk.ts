@@ -23,7 +23,7 @@ export {
   spawnEngine,
   type WireMessage,
 } from "./client.ts";
-export { resolveMadcHome } from "./home.ts";
+export { resolveMadcHome, sessionsOwnerReadUnsupported } from "./home.ts";
 export {
   type HomeReport,
   inspectMadcHome,

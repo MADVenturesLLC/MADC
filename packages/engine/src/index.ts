@@ -21,7 +21,12 @@ export {
   spawnEngine,
   type WireMessage,
 } from "./client.ts";
-export { confinedPath, type HomeSubdir, resolveMadcHome } from "./home.ts";
+export {
+  confinedPath,
+  type HomeSubdir,
+  resolveMadcHome,
+  sessionsOwnerReadUnsupported,
+} from "./home.ts";
 export {
   type HomeReport,
   inspectMadcHome,
