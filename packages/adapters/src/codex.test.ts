@@ -100,8 +100,10 @@ test("binary detection: PATH lookup finds an executable, misses nothing / non-ex
   });
 });
 
+// Skip reason: PATHEXT is Windows-only. Boolean `skip`: bun 1.3.11's node:test shim (CI) runs a
+// test whose `skip` is a string; a boolean is honored there and on Node.
 test("binary detection on Windows honors PATHEXT", {
-  skip: process.platform !== "win32" ? "PATHEXT is Windows-only" : false,
+  skip: process.platform !== "win32",
 }, () => {
   withTempDir((dir) => {
     const bin = join(dir, "codex.EXE");
@@ -330,12 +332,10 @@ test("binary that vanishes at spawn → failed with reason binary-missing (proto
 // prompt is fixed and trivial, and the answer text is never printed.
 const LIVE_CODEX = findCodexBinary(process.env);
 const LIVE_MODEL = process.env.MADC_TEST_CODEX_LIVE_MODEL;
-const liveSkip =
-  LIVE_CODEX === null
-    ? "codex not on PATH"
-    : LIVE_MODEL === undefined || LIVE_MODEL.trim() === ""
-      ? "set MADC_TEST_CODEX_LIVE_MODEL to a model your codex auth serves"
-      : false;
+// Boolean skip (bun 1.3.11's node:test shim runs a test whose `skip` is a string; a boolean is
+// honored there and on Node). Skip reasons: codex not on PATH, or MADC_TEST_CODEX_LIVE_MODEL
+// unset/blank (set it to a model your codex auth serves).
+const liveSkip = LIVE_CODEX === null || LIVE_MODEL === undefined || LIVE_MODEL.trim() === "";
 test("live: the real unmodified codex app-server answers one turn", {
   skip: liveSkip,
   timeout: 180_000,
