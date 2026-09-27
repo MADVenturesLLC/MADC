@@ -380,11 +380,13 @@ export class SessionWriter {
     open: SessionOpenPayload,
     secrets: () => readonly string[],
     ts: number = Date.now(),
-    home?: string,
-    guards?: SessionWriterGuards,
+    home: string | undefined,
+    guards: SessionWriterGuards,
     hooks: SessionWriterHooks = {},
   ): SessionWriter {
-    // Amendment 3 item 3 (Option A): no guardless writer by omission (3c: type level + run time).
+    // Amendment 3 item 3 (Option A): `guards` is a required parameter — omitting it (or a
+    // holdsLock that is not a function) is a tsc error AND a run-time throw (3c; Founder: fix it,
+    // no deviation).
     if (typeof guards?.holdsLock !== "function") {
       throw new TypeError("SessionWriter.create requires a holdsLock guard (Amendment 3 item 3)");
     }
@@ -467,12 +469,13 @@ export class SessionWriter {
     nextSeq: number,
     lastHash: string,
     secrets: () => readonly string[],
-    home?: string,
-    verifiedFile?: SessionFileId,
-    guards?: SessionResumeGuards,
+    home: string | undefined,
+    verifiedFile: SessionFileId | undefined,
+    guards: SessionResumeGuards,
     hooks: SessionWriterHooks = {},
   ): SessionWriter {
-    // Amendment 3 item 3 (Option A): resume binds the lock and the verified size, no defaults.
+    // Amendment 3 item 3 (Option A): `guards` is a required parameter — resume binds the lock and
+    // the verified size, and omitting either is a tsc error AND a run-time throw (3c).
     if (typeof guards?.holdsLock !== "function") {
       throw new TypeError("SessionWriter.resume requires a holdsLock guard (Amendment 3 item 3)");
     }

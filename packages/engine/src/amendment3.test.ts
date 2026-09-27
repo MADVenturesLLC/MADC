@@ -17,6 +17,7 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -358,7 +359,8 @@ test("A3 1b (b): rollback failed → poisoned for the process life; every later 
       const err = m.error as { code: number; data: { path: string; seq: number } };
       assert.equal(err.code, -32009, JSON.stringify(m));
       assert.equal(err.data.seq, firstRefusedSeq, "C2 entry: first seq of the refused batch");
-      assert.equal(err.data.path, path, "C2 entry: the session file");
+      // C2 carries the engine's confined (realpath) path, not the lexical mkdtemp path (F1).
+      assert.equal(err.data.path, realpathSync(path), "C2 entry: the session file");
     };
     expectRefusal(await e.request("turn/start", { threadId: t, input: text("second") }));
     setSessionFsyncForTests(null); // no more injected failures; the poisoned answer needs no I/O
@@ -515,7 +517,8 @@ test("A3 1b (p-r): poisoned inside a reload → -32009 with the close batch's fi
       const err = m.error as { code: number; data: { path: string; seq: number } };
       assert.equal(err.code, -32009, JSON.stringify(m));
       assert.equal(err.data.seq, closeFirstSeq, "the close batch's first seq");
-      assert.equal(err.data.path, path, "the session file");
+      // C2 carries the engine's confined (realpath) path, not the lexical mkdtemp path (F1).
+      assert.equal(err.data.path, realpathSync(path), "the session file");
     };
     const r = await e.request("thread/resume", { threadId: "thr_pr" });
     expectRefusal(r);
@@ -837,62 +840,39 @@ test("A3 3b (kills 17-D): an external append between verification and resume fai
   }
 });
 
-test("A3 3c: create / resume without the guards fail at run time (the type level rejects them too)", () => {
+test("A3 3c: create / resume without the guards fail at the type level (tsc) and at run time", () => {
   const { home, cleanup } = makeHome();
   try {
     const path = join(home, "sessions", "thr_guard.jsonl");
     mkdirSync(join(home, "sessions"), { recursive: true });
-    assert.throws(
-      () =>
-        SessionWriter.create(
-          path,
-          "thr_guard",
-          "madc-default",
-          SAMPLE_OPEN,
-          () => [],
-          1000,
-          home,
-          undefined as never,
-        ),
-      TypeError,
-    );
-    assert.throws(
-      () =>
-        SessionWriter.create(path, "thr_guard", "madc-default", SAMPLE_OPEN, () => [], 1000, home, {
-          holdsLock: undefined,
-        } as never),
-      TypeError,
-    );
-    assert.throws(
-      () =>
-        SessionWriter.resume(
-          path,
-          "thr_guard",
-          "madc-default",
-          1,
-          GENESIS_HASH,
-          () => [],
-          home,
-          undefined,
-          undefined as never,
-        ),
-      TypeError,
-    );
-    assert.throws(
-      () =>
-        SessionWriter.resume(
-          path,
-          "thr_guard",
-          "madc-default",
-          1,
-          GENESIS_HASH,
-          () => [],
-          home,
-          undefined,
-          { holdsLock: () => true } as never, // expectedSize missing
-        ),
-      TypeError,
-    );
+    assert.throws(() => {
+      // @ts-expect-error Amendment 3 item 3: `guards` is a required parameter
+      SessionWriter.create(path, "thr_guard", "madc-default", SAMPLE_OPEN, () => [], 1000, home);
+    }, TypeError);
+    assert.throws(() => {
+      SessionWriter.create(path, "thr_guard", "madc-default", SAMPLE_OPEN, () => [], 1000, home, {
+        // @ts-expect-error Amendment 3 item 3: holdsLock must be a function
+        holdsLock: undefined,
+      });
+    }, TypeError);
+    assert.throws(() => {
+      // @ts-expect-error Amendment 3 item 3: `guards` is a required parameter
+      SessionWriter.resume(path, "thr_guard", "madc-default", 1, GENESIS_HASH, () => [], home);
+    }, TypeError);
+    assert.throws(() => {
+      SessionWriter.resume(
+        path,
+        "thr_guard",
+        "madc-default",
+        1,
+        GENESIS_HASH,
+        () => [],
+        home,
+        undefined,
+        // @ts-expect-error Amendment 3 item 3: resume requires the verified expectedSize
+        { holdsLock: () => true },
+      );
+    }, TypeError);
     assert.equal(existsSync(path), false, "no file created by the refused calls");
   } finally {
     cleanup();
@@ -1124,6 +1104,58 @@ test("A3 4f: a post-link path swap inside the pinned seats/ is caught by the dev
       readdirSync(seats).filter((n) => n.endsWith(".tmp")),
       [],
       "the seed's own temp name is removed",
+    );
+  } finally {
+    setSeedHooksForTests(null);
+    cleanup();
+  }
+});
+
+test("A3 4h (F2): a seat file that vanishes between the first lstat and the opened-fd proof is an error — never 'create', never created:false", () => {
+  const { home, cleanup } = makeHome();
+  setSeedHooksForTests({
+    afterProofOpen: (p) => {
+      rmSync(p); // vanished after the existence probe, mid-proof (rule 3: an error)
+    },
+  });
+  try {
+    assert.equal(seedDefaultSeat(home).created, true, "first seed lands");
+    assert.throws(() => seedDefaultSeat(home), /ENOENT|vanished/);
+  } finally {
+    setSeedHooksForTests(null);
+    cleanup();
+  }
+});
+
+test("A3 4i (F3): on a no-hard-links filesystem, an EEXIST from the in-place create stays created:false after the proof", () => {
+  if (!POSIX) {
+    console.log("SKIP A3 4i: hard-link semantics are POSIX-only here");
+    return;
+  }
+  const { home, cleanup } = makeHome();
+  const seats = join(home, "seats");
+  const path = join(seats, "madc-default.json");
+  setSeedHooksForTests({
+    afterPinCheck: (step, p) => {
+      // A concurrent seeder lands between the first probe's ENOENT and the fallback create.
+      if (step === "link") writeFileSync(p, serializeSeat(MADC_DEFAULT_SEAT));
+    },
+    link: () => {
+      throw Object.assign(new Error("ENOTSUP: operation not supported"), { code: "ENOTSUP" });
+    },
+  });
+  try {
+    const result = seedDefaultSeat(home);
+    assert.deepEqual(
+      result,
+      { path, created: false },
+      "the winning seeder's file is proven, not re-created",
+    );
+    assert.equal(readFileSync(path, "utf8"), serializeSeat(MADC_DEFAULT_SEAT), "bytes untouched");
+    assert.deepEqual(
+      readdirSync(seats).filter((n) => n.endsWith(".tmp")),
+      [],
+      "the loser's temp name is removed",
     );
   } finally {
     setSeedHooksForTests(null);

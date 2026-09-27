@@ -190,7 +190,8 @@ function removeStrayLink(tmp: string, path: string): void {
  * `afterPinCheck`: after the last `seats/` identity re-check, immediately before the path-based
  * `open` / `link` syscall (the residual window Node cannot close). `afterOpen` runs between the
  * temp open and its fstat checks (Amendment 3 4d); `afterLink` runs between `link()` and the
- * post-link checks (4f); `link` replaces the link syscall (4c).
+ * post-link checks (4f); `afterProofOpen` runs inside the `created:false` proof between the open
+ * and its lstat (F2); `link` replaces the link syscall (4c).
  */
 export type SeedTestHooks = {
   beforeOpen?: () => void;
@@ -200,6 +201,7 @@ export type SeedTestHooks = {
   afterPinCheck?: (step: "open" | "link", path: string) => void;
   afterOpen?: (path: string) => void;
   afterLink?: (tmp: string, path: string) => void;
+  afterProofOpen?: (path: string) => void;
   link?: (tmp: string, path: string) => void;
 };
 let seedHooks: SeedTestHooks = {};
@@ -241,6 +243,7 @@ function proveExistingSeat(
   try {
     const st = fstatSync(fd, { bigint: true });
     if (!st.isFile()) throw new Error("seat path is not a regular file");
+    seedHooks.afterProofOpen?.(path);
     const now = lstatSync(path, { bigint: true });
     if (now.dev !== st.dev || now.ino !== st.ino) {
       throw new Error("seat file changed while it was being proven");
@@ -312,15 +315,21 @@ export function seedDefaultSeat(home: string): SeedResult {
   if (!isStrictlyUnder(realSeats, realpathSync(home)) || !seatsPinned()) {
     throw new Error("seats under MADC_HOME must be a real directory");
   }
+  // Only this first existence probe may treat ENOENT as "create" (Amendment 3 item 4 rule 3).
+  let exists = true;
   try {
     lstatSync(path);
-    // Amendment 3 item 4 rule 1: `created:false` only after the opened-fd proof; anything else
-    // at the path (symlink, directory, FIFO, hard-linked file, not in the pinned seats/) is an
-    // error, never "already seeded".
-    proveExistingSeat(path, home, realSeats, seatsPinned);
-    return { path, created: false };
   } catch (err) {
     if (errCode(err) !== "ENOENT") throw err;
+    exists = false;
+  }
+  if (exists) {
+    // Amendment 3 item 4 rule 1: `created:false` only after the opened-fd proof; anything else
+    // at the path (symlink, directory, FIFO, hard-linked file, not in the pinned seats/) is an
+    // error, never "already seeded" — and so is an ENOENT from a file that vanished after the
+    // probe above (rule 3: a vanished path is an error, never `created:false` and never "create").
+    proveExistingSeat(path, home, realSeats, seatsPinned);
+    return { path, created: false };
   }
   const isAt = (p: string, id: FileId): boolean => {
     if (!seatsPinned()) return false;
@@ -367,10 +376,13 @@ export function seedDefaultSeat(home: string): SeedResult {
         } else {
           if (!NO_HARD_LINKS.has(code ?? "")) throw err;
           // Filesystem without hard links: exclusive create in place; a failed write removes
-          // the partial file before rethrowing.
+          // the partial file before rethrowing. `created` is true ONLY on this successful
+          // in-place write — an EEXIST here means another seeder won and stays `created:false`
+          // after the proof (F3).
           try {
             const fallback = writeNewFile(path, bytes, isAt, seatsPinned);
             closeSync(fallback.fd);
+            created = true;
           } catch (werr) {
             if (errCode(werr) === "EEXIST") {
               if (!seatsPinned()) {
@@ -382,7 +394,6 @@ export function seedDefaultSeat(home: string): SeedResult {
               throw werr;
             }
           }
-          created = true;
         }
       }
     } catch (err) {
