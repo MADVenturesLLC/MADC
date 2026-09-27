@@ -3,8 +3,12 @@
 MAD's local-first agent platform: one engine, named seats, any subscription.
 
 > **Status:** build gate **OPEN** for madc. ADRs **0001–0003** are **ACCEPTED**.
-> Scaffold / package skeleton only — no engine loop, protocol host, or adapters yet
-> (those land in later M0 acts per [PLAN-madc-M0-build-plan.md](docs/plan/PLAN-madc-M0-build-plan.md)).
+> M0 vertical slice in flight per
+> [PLAN-madc-M0-build-plan.md](docs/plan/PLAN-madc-M0-build-plan.md): the engine
+> (thread/turn/item protocol host, hash-chained sessions), the provider registry with
+> enforcement, the Kimi Code direct-key seat, and the thin CLI are on main; the Claude
+> Code and Codex app-server backings land with acts A5/A6; act A9 (evidence freeze) is
+> still open. See [docs/runbook/M0.md](docs/runbook/M0.md).
 
 ## The idea
 
