@@ -1,8 +1,15 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
-import { type CliIO, processIO } from "./io.ts";
-import { main } from "./main.ts";
+import { installEarlySignal, takeEarlySignal } from "./early-signal.ts";
+import type { CliIO } from "./io.ts";
+
+// §3e E6/E7: the backstop must be live BEFORE the rest of the module tree is evaluated. This
+// module's static graph is deliberately tiny (node builtins + early-signal.ts); `io.ts` and
+// `main.ts` (which pulls in doctor, the one-shot and the engine client) are imported dynamically
+// inside `runBin`, under the backstop. Type stripping loads the whole static graph before any of
+// it runs, so a static first-import cannot arm the backstop early enough.
+installEarlySignal();
 
 /**
  * §3e E12: a write error (EPIPE included) on the CLI's own stdout or stderr stops further writes
@@ -60,6 +67,7 @@ function flushed(stream: NodeJS.WriteStream, dead: () => boolean): Promise<void>
  * receipt) have flushed (Copilot r4107601166: never exit with the receipt still buffered).
  */
 export async function runBin(engineEntry?: string): Promise<void> {
+  const [{ processIO }, { main }] = await Promise.all([import("./io.ts"), import("./main.ts")]);
   const stdout = guardStream(process.stdout);
   const stderr = guardStream(process.stderr);
   const base = processIO(engineEntry);
@@ -77,6 +85,9 @@ export async function runBin(engineEntry?: string): Promise<void> {
     ...(base.engineEntry !== undefined ? { engineEntry: base.engineEntry } : {}),
   };
   const code = await main(process.argv.slice(2), io);
+  // A command that installs no listeners of its own (--version, --help, usage failures) never
+  // takes the backstop: drop it here so a signal during the flush keeps default handling (F-102).
+  takeEarlySignal();
   process.exitCode = code;
   await Promise.all([flushed(process.stdout, stdout.dead), flushed(process.stderr, stderr.dead)]);
   process.exit(code);

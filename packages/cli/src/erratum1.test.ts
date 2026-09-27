@@ -537,15 +537,23 @@ test("§3c 1/7/8: the idle deadline fires → exit 3, sticky message once, inter
   const sb = sandbox();
   try {
     const mark = join(sb.root, "mark");
-    const t0 = Date.now();
-    const r = await runCli(sb, ["-p", "hi"], {
+    const run = runCli(sb, ["-p", "hi"], {
       engine: FAKE,
       env: {
         MADC_TEST_FAKE_SCENARIO: "silent-turn",
         MADC_TURN_IDLE_MS: "500",
         MADC_TEST_FAKE_MARK: mark,
       },
+      onSpawn: (child) => {
+        setTimeout(() => child.kill("SIGKILL"), 15_000).unref();
+      },
     });
+    // t0 = the fake's turn.start session append: the idle clock arms with the turn/start
+    // response, so the pinned deadline + grace + kill budget is measured from there, not from
+    // process spawn (module load on a slow runner is not part of the run).
+    await waitForSessionFile(sb.home, "turn.start");
+    const t0 = Date.now();
+    const r = await run;
     const ms = Date.now() - t0;
     assert.equal(r.code, 3, r.stdout + r.stderr);
     const hits = r.stderr.split("timeout: no engine message for 500 ms").length - 1;
@@ -564,11 +572,18 @@ test("§3c 2: unknown notifications every 100 ms do not delay the deadline", {
 }, async () => {
   const sb = sandbox();
   try {
-    const t0 = Date.now();
-    const r = await runCli(sb, ["-p", "hi", "--json"], {
+    const run = runCli(sb, ["-p", "hi", "--json"], {
       engine: FAKE,
       env: { MADC_TEST_FAKE_SCENARIO: "unknown-storm-turn", MADC_TURN_IDLE_MS: "500" },
+      onSpawn: (child) => {
+        setTimeout(() => child.kill("SIGKILL"), 15_000).unref();
+      },
     });
+    // Same anchor as §3c 1/7/8: the deadline budget runs from the fake's turn.start append (the
+    // idle clock's arm), not from process spawn.
+    await waitForSessionFile(sb.home, "turn.start");
+    const t0 = Date.now();
+    const r = await run;
     const ms = Date.now() - t0;
     assert.equal(r.code, 3, r.stdout + r.stderr);
     assert.equal(parseJson(r.stdout).error?.message, "timeout: no engine message for 500 ms");
@@ -645,15 +660,25 @@ test("§3c 9: SIGINT / SIGTERM during the timeout grace force at once (130 / 143
   ] as const) {
     const sb = sandbox();
     try {
+      const mark = join(sb.root, "mark");
       let signalledAt = 0;
       const r = await runCli(sb, ["-p", "hi", "--json"], {
         engine: FAKE,
-        env: { MADC_TEST_FAKE_SCENARIO: "silent-turn", MADC_TURN_IDLE_MS: "500" },
+        env: {
+          MADC_TEST_FAKE_SCENARIO: "silent-turn",
+          MADC_TURN_IDLE_MS: "500",
+          MADC_TEST_FAKE_MARK: mark,
+        },
         onSpawn: (child) => {
-          setTimeout(() => {
-            signalledAt = Date.now();
-            child.kill(signal);
-          }, 1_200);
+          // Signal once the idle deadline has fired and the interrupt grace has begun (the fake
+          // records the turn/interrupt): a fixed delay races module load plus the 500 ms idle
+          // clock on a slower runner, and a signal before the grace starts a FRESH grace.
+          waitForFile(mark, "turn/interrupt")
+            .then(() => {
+              signalledAt = Date.now();
+              child.kill(signal);
+            })
+            .catch(() => child.kill("SIGKILL"));
           setTimeout(() => child.kill("SIGKILL"), 15_000).unref();
         },
       });

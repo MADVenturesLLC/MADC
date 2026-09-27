@@ -38,11 +38,22 @@ export class ProviderCallError extends Error {
   readonly kind: "aborted" | "failed";
   /** Upstream HTTP status when one was received. */
   readonly status: number | null;
+  /**
+   * Pinned -32008 reason when the failure means the provider cannot run at all (A5: the vendor
+   * binary vanished between preflight and spawn). Absent for ordinary call failures (-32603).
+   */
+  readonly reason?: "binary-missing";
 
-  constructor(kind: "aborted" | "failed", status: number | null, message: string) {
+  constructor(
+    kind: "aborted" | "failed",
+    status: number | null,
+    message: string,
+    reason?: "binary-missing",
+  ) {
     super(message);
     this.name = "ProviderCallError";
     this.kind = kind;
     this.status = status;
+    if (reason !== undefined) this.reason = reason;
   }
 }
