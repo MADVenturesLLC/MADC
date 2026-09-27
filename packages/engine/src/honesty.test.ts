@@ -85,8 +85,20 @@ test("§8.5 / plan §6: packages/cli imports only @madc/core, engine types, or @
         (typeOnly && spec === "@madc/engine");
       if (!ok) violations.push(`${relative(PACKAGES_DIR, file)}: ${m[0]}`);
     }
-    if (/\bimport\s*\(/.test(text))
-      violations.push(`${relative(PACKAGES_DIR, file)}: dynamic import`);
+    // Dynamic imports obey the same allow-list as static ones (bin.ts defers the heavy tree so
+    // the §3e E6/E7 signal backstop arms first). A non-literal specifier is unverifiable: flagged.
+    for (const _hit of text.matchAll(/\bimport\s*\((?!\s*["'])/g)) {
+      violations.push(`${relative(PACKAGES_DIR, file)}: dynamic import (non-literal)`);
+    }
+    for (const m of text.matchAll(/\bimport\s*\(\s*["']([^"']+)["']\s*\)/g)) {
+      const spec = m[1] ?? "";
+      const ok =
+        spec.startsWith("node:") ||
+        (spec.startsWith(".") && !spec.includes("engine") && !spec.includes("adapters")) ||
+        spec === "@madc/core" ||
+        spec === "@madc/engine/client";
+      if (!ok) violations.push(`${relative(PACKAGES_DIR, file)}: dynamic import ${spec}`);
+    }
   }
   assert.deepEqual(violations, []);
 });

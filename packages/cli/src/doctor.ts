@@ -36,6 +36,7 @@ import {
   spawnEngine,
   verifySessionFile,
 } from "@madc/engine/client";
+import { takeEarlySignal } from "./early-signal.ts";
 import { EXIT } from "./exit-codes.ts";
 import { type CliIO, colorEnabled, paint, TimeoutError, withTimeout } from "./io.ts";
 
@@ -965,6 +966,10 @@ export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number>
   };
   process.on("SIGINT", onSigint);
   process.on("SIGTERM", onSigterm);
+  // §3e E7: a signal recorded by the bin.ts backstop during module load applies to the whole run:
+  // no rows run, and the run exits 130/143 with the (empty) rows so far.
+  const earlySignal = takeEarlySignal();
+  if (earlySignal !== null) sig.exit = earlySignal;
   // MADC_HOME set but not absolute: exit-2 class, and nothing spawns (CLI pin §1).
   let home = resolveHome(io);
   const homeInvalid = home.kind === "invalid";
