@@ -1,5 +1,6 @@
 /**
- * M0-A8 matrix (plan §10 criterion E): the always-in-CI guarantee, auditable by file name in CI
+ * M0-A8 matrix (plan §10 criterion E — the matrix/tests half of the act; criterion F is the
+ * runbook at docs/runbook/M0.md): the always-in-CI guarantee, auditable by file name in CI
  * logs. This file is self-contained — no paid keys, no vendor binaries, no network:
  *
  *  1. Registry FORBID: a forbidden provider throws via `assertAllowed` (fail-closed).
