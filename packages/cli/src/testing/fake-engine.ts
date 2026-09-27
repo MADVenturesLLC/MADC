@@ -666,6 +666,14 @@ rl.on("line", (line) => {
         send({ id: msg.id, result: { turn: inProgress() } });
         return;
       }
+      if (scenario === "json-null-line") {
+        // Copilot PR #23: a JSON but non-object stdout line mid-turn (null and an array) → the
+        // client logs it as a protocol violation; the CLI exits 3 and never crashes.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        process.stdout.write("null\n[]\n");
+        return;
+      }
       if (scenario === "blank-line") {
         // §3e E16 F-73: a blank line on engine stdout is a non-JSON line → exit 3.
         append("turn.start", { turnId, inputText: "hi" });

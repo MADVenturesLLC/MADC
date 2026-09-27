@@ -33,22 +33,19 @@ async function withFakeClient(
   fn: (client: EngineClient) => Promise<void>,
 ): Promise<void> {
   const sb = sandbox();
-  const savedScenario = process.env.MADC_TEST_FAKE_SCENARIO;
-  const savedBody = process.env.MADC_TEST_ERROR_BODY;
   try {
-    process.env.MADC_TEST_FAKE_SCENARIO = scenario;
-    for (const [k, v] of Object.entries(env)) process.env[k] = v;
-    const client = spawnEngine({ env: { MADC_HOME: sb.home }, entry: FAKE });
+    // The scenario and error body reach the fake through the spawn env, never process.env
+    // (Copilot PR #23: no global mutation to snapshot or leak).
+    const client = spawnEngine({
+      env: { MADC_HOME: sb.home, MADC_TEST_FAKE_SCENARIO: scenario, ...env },
+      entry: FAKE,
+    });
     try {
       await fn(client);
     } finally {
       await client.close(1_000);
     }
   } finally {
-    if (savedScenario === undefined) delete process.env.MADC_TEST_FAKE_SCENARIO;
-    else process.env.MADC_TEST_FAKE_SCENARIO = savedScenario;
-    if (savedBody === undefined) delete process.env.MADC_TEST_ERROR_BODY;
-    else process.env.MADC_TEST_ERROR_BODY = savedBody;
     sb.cleanup();
   }
 }
