@@ -6,6 +6,7 @@ import { MADC_VERSION } from "@madc/core";
 import { PROTOCOL_VERSION, resolveMadcHome } from "@madc/engine/client";
 import { CHAT_RESERVED, hasJsonFlag, parseArgs, USAGE } from "./args.ts";
 import { classifyHomePath, runDoctor } from "./doctor.ts";
+import { takeEarlySignal } from "./early-signal.ts";
 import { EXIT } from "./exit-codes.ts";
 import type { CliIO } from "./io.ts";
 import { PROMPT_CAP_BYTES, readPromptFromStdin, runOneShot } from "./oneshot.ts";
@@ -113,6 +114,10 @@ async function oneShot(
   };
   process.on("SIGINT", onSigint);
   process.on("SIGTERM", onSigterm);
+  // §3e E6: a signal recorded by the bin.ts backstop during module load becomes the pre-spawn
+  // signal here; the checks below exit 130/143 before anything spawns.
+  const earlySignal = takeEarlySignal();
+  if (earlySignal !== null) preSignal = earlySignal;
   try {
     const interrupted = (): number => {
       const code = preSignal ?? EXIT.sigint;

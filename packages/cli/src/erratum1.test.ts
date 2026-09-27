@@ -139,6 +139,20 @@ function runOneShotChild(
   }));
 }
 
+/** Poll until the file at `path` contains `needle`. */
+async function waitForFile(path: string, needle: string, ms = 10_000): Promise<void> {
+  const until = Date.now() + ms;
+  for (;;) {
+    try {
+      if (readFileSync(path, "utf8").includes(needle)) return;
+    } catch {
+      // not yet
+    }
+    if (Date.now() > until) throw new Error(`${path} never contained ${needle}`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
+}
+
 /** Poll until some session file under `<home>/sessions` contains `needle`. */
 async function waitForSessionFile(home: string, needle: string, ms = 10_000): Promise<void> {
   const until = Date.now() + ms;
@@ -589,15 +603,25 @@ test("§3c 9: SIGINT / SIGTERM during the timeout grace force at once (130 / 143
   ] as const) {
     const sb = sandbox();
     try {
+      const mark = join(sb.root, "mark");
       let signalledAt = 0;
       const r = await runCli(sb, ["-p", "hi", "--json"], {
         engine: FAKE,
-        env: { MADC_TEST_FAKE_SCENARIO: "silent-turn", MADC_TURN_IDLE_MS: "500" },
+        env: {
+          MADC_TEST_FAKE_SCENARIO: "silent-turn",
+          MADC_TURN_IDLE_MS: "500",
+          MADC_TEST_FAKE_MARK: mark,
+        },
         onSpawn: (child) => {
-          setTimeout(() => {
-            signalledAt = Date.now();
-            child.kill(signal);
-          }, 1_200);
+          // Signal once the idle deadline has fired and the interrupt grace has begun (the fake
+          // records the turn/interrupt): a fixed delay races module load plus the 500 ms idle
+          // clock on a slower runner, and a signal before the grace starts a FRESH grace.
+          waitForFile(mark, "turn/interrupt")
+            .then(() => {
+              signalledAt = Date.now();
+              child.kill(signal);
+            })
+            .catch(() => child.kill("SIGKILL"));
           setTimeout(() => child.kill("SIGKILL"), 15_000).unref();
         },
       });
@@ -1496,10 +1520,15 @@ test("§3e E15: a first SIGINT before turn/start is sent forces at once (exit 13
       engine: FAKE,
       env: { MADC_TEST_FAKE_SCENARIO: "slow-init", MADC_TEST_FAKE_MARK: mark },
       onSpawn: (child) => {
-        setTimeout(() => {
-          signalledAt = Date.now();
-          child.kill("SIGINT");
-        }, 300);
+        // Signal once the fake has received initialize: the CLI is then parked in the
+        // initialize wait with its handlers installed (a fixed 300 ms raced module load on
+        // slower runtimes; E6's named residual is a signal before main runs).
+        waitForFile(mark, "initialize")
+          .then(() => {
+            signalledAt = Date.now();
+            child.kill("SIGINT");
+          })
+          .catch(() => child.kill("SIGKILL"));
         setTimeout(() => child.kill("SIGKILL"), 15_000).unref();
       },
     });
