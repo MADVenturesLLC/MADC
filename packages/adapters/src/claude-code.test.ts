@@ -89,8 +89,10 @@ test("binary detection: PATH lookup finds an executable, misses nothing / non-ex
   });
 });
 
+// Skip reason: PATHEXT is Windows-only. Boolean `skip`: bun 1.3.11's node:test shim (CI) runs a
+// test whose `skip` is a string; a boolean is honored there and on Node.
 test("binary detection on Windows honors PATHEXT", {
-  skip: process.platform !== "win32" ? "PATHEXT is Windows-only" : false,
+  skip: process.platform !== "win32",
 }, () => {
   withTempDir((dir) => {
     const bin = join(dir, "claude.EXE");
@@ -212,7 +214,9 @@ test("binary that vanishes at spawn → failed with reason binary-missing (proto
 // prompt is fixed and trivial, and the answer text is never printed.
 const LIVE_CLAUDE = findClaudeBinary(process.env);
 test("live: the real unmodified claude binary answers one headless turn", {
-  skip: LIVE_CLAUDE === null ? "claude not on PATH" : false,
+  // Skip reason: claude not on PATH. Boolean `skip`: bun 1.3.11's node:test shim (CI) runs a
+  // test whose `skip` is a string; a boolean is honored there and on Node.
+  skip: LIVE_CLAUDE === null,
   timeout: 180_000,
 }, async () => {
   const port = createClaudeCodePort({ binaryPath: LIVE_CLAUDE as string });
