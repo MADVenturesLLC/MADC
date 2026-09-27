@@ -1,6 +1,7 @@
 import type { Writable } from "node:stream";
 import {
   createClaudeCodePort,
+  createCodexCodePort,
   createKimiCodePort,
   honestUserAgent,
   readKimiCredential,
@@ -17,12 +18,13 @@ const log = (line: string) => process.stderr.write(`[madc-engine] ${line}\n`);
 
 /**
  * Production agent: the thread's seat file (seeded `madc-default` by default) on Kimi Code (plan
- * D2) or the unmodified Claude Code binary (A5) per the seat's `preferredBacking`. The Kimi API
- * key is read once from the local environment (`KIMI_API_KEY`); without one, kimi turns answer
- * -32008 `no-credentials`. claude-code reads no MAD credential — the detected `claude` binary
- * (PATH lookup at preflight; -32008 `binary-missing` when absent) inherits the environment and
- * finds its own auth. No base-URL or transport override exists here: production only talks to the
- * pinned catalog endpoint, and only spawns the detected vendor binary.
+ * D2), the unmodified Claude Code binary (A5), or the unmodified Codex binary via `codex
+ * app-server` (A6) per the seat's `preferredBacking`. The Kimi API key is read once from the
+ * local environment (`KIMI_API_KEY`); without one, kimi turns answer -32008 `no-credentials`.
+ * claude-code / codex read no MAD credential — the detected vendor binary (PATH lookup at
+ * preflight; -32008 `binary-missing` when absent) inherits the environment and finds its own
+ * auth. No base-URL or transport override exists here: production only talks to the pinned
+ * catalog endpoint, and only spawns the detected vendor binary.
  */
 export const defaultAgentFactory: AgentFactory = () =>
   createProviderAgent({
@@ -30,6 +32,8 @@ export const defaultAgentFactory: AgentFactory = () =>
     createPort: (apiKey) =>
       createKimiCodePort({ apiKey, userAgent: honestUserAgent(ENGINE_VERSION) }),
     createClaudePort: (binaryPath) => createClaudeCodePort({ binaryPath }),
+    createCodexPort: (binaryPath) =>
+      createCodexCodePort({ binaryPath, clientVersion: ENGINE_VERSION }),
     log,
   });
 

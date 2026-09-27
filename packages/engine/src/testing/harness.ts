@@ -12,6 +12,7 @@ export const KIMI_FAKE_ENGINE = fileURLToPath(new URL("./kimi-fake-engine.ts", i
 export const CLAUDE_FAKE_ENGINE = fileURLToPath(
   new URL("./claude-fake-engine.ts", import.meta.url),
 );
+export const CODEX_FAKE_ENGINE = fileURLToPath(new URL("./codex-fake-engine.ts", import.meta.url));
 export const HANG_ENGINE = fileURLToPath(new URL("./hang-agent-engine.ts", import.meta.url));
 export const FAILING_ENGINE = fileURLToPath(new URL("./failing-agent-engine.ts", import.meta.url));
 export const EXIT_ENGINE = fileURLToPath(new URL("./exit-engine.ts", import.meta.url));

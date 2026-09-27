@@ -1,5 +1,5 @@
 /**
- * Live-provider agent (Acts M0-A3 / A4 / A5). The engine loads and validates the thread's seat
+ * Live-provider agent (Acts M0-A3 / A4 / A5 / A6). The engine loads and validates the thread's seat
  * file at `thread/start` / `thread/resume` (A4) and hands it over in the turn context. Every turn
  * runs a synchronous preflight inside `turn/start` (protocol pin §4.2) before any model or vendor
  * call:
@@ -9,7 +9,8 @@
  * 3. `pinnedModel` resolves for that backing — the pinned pi-ai catalog for kimi-code, a non-empty
  *    vendor model name for claude-code (else -32006 with the seat file path);
  * 4. the backing can run: kimi-code needs a usable credential (else -32008 `no-credentials`);
- *    claude-code needs its unmodified binary detected on PATH (else -32008 `binary-missing`).
+ *    claude-code / codex need their unmodified binary detected on PATH (else -32008
+ *    `binary-missing`).
  *
  * Preflight is side-effect free (no port, no child process; binary detection is a read-only PATH
  * lookup, never an execution). Only `run` builds the port and streams the current input: deltas →
@@ -21,13 +22,16 @@
  */
 import {
   CLAUDE_CODE_PROVIDER_ID,
+  CODEX_PROVIDER_ID,
   findClaudeBinary,
+  findCodexBinary,
   KIMI_CODE_PROVIDER_ID,
   type KimiCredential,
   ProviderCallError,
   type ProviderPort,
   type ProviderTurnResult,
   resolveClaudePinnedModel,
+  resolveCodexPinnedModel,
   resolveKimiPinnedModel,
 } from "@madc/adapters";
 import {
@@ -62,6 +66,17 @@ export type ProviderAgentOptions = {
    * Tests inject a fixed answer.
    */
   readonly detectClaudeBinary?: () => string | null;
+  /**
+   * A6: builds the Codex port for a detected binary path. Its presence means the codex adapter is
+   * in this build (production always passes it; fixtures without it keep the -32008 `unwired`
+   * path honest).
+   */
+  readonly createCodexPort?: (binaryPath: string) => ProviderPort;
+  /**
+   * A6: how the `codex` binary is detected. Default: read-only PATH lookup at preflight time.
+   * Tests inject a fixed answer.
+   */
+  readonly detectCodexBinary?: () => string | null;
   /** stderr logger (never receives secrets or upstream text). */
   readonly log?: (line: string) => void;
 };
@@ -74,6 +89,11 @@ type TurnPlan =
     }
   | {
       readonly backing: typeof CLAUDE_CODE_PROVIDER_ID;
+      readonly binaryPath: string;
+      readonly modelId: string;
+    }
+  | {
+      readonly backing: typeof CODEX_PROVIDER_ID;
       readonly binaryPath: string;
       readonly modelId: string;
     };
@@ -101,8 +121,10 @@ function providerUnavailable(
 export function createProviderAgent(options: ProviderAgentOptions): Agent {
   const { credential } = options;
   const detectClaudeBinary = options.detectClaudeBinary ?? (() => findClaudeBinary(process.env));
+  const detectCodexBinary = options.detectCodexBinary ?? (() => findCodexBinary(process.env));
   let port: ProviderPort | undefined;
   let claudePort: { readonly binaryPath: string; readonly port: ProviderPort } | undefined;
+  let codexPort: { readonly binaryPath: string; readonly port: ProviderPort } | undefined;
 
   const plan = (ctx: TurnPreflightContext): TurnPlan => {
     const { seat } = ctx;
@@ -155,7 +177,23 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
       return { backing: CLAUDE_CODE_PROVIDER_ID, binaryPath, modelId: model.modelId };
     }
 
-    // Registry-allowed but no adapter in this build (codex lands in A6).
+    if (providerId === CODEX_PROVIDER_ID) {
+      // Registry-allowed but no adapter in this build (fixtures that omit the codex adapter).
+      if (options.createCodexPort === undefined) throw providerUnavailable(providerId, "unwired");
+      const model = resolveCodexPinnedModel(seat.pinnedModel);
+      if (!model.ok) {
+        throw new RpcError(ErrorCode.SeatInvalid, "Seat invalid", {
+          seatId: seat.id,
+          path: ctx.seatPath,
+          issues: [model.issue],
+        } satisfies SeatInvalidData);
+      }
+      const binaryPath = detectCodexBinary();
+      if (binaryPath === null) throw providerUnavailable(providerId, "binary-missing");
+      return { backing: CODEX_PROVIDER_ID, binaryPath, modelId: model.modelId };
+    }
+
+    // Registry-allowed but no adapter in this build.
     throw providerUnavailable(providerId, "unwired");
   };
 
@@ -173,7 +211,7 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
       if (planned.backing === KIMI_CODE_PROVIDER_ID) {
         port ??= options.createPort(planned.apiKey);
         turnPort = port;
-      } else {
+      } else if (planned.backing === CLAUDE_CODE_PROVIDER_ID) {
         // plan() refused this backing when the adapter is absent; guard again for the type.
         const createClaudePort = options.createClaudePort;
         if (createClaudePort === undefined) {
@@ -187,6 +225,20 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
           };
         }
         turnPort = claudePort.port;
+      } else {
+        // plan() refused this backing when the adapter is absent; guard again for the type.
+        const createCodexPort = options.createCodexPort;
+        if (createCodexPort === undefined) {
+          throw providerUnavailable(planned.backing, "unwired");
+        }
+        // Detection re-runs every turn; the port is rebuilt only when the binary path changed.
+        if (codexPort?.binaryPath !== planned.binaryPath) {
+          codexPort = {
+            binaryPath: planned.binaryPath,
+            port: createCodexPort(planned.binaryPath),
+          };
+        }
+        turnPort = codexPort.port;
       }
       const { seat } = ctx;
       const id = sink.newItemId();
