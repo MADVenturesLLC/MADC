@@ -149,6 +149,8 @@ function streamCodexTurn(
       // its own auth. MAD never adds, removes, or rewrites a variable.
       child = spawnFn(binaryPath, ["app-server"], { stdio: ["pipe", "pipe", "pipe"] });
     } catch {
+      // A synchronous spawn throw is never a missing binary (node reports not-found
+      // asynchronously via the 'error' event), so no pinned `binary-missing` reason here.
       reject(new ProviderCallError("failed", null, "codex app-server child failed to start"));
       return;
     }
@@ -170,6 +172,10 @@ function streamCodexTurn(
       settled = true;
       if (killTimer !== null) clearTimeout(killTimer);
       request.signal.removeEventListener("abort", onAbort);
+      // Wake every outstanding request: continuations see `settled` and return; no promise (and
+      // the closures it retains) is left pending after the turn is over.
+      for (const resolveRequest of pending.values()) resolveRequest(undefined);
+      pending.clear();
       fn();
     };
     const fail = (err: ProviderCallError): void =>
@@ -220,6 +226,11 @@ function streamCodexTurn(
       params: Record<string, unknown>,
     ): Promise<unknown> =>
       new Promise((resolveRequest) => {
+        if (settled) {
+          // The turn is already over: resolve so the awaiting continuation returns at once.
+          resolveRequest(undefined);
+          return;
+        }
         pending.set(id, resolveRequest);
         write({ id, method, params });
       });
@@ -277,7 +288,14 @@ function streamCodexTurn(
       fail(new ProviderCallError("failed", null, "codex turn failed"));
     };
 
-    const onNotification = (msg: Record<string, unknown>): void => {
+    // Turn-scoped notifications that arrive before the local `turnId` binding: a vendor flush can
+    // put the turn/start response AND its turn notifications in ONE stdout chunk, and the
+    // response continuation (which assigns `turnId`) runs as a microtask only after this
+    // synchronous drain. Buffer such notifications in order and re-dispatch them once `turnId` is
+    // known — the turnId binding check still applies on re-dispatch.
+    const preBind: Record<string, unknown>[] = [];
+
+    const dispatchTurnNotification = (msg: Record<string, unknown>): void => {
       const params = msg.params;
       switch (msg.method) {
         case "item/agentMessage/delta": {
@@ -301,6 +319,28 @@ function streamCodexTurn(
         }
         case "turn/completed":
           onTurnCompleted(params);
+          return;
+        default:
+          return;
+      }
+    };
+
+    const onNotification = (msg: Record<string, unknown>): void => {
+      switch (msg.method) {
+        case "item/agentMessage/delta":
+        case "item/completed":
+        case "turn/completed":
+          if (turnId === null) {
+            // Only a notification that names a turn can ever bind; anything else is dropped.
+            // item/* name it as `turnId`; turn/completed as `turn.id`.
+            const params = msg.params;
+            const namesTurn =
+              stringField(params, "turnId") !== null ||
+              (isRecord(params) && stringField(params.turn, "id") !== null);
+            if (namesTurn) preBind.push(msg);
+            return;
+          }
+          dispatchTurnNotification(msg);
           return;
         default:
           // Every other app-server notification (thread/started, thread/status/changed,
@@ -335,16 +375,22 @@ function streamCodexTurn(
     };
 
     child.on("error", (err: NodeJS.ErrnoException) => {
-      // The binary vanished between preflight detection and spawn (protocol pin §4.2).
       spawnError = err;
-      fail(
-        new ProviderCallError(
-          "failed",
-          null,
-          "codex binary could not be started",
-          "binary-missing",
-        ),
-      );
+      // ENOENT (node's cross-platform not-found): the binary vanished between preflight
+      // detection and spawn (protocol pin §4.2) → the pinned -32008 reason. Anything else
+      // (EACCES, EINVAL, …) is an ordinary call failure (-32603), not "binary-missing".
+      if (err.code === "ENOENT") {
+        fail(
+          new ProviderCallError(
+            "failed",
+            null,
+            "codex binary could not be started",
+            "binary-missing",
+          ),
+        );
+        return;
+      }
+      fail(new ProviderCallError("failed", null, "codex binary could not be started"));
     });
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (chunk: string) => {
@@ -357,9 +403,16 @@ function streamCodexTurn(
         at = stdoutBuf.indexOf("\n");
       }
     });
+    // A closed vendor pipe reports EPIPE as an async stream 'error', never a thrown write — the
+    // try/catch in `write` alone cannot see it, and an unhandled stream error would crash the
+    // engine. Route it into the normal failure path (the child's 'close' settles the same way).
+    child.stdin?.on("error", () => {
+      if (settled) return;
+      fail(new ProviderCallError("failed", null, "codex app-server stdin closed"));
+    });
     // stderr is drained but never read, logged, or surfaced (it can carry vendor text or account
-    // details).
-    child.stderr?.on("data", () => undefined);
+    // details). resume() keeps the stream flowing without a per-chunk callback.
+    child.stderr?.resume?.();
     if (request.signal.aborted) onAbort();
     else request.signal.addEventListener("abort", onAbort, { once: true });
 
@@ -412,7 +465,10 @@ function streamCodexTurn(
       turnId = stringField(turnResult.turn, "id");
       if (turnId === null) {
         fail(new ProviderCallError("failed", null, "codex app-server turn/start failed"));
+        return;
       }
+      // Re-dispatch any same-chunk notifications buffered before the binding (in arrival order).
+      for (const msg of preBind.splice(0)) dispatchTurnNotification(msg);
     })();
   });
 }

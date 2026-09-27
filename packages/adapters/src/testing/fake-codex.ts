@@ -15,6 +15,11 @@
  * - `malformed`        — a non-JSON line on stdout mid-flow
  * - `hang`             — handshake + turn/start answered, turn never completes; turn/interrupt
  *                        is acknowledged but the process runs until killed (abort tests)
+ * - `same-chunk`       — the turn/start response AND the whole turn notification flow (delta,
+ *                        item/completed, turn/completed) in ONE stdout write (regression: events
+ *                        flushed with the response must not be dropped before the turnId binding)
+ * - `exit-after-init`  — answers initialize, then exits 0 at once (regression: the next write
+ *                        lands on the closed stdin pipe → EPIPE must settle the turn, never crash)
  * - `vanish`           — exits 127 immediately (spawn-raced binary-missing is covered by a stub
  *                        spawn that emits `error`; this mode covers the close-without-turn path)
  *
@@ -135,6 +140,22 @@ function handle(msg: Record<string, unknown>): void {
   }
   switch (msg.method) {
     case "initialize":
+      if (mode === "exit-after-init") {
+        // Flush the response, then die before the next client message is written.
+        process.stdout.write(
+          `${JSON.stringify({
+            id: msg.id,
+            result: {
+              userAgent: "fake-codex/0.0.0",
+              codexHome: "/fake/codex-home",
+              platformFamily: "unix",
+              platformOs: "macos",
+            },
+          })}\n`,
+          () => process.exit(0),
+        );
+        return;
+      }
       send({
         id: msg.id,
         result: {
@@ -166,6 +187,29 @@ function handle(msg: Record<string, unknown>): void {
       const input = Array.isArray(params.input) ? (params.input as Record<string, unknown>[]) : [];
       const first = input[0];
       prompt = typeof first?.text === "string" ? first.text : "";
+      if (mode === "same-chunk") {
+        // ONE stdout write: the response plus the whole turn flow in a single chunk.
+        const full = `fake codex answer to: ${prompt}`;
+        const agent = agentItem(full);
+        const lines = [
+          { id: msg.id, result: { turn: turn("inProgress") } },
+          { method: "turn/started", params: { threadId: THREAD_ID, turn: turn("inProgress") } },
+          {
+            method: "item/agentMessage/delta",
+            params: { threadId: THREAD_ID, turnId: TURN_ID, itemId: AGENT_ITEM_ID, delta: full },
+          },
+          {
+            method: "item/completed",
+            params: { item: agent, threadId: THREAD_ID, turnId: TURN_ID, completedAtMs: 4 },
+          },
+          {
+            method: "turn/completed",
+            params: { threadId: THREAD_ID, turn: turn("completed", [agent]) },
+          },
+        ];
+        process.stdout.write(`${lines.map((line) => JSON.stringify(line)).join("\n")}\n`);
+        return;
+      }
       send({ id: msg.id, result: { turn: turn("inProgress") } });
       if (mode === "hang") return;
       setTimeout(mode === "turn-failed" ? failTurn : completeTurn, 10);

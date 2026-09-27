@@ -214,6 +214,64 @@ test("malformed output → failed with a MAD-authored message", async () => {
   assert.equal(err.message, "codex app-server output was not JSON-RPC");
 });
 
+test("same-chunk flush: response plus turn notifications in ONE stdout write still completes", async () => {
+  // Regression: turnId was assigned only when the turn/start await resumed, so notifications in
+  // the same data chunk as the response were dropped and the turn never settled.
+  const deltas: string[] = [];
+  const result = await fakePort("same-chunk").streamTurn(
+    turnRequest({ onTextDelta: (d) => deltas.push(d) }),
+  );
+  assert.equal(result.text, "fake codex answer to: hello codex");
+  assert.deepEqual(deltas, ["fake codex answer to: hello codex"]);
+  assert.equal(result.requestedModelId, MODEL);
+  assert.equal(result.servedModel, MODEL);
+});
+
+test("child exits after initialize: the next write hits the closed pipe; turn fails, no crash", async () => {
+  // Regression: EPIPE on vendor stdin is an async stream 'error', not a thrown write — without a
+  // stdin error listener it crashed the engine; and the outstanding thread/start request must not
+  // hang (pending is flushed on settle).
+  const err = await failureOf(fakePort("exit-after-init").streamTurn(turnRequest()));
+  assert.equal(err.kind, "failed");
+  assert.equal(err.reason, undefined);
+  assert.match(err.message, /^codex app-server (child exited 0|stdin closed)$/);
+});
+
+test("spawn that throws synchronously (EACCES) → failed without the binary-missing reason", async () => {
+  const throwingSpawn = (): ChildProcess => {
+    const err = new Error("spawn EACCES") as NodeJS.ErrnoException;
+    err.code = "EACCES";
+    throw err;
+  };
+  const port = createCodexCodePort({ binaryPath: "/nope/codex", spawn: throwingSpawn });
+  const err = await failureOf(port.streamTurn(turnRequest()));
+  assert.equal(err.kind, "failed");
+  assert.equal(err.reason, undefined);
+  assert.equal(err.message, "codex app-server child failed to start");
+});
+
+test("spawn error event other than ENOENT (EACCES) → failed without the binary-missing reason", async () => {
+  const eaccesSpawn = (): ChildProcess => {
+    const child = new EventEmitter() as ChildProcess;
+    const fakeStream = () =>
+      Object.assign(new EventEmitter(), { setEncoding: () => undefined }) as unknown as NonNullable<
+        ChildProcess["stdout"]
+      >;
+    child.stdout = fakeStream();
+    child.stderr = fakeStream();
+    child.kill = () => true;
+    const err = new Error("spawn /nope/codex EACCES") as NodeJS.ErrnoException;
+    err.code = "EACCES";
+    queueMicrotask(() => child.emit("error", err));
+    return child;
+  };
+  const port = createCodexCodePort({ binaryPath: "/nope/codex", spawn: eaccesSpawn });
+  const err = await failureOf(port.streamTurn(turnRequest()));
+  assert.equal(err.kind, "failed");
+  assert.equal(err.reason, undefined);
+  assert.equal(err.message, "codex binary could not be started");
+});
+
 test("abort (turn/interrupt) sends the documented interrupt, kills the child, ends aborted", async () => {
   await withTempDirAsync(async (dir) => {
     const wireLog = join(dir, "wire.jsonl");
