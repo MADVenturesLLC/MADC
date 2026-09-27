@@ -44,10 +44,11 @@ import { EngineConnection } from "./server.ts";
 import {
   GENESIS_HASH,
   rebuildSession,
-  SessionWriter,
+  type SessionWriter,
   sessionEventHash,
   setSessionAppendOpenForTests,
   setSessionWriteForTests,
+  unguardedSessionWriterForTests,
   verifySessionFile,
   verifySessionText,
 } from "./session-store.ts";
@@ -100,7 +101,7 @@ function readLines(path: string): Line[] {
 function writeSampleSession(dir: string): string {
   mkdirSync(dir, { recursive: true });
   const path = join(dir, "thr_sample.jsonl");
-  const w = SessionWriter.create(
+  const w = unguardedSessionWriterForTests.create(
     path,
     "thr_sample",
     "madc-default",
@@ -183,7 +184,7 @@ test("R-append-nofollow: without O_NOFOLLOW an append never follows a symlink, e
   const { home, cleanup } = makeHome();
   const outside = join(home, "..", "outside-append");
   const resumeWriter = (path: string): SessionWriter =>
-    SessionWriter.resume(
+    unguardedSessionWriterForTests.resume(
       path,
       "thr_sample",
       "madc-default",
@@ -221,7 +222,7 @@ test("R-append-nofollow: without O_NOFOLLOW an append never follows a symlink, e
     assert.equal(readFileSync(target, "utf8"), targetBytes, "the symlink target is never written");
     // A symlink already in place is refused before any open.
     setSessionAppendOpenForTests({ noFollowFlag: false });
-    const linked = SessionWriter.resume(
+    const linked = unguardedSessionWriterForTests.resume(
       path,
       "thr_sample",
       "madc-default",
@@ -304,7 +305,7 @@ test("R-parent-swap: a sessions/ directory swapped for a symlink after confineme
     const target = writeSampleSession(outside);
     const targetBytes = readFileSync(target, "utf8");
     const insideBytes = readFileSync(path, "utf8");
-    const w = SessionWriter.resume(
+    const w = unguardedSessionWriterForTests.resume(
       path,
       "thr_sample",
       "madc-default",
@@ -374,7 +375,7 @@ test("R-snapshot-confined: a sessions/ swapped before the writer snapshots its r
     // resume: the path now resolves outside the home, so no writer is built.
     assert.throws(
       () =>
-        SessionWriter.resume(
+        unguardedSessionWriterForTests.resume(
           path,
           "thr_sample",
           "madc-default",
@@ -390,7 +391,7 @@ test("R-snapshot-confined: a sessions/ swapped before the writer snapshots its r
     const created = join(sessions, "thr_new.jsonl");
     assert.throws(
       () =>
-        SessionWriter.create(
+        unguardedSessionWriterForTests.create(
           created,
           "thr_new",
           "madc-default",
@@ -480,7 +481,7 @@ test("R-create-cleanup: a failed create never unlinks an unrelated file after a 
     });
     assert.throws(
       () =>
-        SessionWriter.create(
+        unguardedSessionWriterForTests.create(
           join(sessions, "thr_new.jsonl"),
           "thr_new",
           "madc-default",
@@ -502,7 +503,7 @@ test("R-create-cleanup: a failed create never unlinks an unrelated file after a 
     });
     assert.throws(
       () =>
-        SessionWriter.create(
+        unguardedSessionWriterForTests.create(
           join(sessions, "thr_own.jsonl"),
           "thr_own",
           "madc-default",
@@ -549,7 +550,7 @@ test("R-tojson: a toJSON hook in a payload never writes an unredacted secret", (
     const sessions = join(home, "sessions");
     mkdirSync(sessions, { recursive: true });
     const path = join(sessions, "thr_hook.jsonl");
-    const w = SessionWriter.create(
+    const w = unguardedSessionWriterForTests.create(
       path,
       "thr_hook",
       "madc-default",
@@ -595,7 +596,7 @@ test("R-resume-identity: resume refuses a different file swapped in after verifi
     if (!verified.ok) return;
     assert.notEqual(verified.file, undefined);
     // The verified file still in place: resume works and the chain continues.
-    const same = SessionWriter.resume(
+    const same = unguardedSessionWriterForTests.resume(
       path,
       "thr_sample",
       "madc-default",
@@ -616,7 +617,7 @@ test("R-resume-identity: resume refuses a different file swapped in after verifi
     const replacementBytes = readFileSync(replacement, "utf8");
     assert.throws(
       () =>
-        SessionWriter.resume(
+        unguardedSessionWriterForTests.resume(
           path,
           "thr_sample",
           "madc-default",

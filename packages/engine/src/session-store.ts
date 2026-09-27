@@ -233,6 +233,8 @@ export function setSessionWriteForTests(fn: WriteChunk | null): void {
 
 type SyncFile = (fd: number) => void;
 type SyncDir = (dir: string) => void;
+type TruncateFile = (fd: number, size: number) => void;
+type CloseFile = (fd: number) => void;
 const defaultSyncFile: SyncFile = (fd) => fsyncSync(fd);
 /**
  * Amendment 2 §4: after a session file is created, fsync its directory so the new name survives a
@@ -249,6 +251,8 @@ const defaultSyncDir: SyncDir = (dir) => {
 };
 let syncFile: SyncFile = defaultSyncFile;
 let syncDir: SyncDir = defaultSyncDir;
+let truncateFile: TruncateFile = (fd, size) => ftruncateSync(fd, size);
+let closeFile: CloseFile = (fd) => closeSync(fd);
 
 /**
  * Test seam (Amendment 2 §8 item 4): observe or fail the per-append file fsync and the `sessions/`
@@ -259,25 +263,62 @@ export function setSessionFsyncForTests(hooks: { file?: SyncFile; dir?: SyncDir 
   syncDir = hooks?.dir ?? defaultSyncDir;
 }
 
+/** Test seam (Amendment 3 1b-t): fail the rollback truncate. `null` restores `ftruncateSync`. Internal. */
+export function setSessionTruncateForTests(fn: TruncateFile | null): void {
+  truncateFile = fn ?? ((fd, size) => ftruncateSync(fd, size));
+}
+
+/**
+ * Test seam (Amendment 3 1e): fail the append-path close. Only the close that ends an append runs
+ * through this (Amendment 3 rule 4); every other close in this module is direct. `null` restores
+ * `closeSync`. Internal.
+ */
+export function setSessionCloseForTests(fn: CloseFile | null): void {
+  closeFile = fn ?? ((fd) => closeSync(fd));
+}
+
+function errCode(err: unknown): string | undefined {
+  return err !== null && typeof err === "object" && "code" in err
+    ? String((err as { code: unknown }).code)
+    : undefined;
+}
+
 /**
  * Amendment 2 guards for one writer. `holdsLock` is the §2 ownership check (the thread lock still
  * carries this acquisition's token; server passes `holdsThreadLock(handle)`). `expectedSize` is the
- * verified file size at resume (§2 position). Both default to "no lock bound" / "size seen now" for
- * direct unit use; the engine always passes them.
+ * verified file size at resume (§2 position).
+ *
+ * Amendment 3 item 3 (Founder: Option A, note 6 rejected, ledger D-184): both `create` and
+ * `resume` REQUIRE `holdsLock`, and `resume` REQUIRES `expectedSize` (the verified size) — no
+ * defaults. The only unguarded mode is the explicit, module-only `unguardedSessionWriterForTests`
+ * opt-in below; a caller can always pass `() => true` itself.
  */
 export type SessionWriterGuards = {
-  readonly holdsLock?: () => boolean;
+  readonly holdsLock: () => boolean;
   readonly expectedSize?: number | undefined;
+};
+
+/** `resume` guards: the verified byte size is required (Amendment 3 item 3, Option A). */
+export type SessionResumeGuards = SessionWriterGuards & { readonly expectedSize: number };
+
+/**
+ * Append-path hooks. `onCloseFailed` reports a close that failed AFTER the batch's fsync returned
+ * (Amendment 3 rule 4): the batch counts, the writer is not broken, and the fd is not retried; the
+ * engine logs the line this hook feeds. `code` is the close error's `.code` (or `"error"`).
+ */
+export type SessionWriterHooks = {
+  readonly onCloseFailed?: (code: string) => void;
 };
 
 /**
  * Appender for one session file. Each append opens the file (`O_APPEND`, never following a
  * symlink), re-checks ownership and position on that fd (Amendment 2 §2), writes its full line(s)
  * through the same fd, fsyncs it (§4), and closes it. A failed write or fsync is rolled back (the
- * file is truncated to its size before the append, best effort), so a torn line or half of a
- * multi-event append is never left behind; a failed ownership or position check writes nothing.
- * After any failed append the writer is broken: every later append fails with the same -32009 and
- * nothing more is written.
+ * file is truncated to its size before the append and the truncate is fsynced, Amendment 3 rule
+ * 2), so a torn line or half of a multi-event append is never left behind; a failed ownership or
+ * position check writes nothing. After any failed append the writer is broken: every later append
+ * fails with the same -32009 and nothing more is written. If the rollback itself failed, the
+ * writer is poisoned (Amendment 3 rule 3) for the life of the engine process.
  */
 export class SessionWriter {
   readonly path: string;
@@ -286,11 +327,14 @@ export class SessionWriter {
   #seq: number;
   #prevHash: string;
   #broken = false;
+  /** Amendment 3 rule 3: the refused batch whose rollback (truncate or its fsync) failed. */
+  #poisonedSeq: { readonly first: number; readonly last: number } | null = null;
   /** §2 position: file size after this writer's last successful write (or verified at resume). */
   #expectedEnd: number;
   /** §2 ownership: the thread lock still carries this writer's acquisition token. */
   readonly #holdsLock: () => boolean;
   readonly #secrets: () => readonly string[];
+  readonly #hooks: SessionWriterHooks;
   /**
    * Real path at create / resume; with a home it was checked to be strictly under realpath(home).
    * Every append must still resolve here.
@@ -307,10 +351,12 @@ export class SessionWriter {
     secrets: () => readonly string[],
     expectedEnd: number,
     holdsLock: () => boolean,
+    hooks: SessionWriterHooks,
   ) {
     this.path = path;
     this.#expectedEnd = expectedEnd;
     this.#holdsLock = holdsLock;
+    this.#hooks = hooks;
     this.#realPath = realPath;
     this.threadId = threadId;
     this.seatId = seatId;
@@ -335,8 +381,14 @@ export class SessionWriter {
     secrets: () => readonly string[],
     ts: number = Date.now(),
     home?: string,
-    guards: SessionWriterGuards = {},
+    guards?: SessionWriterGuards,
+    hooks: SessionWriterHooks = {},
   ): SessionWriter {
+    // Amendment 3 item 3 (Option A): no guardless writer by omission (3c: type level + run time).
+    if (typeof guards?.holdsLock !== "function") {
+      throw new TypeError("SessionWriter.create requires a holdsLock guard (Amendment 3 item 3)");
+    }
+    const holdsLock = guards.holdsLock;
     let created: { dev: bigint; ino: bigint };
     try {
       const fd = openSync(path, APPEND_FLAGS | constants.O_CREAT | constants.O_EXCL, 0o600);
@@ -388,7 +440,8 @@ export class SessionWriter {
       GENESIS_HASH,
       secrets,
       0, // created exclusively just now: empty
-      guards.holdsLock ?? (() => true),
+      holdsLock,
+      hooks,
     );
     try {
       writer.append("session.open", open, ts);
@@ -416,8 +469,20 @@ export class SessionWriter {
     secrets: () => readonly string[],
     home?: string,
     verifiedFile?: SessionFileId,
-    guards: SessionWriterGuards = {},
+    guards?: SessionResumeGuards,
+    hooks: SessionWriterHooks = {},
   ): SessionWriter {
+    // Amendment 3 item 3 (Option A): resume binds the lock and the verified size, no defaults.
+    if (typeof guards?.holdsLock !== "function") {
+      throw new TypeError("SessionWriter.resume requires a holdsLock guard (Amendment 3 item 3)");
+    }
+    if (typeof guards.expectedSize !== "number") {
+      throw new TypeError(
+        "SessionWriter.resume requires the verified size (expectedSize) (Amendment 3 item 3)",
+      );
+    }
+    const holdsLock = guards.holdsLock;
+    const expectedEnd = guards.expectedSize;
     let realPath: string;
     try {
       realPath = realpathSync(path);
@@ -425,14 +490,6 @@ export class SessionWriter {
       throw sessionWriteFailed(threadId, path, nextSeq);
     }
     if (!resolvesUnderHome(realPath, home)) throw sessionWriteFailed(threadId, path, nextSeq);
-    let expectedEnd = guards.expectedSize;
-    if (expectedEnd === undefined) {
-      try {
-        expectedEnd = lstatSync(realPath).size;
-      } catch {
-        throw sessionWriteFailed(threadId, path, nextSeq);
-      }
-    }
     if (verifiedFile !== undefined) {
       let st: { dev: bigint; ino: bigint };
       try {
@@ -453,7 +510,8 @@ export class SessionWriter {
       lastHash,
       secrets,
       expectedEnd,
-      guards.holdsLock ?? (() => true),
+      holdsLock,
+      hooks,
     );
   }
 
@@ -463,6 +521,19 @@ export class SessionWriter {
 
   get broken(): boolean {
     return this.#broken;
+  }
+
+  /** Amendment 3 rule 3: the rollback of a refused batch failed; poisoned for the process life. */
+  get poisoned(): boolean {
+    return this.#poisonedSeq !== null;
+  }
+
+  /**
+   * First and last seq of the refused batch whose rollback failed (rule 3's stderr line; the C2
+   * entry carries `first`). Null while the writer is not poisoned.
+   */
+  get poisonedSeq(): { readonly first: number; readonly last: number } | null {
+    return this.#poisonedSeq;
   }
 
   /** Redact, hash, and append one event. Returns the event exactly as written. */
@@ -480,8 +551,14 @@ export class SessionWriter {
    *
    * Amendment 2: on the fd it writes through, the batch first requires (§2) that the thread lock
    * still carries this writer's token and that `fstat(fd).size` is the expected end offset; either
-   * failing writes nothing. The write is then fsynced (§4) before it counts; a failed write or
-   * fsync truncates back to the prior size. Any failure breaks the writer (-32009).
+   * failing writes nothing. The write is then fsynced (§4) before it counts. Any failure breaks
+   * the writer (-32009).
+   *
+   * Amendment 3 item 1: a failed write or fsync is truncated back to the pre-batch offset AND the
+   * truncate is fsynced before the -32009 (rule 2). If the truncate or that fsync fails, the writer
+   * is poisoned for the process life in addition to broken (rule 3). A close that fails after the
+   * batch's fsync returned does not break the writer and is reported through `onCloseFailed`
+   * (rule 4); a close failure on the error path is ignored.
    */
   appendAll(
     entries: ReadonlyArray<{ type: SessionEventType; payload: SessionPayloads[SessionEventType] }>,
@@ -514,6 +591,8 @@ export class SessionWriter {
     const bytes = Buffer.from(text, "utf8");
     try {
       const fd = openForAppend(this.path);
+      let durable = false;
+      let batchError: unknown = null;
       try {
         const st = fstatSync(fd);
         if (!st.isFile()) throw new Error("session file is not a regular file");
@@ -534,17 +613,31 @@ export class SessionWriter {
           while (off < bytes.length) off += writeChunk(fd, bytes, off, bytes.length - off);
           // §4: durable before it counts (and before any response or notification exposes it).
           syncFile(fd);
+          durable = true;
         } catch (err) {
+          // Amendment 3 rule 2: truncate back to the pre-batch offset, then fsync, before -32009.
           try {
-            ftruncateSync(fd, sizeBefore);
+            truncateFile(fd, sizeBefore);
+            syncFile(fd);
           } catch {
-            // best effort; the verifier still rejects a torn tail
+            // Rule 3: the rollback itself did not reach disk — poisoned for the process life.
+            this.#poisonedSeq = { first: firstSeq, last: firstSeq + events.length - 1 };
           }
-          throw err;
+          batchError = err;
         }
       } finally {
-        closeSync(fd);
+        try {
+          closeFile(fd);
+        } catch (closeErr) {
+          // Rule 4: once the batch is durable the batch counts — the append succeeds, the writer
+          // is not broken, and the fd is not retried (the engine logs the hook's line). On the
+          // error path the close error is ignored; the rule 2 / rule 3 outcome stands.
+          if (durable && batchError === null) {
+            this.#hooks.onCloseFailed?.(errCode(closeErr) ?? "error");
+          }
+        }
       }
+      if (batchError !== null) throw batchError;
     } catch {
       this.#broken = true;
       throw sessionWriteFailed(this.threadId, this.path, firstSeq);
@@ -556,13 +649,80 @@ export class SessionWriter {
   }
 }
 
+/**
+ * Amendment 3 item 3 (Option A): the ONLY unguarded writer mode — an explicit opt-in, named so a
+ * review sees it, for unit tests and fixtures. `holdsLock` is `() => true`; resume reads the file
+ * size at resume time (the pre-Amendment-3 default the option rejected). Module-only by rule: it
+ * MUST NOT be a static member of `SessionWriter` and MUST NOT be re-exported from the package
+ * entry (`index.ts`) or `@madc/engine/client` (`sdk.ts`); 3d's export-surface test pins that.
+ * `testing/fifo-append-probe.ts` reaches it by importing `../session-store.ts` directly.
+ */
+export const unguardedSessionWriterForTests = {
+  create(
+    path: string,
+    threadId: string,
+    seatId: string,
+    open: SessionOpenPayload,
+    secrets: () => readonly string[],
+    ts?: number,
+    home?: string,
+    hooks?: SessionWriterHooks,
+  ): SessionWriter {
+    return SessionWriter.create(
+      path,
+      threadId,
+      seatId,
+      open,
+      secrets,
+      ts,
+      home,
+      { holdsLock: () => true },
+      hooks,
+    );
+  },
+  resume(
+    path: string,
+    threadId: string,
+    seatId: string,
+    nextSeq: number,
+    lastHash: string,
+    secrets: () => readonly string[],
+    home?: string,
+    verifiedFile?: SessionFileId,
+    hooks?: SessionWriterHooks,
+  ): SessionWriter {
+    let expectedSize: number;
+    try {
+      expectedSize = lstatSync(realpathSync(path)).size;
+    } catch {
+      throw sessionWriteFailed(threadId, path, nextSeq);
+    }
+    return SessionWriter.resume(
+      path,
+      threadId,
+      seatId,
+      nextSeq,
+      lastHash,
+      secrets,
+      home,
+      verifiedFile,
+      { holdsLock: () => true, expectedSize },
+      hooks,
+    );
+  },
+} as const;
+
 // ------------------------------------------------------------------- verify
 
 /**
- * Amendment 2 §5 failure classes. `torn-tail`: every complete (`\n`-terminated) line verifies and
- * only a non-empty unterminated fragment and/or NUL bytes follow the last `\n` (crash residue).
- * `integrity`: anything else (hash / seq mismatch, malformed complete line, wrong thread, empty or
- * unreadable file); may be tampering. Either way the engine fails closed and never touches the file.
+ * Amendment 3 item 2 failure classes (replaces Amendment 2 §5's paragraph). `torn-tail` (crash
+ * residue): the file is 0 bytes, or it splits into a prefix `P` of complete (`\n`-terminated)
+ * lines that all verify (`P` may be empty) and a non-empty remainder `R` that either (i) contains
+ * no `\n` (the unterminated-fragment case, NUL fragments included) or (ii) consists only of NUL
+ * bytes and ASCII whitespace, with or without a trailing `\n`. `integrity`: every other failure
+ * (a complete line that does not parse, fails the envelope or schema checks, breaks `seq` or the
+ * hash chain, or names the wrong thread). Either way the engine fails closed and never touches
+ * the file.
  */
 export type SessionFailureKind = "torn-tail" | "integrity";
 
@@ -599,52 +759,53 @@ const ENVELOPE_KEYS = [
   "v",
 ].join(",");
 
+/** Amendment 3 item 2 (b)(ii): NUL bytes and ASCII whitespace (space, tab, CR, LF) only. */
+const CRASH_RESIDUE_CHARS: ReadonlySet<string> = new Set(["\x00", " ", "\t", "\r", "\n"]);
+const isCrashResidueTail = (s: string): boolean =>
+  [...s].every((ch) => CRASH_RESIDUE_CHARS.has(ch));
+
 /**
  * Verify a session file's text (seat pin §4.3): recompute every hash forward from seq 0. Any
  * unparseable line, envelope drift, seq gap, prevHash break, hash mismatch, thread / seat change,
  * or unterminated last line fails, reporting the 1-based line number. Payloads are not
  * shape-checked here and unknown event types pass, so events added later (envelope v:1) still
  * verify; `rebuildSession` checks the M0 payload shapes before any state is built from them.
- * A failure is classified (Amendment 2 §5): an unterminated last line after complete lines that
- * all verify is `torn-tail`; every other failure is `integrity`.
+ * Failures classify per Amendment 3 item 2 (see {@link SessionFailureKind}): a 0-byte file, an
+ * unterminated fragment after verifying complete lines, and a NUL/whitespace-only remainder are
+ * `torn-tail`; everything else is `integrity`.
  */
 export function verifySessionText(text: string, expectedThreadId?: string): SessionVerifyResult {
-  if (text === "") return { ok: false, line: 1, reason: "empty session file", kind: "integrity" };
-  if (!text.endsWith("\n")) {
-    const complete = text.slice(0, text.lastIndexOf("\n") + 1);
-    // The complete lines must verify on their own; a failure there is an integrity failure, even
-    // with a torn tail after it.
-    if (complete !== "") {
-      const head = verifyCompleteLines(complete, expectedThreadId);
-      if (!head.ok) return head;
-    }
-    return {
-      ok: false,
-      line: text.split("\n").length,
-      reason: "unterminated last line",
-      kind: "torn-tail",
-    };
-  }
-  return verifyCompleteLines(text, expectedThreadId);
-}
-
-/** `text` is non-empty and ends with `\n`. */
-function verifyCompleteLines(text: string, expectedThreadId?: string): SessionVerifyResult {
-  const lines = text.slice(0, -1).split("\n");
+  // Item 2 (a): a crash after the directory fsync but before the first data fsync leaves 0 bytes.
+  if (text === "") return { ok: false, line: 1, reason: "empty session file", kind: "torn-tail" };
   const events: SessionEvent[] = [];
   let prevHash = GENESIS_HASH;
   let threadId = expectedThreadId;
   let seatId: string | undefined;
-  for (let i = 0; i < lines.length; i++) {
-    const fail = (reason: string): SessionVerifyResult => ({
-      ok: false,
-      line: i + 1,
-      reason,
-      kind: "integrity",
-    });
+  let offset = 0; // one past the last verified complete line; R = text.slice(offset)
+  for (let i = 0; ; i++) {
+    const nl = text.indexOf("\n", offset);
+    if (nl === -1) {
+      if (offset === text.length) {
+        return { ok: true, events, nextSeq: events.length, lastHash: prevHash };
+      }
+      // Item 2 (b)(i): the remainder holds no `\n` (unterminated fragment, NULs included).
+      return { ok: false, line: i + 1, reason: "unterminated last line", kind: "torn-tail" };
+    }
+    const fail = (reason: string): SessionVerifyResult => {
+      // Item 2 (b)(ii): the remainder from this line on is only NULs and ASCII whitespace.
+      if (isCrashResidueTail(text.slice(offset))) {
+        return {
+          ok: false,
+          line: i + 1,
+          reason: "trailing NUL/whitespace-only residue",
+          kind: "torn-tail",
+        };
+      }
+      return { ok: false, line: i + 1, reason, kind: "integrity" };
+    };
     let e: SessionEvent;
     try {
-      e = JSON.parse(lines[i] ?? "") as SessionEvent;
+      e = JSON.parse(text.slice(offset, nl)) as SessionEvent;
     } catch {
       return fail("line is not valid JSON");
     }
@@ -668,8 +829,8 @@ function verifyCompleteLines(text: string, expectedThreadId?: string): SessionVe
     if (sessionEventHash(prevHash, e) !== e.hash) return fail("hash mismatch");
     prevHash = e.hash;
     events.push(e);
+    offset = nl + 1;
   }
-  return { ok: true, events, nextSeq: events.length, lastHash: prevHash };
 }
 
 const isStr = (v: unknown): v is string => typeof v === "string";

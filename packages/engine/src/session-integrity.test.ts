@@ -32,6 +32,7 @@ import { EngineConnection } from "./server.ts";
 import {
   SessionWriter,
   setSessionFsyncForTests,
+  unguardedSessionWriterForTests,
   verifySessionFile,
   verifySessionText,
 } from "./session-store.ts";
@@ -416,7 +417,7 @@ test("A2 §8.3 writer unit: size drift on the fd fails the batch with -32009, no
   try {
     mkdirSync(join(home, "sessions"), { recursive: true });
     const path = join(home, "sessions", "thr_pos.jsonl");
-    const w = SessionWriter.create(
+    const w = unguardedSessionWriterForTests.create(
       path,
       "thr_pos",
       "madc-default",
@@ -442,7 +443,7 @@ test("A2 §8.3 resume is bound to the verified size: bytes appended after verifi
   try {
     mkdirSync(join(home, "sessions"), { recursive: true });
     const path = join(home, "sessions", "thr_gap.jsonl");
-    SessionWriter.create(
+    unguardedSessionWriterForTests.create(
       path,
       "thr_gap",
       "madc-default",
@@ -453,6 +454,8 @@ test("A2 §8.3 resume is bound to the verified size: bytes appended after verifi
     assert.ok(v.ok);
     if (!v.ok) return;
     assert.equal(v.size, readFileSync(path).length, "verifier reports the verified byte size");
+    if (v.size === undefined) throw new Error("verifier reports the byte size");
+    const expectedSize = v.size;
     appendFileSync(path, "late\n"); // lands between verification and resume
     const before = readFileSync(path);
     const w = SessionWriter.resume(
@@ -465,7 +468,8 @@ test("A2 §8.3 resume is bound to the verified size: bytes appended after verifi
       home,
       v.file,
       {
-        expectedSize: v.size,
+        holdsLock: () => true,
+        expectedSize,
       },
     );
     assert.throws(
@@ -498,7 +502,7 @@ test("A2 §8.4 fsync: one file fsync per append batch, one sessions/ fsync on cr
     const sessions = join(home, "sessions");
     mkdirSync(sessions, { recursive: true });
     const path = join(sessions, "thr_sync.jsonl");
-    const w = SessionWriter.create(
+    const w = unguardedSessionWriterForTests.create(
       path,
       "thr_sync",
       "madc-default",
@@ -565,7 +569,7 @@ test("A2 §8.4 a failed sessions/ directory fsync fails thread/start with -32009
 function sampleSession(home: string): string {
   mkdirSync(join(home, "sessions"), { recursive: true });
   const path = sessionPath(home, "thr_torn");
-  const w = SessionWriter.create(
+  const w = unguardedSessionWriterForTests.create(
     path,
     "thr_torn",
     "madc-default",
@@ -653,7 +657,7 @@ test("A2 §3 dangling turns close in one batch: a failed close leaves the file u
     mkdirSync(join(home, "sessions"), { recursive: true });
     seedDefaultSeat(home);
     const path = sessionPath(home, "thr_dangle");
-    const w = SessionWriter.create(
+    const w = unguardedSessionWriterForTests.create(
       path,
       "thr_dangle",
       "madc-default",
@@ -669,10 +673,13 @@ test("A2 §3 dangling turns close in one batch: a failed close leaves the file u
     w.append("turn.start", { turnId: "turn_b", inputText: "b" });
     const before = sha256(path);
     let syncs = 0;
+    // Amendment 3 rule 2: fail the close batch's fsync; the rollback fsync that follows succeeds,
+    // so the recovery is a durable rollback (row (a)), not a poisoning. The failed batch costs two
+    // file fsyncs: its own and the rollback's.
     setSessionFsyncForTests({
       file: () => {
         syncs++;
-        throw new Error("EIO (injected)");
+        if (syncs === 1) throw new Error("EIO (injected)");
       },
     });
     const e = inProcess(home);
@@ -680,7 +687,7 @@ test("A2 §3 dangling turns close in one batch: a failed close leaves the file u
       await e.init();
       const r = await e.request("thread/resume", { threadId: "thr_dangle" });
       assert.equal((r.error as { code: number }).code, -32009);
-      assert.equal(syncs, 1, "both turn.end events were one batch");
+      assert.equal(syncs, 2, "both turn.end events were one batch (batch fsync + rollback fsync)");
       assert.equal(sha256(path), before, "nothing of the recovery persisted");
       assert.equal(existsSync(lockPath(home, "thr_dangle")), false, "lock released");
     } finally {

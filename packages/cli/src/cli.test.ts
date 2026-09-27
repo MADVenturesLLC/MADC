@@ -734,7 +734,11 @@ test("A7 §3 doctor never hashes through a seat symlink; an unreadable sessions/
     const u = await runCli(sb, ["doctor", "--json"]);
     const locks = check(JSON.parse(u.stdout) as DoctorJson, "locks");
     assert.equal(locks.status, "warn", u.stdout);
-    assert.match(locks.summary, /unreadable \(EACCES\): not inspected/);
+    // Amendment 3 item 5 rule 4: the mode-bits detection text replaces "unreadable (EACCES)".
+    assert.equal(
+      locks.summary,
+      "sessions/ mode 0000: unsupported in M0 (needs owner read for directory fsync)",
+    );
   } finally {
     try {
       chmodSync(sessions, 0o755);

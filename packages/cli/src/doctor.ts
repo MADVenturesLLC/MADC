@@ -33,6 +33,7 @@ import {
   PROTOCOL_VERSION,
   readLock,
   resolveMadcHome,
+  sessionsOwnerReadUnsupported,
   spawnEngine,
   verifySessionFile,
 } from "@madc/engine/client";
@@ -660,6 +661,17 @@ function checkLocks(home: HomeState): Check {
   const dir = join(home.path, "sessions");
   let names: string[];
   let pinned: DirId | null = null;
+  // Amendment 3 item 5 rule 4: an owner-unreadable sessions/ is unsupported in M0 — WARN with the
+  // pinned summary whenever the detection rule matches (lstat mode bits, so the same as root).
+  // Computed before confinement: Bun's realpathSync refuses EACCES on such a directory where
+  // Node's succeeds, and the rule 5 detection never depends on either. A symlink reports 0777, so
+  // it never matches here; the symlink branch below still decides it. If the directory can still
+  // be listed (running as root), the per-lock evidence follows as usual.
+  const unsupportedMode = sessionsOwnerReadUnsupported(dir);
+  const unsupportedSummary =
+    unsupportedMode === null
+      ? null
+      : `sessions/ mode ${unsupportedMode}: unsupported in M0 (needs owner read for directory fsync)`;
   try {
     // Copilot r4107805223 / r4107905013, Bugbot 4107900653: same confinement as the engine's
     // inspection. `lstat` first (no follow): any `sessions` symlink, dangling or not, and any
@@ -671,11 +683,17 @@ function checkLocks(home: HomeState): Check {
       if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       return { id: "locks", status: "pass", summary: "no locks", evidence: { locks: [] } };
     }
-    if (
-      st.isSymbolicLink() ||
-      !st.isDirectory() ||
-      realpathSync(dir) !== join(realpathSync(home.path), "sessions")
-    ) {
+    let realpathOk = false;
+    if (!st.isSymbolicLink() && st.isDirectory()) {
+      try {
+        realpathOk = realpathSync(dir) === join(realpathSync(home.path), "sessions");
+      } catch (err) {
+        // Bun only: EACCES on the owner-unreadable dir. The mode-bits detection decides the row.
+        if (unsupportedMode === null || (err as NodeJS.ErrnoException).code !== "EACCES") throw err;
+        realpathOk = true;
+      }
+    }
+    if (!realpathOk) {
       return {
         id: "locks",
         status: "warn",
@@ -684,11 +702,9 @@ function checkLocks(home: HomeState): Check {
       };
     }
     pinned = { dev: st.dev, ino: st.ino };
-    names = readdirSync(dir).sort();
-    swapHookForTests?.("sessions");
   } catch (err) {
-    // `sessions/` exists (lstat above) but could not be resolved or listed: never a healthy PASS
-    // (Copilot review 5322024643, "previously missed").
+    // `sessions/` exists (lstat above) but its confinement could not be resolved: never a
+    // healthy PASS (Copilot review 5322024643, "previously missed").
     const code = (err as NodeJS.ErrnoException).code ?? "error";
     return {
       id: "locks",
@@ -697,7 +713,27 @@ function checkLocks(home: HomeState): Check {
       evidence: { path: dir, error: code },
     };
   }
-  const warnings: string[] = [];
+  try {
+    names = readdirSync(dir).sort();
+    swapHookForTests?.("sessions");
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code ?? "error";
+    if (unsupportedSummary !== null) {
+      return {
+        id: "locks",
+        status: "warn",
+        summary: unsupportedSummary,
+        evidence: { path: dir, mode: unsupportedMode },
+      };
+    }
+    return {
+      id: "locks",
+      status: "warn",
+      summary: `${dir} unreadable (${code}): not inspected`,
+      evidence: { path: dir, error: code },
+    };
+  }
+  const warnings: string[] = unsupportedSummary === null ? [] : [unsupportedSummary];
   const held: string[] = [];
   const locks: Array<Record<string, unknown>> = [];
   const now = Date.now();

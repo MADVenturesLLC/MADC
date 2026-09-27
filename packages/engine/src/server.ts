@@ -3,7 +3,7 @@ import { join } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
 import type { Agent, AgentTurnContext, TurnSink } from "./agent.ts";
-import { confinedPath } from "./home.ts";
+import { confinedPath, sessionsOwnerReadUnsupported } from "./home.ts";
 import { acquireThreadLock, holdsThreadLock, type LockHandle, releaseThreadLock } from "./lock.ts";
 import {
   alreadyInitialized,
@@ -14,6 +14,7 @@ import {
   methodNotFound,
   notInitialized,
   RpcError,
+  type SessionWriteFailedData,
   threadNotFound,
   turnAlreadyActive,
   turnNotFound,
@@ -40,6 +41,7 @@ import { type LoadedSeat, loadSeat, seedDefaultSeat } from "./seat-store.ts";
 import {
   type RebuiltSession,
   rebuildSession,
+  type SessionEvent,
   type SessionEventType,
   type SessionPayloads,
   SessionWriter,
@@ -140,9 +142,29 @@ export class EngineConnection {
   readonly #threads = new Map<string, ThreadRecord>();
   /** Locks this process still holds without a thread record (probe locks whose release failed). */
   readonly #strayLocks: LockHandle[] = [];
+  /**
+   * Amendment 3 item 1 rule 3 / C2: threads whose writer's rollback failed, for the life of this
+   * process. `path` is the session file and `seq` the FIRST seq of the refused batch (the seq the
+   * failed append's own -32009 carried). Survives `#threads.delete`; every -32009 C3 step 1 or C4
+   * answers for a poisoned thread carries this entry's `path` and `seq`.
+   */
+  readonly #poisoned = new Map<string, { path: string; seq: number }>();
 
   constructor(opts: EngineOptions) {
     this.#opts = opts;
+  }
+
+  /**
+   * C2: an append that left its writer poisoned puts the thread on the process-lifetime list and
+   * logs rule 3's line once (never the payload bytes). No-op for an ordinary broken writer.
+   */
+  #notePoisoned(threadId: string, session: SessionWriter): void {
+    const range = session.poisonedSeq;
+    if (range === null || this.#poisoned.has(threadId)) return;
+    this.#poisoned.set(threadId, { path: session.path, seq: range.first });
+    this.#log(
+      `session ${threadId}: rollback failed; refused seq ${range.first}..${range.last} may persist on disk`,
+    );
   }
 
   run(): Promise<void> {
@@ -305,6 +327,25 @@ export class EngineConnection {
 
     const id = this.#opts.newThreadId?.() ?? newId("thr");
     if (!isValidId(id)) throw internalError("Generated thread id is invalid");
+    // Amendment 3 item 5 rule 3: an owner-unreadable sessions/ fails -32009 BEFORE any lock or
+    // session file is created, with a message that names the cause (POSIX; mode bits, so the
+    // answer is the same as root). Detection is the lstat mode bits (rule 5), which never depends
+    // on realpath/open/readdir succeeding (Bun's realpathSync refuses EACCES where Node's does
+    // not), so it runs on the lexical path before confinement; a symlinked sessions/ passes the
+    // mode check (0777) and is still rejected by confinement below.
+    const sessionsMode = sessionsOwnerReadUnsupported(join(this.#opts.home, "sessions"));
+    if (sessionsMode !== null) {
+      throw new RpcError(
+        ErrorCode.SessionWriteFailed,
+        `sessions/ is not readable by its owner (mode ${sessionsMode} is unsupported in M0; use 0700)`,
+        {
+          threadId: id,
+          path: join(this.#opts.home, "sessions", `${id}.jsonl`),
+          seq: 0,
+        } satisfies SessionWriteFailedData,
+      );
+    }
+    const path = confinedPath(this.#opts.home, "sessions", id, ".jsonl");
     const lock = acquireThreadLock(this.#opts.home, id);
     if (!lock.ok) throw turnAlreadyActive(id, null, lock.holderPid ?? undefined);
     const handle = lock.handle;
@@ -313,7 +354,6 @@ export class EngineConnection {
     const cwd = typeof p.cwd === "string" ? p.cwd : null;
     let session: SessionWriter;
     try {
-      const path = confinedPath(this.#opts.home, "sessions", id, ".jsonl");
       session = SessionWriter.create(
         path,
         id,
@@ -329,6 +369,11 @@ export class EngineConnection {
         this.#opts.home,
         // Amendment 2 §2: every append re-checks that this acquisition still owns the lock.
         { holdsLock: () => holdsThreadLock(handle) },
+        {
+          // Amendment 3 rule 4: a close that fails after a durable batch is logged, not fatal.
+          onCloseFailed: (code) =>
+            this.#log(`session ${id}: close failed after a durable append (${code})`),
+        },
       );
     } catch (err) {
       this.#releaseOrKeep(handle);
@@ -380,10 +425,36 @@ export class EngineConnection {
     const threadId = requireId(p, "threadId", issues);
     throwIfIssues(issues);
 
+    // C4 / rule 6 row (b): a poisoned thread answers -32009 first, without acquiring, releasing
+    // or reloading (the poisoned check runs before any lock step).
+    const poisoned = this.#poisoned.get(threadId);
+    if (poisoned !== undefined) throw sessionWriteFailed(threadId, poisoned.path, poisoned.seq);
+
     const known = this.#threads.get(threadId);
     if (known !== undefined) {
+      if (known.session.broken && holdsThreadLock(known.lock)) {
+        // Rule 6 row (a): a broken writer is cleared only by a reload from disk through the §3
+        // cold-resume path, under the lock this engine already holds (kept, not released). An
+        // active turn still answers -32004.
+        if (known.activeTurnId !== null) throw turnAlreadyActive(threadId, known.activeTurnId);
+        let fresh: ThreadRecord;
+        try {
+          fresh = this.#loadColdThread(threadId, known.lock);
+        } catch (err) {
+          // Reload failure: the record is dropped and the lock released (or kept for shutdown);
+          // poisoned inside the reload keeps the lock until exit (rule 3) and passes -32009.
+          this.#threads.delete(threadId);
+          if (this.#poisoned.has(threadId)) this.#strayLocks.push(known.lock);
+          else this.#releaseOrKeep(known.lock);
+          throw err;
+        }
+        this.#threads.set(threadId, fresh);
+        const thread = fresh.thread;
+        return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+      }
       // Known in this process: still verify we own the on-disk lock before resuming (§3.3); a
-      // re-take reloads the thread from disk (Amendment 2 §3).
+      // re-take reloads the thread from disk (Amendment 2 §3 — row (c): a lost lock is re-taken
+      // even when the old writer was also broken).
       const current = this.#ensureLock(known);
       const thread = current.thread;
       return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
@@ -399,8 +470,10 @@ export class EngineConnection {
       record = this.#loadColdThread(threadId, handle);
     } catch (err) {
       // Not found / unverifiable / seat error: release the lock we just took (or keep it for
-      // shutdown if it cannot be released now — never orphan our own lock).
-      this.#releaseOrKeep(handle);
+      // shutdown if it cannot be released now — never orphan our own lock). Poisoned inside the
+      // reload keeps the lock until exit (rule 3).
+      if (this.#poisoned.has(threadId)) this.#strayLocks.push(handle);
+      else this.#releaseOrKeep(handle);
       throw err;
     }
     this.#threads.set(threadId, record);
@@ -439,6 +512,9 @@ export class EngineConnection {
       throw internalError("Session record failed verification");
     }
     const seat = loadSeat(this.#opts.home, rebuilt.thread.seatId);
+    // verifySessionFile always reports the verified byte size; it is the §2 position bound.
+    const verifiedSize = verified.size;
+    if (verifiedSize === undefined) throw internalError("Session record failed verification");
     const session = SessionWriter.resume(
       path,
       threadId,
@@ -449,7 +525,12 @@ export class EngineConnection {
       this.#opts.home,
       verified.file,
       // Amendment 2 §2: bound to this acquisition and to the verified byte size.
-      { holdsLock: () => holdsThreadLock(handle), expectedSize: verified.size },
+      { holdsLock: () => holdsThreadLock(handle), expectedSize: verifiedSize },
+      {
+        // Amendment 3 rule 4: a close that fails after a durable batch is logged, not fatal.
+        onCloseFailed: (code) =>
+          this.#log(`session ${threadId}: close failed after a durable append (${code})`),
+      },
     );
     if (rebuilt.danglingTurnIds.length > 0) {
       // All dangling turns close in ONE append batch (Copilot r4107434889): either every
@@ -458,13 +539,23 @@ export class EngineConnection {
       // that is the batch ts, and the thread's updatedAt covers the close.
       const closedAt =
         rebuilt.turns.find((t) => t.id === rebuilt.danglingTurnIds[0])?.completedAt ?? Date.now();
-      const events = session.appendAll(
-        rebuilt.danglingTurnIds.map((turnId) => ({
-          type: "turn.end" as const,
-          payload: { turnId, status: "interrupted" as const, error: null },
-        })),
-        closedAt,
-      );
+      let events: SessionEvent[];
+      try {
+        events = session.appendAll(
+          rebuilt.danglingTurnIds.map((turnId) => ({
+            type: "turn.end" as const,
+            payload: { turnId, status: "interrupted" as const, error: null },
+          })),
+          closedAt,
+        );
+      } catch (err) {
+        // Amendment 3 item 1 "Poisoned inside a reload": if the rollback of this close batch
+        // failed, C2 adds the thread to #poisoned and rule 3's line is logged once. The request
+        // then answers the append's own -32009; the caller keeps the lock until exit (rule 3)
+        // instead of releasing it, and no record is kept.
+        this.#notePoisoned(threadId, session);
+        throw err;
+      }
       for (const event of events) {
         rebuilt.thread.updatedAt = Math.max(rebuilt.thread.updatedAt, event.ts);
       }
@@ -585,7 +676,9 @@ export class EngineConnection {
     try {
       fresh = this.#loadColdThread(threadId, lock.handle);
     } catch (err) {
-      this.#releaseOrKeep(lock.handle);
+      // Poisoned inside the reload: the lock is kept until exit (rule 3), never released here.
+      if (this.#poisoned.has(threadId)) this.#strayLocks.push(lock.handle);
+      else this.#releaseOrKeep(lock.handle);
       throw err;
     }
     this.#threads.set(threadId, fresh);
@@ -601,31 +694,44 @@ export class EngineConnection {
     const input = parseUserInput(p.input, issues);
     throwIfIssues(issues);
 
+    // Parameter validation, -32002 and -32004 stay first and unchanged (Amendment 3 C3).
     let record = this.#threads.get(threadId);
     if (record === undefined) throw threadNotFound(threadId);
     if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
-    // A broken session writer is permanent: -32009 before any preflight (never a later refusal).
-    const session = record.session;
-    if (session.broken) throw sessionWriteFailed(threadId, session.path, session.nextSeq);
-    // Seat / registry / credential refusals are response errors before any turn exists (§4.2).
-    let ctx = this.#turnContext(record, input);
-    this.#opts.agent.preflight?.(ctx);
-    const current = this.#ensureLock(record);
-    if (current !== record) {
-      // Re-taken and reloaded from disk (Amendment 2 §3): preflight the reloaded seat too.
-      record = current;
-      ctx = this.#turnContext(record, input);
-      this.#opts.agent.preflight?.(ctx);
+    // C3 step 1: a poisoned thread answers -32009 with the C2 entry's path and first refused seq.
+    const poisoned = this.#poisoned.get(threadId);
+    if (poisoned !== undefined) throw sessionWriteFailed(threadId, poisoned.path, poisoned.seq);
+    // C3 step 2: a lost lock is re-taken and the thread reloaded from disk BEFORE anything else
+    // (rule 6 row (c); re-take errors now come before preflight refusals, and the re-take and
+    // reload run even when preflight would then refuse). A failed reload follows "Reload failure".
+    if (!holdsThreadLock(record.lock)) {
+      record = this.#ensureLock(record);
     }
+    // C3 step 3: a broken writer answers -32009 (rule 6 rows (a)/(b): only thread/resume reloads
+    // it, or nothing in this process does). This runs before preflight even after a re-take.
+    if (record.session.broken) {
+      throw sessionWriteFailed(threadId, record.session.path, record.session.nextSeq);
+    }
+    // C3 step 4: seat / registry / credential preflight, exactly once, against the record that
+    // will append (the reloaded record after a re-take; D-162). A refusal after a re-take leaves
+    // the re-taken lock held by this process, as any refused turn/start does.
+    const ctx = this.#turnContext(record, input);
+    this.#opts.agent.preflight?.(ctx);
 
     const now = Date.now();
     const turnId = newId("turn");
     // turn.start is durable before the turn exists: an append failure is a -32009 response error.
-    record.session.append(
-      "turn.start",
-      { turnId, inputText: input.map((part) => part.text).join("\n") },
-      now, // == turn.startedAt
-    );
+    try {
+      // C3 step 5: only after preflight, append turn.start.
+      record.session.append(
+        "turn.start",
+        { turnId, inputText: input.map((part) => part.text).join("\n") },
+        now, // == turn.startedAt
+      );
+    } catch (err) {
+      this.#notePoisoned(threadId, record.session);
+      throw err;
+    }
     const turn: Turn = {
       id: turnId,
       threadId,
@@ -711,6 +817,7 @@ export class EngineConnection {
       return true;
     } catch (err) {
       if (!(err instanceof RpcError)) throw err;
+      this.#notePoisoned(record.thread.id, record.session);
       this.#finishTurn(record, tr, "failed", err.toBody());
       return false;
     }
@@ -726,6 +833,7 @@ export class EngineConnection {
     try {
       return record.session.append(type, payload, ts).payload;
     } catch (err) {
+      this.#notePoisoned(record.thread.id, record.session);
       this.#log(
         `session append failed (${type}): ${err instanceof Error ? err.message : String(err)}`,
       );
@@ -864,6 +972,7 @@ export class EngineConnection {
         now, // == turn.completedAt
       );
     } catch (err) {
+      this.#notePoisoned(record.thread.id, record.session);
       this.#log(
         `session append failed (turn.end): ${err instanceof Error ? err.message : String(err)}`,
       );

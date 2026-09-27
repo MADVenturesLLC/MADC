@@ -6,12 +6,12 @@
 import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { SessionWriter } from "../session-store.ts";
+import { unguardedSessionWriterForTests } from "../session-store.ts";
 
 const dir = process.argv[2] ?? "";
 mkdirSync(dir, { recursive: true });
 const path = join(dir, "thr_fifo.jsonl");
-const writer = SessionWriter.create(
+const writer = unguardedSessionWriterForTests.create(
   path,
   "thr_fifo",
   "madc-default",
