@@ -190,6 +190,9 @@ function isThreadShape(t: unknown, seatId: string): t is Thread {
 /**
  * Erratum §3b "well-formed message": every object in `client.messages` is a notification, a
  * response, or malformed (N2–N4). The `jsonrpc` field is neither required nor checked.
+ * Accepts `unknown` and never throws (Copilot PR #23): a non-object JSON value classifies as the
+ * N4-style malformed case. (The client already routes non-object lines to `protocolViolations`
+ * instead of `messages`; this is belt-and-braces.)
  */
 type MessageClass =
   | { readonly kind: "ok" }
@@ -197,25 +200,29 @@ type MessageClass =
   | { readonly kind: "n3" } // neither a method nor an id
   | { readonly kind: "n4"; readonly malformedError: boolean }; // any other malformed object
 
-function classifyMessage(m: WireMessage): MessageClass {
-  const hasId = Object.hasOwn(m, "id");
-  const hasMethod = Object.hasOwn(m, "method");
+export function classifyMessage(m: unknown): MessageClass {
+  if (m === null || typeof m !== "object" || Array.isArray(m)) {
+    return { kind: "n4", malformedError: false };
+  }
+  const w = m as WireMessage;
+  const hasId = Object.hasOwn(w, "id");
+  const hasMethod = Object.hasOwn(w, "method");
   if (hasId && hasMethod) return { kind: "n2" };
   if (!hasId && !hasMethod) return { kind: "n3" };
   if (hasMethod) {
     // A notification: `method` must be a string (there is no own id key here).
-    return typeof m.method === "string" ? { kind: "ok" } : { kind: "n4", malformedError: false };
+    return typeof w.method === "string" ? { kind: "ok" } : { kind: "n4", malformedError: false };
   }
   // A response: own id that is a number or a string, or null together with `error`; exactly one
   // of own `result` and own `error`; an error is an integer code plus a string message.
-  if (typeof m.id !== "number" && typeof m.id !== "string" && m.id !== null) {
+  if (typeof w.id !== "number" && typeof w.id !== "string" && w.id !== null) {
     return { kind: "n4", malformedError: false };
   }
-  const hasResult = Object.hasOwn(m, "result");
-  const hasError = Object.hasOwn(m, "error");
+  const hasResult = Object.hasOwn(w, "result");
+  const hasError = Object.hasOwn(w, "error");
   if (hasResult === hasError) return { kind: "n4", malformedError: false };
-  if (m.id === null && !hasError) return { kind: "n4", malformedError: false };
-  if (hasError && !isErrorBody(m.error)) return { kind: "n4", malformedError: true };
+  if (w.id === null && !hasError) return { kind: "n4", malformedError: false };
+  if (hasError && !isErrorBody(w.error)) return { kind: "n4", malformedError: true };
   return { kind: "ok" };
 }
 
@@ -451,7 +458,7 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
           return;
         }
         for (; scannedMessages < c.messages.length; scannedMessages++) {
-          const cls = classifyMessage(c.messages[scannedMessages] as WireMessage);
+          const cls = classifyMessage(c.messages[scannedMessages]);
           if (cls.kind === "ok") continue;
           clearInterval(violationTimer);
           reject(new ProtocolMismatch(violationMessage(cls)));

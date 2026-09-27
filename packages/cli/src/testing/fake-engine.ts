@@ -183,6 +183,18 @@ rl.on("line", (line) => {
         send({ id: msg.id, result: null });
         return;
       }
+      if (scenario === "init-then-hang") {
+        // §3e E7: initialize is answered, then the engine never exits on stdin EOF.
+        send({
+          id: msg.id,
+          result: {
+            serverInfo: { name: "madc-engine", version: "0.0.0" },
+            protocolVersion: "madc-m0/1",
+          },
+        });
+        keepAlive();
+        return;
+      }
       send({
         id: msg.id,
         result: {
@@ -652,6 +664,14 @@ rl.on("line", (line) => {
         send({ method: "turn/completed", params: { turn: early } });
         append("turn.end", { turnId: early.id as string, status: "completed", error: null });
         send({ id: msg.id, result: { turn: inProgress() } });
+        return;
+      }
+      if (scenario === "json-null-line") {
+        // Copilot PR #23: a JSON but non-object stdout line mid-turn (null and an array) → the
+        // client logs it as a protocol violation; the CLI exits 3 and never crashes.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress() } });
+        process.stdout.write("null\n[]\n");
         return;
       }
       if (scenario === "blank-line") {

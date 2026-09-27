@@ -24,6 +24,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { CliIO } from "./io.ts";
 import { main, parseTurnIdleMs } from "./main.ts";
+import { classifyMessage } from "./oneshot.ts";
 
 const LAUNCHER = fileURLToPath(new URL("./testing/cli-launcher.ts", import.meta.url));
 const DRIVER = fileURLToPath(new URL("./testing/oneshot-driver.ts", import.meta.url));
@@ -137,6 +138,20 @@ function runOneShotChild(
     ...r,
     ms: Date.now() - t0,
   }));
+}
+
+/** Poll until the file at `path` contains `needle`. */
+async function waitForFile(path: string, needle: string, ms = 10_000): Promise<void> {
+  const until = Date.now() + ms;
+  for (;;) {
+    try {
+      if (readFileSync(path, "utf8").includes(needle)) return;
+    } catch {
+      // not yet
+    }
+    if (Date.now() > until) throw new Error(`${path} never contained ${needle}`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
 }
 
 /** Poll until some session file under `<home>/sessions` contains `needle`. */
@@ -468,6 +483,47 @@ test("§3b N7: initialize result serverInfo and thread/start result full Thread 
     const out = parseJson(r.stdout);
     assert.equal(out.error?.message, "protocol violation: initialize returned an invalid result");
     assert.doesNotMatch(r.stdout + r.stderr, /Cannot read properties/);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("§3b classifier never throws: non-object JSON values classify as malformed; a null/[] line mid-turn → exit 3, no crash (Copilot PR #23)", {
+  timeout: 60_000,
+}, async () => {
+  // Unit: the classifier accepts unknown and treats non-object JSON values as N4-style malformed.
+  for (const value of [null, [], 7, "x"]) {
+    assert.deepEqual(classifyMessage(value), { kind: "n4", malformedError: false });
+  }
+  // End to end: the client routes a non-object line to protocolViolations; the CLI exits 3.
+  const sb = sandbox();
+  try {
+    const r = await runCli(sb, ["-p", "hi", "--json"], {
+      engine: FAKE,
+      env: { MADC_TEST_FAKE_SCENARIO: "json-null-line" },
+    });
+    assert.equal(r.code, 3, r.stdout + r.stderr);
+    assert.equal(
+      parseJson(r.stdout).error?.message,
+      "protocol violation: non-JSON line on engine stdout",
+    );
+    assert.equal(r.signal, null, "no crash");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("oneshot-driver: a non-numeric or non-positive ms knob is a clear harness error, never NaN (Copilot PR #23)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    const r = await runCli(sb, [], {
+      driver: true,
+      env: { MADC_TEST_FAKE_SCENARIO: "", MADC_TEST_TURN_IDLE_MS: "abc" },
+    });
+    assert.notEqual(r.code, 0, r.stdout + r.stderr);
+    assert.match(r.stderr, /MADC_TEST_TURN_IDLE_MS must be a positive integer/);
   } finally {
     sb.cleanup();
   }
@@ -1220,6 +1276,87 @@ test("§3e E7: doctor on a signal kills the probe, removes the temp dir, exits 1
   }
 });
 
+test("§3e E7: a signal during the probe's stdin-EOF wait kills the probe at once (Bugbot: the hook must outlive initialize)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  const tmp = join(sb.root, "tmp");
+  mkdirSync(tmp);
+  try {
+    let signalledAt = 0;
+    const r = await runCli(sb, ["doctor", "--json"], {
+      engine: FAKE,
+      // The fake answers initialize, then never exits on EOF: without the kill the probe would
+      // sit out the rest of its 5 s budget.
+      env: { MADC_TEST_FAKE_SCENARIO: "init-then-hang", TMPDIR: tmp },
+      onSpawn: (child) => {
+        setTimeout(() => {
+          signalledAt = Date.now();
+          child.kill("SIGTERM");
+        }, 600);
+        setTimeout(() => child.kill("SIGKILL"), 10_000).unref();
+      },
+    });
+    assert.equal(r.code, 143, r.stdout + r.stderr);
+    assert.ok(
+      Date.now() - signalledAt < 1_500,
+      `probe killed without waiting out the 5 s budget (${Date.now() - signalledAt} ms)`,
+    );
+    const report = JSON.parse(r.stdout) as { exitCode: number };
+    assert.equal(report.exitCode, 143);
+    assert.equal(
+      readdirSync(tmp).filter((n) => n.startsWith("madc-doctor-")).length,
+      0,
+      "no madc-doctor-* left behind",
+    );
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("§3e E7: a signal during --init runs no further rows (only the rows so far are reported)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    let signalledAt = 0;
+    const r = await runCli(sb, ["doctor", "--init", "--json"], {
+      engine: FAKE,
+      // The fake answers initialize, then never exits on EOF: the init probe's budget is 30 s,
+      // so a prompt exit proves the kill, and checks == ["init"] proves no further rows ran.
+      env: { MADC_TEST_FAKE_SCENARIO: "init-then-hang" },
+      onSpawn: (child) => {
+        setTimeout(() => {
+          signalledAt = Date.now();
+          child.kill("SIGTERM");
+        }, 600);
+        setTimeout(() => child.kill("SIGKILL"), 10_000).unref();
+      },
+    });
+    assert.equal(r.code, 143, r.stdout + r.stderr);
+    assert.ok(
+      Date.now() - signalledAt < 1_500,
+      `the 30 s init budget was not waited out (${Date.now() - signalledAt} ms)`,
+    );
+    const report = JSON.parse(r.stdout) as {
+      ok: boolean;
+      exitCode: number;
+      checks: Array<{ id: string }>;
+      counts: Record<string, number>;
+    };
+    assert.equal(report.ok, false);
+    assert.equal(report.exitCode, 143);
+    assert.deepEqual(
+      report.checks.map((c) => c.id),
+      ["init"],
+      "no further rows after the signal (runtime included)",
+    );
+    assert.deepEqual(report.counts, { pass: 0, warn: 0, fail: 1, skip: 0 });
+  } finally {
+    sb.cleanup();
+  }
+});
+
 test("§3e E8: parse-level usage failures print one JSON object when --json is anywhere in argv", {
   timeout: 60_000,
 }, async () => {
@@ -1415,10 +1552,15 @@ test("§3e E15: a first SIGINT before turn/start is sent forces at once (exit 13
       engine: FAKE,
       env: { MADC_TEST_FAKE_SCENARIO: "slow-init", MADC_TEST_FAKE_MARK: mark },
       onSpawn: (child) => {
-        setTimeout(() => {
-          signalledAt = Date.now();
-          child.kill("SIGINT");
-        }, 300);
+        // Signal once the fake has received initialize: the CLI is then parked in the
+        // initialize wait with its handlers installed (a fixed 300 ms raced module load on
+        // slower runtimes; E6's named residual is a signal before main runs).
+        waitForFile(mark, "initialize")
+          .then(() => {
+            signalledAt = Date.now();
+            child.kill("SIGINT");
+          })
+          .catch(() => child.kill("SIGKILL"));
         setTimeout(() => child.kill("SIGKILL"), 15_000).unref();
       },
     });
