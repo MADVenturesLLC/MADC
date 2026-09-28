@@ -121,7 +121,14 @@ export async function runAuthSet(argv: readonly string[], deps: AuthSetDeps = {}
   }
   const entry = getById(providerId);
   if (entry === undefined) {
-    return fail(2, `unknown provider id "${providerId}" (not in the registry catalog)`);
+    // Identifier-independent on purpose (M1-A2 fix, Copilot 4126239605): the sole argument may be
+    // a credential pasted where a provider id belongs, so the diagnostic must never interpolate
+    // it — same no-echo rule as the arity and grammar paths. (The lane refusals below run only
+    // for ids that ARE catalog entries, so interpolating those public ids is safe.)
+    return fail(
+      2,
+      "unknown provider id (value not echoed; the argument must be a registry catalog id such as kimi-code — a credential is never an argument)",
+    );
   }
   if (entry.status === "forbidden") {
     return fail(4, `${providerId} is a forbidden lane: madc never stores its credentials`);

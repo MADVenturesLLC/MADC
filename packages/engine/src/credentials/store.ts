@@ -82,11 +82,18 @@ export type CredentialStoreDeps = {
 };
 
 export type CredentialStore = {
-  /** Presence only. */
+  /** Presence only. An existing-but-empty keychain record counts as present. */
   status(providerId: string): Promise<boolean>;
-  /** Where the credential resolves from, or null when absent (drives `auth/status` + doctor). */
+  /**
+   * Where the credential resolves from, or null when absent. Engine-internal presence metadata
+   * (the pinned `auth/status` wire shape is `{ providerId, present }` only).
+   */
   source(providerId: string): Promise<CredentialSource | null>;
-  /** Engine-internal only — never exposed via the protocol. */
+  /**
+   * Engine-internal only — never exposed via the protocol. An existing keychain record (even an
+   * empty one) is returned as-is and BLOCKS the env fallback; callers validate usability. Null
+   * only when no record exists and the `MADC_DEV_ENV_KEYS=1` fallback has no value either.
+   */
   get(providerId: string): Promise<string | null>;
   set(providerId: string, secret: string): Promise<void>;
   remove(providerId: string): Promise<void>;
@@ -278,8 +285,12 @@ export function createCredentialStore(deps: CredentialStoreDeps = {}): Credentia
       return envValue(providerId) !== null ? "env" : null;
     },
     async get(providerId) {
+      // An EXISTING record always wins — even an empty one (M1-A2 fix, Copilot 4126239668):
+      // `read` answers null only for "absent", so any non-null result short-circuits the env
+      // fallback and keeps get/status/source in agreement. An empty record is returned as-is;
+      // usability is the caller's check (readKimiCredential rejects "" → -32008 no-credentials).
       const stored = await backend.read(providerId);
-      if (stored !== null && stored !== "") return stored;
+      if (stored !== null) return stored;
       return envValue(providerId);
     },
     set(providerId, secret) {

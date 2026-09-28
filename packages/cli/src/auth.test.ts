@@ -18,8 +18,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { parseArgs } from "./args.ts";
+import type { CliIO } from "./io.ts";
+import { main } from "./main.ts";
 
 const ENGINE_SRC = fileURLToPath(new URL("../../engine/src/", import.meta.url));
 const REAL_BIN = join(ENGINE_SRC, "bin.ts");
@@ -357,6 +361,113 @@ test("A2 doctor: MADC_DEV_ENV_KEYS=1 is disclosed loudly (WARN); unset means key
     assert.match(unsetRow.summary, /madc auth status kimi-code/);
     assert.equal(unsetRow.evidence.devEnvKeys, false);
     assert.ok(!unset.stdout.includes(SYNTHETIC));
+  } finally {
+    sb.cleanup();
+  }
+});
+
+// --------------------------------------- Copilot 4126239496: flag diagnostics never echo a token
+
+/** In-process IO double (index.test.ts pattern): no child processes, no streams beyond memory. */
+function fakeIO(): CliIO & { out: () => string; err: () => string } {
+  let out = "";
+  let err = "";
+  return {
+    stdout: { write: (s: string) => (out += s) },
+    stderr: { write: (s: string) => (err += s) },
+    stdin: new PassThrough(),
+    env: {},
+    stdoutIsTTY: false,
+    stderrIsTTY: false,
+    cwd: "/",
+    out: () => out,
+    err: () => err,
+  };
+}
+
+const FLAG_SECRET = "-sk-synthetic-flag-echo-0123456789";
+const FLAG_SECRET_DASHDASH = "--sk-sp-synthetic-plan-flag-0123456789";
+const GLOBAL_FLAG_SECRET = "--sk-synthetic-global-flag-0123456789";
+const XAI_FLAG_SECRET = "-xai-synthetic-flag-echo-0123456789";
+
+test("A2 fix 4126239496: credential-shaped `-`-leading auth arguments are never echoed by flag diagnostics", () => {
+  // The defect: the global flag loop ran before the auth branch, so `madc auth set kimi-code -sk-…`
+  // hit the generic `unknown flag ${arg}` path and printed the credential to stderr (and, with
+  // --json anywhere, into the E8 JSON usage object on stdout).
+  for (const argv of [
+    ["auth", "set", "kimi-code", FLAG_SECRET],
+    ["auth", "set", "kimi-code", FLAG_SECRET_DASHDASH],
+    ["auth", "set", XAI_FLAG_SECRET, "kimi-code"],
+    ["auth", "rm", FLAG_SECRET],
+    // Credential-shaped tokens are suppressed even before an `auth` positional appears.
+    [GLOBAL_FLAG_SECRET, "doctor"],
+  ]) {
+    const parsed = parseArgs(argv);
+    assert.equal(parsed.kind, "usage", argv.join(" "));
+    if (parsed.kind !== "usage") continue;
+    for (const secret of [FLAG_SECRET, FLAG_SECRET_DASHDASH, GLOBAL_FLAG_SECRET, XAI_FLAG_SECRET]) {
+      assert.ok(!parsed.message.includes(secret), `message echoes ${secret}: ${parsed.message}`);
+    }
+  }
+});
+
+test("A2 fix 4126239496: E8 JSON usage failure carries no echoed credential", async () => {
+  const io = fakeIO();
+  const code = await main(["auth", "set", "kimi-code", FLAG_SECRET, "--json"], io);
+  assert.equal(code, 2);
+  const out = JSON.parse(io.out()) as { ok: boolean; exitCode: number; error: { message: string } };
+  assert.equal(out.ok, false);
+  assert.equal(out.exitCode, 2);
+  assert.ok(!io.out().includes(FLAG_SECRET), "stdout echoes the credential");
+  assert.ok(!io.err().includes(FLAG_SECRET), "stderr echoes the credential");
+  assert.match(out.error.message, /unknown flag/);
+});
+
+test("A2 fix 4126239496: the M0-pinned diagnostic for ordinary flag typos is unchanged", () => {
+  // erratum1 §3e pins `madc: unknown flag --nope`; non-credential typos keep the exact message.
+  assert.deepEqual(parseArgs(["--nope"]), { kind: "usage", message: "unknown flag --nope" });
+  assert.deepEqual(parseArgs(["-p", "hi", "--nope"]), {
+    kind: "usage",
+    message: "unknown flag --nope",
+  });
+});
+
+test("A2 fix 4126239496 e2e: a credential-shaped flag argument never reaches stdout or stderr", async () => {
+  const sb = sandbox();
+  try {
+    const kc = keychainSandbox(sb);
+    for (const secret of [FLAG_SECRET, FLAG_SECRET_DASHDASH]) {
+      const r = await runCli(sb, ["auth", "set", "kimi-code", secret], {
+        engine: REAL_BIN,
+        env: { ...kc.env, MADC_DEV_ENV_KEYS: "1" },
+      });
+      assert.equal(r.code, 2, secret);
+      assert.ok(!r.stderr.includes(secret), `stderr echoes ${secret}`);
+      assert.ok(!r.stdout.includes(secret), `stdout echoes ${secret}`);
+      assert.equal(existsSync(kc.accountFile("kimi-code")), false);
+    }
+  } finally {
+    sb.cleanup();
+  }
+});
+
+// ------------------------------------- Copilot 4126239605: sole-argument credential never echoed
+
+test("A2 fix 4126239605 e2e: a credential-shaped sole `auth set` argument is a usage error and is never echoed", async () => {
+  const sb = sandbox();
+  try {
+    const kc = keychainSandbox(sb);
+    const sole = "sk-synthetic-sole-argument-credential-0123456789";
+    const r = await runCli(sb, ["auth", "set", sole], {
+      engine: REAL_BIN,
+      env: { ...kc.env, MADC_DEV_ENV_KEYS: "1" },
+      stdin: "unused\n",
+    });
+    assert.equal(r.code, 2);
+    assert.match(r.stderr, /unknown provider id/);
+    assert.ok(!r.stderr.includes(sole), "the one-shot diagnostic echoes the sole argument");
+    assert.ok(!r.stdout.includes(sole));
+    assert.equal(existsSync(kc.accountFile(sole)), false);
   } finally {
     sb.cleanup();
   }

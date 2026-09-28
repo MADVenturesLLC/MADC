@@ -62,6 +62,27 @@ export function hasJsonFlag(argv: readonly string[]): boolean {
   return false;
 }
 
+/**
+ * The pinned credential shapes (seat pin §4.2 / S6: generic `sk-…`, plan `sk-sp-…`, `xai-…`),
+ * used ONLY to decide whether a diagnostic may echo a `-`-leading token (M1-A2 fix, Copilot
+ * 4126239496): `madc auth set kimi-code -sk-…` must be rejected WITHOUT printing the argument.
+ * Deliberately local — the CLI may not import engine redaction code (plan §6 import rules); the
+ * shapes themselves are pin-frozen.
+ */
+const CREDENTIAL_SHAPED = /^(?:sk-(?:sp-)?|xai-)/i;
+
+/**
+ * The unknown-flag diagnostic. Ordinary typos keep the M0-pinned message (`unknown flag --nope`,
+ * erratum1 §3e); inside an `auth` command, or when the token itself is credential-shaped, the raw
+ * argument is never interpolated — it may be a credential pasted on the command line.
+ */
+function unknownFlagMessage(arg: string, inAuthCommand: boolean): string {
+  if (inAuthCommand || CREDENTIAL_SHAPED.test(arg.replace(/^-+/, ""))) {
+    return "unknown flag (token not echoed: a credential on the command line is never accepted)";
+  }
+  return `unknown flag ${arg}`;
+}
+
 export function parseArgs(argv: readonly string[]): ParsedArgs {
   let version = false;
   let help = false;
@@ -110,7 +131,9 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
         break;
       }
       default:
-        return usage(`unknown flag ${arg}`);
+        // positionals seen SO FAR decide the auth context: `madc auth set <id> -sk-…` has
+        // positionals[0] === "auth" by the time the flag token is reached (Copilot 4126239496).
+        return usage(unknownFlagMessage(arg, positionals[0] === "auth"));
     }
   }
   if (help) return { kind: "help" };

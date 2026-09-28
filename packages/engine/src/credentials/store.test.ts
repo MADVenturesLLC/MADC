@@ -185,6 +185,58 @@ test("A2 env fallback: the keychain always wins over env", async () => {
   }
 });
 
+test("A2 fix 4126239668: an empty keychain record is PRESENT — get/status/source agree and env never supersedes it (darwin)", async () => {
+  // The defect: get() treated an existing-but-empty record as absent (`stored !== ""`) and fell
+  // through to the env value, while status/source reported the keychain as present — the env
+  // fallback silently superseded an existing record under MADC_DEV_ENV_KEYS=1.
+  const kc = fakeKeychain("darwin");
+  try {
+    writeFileSync(kc.accountFile("kimi-code"), "", { mode: 0o600 });
+    const store = createCredentialStore({
+      env: { ...kc.env, [MADC_DEV_ENV_KEYS]: "1", KIMI_API_KEY: SYNTHETIC },
+    });
+    assert.equal(await store.status("kimi-code"), true, "the record exists");
+    assert.equal(await store.source("kimi-code"), "keychain");
+    assert.equal(
+      await store.get("kimi-code"),
+      "",
+      "get returns the (empty) stored record — never the env value; usability is the caller's check",
+    );
+  } finally {
+    kc.cleanup();
+  }
+});
+
+test("A2 fix 4126239668: an empty record blocks the env fallback the same way (linux)", async () => {
+  const kc = fakeKeychain("linux");
+  try {
+    writeFileSync(kc.accountFile("xai-api"), "", { mode: 0o600 });
+    const store = createCredentialStore({
+      env: { ...kc.env, [MADC_DEV_ENV_KEYS]: "1", MADC_API_KEY_XAI_API: SYNTHETIC_2 },
+    });
+    assert.equal(await store.status("xai-api"), true);
+    assert.equal(await store.source("xai-api"), "keychain");
+    assert.equal(await store.get("xai-api"), "");
+  } finally {
+    kc.cleanup();
+  }
+});
+
+test("A2 fix 4126239668: an empty record without the flag stays consistently unusable, and removal clears it", async () => {
+  const kc = fakeKeychain("darwin");
+  try {
+    writeFileSync(kc.accountFile("kimi-code"), "", { mode: 0o600 });
+    const store = createCredentialStore({ env: kc.env });
+    assert.equal(await store.status("kimi-code"), true);
+    assert.equal(await store.get("kimi-code"), "");
+    await store.remove("kimi-code");
+    assert.equal(await store.status("kimi-code"), false);
+    assert.equal(await store.get("kimi-code"), null);
+  } finally {
+    kc.cleanup();
+  }
+});
+
 test("A2 credentialEnvVar: M0's KIMI_API_KEY is preserved; every other id derives MADC_API_KEY_<ID>", () => {
   assert.equal(credentialEnvVar("kimi-code"), "KIMI_API_KEY");
   assert.equal(credentialEnvVar("xai-api"), "MADC_API_KEY_XAI_API");

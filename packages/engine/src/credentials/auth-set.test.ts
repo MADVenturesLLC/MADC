@@ -100,6 +100,26 @@ test("A2 auth-set: id grammar and unknown ids are usage errors", async () => {
   assert.deepEqual(store.sets, []);
 });
 
+test("A2 fix 4126239605: the unknown-provider diagnostic never interpolates the sole argument (it may be a credential)", async () => {
+  // The defect: `unknown provider id ${providerId}` echoed the raw argument, so a credential-shaped
+  // sole argument (`madc-engine auth-set sk-…`) was printed to stderr. The message must be
+  // identifier-independent, like the arity and grammar paths already are.
+  const store = fakeStore();
+  for (const sole of [
+    "sk-synthetic-sole-argument-credential-0123456789",
+    "sk-sp-synthetic-sole-plan-credential-0123456789",
+    "xai-synthetic-sole-argument-credential-01",
+  ]) {
+    const err = captureStderr();
+    const code = await runAuthSet([sole], { store, stderr: err, env: {} });
+    assert.equal(code, 2, sole);
+    assert.match(err.text(), /unknown provider id/, sole);
+    assert.ok(!err.text().includes(sole), `the diagnostic echoes the sole argument: ${sole}`);
+    assert.ok(!err.text().includes(sole.replace(/^(sk-sp-|sk-|xai-)/, "")), "no partial echo");
+  }
+  assert.deepEqual(store.sets, []);
+});
+
 // ----------------------------------------------------------------------- lane policy (A2 forbidden)
 
 test("A2 auth-set: forbidden lanes are refused (exit 4) — including every consumer-login/token-replay id", async () => {
