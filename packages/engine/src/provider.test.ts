@@ -247,7 +247,13 @@ function preflightFor(
 
 test("defense in depth: the agent's registry check still refuses seats built in code (-32007 / -32008)", () => {
   const cases: Array<[string, number, Record<string, unknown>]> = [
-    ["ollama-cloud", -32008, { providerId: "ollama-cloud", reason: "unwired" }],
+    // M1-A1 (D-M1-3): allowed-direct no longer implies a headless allow; the policy denial
+    // (-32007 headless-not-permitted) fires before the unwired stub state (-32008).
+    [
+      "ollama-cloud",
+      -32007,
+      { providerId: "ollama-cloud", status: "allowed-direct", reason: "headless-not-permitted" },
+    ],
     [
       "zai-glm-coding-plan",
       -32007,
