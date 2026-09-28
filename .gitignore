@@ -26,6 +26,7 @@ sessions/
 transcripts/
 .madc/
 .claude/settings.local.json
+.mimosa/
 
 # OS / editor
 .DS_Store
