@@ -848,7 +848,7 @@ test("§3c 14: parseTurnIdleMs — default 600000, bounds, every invalid form", 
   }
 });
 
-test("§3c 15: responseTimeoutMs is injectable (timeout 200ms at each request stage)", {
+test("§3c 15: responseTimeoutMs is injectable (timeout fires at each request stage)", {
   timeout: 60_000,
 }, async () => {
   // initialize never answered: no receipt, threadId null
@@ -857,11 +857,11 @@ test("§3c 15: responseTimeoutMs is injectable (timeout 200ms at each request st
     const r = await runOneShotChild(sb, {
       scenario: "never-answer-init",
       turnIdleMs: 60_000,
-      responseTimeoutMs: 200,
+      responseTimeoutMs: 5000,
       json: false,
     });
     assert.equal(r.code, 3, r.stdout + r.stderr);
-    assert.match(r.stderr, /^madc: engine error: timeout 200ms\nexit 3\n$/);
+    assert.match(r.stderr, /^madc: engine error: timeout 5000ms\nexit 3\n$/);
     assert.equal(r.stderr.includes("─ receipt"), false, "no receipt before thread/start");
   } finally {
     sb.cleanup();
@@ -872,11 +872,11 @@ test("§3c 15: responseTimeoutMs is injectable (timeout 200ms at each request st
     const r = await runOneShotChild(sb2, {
       scenario: "never-answer-thread",
       turnIdleMs: 60_000,
-      responseTimeoutMs: 200,
+      responseTimeoutMs: 5000,
     });
     assert.equal(r.code, 3, r.stdout + r.stderr);
     const out = parseJson(r.stdout);
-    assert.equal(out.error?.message, "timeout 200ms");
+    assert.equal(out.error?.message, "timeout 5000ms");
     assert.equal(out.threadId, null);
   } finally {
     sb2.cleanup();
@@ -887,13 +887,13 @@ test("§3c 15: responseTimeoutMs is injectable (timeout 200ms at each request st
     const r = await runOneShotChild(sb3, {
       scenario: "never-answer-turn",
       turnIdleMs: 60_000,
-      responseTimeoutMs: 200,
+      responseTimeoutMs: 5000,
       json: false,
     });
     assert.equal(r.code, 3, r.stdout + r.stderr);
     assert.match(r.stderr, /^ turn {5}UNKNOWN /m);
     assert.match(r.stderr, /UNVERIFIED: turn unknown \(turn\/start sent, no answer\)/);
-    assert.match(r.stderr, /^ error {4}engine: timeout 200ms$/m);
+    assert.match(r.stderr, /^ error {4}engine: timeout 5000ms$/m);
   } finally {
     sb3.cleanup();
   }
