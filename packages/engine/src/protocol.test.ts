@@ -38,7 +38,7 @@ test("§8.1 initialize / initialized handshake; second initialize → -32001", a
     const result = await handshake(client);
     assert.deepEqual(result, {
       serverInfo: { name: "madc-engine", version: "0.0.0" },
-      protocolVersion: "madc-m0/1",
+      protocolVersion: "madc-m1/1",
     });
     const again = await expectRpcError(
       client.request("initialize", { clientInfo: { name: "x", version: "1" } }),
@@ -162,7 +162,7 @@ test("parser accepts requests with jsonrpc:2.0 and without", async () => {
       }),
     );
     const res = await client.waitFor((m) => m.id === "s1");
-    assert.equal((res.result as { protocolVersion: string }).protocolVersion, "madc-m0/1");
+    assert.equal((res.result as { protocolVersion: string }).protocolVersion, "madc-m1/1");
     assert.equal(Object.hasOwn(res, "jsonrpc"), false);
     client.sendRaw(JSON.stringify({ id: 7, method: "thread/list" }));
     const list = await client.waitFor((m) => m.id === 7);
@@ -533,7 +533,7 @@ test("§8.4 malformed line → -32700 (id null); invalid shapes → -32600; engi
     // Blank lines ignored; engine still serves.
     client.sendRaw("");
     const init = await handshake(client);
-    assert.equal(init.protocolVersion, "madc-m0/1");
+    assert.equal(init.protocolVersion, "madc-m1/1");
   });
 });
 

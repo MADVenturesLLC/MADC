@@ -1,6 +1,8 @@
 /**
- * @madc/engine — local protocol host (Act M0-A2), seat files + hash-chained sessions (M0-A4).
- * Contract: docs/plan/PIN-madc-M0-protocol-messages.md. stdio JSONL only.
+ * @madc/engine — local protocol host (Act M0-A2), seat files + hash-chained sessions (M0-A4),
+ * engine-owned credential store + `auth/*` presence methods (M1-A2).
+ * Contract: docs/plan/PIN-madc-M1-protocol-messages.md (supersedes the M0 pin for M1 work).
+ * stdio JSONL only.
  */
 
 export { type AcpAdapter, createAcpAdapter, NotImplementedError } from "./acp/index.ts";
@@ -21,6 +23,19 @@ export {
   spawnEngine,
   type WireMessage,
 } from "./client.ts";
+export { runAuthSet } from "./credentials/auth-set.ts";
+export {
+  type CredentialSource,
+  type CredentialStore,
+  type CredentialStoreDeps,
+  createCredentialStore,
+  credentialEnvVar,
+  KEYCHAIN_SERVICE,
+  MADC_DEV_ENV_KEYS,
+  type RunCommand,
+  type RunCommandResult,
+  type RunCommandSpec,
+} from "./credentials/store.ts";
 export {
   confinedPath,
   type HomeSubdir,

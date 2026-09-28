@@ -854,21 +854,30 @@ function checkRegistry(): Check {
 }
 
 function checkKimiCredential(io: CliIO): Check {
-  // Presence only: never the value, its length, a prefix or a hash.
-  const set = (io.env.KIMI_API_KEY ?? "").trim() !== "";
-  return set
-    ? {
-        id: "cred.kimi-code",
-        status: "pass",
-        summary: "KIMI_API_KEY set",
-        evidence: { env: "KIMI_API_KEY", set: true },
-      }
-    : {
-        id: "cred.kimi-code",
-        status: "warn",
-        summary: "KIMI_API_KEY not set: turns answer -32008 no-credentials",
-        evidence: { env: "KIMI_API_KEY", set: false },
-      };
+  // M1-A2 (D-M1-5): credentials live in the OS keychain, resolved by the engine; the environment
+  // satisfies presence ONLY under the pinned MADC_DEV_ENV_KEYS=1 development exception, which this
+  // row must disclose loudly. Presence only: never a value, its length, a prefix or a hash.
+  // Keychain presence per provider is queried by `madc auth status <providerId>`; the full lanes
+  // report (every lane's credentials/binary presence) lands in M1-A8.
+  const devEnvKeys = io.env.MADC_DEV_ENV_KEYS === "1";
+  const envSet = (io.env.KIMI_API_KEY ?? "").trim() !== "";
+  if (devEnvKeys) {
+    return {
+      id: "cred.kimi-code",
+      status: "warn",
+      summary: envSet
+        ? "MADC_DEV_ENV_KEYS=1 dev exception (D-M1-5): KIMI_API_KEY set — env fallback ACTIVE; the keychain wins when present; unset the flag for keychain-only"
+        : "MADC_DEV_ENV_KEYS=1 dev exception (D-M1-5): env fallback ACTIVE but KIMI_API_KEY empty; credentials resolve from the OS keychain (madc auth status kimi-code)",
+      evidence: { devEnvKeys: true, env: "KIMI_API_KEY", set: envSet, store: "os-keychain" },
+    };
+  }
+  return {
+    id: "cred.kimi-code",
+    status: "skip",
+    summary:
+      "credentials resolve from the OS keychain (MADC_DEV_ENV_KEYS unset; env KIMI_API_KEY ignored): madc auth status kimi-code",
+    evidence: { devEnvKeys: false, env: "KIMI_API_KEY", set: envSet, store: "os-keychain" },
+  };
 }
 
 /** PATH lookup only (PATHEXT on Windows). Never executes anything. */

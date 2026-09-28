@@ -1,10 +1,13 @@
 /**
  * `madc` entry logic (CLI pin §1). Talks to the engine only through `@madc/engine/client`
- * (spawned child, stdio JSONL). M0 surface: --version, --help, doctor, headless -p. No chat.
+ * (spawned child, stdio JSONL) — except `auth set`, which spawns the one-shot
+ * `madc-engine auth-set` child (M1-A2, protocol pin §2: never a JSONL session). M0 surface:
+ * --version, --help, doctor, headless -p. M1-A2 adds `auth set|rm|status`. No chat.
  */
 import { MADC_VERSION } from "@madc/core";
 import { PROTOCOL_VERSION, resolveMadcHome } from "@madc/engine/client";
 import { CHAT_RESERVED, hasJsonFlag, parseArgs, USAGE } from "./args.ts";
+import { runAuth } from "./auth.ts";
 import { classifyHomePath, runDoctor } from "./doctor.ts";
 import { takeEarlySignal } from "./early-signal.ts";
 import { EXIT } from "./exit-codes.ts";
@@ -32,6 +35,8 @@ export async function main(argv: readonly string[], io: CliIO): Promise<number> 
       return EXIT.usage;
     case "doctor":
       return runDoctor(io, { json: parsed.json, init: parsed.init });
+    case "auth":
+      return runAuth(io, parsed.sub, parsed.providerId);
     case "oneshot":
       return oneShot(io, parsed.prompt, parsed.seatId, parsed.json);
   }

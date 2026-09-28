@@ -9,6 +9,11 @@
  * integrity classification), the read-only lock reader and pid probe (`kill(pid, 0)` sends no
  * signal), and the pure registry catalog. Nothing here acquires, reclaims, releases, seeds or
  * appends; `seedDefaultSeat` is deliberately not exported (`doctor --init` goes through the engine).
+ *
+ * Act M1-A2: adds `spawnAuthSet` — the CLI's way to run the one-shot `madc-engine auth-set
+ * <providerId>` child (protocol pin §2: a separate process, NOT a JSONL session; stdio inherited
+ * so the child owns the no-echo TTY prompt). The credential store itself stays host-side: the CLI
+ * never reads, writes or sees a credential value.
  */
 
 export { listCatalog, type ProviderEntry, type ProviderStatus } from "@madc/registry";
@@ -19,7 +24,9 @@ export {
   EngineProtocolError,
   EngineRpcError,
   type Notification,
+  type SpawnAuthSetOptions,
   type SpawnEngineOptions,
+  spawnAuthSet,
   spawnEngine,
   type WireMessage,
 } from "./client.ts";

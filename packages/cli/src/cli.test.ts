@@ -184,26 +184,28 @@ test("A7 §7.1 doctor exits 0 on an engine-seeded home with no KIMI_API_KEY and 
       }
     }
     assert.equal(check(report, "engine").status, "pass");
-    assert.match(check(report, "engine").summary, /^madc-m0\/1 · \d+ ms · exit 0$/);
+    assert.match(check(report, "engine").summary, /^madc-m1\/1 · \d+ ms · exit 0$/);
     assert.match(check(report, "seat").summary, /^madc-default · sha256:[0-9a-f]{12}$/);
     assert.match(
       check(report, "session").summary,
       /^thr_[0-9a-f]+ · \d+ events · head [0-9a-f]{12}$/,
     );
-    assert.equal(check(report, "cred.kimi-code").status, "warn");
+    // M1-A2: with MADC_DEV_ENV_KEYS unset the env says nothing about credentials (they live in
+    // the OS keychain), so the row SKIPs instead of M0's env-presence WARN.
+    assert.equal(check(report, "cred.kimi-code").status, "skip");
     assert.equal(check(report, "bin.claude").summary, "not on PATH · adapter not built (A5)");
     assert.equal(check(report, "bin.codex").summary, "not on PATH · adapter not built (A6)");
-    assert.deepEqual(report.counts, { pass: 7, warn: 1, fail: 0, skip: 2 });
+    assert.deepEqual(report.counts, { pass: 7, warn: 0, fail: 0, skip: 3 });
     const text = await runCli(sb, ["doctor"]);
     assert.equal(text.code, 0);
     const rows = text.stdout.trim().split("\n");
-    assert.equal(rows[0], "madc doctor · madc 0.0.0 · protocol madc-m0/1");
+    assert.equal(rows[0], "madc doctor · madc 0.0.0 · protocol madc-m1/1");
     assert.deepEqual(
       rows.slice(1, -1).map((l) => l.slice(6).split(" ")[0]),
       DOCTOR_IDS,
       "text rows in pinned order",
     );
-    assert.match(rows.at(-1) ?? "", /^RESULT {2}0 FAIL · 1 WARN · 2 SKIP · \d+ ms {3}exit 0$/);
+    assert.match(rows.at(-1) ?? "", /^RESULT {2}0 FAIL · 0 WARN · 3 SKIP · \d+ ms {3}exit 0$/);
     assert.doesNotMatch(text.stdout + text.stderr, ANSI, "non-TTY output has no ANSI");
   } finally {
     sb.cleanup();
@@ -419,7 +421,7 @@ test("A7 §7.4 madc -p hi --json against the fake Kimi engine: one JSON object, 
     ]);
     assert.equal(out.ok, true);
     assert.equal(out.exitCode, 0);
-    assert.equal(out.protocolVersion, "madc-m0/1");
+    assert.equal(out.protocolVersion, "madc-m1/1");
     assert.equal(out.seatId, "madc-default");
     assert.equal(out.error, null);
     assert.equal(out.turn.status, "completed");
@@ -468,13 +470,27 @@ test("A7 §7.4 madc -p hi --json against the fake Kimi engine: one JSON object, 
     assert.doesNotMatch(plain.stdout + plain.stderr, ANSI);
     assert.equal(plain.stdout.includes(FAKE_KEY) || plain.stderr.includes(FAKE_KEY), false);
 
+    // M1-A2: without the pinned MADC_DEV_ENV_KEYS=1 flag the env key is IGNORED by the engine
+    // (credentials resolve from the OS keychain), so the row SKIPs; with the flag the row WARNs
+    // and discloses the active env fallback loudly (D-M1-5). Neither ever prints the key.
     const doc = await runCli(sb, ["doctor", "--json"], { env: { KIMI_API_KEY: FAKE_KEY } });
-    assert.equal(
-      check(JSON.parse(doc.stdout) as DoctorJson, "cred.kimi-code").summary,
-      "KIMI_API_KEY set",
-    );
+    const docRow = check(JSON.parse(doc.stdout) as DoctorJson, "cred.kimi-code");
+    assert.equal(docRow.status, "skip");
+    assert.match(docRow.summary, /OS keychain/);
     assert.equal(
       doc.stdout.includes(FAKE_KEY) || doc.stderr.includes(FAKE_KEY),
+      false,
+      "doctor never prints the key",
+    );
+    const docDev = await runCli(sb, ["doctor", "--json"], {
+      env: { KIMI_API_KEY: FAKE_KEY, MADC_DEV_ENV_KEYS: "1" },
+    });
+    const docDevRow = check(JSON.parse(docDev.stdout) as DoctorJson, "cred.kimi-code");
+    assert.equal(docDevRow.status, "warn");
+    assert.match(docDevRow.summary, /MADC_DEV_ENV_KEYS=1 dev exception \(D-M1-5\)/);
+    assert.match(docDevRow.summary, /env fallback ACTIVE/);
+    assert.equal(
+      docDev.stdout.includes(FAKE_KEY) || docDev.stderr.includes(FAKE_KEY),
       false,
       "doctor never prints the key",
     );

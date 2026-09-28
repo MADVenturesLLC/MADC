@@ -484,7 +484,10 @@ test("turn/interrupt mid-stream → interrupted, no servedModel receipt", async 
 
 test("production engine entry defaults to the Kimi agent: no key → -32008 no-credentials", async () => {
   const { home, cleanup } = makeHome();
-  const client = startEngine(home, ENGINE_ENTRY);
+  // M1-A2: the production entry resolves the key through the credential store. The win32 seam
+  // selects the no-backend path so this test never probes a live keychain (and hermeticEnv has
+  // already stripped every ambient credential plus MADC_DEV_ENV_KEYS): no key → -32008.
+  const client = startEngine(home, ENGINE_ENTRY, { MADC_TEST_KEYCHAIN_PLATFORM: "win32" });
   try {
     await handshake(client);
     const { thread } = await client.request("thread/start", {});
