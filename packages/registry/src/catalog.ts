@@ -229,7 +229,7 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     wired: false,
     credentialClass: "payg",
     headless: "allowed",
-    verifiedAt: "2026-09-24",
+    verifiedAt: "",
     termsUrl: "",
     sourceQuote: "PAYG/credits API keys; docs teach wiring into coding agents / Claude Code.",
     sourceUrl:
@@ -244,7 +244,7 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     wired: false,
     credentialClass: "payg",
     headless: "allowed",
-    verifiedAt: "2026-09-24",
+    verifiedAt: "",
     termsUrl: "",
     sourceQuote: "Developer API keys for OpenAI-compatible tools; not a ChatGPT-like coding sub",
     sourceUrl:
@@ -258,7 +258,7 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     clientIdentity: "default",
     wired: false,
     credentialClass: "vendor-session",
-    verifiedAt: "2026-09-24",
+    verifiedAt: "",
     termsUrl: "",
     sourceQuote:
       "Drive `copilot --acp` (ACP public preview) or official extensions; no raw ChatGPT-style sub key for arbitrary HTTP",
@@ -344,7 +344,8 @@ export function getById(id: string): ProviderEntry | undefined {
 /**
  * Mode policy per entry (M1-A1): forbidden serves nothing; interactive-only serves interactive
  * only; allowed-direct serves interactive always and headless only with `headless: "allowed"`;
- * vendor-agent lanes serve both modes. Wiring is orthogonal (unwired → -32008 at requireLive).
+ * vendor-agent lanes serve both modes. This checks mode only, not wiring or terms freshness;
+ * callers must supply `now` and `requireLive` to assertAllowed to enforce both.
  */
 export function canServe(entry: ProviderEntry, mode: RunMode): boolean {
   if (entry.status === "forbidden") return false;
@@ -354,7 +355,7 @@ export function canServe(entry: ProviderEntry, mode: RunMode): boolean {
   return true;
 }
 
-/** Pure lane listing per mode (M1 plan §5). */
+/** Pure lane listing by mode only; entries may be unwired or stale (M1 plan §5). */
 export function lanesFor(mode: RunMode): readonly ProviderEntry[] {
   return PROVIDER_CATALOG.filter((entry) => canServe(entry, mode));
 }
