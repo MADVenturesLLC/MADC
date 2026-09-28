@@ -10,6 +10,15 @@ export type CliIO = {
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly stdoutIsTTY: boolean;
   readonly stderrIsTTY: boolean;
+  /**
+   * stdin TTY gate for the app (DESIGN-SPEC §5.0: the app needs all three TTYs or it does not
+   * start). Undefined counts as not a TTY, so existing constructors that omit it never launch
+   * the app in tests.
+   */
+  readonly stdinIsTTY?: boolean | undefined;
+  /** Output-stream width (§3.4/§9); undefined counts as below 80 columns. */
+  readonly columns?: number | undefined;
+  readonly rows?: number | undefined;
   readonly cwd: string;
   /**
    * Engine entry script. Undefined = the real engine (`@madc/engine/client` default). Only the
@@ -26,6 +35,9 @@ export function processIO(engineEntry?: string): CliIO {
     env: process.env,
     stdoutIsTTY: process.stdout.isTTY === true,
     stderrIsTTY: process.stderr.isTTY === true,
+    stdinIsTTY: process.stdin.isTTY === true,
+    columns: process.stdout.columns,
+    rows: process.stdout.rows,
     // §3e E16 F-130: read lazily — only the one-shot needs cwd, and a deleted current directory
     // must not break `--version`, `--help`, usage errors or doctor.
     get cwd() {

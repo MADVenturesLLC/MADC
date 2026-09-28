@@ -4,6 +4,8 @@
  */
 import { MADC_VERSION } from "@madc/core";
 import { PROTOCOL_VERSION, resolveMadcHome } from "@madc/engine/client";
+import { runWitnessApp } from "./app/launch.ts";
+import { ProcessTty } from "./app/tty.ts";
 import { CHAT_RESERVED, hasJsonFlag, parseArgs, USAGE } from "./args.ts";
 import { classifyHomePath, runDoctor } from "./doctor.ts";
 import { takeEarlySignal } from "./early-signal.ts";
@@ -23,6 +25,16 @@ export async function main(argv: readonly string[], io: CliIO): Promise<number> 
       io.stdout.write(USAGE);
       return EXIT.ok;
     case "usage":
+      // Rev 6.2 (P-2/P-3/P-4): on a full TTY, bare `madc` opens the app and `madc "<text>"`
+      // opens it and sends <text> as the first turn. Otherwise today's bytes exactly (hard
+      // rule 1: nothing changes in non-TTY mode).
+      if (
+        !hasJsonFlag(argv) &&
+        (parsed.message === "no command given" || parsed.message === CHAT_RESERVED) &&
+        appGateOpen(io)
+      ) {
+        return witnessEntry(io, firstPositional(argv));
+      }
       // §3e E8: with `--json` anywhere as a flag token, every parse-level usage failure prints
       // one JSON object and nothing on stderr.
       if (hasJsonFlag(argv)) return usageFailure(io, true, parsed.message);
@@ -34,6 +46,115 @@ export async function main(argv: readonly string[], io: CliIO): Promise<number> 
       return runDoctor(io, { json: parsed.json, init: parsed.init });
     case "oneshot":
       return oneShot(io, parsed.prompt, parsed.seatId, parsed.json);
+  }
+}
+
+/** §5.0 app gate (IQW-1): stdin, stdout and stderr must all be TTYs or the app does not start. */
+function appGateOpen(io: CliIO): boolean {
+  return io.stdinIsTTY === true && io.stdoutIsTTY && io.stderrIsTTY;
+}
+
+/** The single positional of `madc "<text>"` (parseArgs' own flag rules), or null for bare madc. */
+function firstPositional(argv: readonly string[]): string | null {
+  let flagsDone = false;
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i] ?? "";
+    if (flagsDone || arg === "-" || !arg.startsWith("-")) return arg === "" ? null : arg;
+    if (arg === "--") {
+      flagsDone = true;
+      continue;
+    }
+    if (arg === "-p" || arg === "-s") i++;
+  }
+  return null;
+}
+
+/**
+ * The Witness app entry (DESIGN-SPEC §5.0): the config checks print as today before the app
+ * starts; then the tier decides between the full app, the line mode and inline mode.
+ */
+async function witnessEntry(io: CliIO, firstPrompt: string | null): Promise<number> {
+  const earlySignal = takeEarlySignal();
+  if (earlySignal !== null) {
+    io.stderr.write("madc: interrupted by signal\n");
+    return earlySignal;
+  }
+  let home: string;
+  try {
+    home = resolveMadcHome(io.env as NodeJS.ProcessEnv);
+  } catch (err) {
+    return usageFailure(io, false, err instanceof Error ? err.message : String(err));
+  }
+  const homeState = classifyHomePath(home);
+  if (homeState.kind === "not-directory") {
+    return usageFailure(io, false, `MADC_HOME ${home} exists but is not a directory`);
+  }
+  if (homeState.kind === "invalid") {
+    return usageFailure(io, false, homeState.message);
+  }
+  const idle = parseTurnIdleMs(io.env);
+  if (!idle.ok) return usageFailure(io, false, idle.message);
+  let cwd: string;
+  try {
+    cwd = io.cwd;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | null)?.code ?? "error";
+    return usageFailure(io, false, `current directory is not accessible (${code})`);
+  }
+  const runIo: CliIO = {
+    stdout: io.stdout,
+    stderr: io.stderr,
+    stdin: io.stdin,
+    env: io.env,
+    stdoutIsTTY: io.stdoutIsTTY,
+    stderrIsTTY: io.stderrIsTTY,
+    stdinIsTTY: io.stdinIsTTY,
+    columns: io.columns,
+    rows: io.rows,
+    cwd,
+    ...(io.engineEntry !== undefined ? { engineEntry: io.engineEntry } : {}),
+  };
+  // §5.0: the app owns the terminal it runs on. Signals reach it through these listeners; the
+  // Ctrl-C KEY arrives in raw mode and is handled by the app's own key decoder (§5.8.1).
+  const tty = new ProcessTty(
+    process.stdin as NodeJS.ReadStream,
+    process.stdout as NodeJS.WriteStream,
+  );
+  let app: { onSigint(): void; onSigterm(): void; onSighup(): void } | null = null;
+  const onSigint = (): void => app?.onSigint();
+  const onSigterm = (): void => app?.onSigterm();
+  const onSighup = (): void => app?.onSighup();
+  process.on("SIGINT", onSigint);
+  process.on("SIGTERM", onSigterm);
+  process.on("SIGHUP", onSighup);
+  try {
+    return await runWitnessApp({
+      io: runIo,
+      home,
+      turnIdleMs: idle.ms,
+      firstPrompt,
+      tty,
+      onApp: (a) => {
+        app = a;
+      },
+      onSighup: () => {
+        // O-4: restore default handling for SIGHUP, then re-raise so the OS reports 129.
+        process.removeListener("SIGHUP", onSighup);
+        process.kill(process.pid, "SIGHUP");
+      },
+      onFinalVerifySignal: (sig) => {
+        // §5.8.1 O-2: the signal landed inside the final-verify window — the F-102 path. The
+        // app has restored the terminal; drop our listener and re-raise so the OS reports it.
+        if (sig === "SIGINT") process.removeListener("SIGINT", onSigint);
+        if (sig === "SIGTERM") process.removeListener("SIGTERM", onSigterm);
+        if (sig === "SIGHUP") process.removeListener("SIGHUP", onSighup);
+        process.kill(process.pid, sig);
+      },
+    });
+  } finally {
+    process.removeListener("SIGINT", onSigint);
+    process.removeListener("SIGTERM", onSigterm);
+    process.removeListener("SIGHUP", onSighup);
   }
 }
 

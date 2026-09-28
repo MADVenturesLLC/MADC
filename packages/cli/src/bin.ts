@@ -78,6 +78,11 @@ export async function runBin(engineEntry?: string): Promise<void> {
     env: base.env,
     stdoutIsTTY: base.stdoutIsTTY,
     stderrIsTTY: base.stderrIsTTY,
+    // §5.0 app gate + §3.4 tier sizing: pass the TTY flags and dimensions through — dropping
+    // them here made the gate read stdinIsTTY === undefined and print USAGE instead of the app.
+    stdinIsTTY: base.stdinIsTTY,
+    columns: base.columns,
+    rows: base.rows,
     // F-130: lazy on purpose — only the one-shot reads cwd, and a deleted cwd must not throw here.
     get cwd() {
       return base.cwd;

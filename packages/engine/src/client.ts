@@ -21,6 +21,14 @@ export type SpawnEngineOptions = {
   entry?: string;
   /** Runtime binary; defaults to the current one (`node` or `bun`). */
   runtime?: string;
+  /**
+   * Engine stderr disposition (DESIGN-SPEC §5.10, Founder allowance M-1/pin W-1, for the app act
+   * only). `"inherit"` (the default, and what -p and doctor keep) passes vendor and engine logs
+   * straight through; `"pipe"` collects the lines on the client (`stderrLines`, `onStderrLine`)
+   * so an alternate-screen app can show them instead of having them drawn over its layout. No
+   * protocol method and no engine behaviour change: this only retargets the child's stderr fd.
+   */
+  stderr?: "inherit" | "pipe";
 };
 
 export class EngineRpcError extends Error {
@@ -90,11 +98,19 @@ export class EngineClient {
   readonly messages: WireMessage[] = [];
   /** stdout lines that were not valid JSON objects (must stay empty: stdout is protocol only). */
   readonly protocolViolations: string[] = [];
+  /**
+   * Engine stderr lines when spawned with `stderr: "pipe"` (allowance M-1); empty with the
+   * default `"inherit"`, which leaves the fd pointing at the parent's stderr.
+   */
+  readonly stderrLines: string[] = [];
+  /** Optional hook: called with each piped stderr line (already newline-stripped). */
+  onStderrLine: ((line: string) => void) | null = null;
   readonly exited: Promise<number | null>;
   #nextId = 1;
   #terminated = false;
   readonly #pending = new Map<RequestId, Pending>();
   #waiters: Waiter[] = [];
+  readonly #waiterTimers = new Set<ReturnType<typeof setTimeout>>();
 
   constructor(child: ChildProcess) {
     this.child = child;
@@ -103,6 +119,13 @@ export class EngineClient {
     createInterface({ input: stdout, crlfDelay: Number.POSITIVE_INFINITY }).on("line", (line) =>
       this.#onLine(line),
     );
+    const stderr = child.stderr;
+    if (stderr !== null) {
+      createInterface({ input: stderr, crlfDelay: Number.POSITIVE_INFINITY }).on("line", (line) => {
+        this.stderrLines.push(line);
+        this.onStderrLine?.(line);
+      });
+    }
     // Writes to a dead or never-started child fail asynchronously; the terminal path below settles
     // every caller, so stdin write errors carry no extra information.
     child.stdin?.on("error", () => undefined);
@@ -200,18 +223,33 @@ export class EngineClient {
     if (seen !== undefined) return Promise.resolve(seen);
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
+        this.#waiterTimers.delete(timer);
         this.#waiters = this.#waiters.filter((w) => w !== waiter);
         reject(new Error(`timed out after ${timeoutMs}ms waiting for engine message`));
       }, timeoutMs);
+      this.#waiterTimers.add(timer);
       const waiter: Waiter = {
         match,
         resolve: (m) => {
           clearTimeout(timer);
+          this.#waiterTimers.delete(timer);
           resolve(m);
         },
       };
       this.#waiters.push(waiter);
     });
+  }
+
+  /**
+   * Clear every pending waiter and its timeout (app act, DESIGN-SPEC §5.10 latitude): a client
+   * whose engine died mid-turn would otherwise hold its waiter's timer — for an unbounded wait,
+   * up to 24 days — keeping the parent's event loop alive. Waiter promises are left unsettled;
+   * callers race them with the engine-exit signal and attach catch handlers.
+   */
+  cancelWaiters(): void {
+    for (const timer of this.#waiterTimers) clearTimeout(timer);
+    this.#waiterTimers.clear();
+    this.#waiters = [];
   }
 
   async waitForNotification<M extends ServerNotificationMethod>(
@@ -259,7 +297,7 @@ export function spawnEngine(opts: SpawnEngineOptions = {}): EngineClient {
     ? [opts.entry ?? ENGINE_ENTRY]
     : ["--disable-warning=ExperimentalWarning", opts.entry ?? ENGINE_ENTRY];
   const child = spawn(runtime, args, {
-    stdio: ["pipe", "pipe", "inherit"],
+    stdio: ["pipe", "pipe", opts.stderr ?? "inherit"],
     env: withoutUndefined({ ...process.env, ...opts.env }),
   });
   return new EngineClient(child);
