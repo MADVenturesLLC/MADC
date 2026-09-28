@@ -1,21 +1,31 @@
 import { getById } from "./catalog.ts";
 import { type Intent, type ProviderEntry, RegistryDeniedError } from "./types.ts";
 
-/**
- * Fail-closed enforcement: unknown / forbidden / interactive-only+headless /
- * connect mismatch / unwired-when-live-required all throw RegistryDeniedError.
- * Pure — no network, keychain, or filesystem I/O.
- */
-export function assertAllowed(intent: Intent): ProviderEntry {
-  const entry = getById(intent.providerId);
-  if (entry === undefined) {
-    throw new RegistryDeniedError(
-      "unknown-provider",
-      intent.providerId,
-      `Unknown provider "${intent.providerId}" — deny (fail-closed).`,
-    );
-  }
+/** Default freshness window (M1-A1 / D-M1-6): an allow entry older than this denies. */
+export const DEFAULT_STALE_DAYS = 30;
 
+/**
+ * Pure freshness check: `verifiedAt` older than `days` (default 30) means stale.
+ * An empty or unparseable `verifiedAt` is stale (never verified → fail-closed).
+ * Exactly `days` old is not stale ("more than 30 days old" denies).
+ */
+export function isStale(
+  entry: ProviderEntry,
+  now: number,
+  days: number = DEFAULT_STALE_DAYS,
+): boolean {
+  const verified = Date.parse(entry.verifiedAt);
+  if (Number.isNaN(verified)) return true;
+  return now - verified > days * 86_400_000;
+}
+
+/**
+ * Fail-closed evaluation of one entry: forbidden / interactive-only+headless /
+ * headless-denied+headless / connect mismatch / stale-without-override / unwired-when-live-required
+ * all throw RegistryDeniedError. Pure — no network, keychain, clock, or filesystem I/O:
+ * freshness is evaluated only when `intent.now` is supplied by the caller.
+ */
+export function checkEntry(entry: ProviderEntry, intent: Intent): ProviderEntry {
   if (entry.status === "forbidden") {
     throw new RegistryDeniedError(
       "forbidden",
@@ -29,6 +39,19 @@ export function assertAllowed(intent: Intent): ProviderEntry {
       "interactive-only-headless",
       entry.id,
       `Provider "${entry.id}" is interactive-only; headless mode denied.`,
+    );
+  }
+
+  // M1-A1 / D-M1-3: allowed-direct alone never implies a headless allow.
+  if (
+    entry.status === "allowed-direct" &&
+    entry.headless === "denied" &&
+    intent.mode === "headless"
+  ) {
+    throw new RegistryDeniedError(
+      "headless-not-permitted",
+      entry.id,
+      `Provider "${entry.id}" denies headless use until the Founder records permission (D-M1-3).`,
     );
   }
 
@@ -60,6 +83,20 @@ export function assertAllowed(intent: Intent): ProviderEntry {
     );
   }
 
+  // D-M1-6: a stale allow entry denies; a per-entry Founder override lets it through.
+  // `forbidden` never relaxes on staleness (handled above, before any freshness read).
+  if (
+    intent.now !== undefined &&
+    entry.founderOverride === undefined &&
+    isStale(entry, intent.now)
+  ) {
+    throw new RegistryDeniedError(
+      "terms-stale",
+      entry.id,
+      `Provider "${entry.id}" terms were last verified ${entry.verifiedAt || "never"}; re-verify or record a Founder override.`,
+    );
+  }
+
   if (intent.requireLive === true && entry.wired !== true) {
     throw new RegistryDeniedError(
       "unwired",
@@ -69,4 +106,21 @@ export function assertAllowed(intent: Intent): ProviderEntry {
   }
 
   return entry;
+}
+
+/**
+ * Fail-closed enforcement by registry id: unknown id denies, otherwise checkEntry.
+ * Pure — no network, keychain, or filesystem I/O.
+ */
+export function assertAllowed(intent: Intent): ProviderEntry {
+  const entry = getById(intent.providerId);
+  if (entry === undefined) {
+    throw new RegistryDeniedError(
+      "unknown-provider",
+      intent.providerId,
+      `Unknown provider "${intent.providerId}" — deny (fail-closed).`,
+    );
+  }
+
+  return checkEntry(entry, intent);
 }
