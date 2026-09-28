@@ -99,6 +99,14 @@ test("catalog v2: every roadmap §3 row, the forbidden sub-paths, and the M1 ids
     assert.equal(entry.termsUrl, "", `${id} must not pin an unverified terms page`);
     assert.equal(entry.wired, false, `${id} stays unwired until a PAYG terms source is cited`);
   }
+
+  for (const id of ["openrouter", "groq-cloud", "github-copilot"] as const) {
+    const entry = getById(id);
+    assert.ok(entry, id);
+    assert.equal(entry.termsUrl, "", `${id} has no pinned live terms page`);
+    assert.equal(entry.verifiedAt, "", `${id} must not claim a live terms verification`);
+    assert.equal(isStale(entry, Date.parse("2026-09-25")), true, `${id} stays stale`);
+  }
 });
 
 test("forbidden ids throw for both modes and both connects", () => {
@@ -319,6 +327,36 @@ test("isStale units: never-verified is stale; the 30-day boundary is exact", () 
 
   const garbage = { ...kimi, verifiedAt: "not-a-date" };
   assert.equal(isStale(garbage, now), true, "unparseable verifiedAt is stale (fail-closed)");
+});
+
+test("staleness fails closed for invalid clocks, windows, and verification dates", () => {
+  const kimi = getById("kimi-code");
+  assert.ok(kimi);
+  const now = Date.parse("2026-09-25T00:00:00Z");
+
+  for (const invalidNow of [Number.NaN, Infinity, -Infinity, null, "2026-09-25"]) {
+    assert.equal(isStale(kimi, invalidNow as number), true, String(invalidNow));
+    assert.equal(
+      denialReason(() =>
+        assertAllowed({
+          providerId: "kimi-code",
+          mode: "headless",
+          connect: "direct",
+          now: invalidNow as number,
+        }),
+      ),
+      "terms-stale",
+      String(invalidNow),
+    );
+  }
+  assert.equal(isStale(kimi, 0), true, "a verification date after the clock is stale");
+
+  for (const invalidDays of [Number.NaN, Infinity, -Infinity, -1]) {
+    assert.equal(isStale(kimi, now, invalidDays), true, String(invalidDays));
+  }
+  for (const verifiedAt of ["2026-09-26", "2099-01-01", "2026-02-30"]) {
+    assert.equal(isStale({ ...kimi, verifiedAt }, now), true, verifiedAt);
+  }
 });
 
 test("kimi-code allowed-direct passes (headless ok)", () => {

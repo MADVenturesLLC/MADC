@@ -6,7 +6,7 @@ export const DEFAULT_STALE_DAYS = 30;
 
 /**
  * Pure freshness check: `verifiedAt` older than `days` (default 30) means stale.
- * An empty or unparseable `verifiedAt` is stale (never verified → fail-closed).
+ * An invalid or future `verifiedAt`, clock, or freshness window is stale (fail-closed).
  * Exactly `days` old is not stale ("more than 30 days old" denies).
  */
 export function isStale(
@@ -14,9 +14,15 @@ export function isStale(
   now: number,
   days: number = DEFAULT_STALE_DAYS,
 ): boolean {
+  if (!Number.isFinite(now) || !Number.isFinite(days) || days < 0) return true;
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(entry.verifiedAt)) return true;
   const verified = Date.parse(entry.verifiedAt);
-  if (Number.isNaN(verified)) return true;
-  return now - verified > days * 86_400_000;
+  if (
+    !Number.isFinite(verified) ||
+    new Date(verified).toISOString().slice(0, 10) !== entry.verifiedAt
+  )
+    return true;
+  return verified > now || (now - verified) / 86_400_000 > days;
 }
 
 /**
