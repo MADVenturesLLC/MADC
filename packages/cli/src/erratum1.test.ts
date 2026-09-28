@@ -851,6 +851,8 @@ test("§3c 14: parseTurnIdleMs — default 600000, bounds, every invalid form", 
 test("§3c 15: responseTimeoutMs is injectable at each request stage", {
   timeout: 60_000,
 }, async () => {
+  // Stagger the injected values to prove each request stage honors its own timeout while leaving
+  // enough headroom for slower Node 22.19 Actions runners to reach the intended stage reliably.
   const initTimeoutMs = 500;
   const threadTimeoutMs = 650;
   const turnTimeoutMs = 800;
@@ -864,10 +866,7 @@ test("§3c 15: responseTimeoutMs is injectable at each request stage", {
       json: false,
     });
     assert.equal(r.code, 3, r.stdout + r.stderr);
-    assert.match(
-      r.stderr,
-      new RegExp(String.raw`^madc: engine error: timeout ${initTimeoutMs}ms\nexit 3\n$`),
-    );
+    assert.equal(r.stderr, `madc: engine error: timeout ${initTimeoutMs}ms\nexit 3\n`);
     assert.equal(r.stderr.includes("─ receipt"), false, "no receipt before thread/start");
   } finally {
     sb.cleanup();
@@ -899,7 +898,10 @@ test("§3c 15: responseTimeoutMs is injectable at each request stage", {
     assert.equal(r.code, 3, r.stdout + r.stderr);
     assert.match(r.stderr, /^ turn {5}UNKNOWN /m);
     assert.match(r.stderr, /UNVERIFIED: turn unknown \(turn\/start sent, no answer\)/);
-    assert.match(r.stderr, new RegExp(String.raw`^ error {4}engine: timeout ${turnTimeoutMs}ms$`, "m"));
+    const errorLines = r.stderr
+      .split("\n")
+      .filter((line) => line.startsWith(" error    engine: timeout "));
+    assert.deepEqual(errorLines, [` error    engine: timeout ${turnTimeoutMs}ms`], r.stderr);
   } finally {
     sb3.cleanup();
   }
