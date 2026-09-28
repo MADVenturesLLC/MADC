@@ -85,3 +85,141 @@ export class RecordingOut {
     return this.text().replace(/\u001b\[[0-9;]*m/g, "");
   }
 }
+
+/**
+ * A minimal terminal emulator for SCREEN-STATE assertions: feed it everything a VirtualTty
+ * recorded and read back the visible grid, cell by cell. This catches the remnant class of
+ * repaint bugs that string-level frame comparisons hide — a shorter line painted over a longer
+ * one keeps the old tail on the same row, and a frame taller than the screen scrolls, so stale
+ * cells can survive anywhere the new frame does not fully overwrite.
+ *
+ * Supports exactly what the app writes — `\u001b[H`, `\u001b[2J`, `\u001b[J`, `\u001b[K`, the
+ * 1049/25 private modes (the alt-screen swap is modelled as a clear so state never leaks across
+ * start/exit), SGR (ignored for content), `\r`, `\n` — plus width wrap with bottom scroll.
+ * Wrap is immediate (a real terminal defers the wrap by one cell); the app's lines stay under
+ * the terminal width, so the approximation never fires in practice.
+ */
+export class ScreenModel {
+  readonly #cols: number;
+  #lines: string[];
+  #cx = 0;
+  #cy = 0;
+
+  constructor(cols: number, rows: number) {
+    this.#cols = cols;
+    this.#lines = Array.from({ length: rows }, () => "");
+  }
+
+  /** Apply a recorded write stream to the grid. */
+  feed(text: string): void {
+    let i = 0;
+    while (i < text.length) {
+      const ch = text[i] ?? "";
+      if (ch === "\u001b") {
+        const rest = text.slice(i);
+        // biome-ignore lint/suspicious/noControlCharactersInRegex: matching the app's own CSI bytes.
+        const m = rest.match(/^\u001b\[[?]?[0-9;]*[A-Za-z]/);
+        if (m !== null) {
+          this.#control(m[0] ?? "");
+          i += m[0].length;
+          continue;
+        }
+        i++; // a lone ESC: no cell effect
+        continue;
+      }
+      if (ch === "\r") {
+        this.#cx = 0;
+        i++;
+        continue;
+      }
+      if (ch === "\n") {
+        // The app's stdout goes through a PTY with the default ONLCR output mode, so `\n`
+        // reaches the terminal as CRLF: next row, column 0.
+        this.#cx = 0;
+        this.#newline();
+        i++;
+        continue;
+      }
+      this.#put(ch);
+      i++;
+    }
+  }
+
+  /** The visible screen: rows with trailing blanks trimmed, empty tail rows dropped. */
+  lines(): string[] {
+    const trimmed = this.#lines.map((l) => l.replace(/[ \t]+$/, ""));
+    while (trimmed.length > 0 && trimmed[trimmed.length - 1] === "") trimmed.pop();
+    return trimmed;
+  }
+
+  /** The whole visible screen as one string. */
+  text(): string {
+    return this.lines().join("\n");
+  }
+
+  #control(seq: string): void {
+    const body = seq.slice(2, -1);
+    const fin = seq[seq.length - 1] ?? "";
+    if (fin === "H") {
+      this.#cx = 0;
+      this.#cy = 0;
+      return;
+    }
+    if (fin === "J") {
+      const n = body === "" || body === "0" ? "0" : body;
+      if (n === "0") {
+        // Erase from cursor to end of screen (rest of this row + every row below).
+        this.#setRow(this.#cy, this.#row(this.#cy).slice(0, this.#cx));
+        for (let y = this.#cy + 1; y < this.#lines.length; y++) this.#setRow(y, "");
+      } else if (n === "2") {
+        for (let y = 0; y < this.#lines.length; y++) this.#setRow(y, "");
+      }
+      return;
+    }
+    if (fin === "K") {
+      const n = body === "" || body === "0" ? "0" : body;
+      if (n === "0") this.#setRow(this.#cy, this.#row(this.#cy).slice(0, this.#cx));
+      else if (n === "2") this.#setRow(this.#cy, "");
+      return;
+    }
+    if (fin === "h" || fin === "l") {
+      // 1049 (alt screen) and 25 (cursor visibility): the swap clears, the rest are no-ops.
+      if (body.includes("1049")) {
+        for (let y = 0; y < this.#lines.length; y++) this.#setRow(y, "");
+        this.#cx = 0;
+        this.#cy = 0;
+      }
+      return;
+    }
+    if (fin === "m") return; // SGR: content unaffected
+    // Cursor moves and everything else the app never writes: ignored.
+  }
+
+  #row(y: number): string {
+    return this.#lines[y] ?? "";
+  }
+
+  #setRow(y: number, content: string): void {
+    this.#lines[y] = content;
+  }
+
+  #put(ch: string): void {
+    const row = this.#row(this.#cy).padEnd(this.#cx, " ");
+    this.#setRow(this.#cy, row.slice(0, this.#cx) + ch + row.slice(this.#cx + ch.length));
+    this.#cx += ch.length;
+    if (this.#cx >= this.#cols) {
+      this.#cx = 0;
+      this.#newline();
+    }
+  }
+
+  #newline(): void {
+    if (this.#cy + 1 >= this.#lines.length) {
+      this.#lines.shift();
+      this.#lines.push("");
+      this.#cy = this.#lines.length - 1;
+    } else {
+      this.#cy++;
+    }
+  }
+}

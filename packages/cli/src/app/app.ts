@@ -491,11 +491,27 @@ export class WitnessApp {
 
   paint(): void {
     const frame = this.#frame();
-    this.#tty.write(`\u001b[H${frame.join("\n")}\u001b[J`);
+    const height = Math.max(this.#tty.rows(), 10);
+    // Bottom-anchored viewport: a frame taller than the screen keeps its LAST `height` lines —
+    // pills, prompt and hints always stay visible — because a frame that scrolls the terminal
+    // mid-paint misaligns every row after the scroll and stale cells survive anywhere the new
+    // lines are shorter than the old ones.
+    const visible = frame.length > height ? frame.slice(frame.length - height) : frame;
+    // Erase-to-end-of-row after every line: a shorter line painted over a longer earlier one
+    // must not leave the old tail beside it (old elapsed text, prompt/hint rows, box borders).
+    // \u001b[J then clears everything below the frame, so the screen can hold no remnants.
+    this.#tty.write(`\u001b[H${visible.join("\u001b[K\n")}\u001b[K\u001b[J`);
   }
 
   #bannerView(): BannerData {
-    return { ...this.#banner, threadId: this.threadId, uiNote: this.uiNote };
+    // The banner's doctor block is the LIVE summary (§5.1: counts move as the launch doctor
+    // streams; ms lands on finish), not the frozen construction-time fixture.
+    return {
+      ...this.#banner,
+      doctor: this.doctor,
+      threadId: this.threadId,
+      uiNote: this.uiNote,
+    };
   }
 
   #userTextOf(turn: TurnRecord): string | null {

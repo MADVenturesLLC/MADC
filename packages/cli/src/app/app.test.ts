@@ -12,14 +12,16 @@ import { join } from "node:path";
 import { Readable } from "node:stream";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
+import type { Check } from "../doctor.ts";
 import { EXIT } from "../exit-codes.ts";
 import type { CliIO } from "../io.ts";
-import { RecordingOut, VirtualTty } from "../testing/virtual-tty.ts";
+import { RecordingOut, ScreenModel, VirtualTty } from "../testing/virtual-tty.ts";
 import { type KeyValue, WitnessApp } from "./app.ts";
-import type { BannerData } from "./frames.ts";
+import type { BannerData, DoctorSummary } from "./frames.ts";
 import { runInlineApp } from "./inline.ts";
 import { runWitnessApp } from "./launch.ts";
 import { runLineModeApp } from "./line-mode.ts";
+import { visibleWidth } from "./style.ts";
 
 const APP_ENGINE = fileURLToPath(new URL("../testing/app-engine.ts", import.meta.url));
 
@@ -35,7 +37,11 @@ type Rig = {
 /** Fresh home + wired app for one test; the launch doctor is stubbed (banner fixture). */
 function rig(
   script: unknown[],
-  opts: { onExit?: (c: number) => void; onSighup?: () => void } = {},
+  opts: {
+    onExit?: (c: number) => void;
+    onSighup?: () => void;
+    doctor?: DoctorSummary;
+  } = {},
 ): Rig {
   const home = mkdtempSync(join(tmpdir(), "madc-app-"));
   process.env.MADC_TEST_APP_TURNS = JSON.stringify(script);
@@ -69,7 +75,7 @@ function rig(
     userHome: "/home/mike",
     cwd: "/home/mike/code/madc",
     threadId: null,
-    doctor: {
+    doctor: opts.doctor ?? {
       running: false,
       pass: 7,
       warn: 0,
@@ -611,6 +617,181 @@ describe("§5.7 evidence overlay at 80-109 columns", () => {
       assert.match(frame, /SEAT/);
       assert.match(frame, /CHAIN/);
       r.tty.key("tab"); // closes
+      await r.cleanup();
+    } catch (e) {
+      await r.cleanup();
+      throw e;
+    }
+  });
+});
+
+describe("§5.1 banner doctor counts track the live launch doctor", () => {
+  it("streamed rows update the banner PASS/WARN/FAIL/SKIP line and warn rows print under the banner while it runs; ms lands on finish", async () => {
+    // The real launch builds the banner with an EMPTY, still-running doctor summary and streams
+    // rows into the app afterwards (launch.ts) — the banner must reflect those rows live.
+    const r = rig([], {
+      doctor: {
+        running: true,
+        pass: 0,
+        warn: 0,
+        fail: 0,
+        skip: 0,
+        ms: null,
+        warnRows: [],
+        rowLines: [],
+        failAtLaunch: false,
+      },
+    });
+    try {
+      await r.app.start();
+      const row = (id: string, status: Check["status"], summary: string): Check => ({
+        id,
+        status,
+        summary,
+        evidence: {},
+      });
+      r.app.onDoctorRow(row("runtime", "pass", "node v26.5.1 (floor 22.19)"));
+      r.app.onDoctorRow(row("engine", "pass", "engine probe answered initialize"));
+      r.app.onDoctorRow(row("home", "pass", "MADC_HOME default · sessions/ writable"));
+      r.app.onDoctorRow(
+        row(
+          "cred.kimi-code",
+          "warn",
+          "KIMI_API_KEY not set: provider rows stay WARN until a key exists",
+        ),
+      );
+      r.app.onDoctorRow(row("bin.claude", "skip", "claude binary not on PATH"));
+      const mid = r.tty.lastFrame().join("\n");
+      // Mid-stream: the counts are already live (the banner must not sit at 0 while checks run).
+      assert.match(mid, /✓ 3 PASS · ▲ 1 WARN · 0 FAIL · ○ 1 SKIP/);
+      // §5.1: the WARN row prints in full under the banner.
+      assert.match(mid, /▲ cred\.kimi-code: KIMI_API_KEY not set/);
+      r.app.onDoctorFinished(214);
+      const frame = r.tty.lastFrame().join("\n");
+      assert.match(frame, /✓ 3 PASS · ▲ 1 WARN · 0 FAIL · ○ 1 SKIP/);
+      assert.match(frame, /Doctor at launch {2}read-only {2}214 ms/);
+      await r.cleanup();
+    } catch (e) {
+      await r.cleanup();
+      throw e;
+    }
+  });
+});
+
+describe("§5.9 /doctor overlay leaves no screen remnants at 143×44", () => {
+  // Screen-STATE assertions: replay every recorded write into a terminal emulator and check
+  // the visible grid, not the latest frame string — stale cells from shorter lines painted
+  // over longer ones, or from frames taller than the screen, must not survive any step.
+  const COLS = 143;
+  const ROWS = 44;
+  const overlayBoxWidth = 96; // overlayWidth(143) = min(max(143-4, 40), 96)
+
+  const screenOf = (tty: VirtualTty): ScreenModel => {
+    const s = new ScreenModel(COLS, ROWS);
+    s.feed(tty.chunks.join(""));
+    return s;
+  };
+
+  /** The invariants that hold whenever the overlay is OPEN (banner collapsed, pane closed). */
+  const assertOpenScreen = (s: ScreenModel): void => {
+    const lines = s.lines();
+    const text = lines.join("\n");
+    assert.match(text, /\/doctor/, "overlay title row present");
+    assert.match(text, /Esc close · r re-run/, "overlay hint present");
+    const boxRows = lines.filter((l) => l.includes("│"));
+    assert.ok(boxRows.length >= 3, `overlay box rows present (got ${boxRows.length})`);
+    for (const line of boxRows) {
+      // A clean box row is exactly the box: border + inner + border. Anything wider is a
+      // stale cell from an earlier frame (old elapsed/pill/prompt text beside the overlay).
+      assert.equal(
+        visibleWidth(line),
+        overlayBoxWidth,
+        `stale remnant beside the overlay box: ${JSON.stringify(line)}`,
+      );
+    }
+    // Exactly one prompt line, one hints line, one elapsed pill — duplicates are stale rows.
+    assert.equal(lines.filter((l) => l.includes("❯")).length, 1, "exactly one prompt line");
+    assert.equal(
+      lines.filter((l) => l.includes("evidence pane")).length,
+      1,
+      "exactly one hints line",
+    );
+    assert.equal(
+      lines.filter((l) => /idle · \d+(\.\d+)?s/.test(l)).length,
+      1,
+      "exactly one elapsed pill row",
+    );
+  };
+
+  /** The invariants that hold once the overlay is CLOSED again. */
+  const assertClosedScreen = (s: ScreenModel): void => {
+    const lines = s.lines();
+    const text = lines.join("\n");
+    assert.ok(!text.includes("Esc close"), "overlay hint gone");
+    assert.deepEqual(
+      [],
+      lines.filter((l) => l.includes("│")),
+      "no overlay box borders remain",
+    );
+    assert.equal(lines.filter((l) => l.includes("❯")).length, 1, "exactly one prompt line");
+    assert.equal(
+      lines.filter((l) => l.includes("evidence pane")).length,
+      1,
+      "exactly one hints line",
+    );
+    assert.equal(
+      lines.filter((l) => /idle · \d+(\.\d+)?s/.test(l)).length,
+      1,
+      "exactly one elapsed pill row",
+    );
+  };
+
+  it("opening /doctor, re-running with r, and closing with Esc leaves a clean screen", async () => {
+    const r = rig([
+      { kind: "ok", text: "first fixture reply fills the transcript" },
+      { kind: "ok", text: "second fixture reply lengthens the transcript" },
+    ]);
+    (r.tty as VirtualTty).resize(COLS, ROWS);
+    try {
+      await r.app.start();
+      r.app.onDoctorFinished(10);
+      for (const prompt of ["hi", "hi again"]) {
+        sendTurn(r.tty, prompt);
+        await until(
+          () =>
+            r.app.phase === "idle" &&
+            r.app.turns.length > 0 &&
+            r.app.turns[r.app.turns.length - 1]?.verify != null,
+          `turn ${prompt}`,
+        );
+      }
+      assertClosedScreen(screenOf(r.tty)); // baseline: the pre-overlay screen is clean
+
+      // Open: the overlay streams rows in; the final visible grid must hold no stale cells.
+      type(r.tty, "/doctor");
+      r.tty.key("enter");
+      await until(() => r.app.doctorOverlayOpen, "overlay open");
+      await until(
+        () => r.tty.lastFrame().join("\n").includes("bin.codex"),
+        "overlay rows finished streaming",
+      );
+      assertOpenScreen(screenOf(r.tty));
+
+      // Re-run with r: the box shrinks to the placeholder then regrows — no remnants may
+      // survive the shrink/regrow cycle either.
+      const before = r.tty.chunks.length;
+      r.tty.key({ char: "r" } as KeyValue);
+      await until(
+        () =>
+          r.tty.chunks.length > before + 2 && r.tty.lastFrame().join("\n").includes("bin.codex"),
+        "overlay re-run finished streaming",
+      );
+      assertOpenScreen(screenOf(r.tty));
+
+      // Close with Esc: the frame shrinks back; nothing of the overlay may remain.
+      r.tty.key("esc");
+      await until(() => !r.app.doctorOverlayOpen, "overlay closed");
+      assertClosedScreen(screenOf(r.tty));
       await r.cleanup();
     } catch (e) {
       await r.cleanup();
