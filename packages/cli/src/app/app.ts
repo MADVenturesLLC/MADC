@@ -256,8 +256,14 @@ export class WitnessApp {
       return ["", " ".repeat(pad) + msg, ""];
     }
     const lines: string[] = [];
+    // The docked pane (>=110) takes a 38-column right column; the banner, header and
+    // transcript render at the width they actually occupy so cards/wraps align to the rail,
+    // not the full screen — and the banner is never drawn wider than its region and clipped
+    // afterwards (§5.7), because a clip cannot repair a box composed too wide.
+    const paneDocked = this.evidenceOpen && width >= 110;
+    const transcriptWidth = paneDocked ? width - 38 : width;
     if (this.bannerExpanded) {
-      lines.push(...renderBanner(this.#bannerView(), width, this.#style, this.#g));
+      lines.push(...renderBanner(this.#bannerView(), transcriptWidth, this.#style, this.#g));
     } else {
       lines.push(
         renderHeader(
@@ -269,7 +275,7 @@ export class WitnessApp {
             userHome: this.#banner.userHome,
             threadId: this.threadId,
           },
-          width,
+          transcriptWidth,
           this.#style,
         ),
       );
@@ -282,10 +288,6 @@ export class WitnessApp {
         ),
       );
     }
-    // The docked pane (>=110) takes a 38-column right column; the transcript renders at the
-    // width it actually occupies so cards/wraps align to the rail, not the full screen.
-    const paneDocked = this.evidenceOpen && width >= 110;
-    const transcriptWidth = paneDocked ? width - 38 : width;
     for (const turn of this.turns) {
       const number = this.turns.indexOf(turn) + 1;
       lines.push(

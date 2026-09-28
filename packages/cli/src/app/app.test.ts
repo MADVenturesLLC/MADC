@@ -800,6 +800,142 @@ describe("§5.9 /doctor overlay leaves no screen remnants at 143×44", () => {
   });
 });
 
+describe("§5.7 docked evidence pane at 143×44", () => {
+  // The pane docks at >=110 columns: the transcript keeps width-38 columns and the pane box
+  // takes 36. Screen-STATE assertions (the §5.9 emulator): the banner must honour the width it
+  // actually occupies — rendering it at the full terminal width and clipping afterwards split
+  // ANSI colour sequences mid-span and pushed the pane borders off their columns.
+  const COLS = 143;
+  const ROWS = 44;
+  const REGION = COLS - 38; // the 105-column transcript region beside the docked pane
+  const PANE_W = 36;
+
+  const screenOf = (tty: VirtualTty): ScreenModel => {
+    const s = new ScreenModel(COLS, ROWS);
+    s.feed(tty.chunks.join(""));
+    return s;
+  };
+
+  // Pane rows start with the box's left border glyph — │ for content rows, ╭/╰ for the
+  // titled top and bottom rows — and end with its mirror (│/╮/╯) 36 columns later.
+  const PANE_START = new Set(["│", "╭", "╰"]);
+  const PANE_END = new Set(["│", "╮", "╯"]);
+
+  const paneRowsOf = (lines: readonly string[]): readonly string[] =>
+    lines.filter((l) => l.length > REGION && PANE_START.has(l[REGION] ?? ""));
+
+  /** Invariants whenever the pane is docked: fixed border columns, one prompt/hints/pill line
+   *  each — and no escape bytes or SGR parameters left as visible cells. */
+  const assertPaneDocked = (s: ScreenModel): void => {
+    const lines = s.lines();
+    const text = lines.join("\n");
+    // A clip that splits an SGR span leaves its parameter digits as cells (`…38;5;238m`).
+    assert.ok(!text.includes("\u001b"), "escape byte rendered as a visible cell");
+    assert.ok(!/(?:38;5;|38;2;|48;5;)\d+/.test(text), "SGR parameters leaked as text");
+    // Pane box: both borders at fixed columns on every pane row; a pane row is exactly the
+    // region plus the 36-column pane — anything else is a clipped or stale cell.
+    const paneRows = paneRowsOf(lines);
+    assert.ok(paneRows.length >= 10, `pane rows present (got ${paneRows.length})`);
+    for (const [i, l] of paneRows.entries()) {
+      assert.ok(
+        PANE_END.has(l[REGION + PANE_W - 1] ?? ""),
+        `pane right border drifted on row ${i}`,
+      );
+      assert.equal(
+        visibleWidth(l),
+        REGION + PANE_W,
+        `row ${i} exceeds region+pane: ${JSON.stringify(l)}`,
+      );
+    }
+    assert.equal(lines.filter((l) => l.includes("❯")).length, 1, "exactly one prompt line");
+    assert.equal(
+      lines.filter((l) => l.includes("evidence pane")).length,
+      1,
+      "exactly one hints line",
+    );
+    assert.equal(
+      lines.filter((l) => /idle · \d+(\.\d+)?s/.test(l)).length,
+      1,
+      "exactly one elapsed pill row",
+    );
+  };
+
+  /** The expanded banner beside the docked pane: the doctor summary and registry policy render
+   *  complete inside the region (not cut at the pane column mid-row), and the banner box rows
+   *  that continue below the pane keep borders at columns 0 and 101 — never under the pane. */
+  const assertBannerBesidePane = (s: ScreenModel): void => {
+    assertPaneDocked(s);
+    const lines = s.lines();
+    const text = lines.join("\n");
+    assert.match(text, /✓ 7 PASS · ▲ 0 WARN · 0 FAIL · ○ 2 SKIP/);
+    assert.match(text, /Doctor at launch {2}read-only {2}214 ms/);
+    assert.match(text, /policy +7 direct · 3 via vendor · 2 interactive · 4 forbidden/);
+    for (const [i, l] of lines.entries()) {
+      if (l.includes("│") && paneRowsOf([l]).length === 0) {
+        assert.equal(l[0], "│", `banner row ${i} does not start at its box border`);
+        assert.equal(l[101], "│", `banner row ${i} box border pushed past the box`);
+        assert.equal(
+          visibleWidth(l),
+          102,
+          `banner row ${i} ignores its available width: ${JSON.stringify(l)}`,
+        );
+      }
+    }
+  };
+
+  /** Invariants once the pane is closed again with Tab. */
+  const assertPaneClosed = (s: ScreenModel): void => {
+    const lines = s.lines();
+    assert.deepEqual([], paneRowsOf(lines), "no docked pane borders remain");
+    assert.equal(lines.filter((l) => l.includes("❯")).length, 1, "exactly one prompt line");
+    assert.equal(
+      lines.filter((l) => l.includes("evidence pane")).length,
+      1,
+      "exactly one hints line",
+    );
+  };
+
+  it("Tab docks the pane beside a banner that respects its region; Tab again closes clean", async () => {
+    const r = rig([
+      { kind: "ok", text: "first fixture reply fills the transcript" },
+      { kind: "ok", text: "second fixture reply lengthens the transcript" },
+    ]);
+    (r.tty as VirtualTty).resize(COLS, ROWS);
+    try {
+      await r.app.start();
+      r.app.onDoctorFinished(214);
+      assertPaneClosed(screenOf(r.tty)); // banner expanded, no pane: clean baseline
+
+      // Dock while the banner is still expanded: the doctor counts, the registry policy row
+      // and the box borders must all fit the 105-column region, complete and aligned.
+      r.tty.key("tab");
+      await until(() => r.app.evidenceOpen, "pane docked beside the banner");
+      assertBannerBesidePane(screenOf(r.tty));
+
+      // Two turns collapse the banner to the header; the pane keeps its columns.
+      for (const prompt of ["hi", "hi again"]) {
+        sendTurn(r.tty, prompt);
+        await until(
+          () =>
+            r.app.phase === "idle" &&
+            r.app.turns.length > 0 &&
+            r.app.turns[r.app.turns.length - 1]?.verify != null,
+          `turn ${prompt}`,
+        );
+      }
+      assertPaneDocked(screenOf(r.tty));
+
+      r.tty.key("tab"); // closes the pane
+      await until(() => !r.app.evidenceOpen, "pane closed");
+      assertPaneClosed(screenOf(r.tty));
+      await r.cleanup();
+    } catch (e) {
+      await r.cleanup();
+      throw e;
+    }
+  });
+});
+
 describe("/doctor overlay re-run key", () => {
   it("'r' re-runs the read-only doctor rows while the overlay is open", async () => {
     const r = rig([]);

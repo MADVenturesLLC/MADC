@@ -18,7 +18,7 @@ import {
   renderTurn,
 } from "./frames.ts";
 import type { ChainVerify, TurnRecord } from "./state.ts";
-import { glyphsFor, Style } from "./style.ts";
+import { glyphsFor, middleEllipsize, Style, truncateChrome, visibleWidth } from "./style.ts";
 
 const doctor: DoctorSummary = {
   running: false,
@@ -494,5 +494,29 @@ describe("§9 width helpers", () => {
     assert.equal(displayCwd("/home/mike/code/madc", "/home/mike"), "~/code/madc");
     assert.equal(displayCwd("/home/mike", "/home/mike"), "~");
     assert.equal(displayCwd("/opt/x", "/home/mike"), "/opt/x");
+  });
+  it("truncateChrome never splits an ANSI colour sequence at the cut", () => {
+    const okSpan = "\u001b[38;5;79m";
+    const reset = "\u001b[0m";
+    // Plain text is byte-for-byte the old behaviour (no SGR → no closing reset).
+    assert.equal(truncateChrome("abcdefghij", 5), "abcd…");
+    const cut = truncateChrome(`${okSpan}hello world${reset}`, 5);
+    assert.equal(cut, `${okSpan}hell…${reset}`);
+    assert.equal(visibleWidth(cut), 5);
+  });
+  it("middleEllipsize keeps spans whole at the head and tail cuts", () => {
+    const okSpan = "\u001b[38;5;79m";
+    const reset = "\u001b[0m";
+    const m = middleEllipsize(`${okSpan}${"a".repeat(30)}${reset}`, 10);
+    assert.equal(m, `${okSpan}aaaaa…${okSpan}aaaa${reset}`);
+    assert.equal(visibleWidth(m), 10);
+  });
+  it("middleEllipsize keeps the retained tail in its own colour, not the head's", () => {
+    const red = "\u001b[31m";
+    const green = "\u001b[32m";
+    const reset = "\u001b[0m";
+    const m = middleEllipsize(`${red}12345${green}67890${reset}`, 8);
+    assert.equal(m, `${red}1234…${green}890${reset}`);
+    assert.equal(visibleWidth(m), 8);
   });
 });

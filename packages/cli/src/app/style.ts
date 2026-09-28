@@ -250,6 +250,33 @@ export function wordWrap(text: string, width: number): string[] {
   return out;
 }
 
+/**
+ * Clip tokens of `s`: SGR spans and visible characters, in order. A span is one zero-width
+ * token — a clip may drop it whole but never split it, because a dangling `\u001b[38;…`
+ * prints its parameter bytes as cells and corrupts every width computed after it (§5.7 docked
+ * pane, §9 chrome truncation).
+ */
+function clipTokens(s: string): { esc: boolean; text: string }[] {
+  const toks: { esc: boolean; text: string }[] = [];
+  let i = 0;
+  while (i < s.length) {
+    if (s[i] === "\u001b") {
+      // Style-built lines are well-formed `\u001b[…m`; a malformed escape degrades to one
+      // zero-width char rather than swallowing the text that follows it.
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: SGR sequences are exactly what we match here.
+      const m = s.slice(i).match(/^\u001b\[[0-9;]*m/);
+      const text = m === null ? (s[i] ?? "") : m[0];
+      toks.push({ esc: true, text });
+      i += text.length;
+      continue;
+    }
+    const ch = String.fromCodePoint(s.codePointAt(i) ?? 0x20);
+    toks.push({ esc: false, text: ch });
+    i += ch.length;
+  }
+  return toks;
+}
+
 /** Truncate to `width` with an ellipsis when over (chrome only; §9 truncation rules). */
 export function truncateChrome(s: string, width: number): string {
   if (width <= 1) return s;
@@ -257,12 +284,19 @@ export function truncateChrome(s: string, width: number): string {
   const glyphs = glyphsFor(false);
   let out = "";
   let acc = 0;
-  for (const ch of s) {
+  for (const t of clipTokens(s)) {
+    if (t.esc) {
+      out += t.text;
+      continue;
+    }
     if (acc >= width - 1) break;
-    out += ch;
+    out += t.text;
     acc += 1;
   }
-  return out + glyphs.ellipsis;
+  // Close any span the cut left open: the ellipsis and the cells painted after this line (the
+  // docked pane's padding and border) must not inherit the clipped text's colour.
+  const reset = out.includes("\u001b[") ? "\u001b[0m" : "";
+  return out + glyphs.ellipsis + reset;
 }
 
 /** Middle-ellipsize to `width` (§9 chrome truncation: paths keep head+tail around a …). */
@@ -272,19 +306,43 @@ export function middleEllipsize(s: string, width: number): string {
   const keep = Math.max(1, width - 1);
   const head = Math.ceil(keep / 2);
   const tail = Math.floor(keep / 2);
-  let out = "";
+  const toks = clipTokens(s);
+  let front = "";
   let acc = 0;
-  for (const ch of s) {
-    if (acc >= head) break;
-    out += ch;
-    acc += 1;
+  for (const t of toks) {
+    if (!t.esc) {
+      if (acc >= head) break;
+      acc += 1;
+    }
+    front += t.text;
   }
   let back = "";
   acc = 0;
-  for (const ch of [...s].reverse()) {
-    if (acc >= tail) break;
-    back = ch + back;
-    acc += 1;
+  let i = toks.length - 1;
+  for (; i >= 0; i--) {
+    const t = toks[i];
+    if (t === undefined) continue;
+    if (!t.esc) {
+      if (acc >= tail) break;
+      acc += 1;
+    }
+    back = t.text + back;
   }
-  return out + e + back;
+  // The retained tail must keep the colour it had in `s`, not the head's: the span that styled
+  // it can sit before chars the cut dropped (red 12345 / green 67890 → the green opener is
+  // left of the dropped `67`). Scan past the dropped visible chars to the escape run that was
+  // active at the tail's first kept char and carry it over. A run of `\u001b[0m` means the
+  // tail was default-coloured; anything before that run was already closed, so the scan stops
+  // at the first run found.
+  let styleRun = "";
+  for (; i >= 0; i--) {
+    const t = toks[i];
+    if (t === undefined) continue;
+    if (t.esc) {
+      styleRun = t.text + styleRun;
+      continue;
+    }
+    if (styleRun !== "") break;
+  }
+  return front + e + styleRun + back;
 }

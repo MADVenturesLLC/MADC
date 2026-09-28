@@ -80,7 +80,10 @@ export function renderOverlay(
 ): string[] {
   const inner = Math.max(boxW - 2, 20);
   const rows: string[] = [];
-  const titleWidth = visibleWidth(title) + visibleWidth(hint) + 2;
+  // The titled row's fixed columns: the leading ─ plus the four padding spaces around the
+  // title, the dash run and the hint — so the top border is exactly as wide as every content
+  // row and the box's right border stays on one column (§5.7 docked pane, §5.9 overlay).
+  const titleWidth = visibleWidth(title) + visibleWidth(hint) + 5;
   rows.push(
     style.role(
       "border",
