@@ -1479,7 +1479,7 @@ export class WitnessApp {
     // R-g: one final verify after the engine exits, bounded (O-1) — except when there is no
     // thread (R-g) or a signal arrives during the verify (O-2, below).
     let finalVerifyFailed = false;
-    let finalVerify: ChainVerify | null = this.lastVerify;
+    let finalVerify: ChainVerify | null = null;
     if (this.threadId !== null && this.sessionPath !== null) {
       // §5.8.1 O-2 window: a signal while this verify (or the exit write below) runs takes the
       // F-102 path via #signalDuringFinalVerifyInterrupt — restore, re-raise, no receipt.
