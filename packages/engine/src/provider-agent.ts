@@ -64,6 +64,7 @@ import {
   type SeatInvalidData,
 } from "./protocol/errors.ts";
 import type { Item, ServedModelItem } from "./protocol/types.ts";
+import { laneMismatch } from "./seats/lane.ts";
 
 /**
  * One registry-driven direct-key lane (M1-A3): the credential resolved at engine start through the
@@ -155,11 +156,6 @@ const TURN_MODE = "headless" as const;
 /** Intent `connect` per seat pin §2: from the registry entry; unknown ids fail closed as direct. */
 function connectFor(entry: ProviderEntry | undefined): ConnectPreference {
   return entry?.connect === "vendor-agent" ? "vendor-agent" : "direct";
-}
-
-/** Billing class for the same-lane rule; forbidden entries carry none (seat pin §2 payload). */
-function credentialClassOf(entry: ProviderEntry): string {
-  return "credentialClass" in entry ? entry.credentialClass : "none";
 }
 
 function providerUnavailable(
@@ -314,17 +310,18 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
     async run(ctx: AgentTurnContext, sink: TurnSink): Promise<void> {
       const { seat } = ctx;
       const primary = planFor(seat.preferredBacking, ctx);
-      const fallbacks = seat.fallbacks ?? [];
+      const fallbacks = seat.fallbacks;
       let nextIndex = 0;
 
       /**
        * The next fallback candidate worth a call. Same-lane mismatches are rejected BEFORE any
-       * call with the pinned event + error item (D-M1-7); denied lanes, missing
+       * call with the pinned event + error item (D-M1-7, decided by `seats/lane.ts` — the one
+       * predicate seat load's never-eligible warning uses too); denied lanes, missing
        * adapters/credentials/binaries and unresolvable pinned models are skipped with a log line
-       * (a seat carries ONE pinnedModel; a candidate whose lane cannot resolve it is not usable —
-       * per-seat fallback model locking lands with the A7 roster). `halt` stops the walk at once
-       * (Copilot 4131965600): the rejection record failed to persist, the session is poisoned and
-       * the turn is already finalized — nothing further may be emitted, built or called.
+       * (a seat carries ONE pinnedModel; a candidate whose lane cannot resolve it is not usable).
+       * `halt` stops the walk at once (Copilot 4131965600): the rejection record failed to persist,
+       * the session is poisoned and the turn is already finalized — nothing further may be emitted,
+       * built or called.
        */
       const nextCandidate = (): Walk => {
         const assigned = getById(seat.preferredBacking);
@@ -337,18 +334,9 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
             options.log?.(`fallback ${candidate}: not a registry provider id; skipped`);
             continue;
           }
-          if (
-            entry.status !== assigned.status ||
-            credentialClassOf(entry) !== credentialClassOf(assigned)
-          ) {
-            const assignedLane = {
-              status: assigned.status,
-              credentialClass: credentialClassOf(assigned),
-            };
-            const candidateLane = {
-              status: entry.status,
-              credentialClass: credentialClassOf(entry),
-            };
+          const mismatch = laneMismatch(assigned, entry);
+          if (mismatch !== null) {
+            const { assignedLane, candidateLane } = mismatch;
             // Pinned dual record (seat pin §2 / §4.2): the durable JSONL event first, then the
             // error-style item naming the seat, the candidate and both lanes. If the event is not
             // durable, the turn is already failed server-side: stop before the paired item and

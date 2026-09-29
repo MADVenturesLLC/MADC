@@ -181,8 +181,9 @@ test("A2 §3.5/P4 there is no auth/set over JSONL: -32601, the secret is never e
 });
 
 test("A2 schema test: no JSONL method accepts a secret value (pin §8.3)", () => {
-  // The complete M1 method list, as pinned (protocol pin §3): M0's six plus the two presence
-  // methods. No `auth/set`, and nothing whose name suggests a secret-carrying request.
+  // The complete M1 method list, as pinned (protocol pin §3): M0's six, the two presence methods
+  // (M1-A2) and `seat/list` (M1-A7). No `auth/set`, and nothing whose name suggests a
+  // secret-carrying request.
   assert.deepStrictEqual(
     [...CLIENT_REQUEST_METHODS],
     [
@@ -192,6 +193,7 @@ test("A2 schema test: no JSONL method accepts a secret value (pin §8.3)", () =>
       "thread/list",
       "turn/start",
       "turn/interrupt",
+      "seat/list",
       "auth/status",
       "auth/remove",
     ],
@@ -214,6 +216,12 @@ test("A2 schema test: no JSONL method accepts a secret value (pin §8.3)", () =>
     "providerId",
   ]);
   for (const [method, fields] of Object.entries(CLIENT_REQUEST_PARAM_FIELDS)) {
+    // `seat/list` is the one method protocol pin §3.5 gives empty params (`{}`): it declares no
+    // field, which is the strongest possible no-secret shape. Every other method declares some.
+    if (method === "seat/list") {
+      assert.deepStrictEqual([...fields], [], "seat/list takes no params");
+      continue;
+    }
     assert.ok(fields.length > 0, `${method} declares its params`);
     for (const field of fields) {
       assert.ok(NON_SECRET_FIELDS.has(field), `${method}.${field} is not a declared field`);

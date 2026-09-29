@@ -22,6 +22,7 @@ import {
   expectRpcError,
   handshake,
   makeHome,
+  seatFileBody,
   startEngine,
   withEngine,
   writeSeatFile,
@@ -56,7 +57,9 @@ test("honesty §6.1: first engine start seeds seats/madc-default.json exactly as
     const path = join(home, "seats", "madc-default.json");
     const seeded = JSON.parse(readFileSync(path, "utf8"));
     assert.deepEqual(seeded, PIN_MADC_DEFAULT, "seed content is pin §3");
-    assert.deepEqual(seeded, JSON.parse(JSON.stringify(MADC_DEFAULT_SEAT)), "seed == built-in");
+    // The FILE projection of the built-in seat, not the in-memory object: since M1-A7 the
+    // in-memory v1 seat carries S2's migrated `fallbacks: []`, which the v1 file must not.
+    assert.deepEqual(seeded, seatFileBody(MADC_DEFAULT_SEAT), "seed == built-in");
     assert.deepEqual(Object.keys(seeded), Object.keys(PIN_MADC_DEFAULT), "pin key order");
     for (const sub of ["seats", "sessions", "memory"]) {
       assert.ok(statSync(join(home, sub)).isDirectory(), sub);
@@ -241,7 +244,32 @@ const BAD_SEATS: Array<{
     seat: { id: "someone-else" },
     issues: ['id "someone-else" must equal the filename stem "id-mismatch"'],
   },
-  { name: "version-2", seat: { version: 2 }, issues: ["version must be 1"] },
+  // M1-A7 (seat pin S2) supersedes the M0 "version must be 1" refusal: `version: 2` is a valid
+  // schema, but it REQUIRES `displayName` and `fallbacks`, and any other version still fails.
+  {
+    name: "version-2-no-displayname",
+    seat: { version: 2, fallbacks: [] },
+    issues: ["displayName must be a non-empty string at version 2"],
+  },
+  {
+    name: "version-2-no-fallbacks",
+    seat: { version: 2, displayName: "No Fallbacks" },
+    issues: ["fallbacks must be an array of registry provider ids at version 2"],
+  },
+  {
+    name: "version-2-neither",
+    seat: { version: 2 },
+    issues: [
+      "displayName must be a non-empty string at version 2",
+      "fallbacks must be an array of registry provider ids at version 2",
+    ],
+  },
+  {
+    name: "version-2-blank-displayname",
+    seat: { version: 2, displayName: "   ", fallbacks: [] },
+    issues: ["displayName must be a non-empty string at version 2"],
+  },
+  { name: "version-3", seat: { version: 3 }, issues: ["version must be 1 or 2"] },
   // M1-A3 (seat pin S1): backing validity is registry-driven. "ollama-cloud" — the M0
   // counter-example — is a valid backing since M1-A3 wired it (positive case below); the bad
   // cases are an unknown id, a forbidden lane and an unwired stub.

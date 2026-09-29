@@ -31,6 +31,7 @@ import {
   type RequestId,
   type RpcErrorBody,
   SERVER_NAME,
+  type SeatListResult,
   type ServerNotifications,
   type Thread,
   type ThreadListResult,
@@ -39,7 +40,10 @@ import {
   type UserInput,
 } from "./protocol/types.ts";
 import { encodeMessage, isPlainObject, parseLine } from "./protocol/wire.ts";
-import { type LoadedSeat, loadSeat, seedDefaultSeat } from "./seat-store.ts";
+import { type LoadedSeat, loadSeat } from "./seat-store.ts";
+import { listSeatSummaries } from "./seats/list.ts";
+import { ensureSeatMemoryFile } from "./seats/memory.ts";
+import { seedRosterSeats } from "./seats/roster.ts";
 import {
   type RebuiltSession,
   rebuildSession,
@@ -212,12 +216,18 @@ export class EngineConnection {
   }
 
   /**
-   * Seat pin §1: on engine start, seed `seats/madc-default.json` if missing (never overwritten).
-   * A failure is logged, not fatal: `thread/start` then reports the seat error itself.
+   * Seat pin §1 / §3 (S3): on engine start, seed the five roster seats — each only when its own
+   * `seats/<id>.json` is missing, never overwriting an existing file. A failure is logged, not
+   * fatal: `thread/start` then reports that seat's error itself (-32005 for a seat that never
+   * landed). Every refused seat is named in the log — Amendment 3 item 4 forbids passing a refusal
+   * off as "already seeded".
    */
   #seedHome(): void {
     try {
-      seedDefaultSeat(this.#opts.home);
+      const report = seedRosterSeats(this.#opts.home);
+      for (const failure of report.failures) {
+        this.#log(`seed failed for seat ${failure.seatId}: ${failure.message}`);
+      }
     } catch (err) {
       this.#log(`seed failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -321,12 +331,55 @@ export class EngineConnection {
         return this.#turnStart(params);
       case "turn/interrupt":
         return this.#turnInterrupt(params);
+      case "seat/list":
+        return { value: this.#seatList(params) };
       case "auth/status":
         return this.#authStatus(params);
       case "auth/remove":
         return this.#authRemove(params);
       default:
         throw methodNotFound(method);
+    }
+  }
+
+  // -------------------------------------------------------------------- seats
+
+  /**
+   * M1-A7 (protocol pin §3.5 P4): `{ data: SeatSummary[] }`, the projection this act locks
+   * (`SeatSummary`, protocol types). Read-only. Params are pinned as `{}`, so any field at all is
+   * -32602 — the method takes nothing and can therefore never be handed a secret value.
+   */
+  #seatList(params: unknown): SeatListResult {
+    const p = paramsObject(params);
+    const unexpected = Object.keys(p);
+    if (unexpected.length > 0) {
+      throw invalidParams([`seat/list takes no params (got ${unexpected.join(", ")})`]);
+    }
+    return { data: listSeatSummaries(this.#opts.home) };
+  }
+
+  /**
+   * Seat-load warnings (seat pin §2, D-M1-7): a listed fallback that can never be eligible under
+   * the same-lane rule is warned about at load, on stderr — never silently dropped, and never a
+   * load failure (the seat file is valid; that one hop just can never serve). `seat/list` reports
+   * the same warnings and `madc doctor` surfaces them in M1-A8.
+   */
+  #noteSeatWarnings(seat: LoadedSeat): void {
+    for (const warning of seat.warnings) this.#log(warning);
+  }
+
+  /**
+   * Create the seat's own memory file if it is missing (seat pin §1 `memory/<seatId>.md`). Never
+   * overwrites, never appends, never follows a symlink; a refusal is logged and the thread still
+   * serves — memory notes are optional in M1 and no act commissions their content format.
+   */
+  #materializeSeatMemory(seat: LoadedSeat): void {
+    try {
+      ensureSeatMemoryFile(this.#opts.home, seat.seat);
+    } catch (err) {
+      this.#log(
+        `seat ${seat.seat.id}: memory path unavailable (${err instanceof Error ? err.message : String(err)})`,
+      );
     }
   }
 
@@ -395,6 +448,7 @@ export class EngineConnection {
 
     // Seat load happens in thread/start (protocol pin §4.2): -32005 / -32006 before any lock.
     const seat = loadSeat(this.#opts.home, seatId);
+    this.#noteSeatWarnings(seat);
 
     const id = this.#opts.newThreadId?.() ?? newId("thr");
     if (!isValidId(id)) throw internalError("Generated thread id is invalid");
@@ -459,6 +513,15 @@ export class EngineConnection {
       status: "idle",
       preview: "",
     };
+    // M1-A7 (seat pin §1, §8 item 4): a thread on a seat materializes THAT seat's own memory path
+    // — never another seat's, never a shared one (plan A7 forbidden: "shared memory between
+    // seats"). It runs here, not at turn time, so a seat whose turns this build refuses still owns
+    // its memory path: `surface-architect` cannot pass turn preflight until the Founder records
+    // Ollama headless permission (D-M1-3/D-M1-4) or M1-A5 lands interactive attestation, and
+    // neither gate is relaxed by creating an empty 0600 note file. Best effort and never fatal:
+    // memory notes are optional in M1 and no act commissions their content format, so a refusal
+    // here must not fail a thread that could otherwise serve.
+    this.#materializeSeatMemory(seat);
     this.#threads.set(id, {
       thread,
       lock: handle,
@@ -583,6 +646,7 @@ export class EngineConnection {
       throw internalError("Session record failed verification");
     }
     const seat = loadSeat(this.#opts.home, rebuilt.thread.seatId);
+    this.#noteSeatWarnings(seat);
     // verifySessionFile always reports the verified byte size; it is the §2 position bound.
     const verifiedSize = verified.size;
     if (verifiedSize === undefined) throw internalError("Session record failed verification");

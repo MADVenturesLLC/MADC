@@ -88,8 +88,30 @@ export {
   type SeedResult,
   seatFilePath,
   seedDefaultSeat,
+  seedSeatFile,
   serializeSeat,
 } from "./seat-store.ts";
+export {
+  type Lane,
+  type LaneMismatch,
+  laneMismatch,
+  laneOf,
+  type NeverEligible,
+  neverEligibleFallbacks,
+  neverEligibleWarning,
+} from "./seats/lane.ts";
+export { listSeatSummaries, seatSummary } from "./seats/list.ts";
+export { ensureSeatMemoryFile, type SeatMemoryFile } from "./seats/memory.ts";
+export {
+  DAEDALUS_SEAT,
+  HEPHAESTUS_SEAT,
+  PROMETHEUS_SEAT,
+  ROSTER_SEATS,
+  type RosterSeedFailure,
+  type RosterSeedReport,
+  SURFACE_ARCHITECT_SEAT,
+  seedRosterSeats,
+} from "./seats/roster.ts";
 export { ENGINE_VERSION, EngineConnection, type EngineOptions, runEngine } from "./server.ts";
 export {
   createRedactor,

@@ -12,6 +12,11 @@ test("engine public surface exports protocol constants, host, and client SDK", (
   assert.equal(engine.echoAgent.name, "echo");
   // A4: the seed writer doctor --init reuses, and the home report helper.
   assert.equal(typeof engine.seedDefaultSeat, "function");
+  // M1-A7: the roster seed writer and the `seat/list` projection are host surface too.
+  assert.equal(typeof engine.seedRosterSeats, "function");
+  assert.equal(typeof engine.seedSeatFile, "function");
+  assert.equal(typeof engine.listSeatSummaries, "function");
+  assert.equal(engine.ROSTER_SEATS.length, 5);
   assert.equal(typeof engine.inspectMadcHome, "function");
   assert.equal(typeof engine.verifySessionFile, "function");
   // M1-A2: the credential store and the one-shot auth-set runner are host surface.
@@ -35,6 +40,11 @@ test("@madc/engine/client (CLI surface) carries no engine loop or agents", () =>
     "startStdioEngine",
     "SessionWriter",
     "seedDefaultSeat",
+    // M1-A7: the CLI reaches seats through the `seat/list` method, never through the writer or the
+    // host-side projection.
+    "seedSeatFile",
+    "seedRosterSeats",
+    "listSeatSummaries",
     "runAuthSet",
     "createCredentialStore",
     "defaultAgentFactory",

@@ -20,6 +20,7 @@ import {
   handshake,
   KIMI_FAKE_ENGINE,
   makeHome,
+  seatFileBody,
   startEngine,
   startEngineCapturingStderr,
   writeSeatFile,
@@ -205,7 +206,9 @@ test("honesty: a Claude OAuth token in KIMI_API_KEY is refused (-32008), never s
 
 /** A seat file body: `madc-default` fields with overrides (written under `$MADC_HOME/seats`). */
 function seatJson(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
-  return { ...MADC_DEFAULT_SEAT, id, ...overrides };
+  // Through the file projection: the in-memory v1 seat carries S2's migrated `fallbacks`, which a
+  // v1 FILE must not (M1-A7).
+  return { ...seatFileBody(MADC_DEFAULT_SEAT), id, ...overrides };
 }
 
 /** In-process preflight of the provider agent for a seat built in code (bypasses seat files). */
