@@ -5,9 +5,10 @@
  * reads a seat file any other way than `loadSeat` does (no-follow fd, real-path confinement, inode
  * re-check), so listing cannot be turned into a read of something outside `$MADC_HOME`.
  *
- * A file that does not load is reported as `ok: false` with its code and issues rather than
+ * A seat whose file does not load is reported as `ok: false` with its code and issues rather than
  * dropped: an operator who can see `seats/<id>.json` on disk must be able to see why the engine
- * refuses it (and M1-A8's doctor reads the same projection).
+ * refuses it (and M1-A8's doctor reads the same projection). Names that could never be a seat id
+ * are the one exception, and why is stated on `listSeatSummaries`.
  */
 import { readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
@@ -45,10 +46,22 @@ export function seatSummary(loaded: LoadedSeat): SeatSummary {
 }
 
 /**
- * Every `seats/<id>.json` in `$MADC_HOME`, sorted by seat id. Dot-names are skipped: the seed
- * writer's temp files start with "." precisely so they can never be loaded as a seat. A `seats/`
- * that is missing, unreadable, or does not resolve strictly inside the real `$MADC_HOME` lists
- * nothing (fail-safe for a read-only report; `madc doctor` is the surface that says why).
+ * Every seat in `$MADC_HOME/seats/`, sorted by seat id. Two kinds of name are deliberately NOT
+ * listed, and neither is a seat this engine could ever load:
+ *
+ * - dot-names — the seed writer's temp files start with "." precisely so they can never be read as
+ *   a seat (and they end in `.tmp`, so the suffix filter already excludes them);
+ * - a stem that is not a valid protocol id (e.g. `bad.id.json`) — `thread/start` refuses such a
+ *   `seatId` with -32602 before any path join, so the file is unreachable as a seat by
+ *   construction. It is skipped rather than reported because reporting it would echo
+ *   operator-controlled filename bytes into a protocol response the CLI prints verbatim; a stray
+ *   file in `seats/` is home-level junk and belongs to `madc doctor` (M1-A8), which reports the
+ *   directory itself.
+ *
+ * A name that IS a valid seat id but whose file does not load is reported as `ok: false` with its
+ * code and issues, never dropped. A `seats/` that is missing, unreadable, or does not resolve
+ * strictly inside the real `$MADC_HOME` lists nothing (fail-safe for a read-only report; doctor is
+ * the surface that says why).
  */
 export function listSeatSummaries(home: string): SeatSummary[] {
   const dir = join(home, "seats");

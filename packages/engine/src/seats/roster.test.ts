@@ -17,7 +17,15 @@
  *    before any provider request — asserted below — plus its own memory path at thread/start.
  */
 import assert from "node:assert/strict";
-import { existsSync, readdirSync, readFileSync, statSync, symlinkSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import {
@@ -32,7 +40,7 @@ import { ErrorCode, RpcError } from "../protocol/errors.ts";
 import type { Item, SeatListParams, ServedModelItem, Turn } from "../protocol/types.ts";
 import { createProviderAgent, type DirectLane } from "../provider-agent.ts";
 import { type EngineSeat, MADC_DEFAULT_SEAT } from "../seat.ts";
-import { loadSeat, serializeSeat } from "../seat-store.ts";
+import { loadSeat, seedSeatFile, serializeSeat } from "../seat-store.ts";
 import { type FallbackRejectedPayload, verifySessionFile } from "../session-store.ts";
 import {
   CODEX_FAKE_ENGINE,
@@ -46,6 +54,7 @@ import {
   writeSeatFile,
 } from "../testing/harness.ts";
 import { laneMismatch, neverEligibleFallbacks } from "./lane.ts";
+import { ensureSeatMemoryFile } from "./memory.ts";
 import {
   DAEDALUS_SEAT,
   HEPHAESTUS_SEAT,
@@ -1141,4 +1150,160 @@ test("A7: the seeded roster's pinnedModel values are the ones this act locked", 
     ROSTER_IDS,
     "seat pin §3 order",
   );
+});
+
+// ------------------------------------------------------------------ Copilot review regressions
+// Each test below pins one finding from the PR #37 review so the fix cannot silently regress.
+
+test("A7 review r4137933951: the seed writer refuses an id outside the protocol grammar, before any path join", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    assert.equal(seedSeatFile(home, MADC_DEFAULT_SEAT).created, true, "the home dirs exist");
+    // The precondition that makes the escape reachable. Without it the dot-prefixed temp name
+    // ENOENTs first and the hole hides, so the test supplies it: with the grammar guard removed,
+    // this seed lands at `$MADC_HOME/escape.json` and reports `created: true` (verified by probe).
+    mkdirSync(join(home, "seats", "..."), { mode: 0o700 });
+
+    for (const id of ["../escape", "..", "a/b", ".hidden", ""]) {
+      assert.throws(
+        () => seedSeatFile(home, { ...MADC_DEFAULT_SEAT, id }),
+        /must match \^\[A-Za-z0-9\]/,
+        id,
+      );
+    }
+    assert.equal(existsSync(join(home, "escape.json")), false, "no seat file outside seats/");
+    assert.deepEqual(
+      readdirSync(home).sort(),
+      ["memory", "seats", "sessions"],
+      "the home gained no stray name",
+    );
+    // The already-seeded default is untouched and still reports created:false.
+    assert.equal(seedSeatFile(home, MADC_DEFAULT_SEAT).created, false);
+  } finally {
+    cleanup();
+  }
+});
+
+test("A7 review r4137934009: a seat declaring another seat's memory path materializes nothing", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const borrowed: EngineSeat = {
+      ...DAEDALUS_SEAT,
+      memory: { mode: "file", path: "memory/hephaestus.md" },
+    };
+    assert.equal(
+      ensureSeatMemoryFile(home, borrowed),
+      null,
+      "a declared path that is not the seat's own is left alone",
+    );
+    assert.equal(
+      existsSync(join(home, "memory", "hephaestus.md")),
+      false,
+      "no other seat's file was created",
+    );
+
+    // Its OWN pinned default path still materializes, exclusively, 0600, and is never rewritten.
+    const own = ensureSeatMemoryFile(home, DAEDALUS_SEAT);
+    assert.equal(own?.created, true);
+    assert.equal(existsSync(join(home, "memory", "daedalus.md")), true);
+    if (POSIX) assert.equal(mode(join(home, "memory", "daedalus.md")), 0o600);
+    assert.equal(ensureSeatMemoryFile(home, DAEDALUS_SEAT)?.created, false, "never overwritten");
+
+    // An in-session seat has no path at all.
+    assert.equal(
+      ensureSeatMemoryFile(home, { ...DAEDALUS_SEAT, memory: { mode: "in-session" } }),
+      null,
+    );
+  } finally {
+    cleanup();
+  }
+});
+
+test("A7 review r4137934052: a nested memory path with a swapped intermediate component cannot escape the home", () => {
+  const { home, cleanup } = makeHome();
+  const outside = join(home, "..", "outside-a7-mem");
+  try {
+    mkdirSync(join(home, "memory"), { recursive: true, mode: 0o700 });
+    mkdirSync(outside, { recursive: true, mode: 0o700 });
+    // `memory/team` is a symlink out of the home. O_NOFOLLOW protects only the FINAL component, so
+    // a declared nested path is never created by this act at all.
+    symlinkSync(outside, join(home, "memory", "team"));
+    const seat: EngineSeat = {
+      ...DAEDALUS_SEAT,
+      id: "team-seat",
+      memory: { mode: "file", path: "memory/team/team-seat.md" },
+    };
+    assert.equal(ensureSeatMemoryFile(home, seat), null);
+    assert.deepEqual(readdirSync(outside), [], "nothing was created through the swapped component");
+    // The seat's own default path is still available to it, and stays inside the home.
+    assert.equal(
+      ensureSeatMemoryFile(home, {
+        ...DAEDALUS_SEAT,
+        id: "team-seat",
+        memory: { mode: "file", path: "memory/team-seat.md" },
+      })?.created,
+      true,
+    );
+    assert.equal(existsSync(join(home, "memory", "team-seat.md")), true);
+    assert.deepEqual(readdirSync(outside), [], "still nothing outside");
+  } finally {
+    cleanup();
+  }
+});
+
+test("A7 review r4137934103: the serializer refuses a v2 seat with no usable displayName, so the writer can never seed an unloadable seat", () => {
+  const missing = { ...DAEDALUS_SEAT, displayName: undefined } as unknown as EngineSeat;
+  assert.throws(() => serializeSeat(missing), /displayName is required at version 2/);
+  assert.throws(
+    () => serializeSeat({ ...DAEDALUS_SEAT, displayName: "   " }),
+    /displayName is required at version 2/,
+  );
+  // v1 is unaffected: its schema has no displayName key, so the bytes must not gain one.
+  assert.equal(serializeSeat(MADC_DEFAULT_SEAT).includes("displayName"), false);
+  // The refusal reaches the seed writer, the only caller that persists bytes.
+  const { home, cleanup } = makeHome();
+  try {
+    assert.throws(() => seedSeatFile(home, missing), /displayName is required at version 2/);
+    assert.equal(existsSync(join(home, "seats", "daedalus.json")), false, "nothing half-written");
+  } finally {
+    cleanup();
+  }
+});
+
+test("A7 review r4137934156: seat/list never echoes a stem that could not be a seat id, and still reports an unloadable seat", async () => {
+  const { home, cleanup } = makeHome();
+  const { client } = startEngineCapturingStderr(home, ECHO_ENGINE);
+  try {
+    await handshake(client);
+    const seats = join(home, "seats");
+    // A stem outside the protocol id grammar: `thread/start` refuses it with -32602 before any path
+    // join, so it is not a seat — and its operator-controlled name never enters a response the CLI
+    // prints verbatim.
+    writeFileSync(join(seats, "bad.id.json"), serializeSeat(DAEDALUS_SEAT), { mode: 0o600 });
+    // A grammar-valid stem whose file does not load IS reported rather than hidden.
+    writeFileSync(join(seats, "mismatch.json"), serializeSeat(DAEDALUS_SEAT), { mode: 0o600 });
+
+    const { data } = await client.request("seat/list", {});
+    const ids = data.map((s) => s.id);
+    assert.equal(ids.includes("bad.id"), false, "an impossible seat id is not echoed");
+    for (const id of ids) {
+      assert.match(
+        id,
+        /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/,
+        "every listed id satisfies the grammar",
+      );
+    }
+    const mismatch = data.find((s) => s.id === "mismatch");
+    assert.ok(mismatch !== undefined && mismatch.ok === false, "an unloadable seat is reported");
+    assert.equal(mismatch.code, ErrorCode.SeatInvalid);
+    assert.deepEqual(mismatch.issues, ['id "daedalus" must equal the filename stem "mismatch"']);
+    assert.deepEqual(
+      ids.sort(),
+      [...ROSTER_IDS, "mismatch"].sort(),
+      "the roster still lists in full",
+    );
+  } finally {
+    await client.close();
+    cleanup();
+  }
 });

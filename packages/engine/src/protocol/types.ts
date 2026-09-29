@@ -199,9 +199,13 @@ export type SeatListParams = Record<string, never>;
  * not summary data) and `handoffs` (a frozen M1 stub — always `{ enabled: false, targets: [] }`).
  * No field carries a secret: a seat file holds none, and credentials stay in the keychain (M1-A2).
  *
- * A seat file that does not load is reported, not hidden: `ok: false` with the load error's code
+ * A seat whose file does not load is reported, not hidden: `ok: false` with the load error's code
  * (-32005 / -32006) and its issues, so `madc seats ls` and doctor (M1-A8) can name the broken file
- * instead of silently dropping a seat the operator can see on disk.
+ * instead of silently dropping a seat the operator can see on disk. The one name never echoed back
+ * is a `seats/*.json` stem that could not be a seat id at all — `thread/start` refuses it with
+ * -32602 before any path join, and echoing operator-controlled filename bytes into a response the
+ * CLI prints verbatim is not a trade this method needs to make (`seats/list.ts` records the
+ * disposition; stray files in `seats/` are doctor's report).
  */
 export type SeatSummary =
   | {

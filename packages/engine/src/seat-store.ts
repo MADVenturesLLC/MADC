@@ -56,6 +56,21 @@ export function seatFilePath(home: string, id: string): string {
 }
 
 /**
+ * The `displayName` a v2 file must carry, or `null` for a v1 seat (whose schema has no such key).
+ * Throws rather than emitting a placeholder: S2 requires a non-empty `displayName` at version 2, so
+ * writing `""` would let the seed writer create a file `validateSeat` then refuses — a seat the
+ * engine seeded but can never load. Failing in the writer keeps that impossible.
+ */
+function v2DisplayName(seat: EngineSeat): string | null {
+  if (seat.version !== 2) return null;
+  const name = seat.displayName;
+  if (name === undefined || name.trim() === "") {
+    throw new Error(`seat ${seat.id}: displayName is required at version 2`);
+  }
+  return name;
+}
+
+/**
  * The one seat serializer (the seed writer uses it). Deterministic bytes: keys are emitted in
  * seat pin §2 / §3 order regardless of the input object's key order, 2-space indentation, LF line
  * endings, and exactly one trailing newline. `displayName` and `fallbacks` are emitted only for a
@@ -64,6 +79,7 @@ export function seatFilePath(home: string, id: string): string {
  * those bytes literally.
  */
 export function serializeSeat(seat: EngineSeat): string {
+  const displayName = v2DisplayName(seat);
   const memory =
     seat.memory.mode === "file"
       ? { mode: seat.memory.mode, path: seat.memory.path }
@@ -77,7 +93,7 @@ export function serializeSeat(seat: EngineSeat): string {
     version: seat.version,
     role: seat.role,
     standingInstructions: seat.standingInstructions,
-    ...(seat.version === 2 ? { displayName: seat.displayName ?? "" } : {}),
+    ...(displayName === null ? {} : { displayName }),
     pinnedModel: seat.pinnedModel,
     preferredBacking: seat.preferredBacking,
     ...(seat.version === 2 ? { fallbacks: [...seat.fallbacks] } : {}),
@@ -288,6 +304,16 @@ function proveExistingSeat(
  * and is unchanged.
  */
 export function seedSeatFile(home: string, seat: EngineSeat): SeedResult {
+  // Seat pin §1 path confinement: the id grammar is checked BEFORE any path join. In M0 this
+  // writer only ever took the constant `madc-default`; since M1-A7 it takes any seat, so the check
+  // is the writer's own — and it is load-bearing, not decorative. Every later check pins the
+  // inode and the `seats/` directory, NOT the directory the linked name landed in, so an id such
+  // as `../escape` links the seed to `$MADC_HOME/escape.json` and still reports `created: true`
+  // (verified: it needs a literal `...` dir in `seats/` for the dot-prefixed temp name to resolve,
+  // which is exactly the kind of precondition a confinement rule must not depend on).
+  if (!isValidId(seat.id)) {
+    throw new Error(`seat id "${seat.id}" must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`);
+  }
   mkdirSync(home, { recursive: true, mode: 0o700 });
   enforcePrivateDir(home);
   let seatsId: FileId | null = null;
