@@ -16,6 +16,7 @@ import {
   expectRpcError,
   handshake,
   makeHome,
+  seatFileBody,
   startEngineCapturingStderr,
   writeSeatFile,
 } from "./testing/harness.ts";
@@ -73,7 +74,8 @@ async function withClaudeEngine(setup: Setup, fn: (run: Run) => Promise<void>): 
 /** A claude-code backed seat file body (madc-default fields with the backing swapped). */
 function claudeSeat(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    ...MADC_DEFAULT_SEAT,
+    // File projection: a v1 FILE must not carry S2's migrated `fallbacks` (M1-A7).
+    ...seatFileBody(MADC_DEFAULT_SEAT),
     id,
     preferredBacking: "claude-code",
     pinnedModel: CLAUDE_MODEL,

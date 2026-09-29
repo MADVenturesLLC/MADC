@@ -36,6 +36,7 @@ import {
   expectRpcError,
   handshake,
   makeHome,
+  seatFileBody,
   startEngine,
   writeSeatFile,
 } from "./testing/harness.ts";
@@ -437,7 +438,8 @@ test("A3 e2e: an ollama-cloud seat file loads (S1) and every headless turn is re
   });
   try {
     writeSeatFile(home, {
-      ...MADC_DEFAULT_SEAT,
+      // File projection: a v1 FILE must not carry S2's migrated `fallbacks` (M1-A7).
+      ...seatFileBody(MADC_DEFAULT_SEAT),
       id: "surface-architect",
       role: "contracts and pins",
       preferredBacking: "ollama-cloud",

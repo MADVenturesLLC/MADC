@@ -30,6 +30,7 @@ import {
 } from "./protocol/errors.ts";
 import { isValidId } from "./protocol/ids.ts";
 import { type EngineSeat, MADC_DEFAULT_SEAT, validateSeat } from "./seat.ts";
+import { neverEligibleFallbacks, neverEligibleWarning } from "./seats/lane.ts";
 
 /** Seat files larger than this are refused (-32006) instead of being parsed. */
 const MAX_SEAT_BYTES = 1024 * 1024;
@@ -37,7 +38,17 @@ const MAX_SEAT_BYTES = 1024 * 1024;
 const HOME_SUBDIRS = ["seats", "sessions", "memory"] as const;
 
 /** A seat as loaded from disk, with the file it came from (reported in -32006 data). */
-export type LoadedSeat = { readonly seat: EngineSeat; readonly path: string };
+export type LoadedSeat = {
+  readonly seat: EngineSeat;
+  readonly path: string;
+  /**
+   * Seat-load warnings (seat pin §2: "Seat load (M1-A7) and `madc doctor` warn on any listed
+   * fallback that can never be eligible"). Never a load failure: the seat file is valid, one of its
+   * fallback hops just can never serve under the D-M1-7 same-lane rule until the registry or the
+   * roster cell changes. The engine logs them; `seat/list` reports them.
+   */
+  readonly warnings: readonly string[];
+};
 
 /** Operator-facing seat file path (lexical; `id` must already be a valid id). */
 export function seatFilePath(home: string, id: string): string {
@@ -46,9 +57,11 @@ export function seatFilePath(home: string, id: string): string {
 
 /**
  * The one seat serializer (the seed writer uses it). Deterministic bytes: keys are emitted in
- * seat pin §3 order regardless of the input object's key order, 2-space indentation, LF line
- * endings, and exactly one trailing newline. `seedDefaultSeat` writes
- * `serializeSeat(MADC_DEFAULT_SEAT)`; a test pins those bytes literally.
+ * seat pin §2 / §3 order regardless of the input object's key order, 2-space indentation, LF line
+ * endings, and exactly one trailing newline. `displayName` and `fallbacks` are emitted only for a
+ * `version: 2` seat, so `seedSeatFile(home, MADC_DEFAULT_SEAT)` still writes the byte-identical M0
+ * v1 seed (S2: a v1 file is never rewritten, and its bytes never gain the v2 keys); a test pins
+ * those bytes literally.
  */
 export function serializeSeat(seat: EngineSeat): string {
   const memory =
@@ -64,8 +77,10 @@ export function serializeSeat(seat: EngineSeat): string {
     version: seat.version,
     role: seat.role,
     standingInstructions: seat.standingInstructions,
+    ...(seat.version === 2 ? { displayName: seat.displayName ?? "" } : {}),
     pinnedModel: seat.pinnedModel,
     preferredBacking: seat.preferredBacking,
+    ...(seat.version === 2 ? { fallbacks: [...seat.fallbacks] } : {}),
     memory,
     tools,
     policy: { headlessOk: seat.policy.headlessOk },
@@ -262,15 +277,17 @@ function proveExistingSeat(
 }
 
 /**
- * Create `$MADC_HOME` with `seats/`, `sessions/`, `memory/` (0700) and write
- * `seats/madc-default.json` (0600) with exactly `MADC_DEFAULT_SEAT` if it does not exist yet.
- * The bytes go to a private temp file first (O_EXCL, fsync), which is then hard-linked into
- * place: `link` never replaces an existing file (an operator's file or a concurrent seeder wins),
- * and a failed or interrupted write can never leave a partial seat file behind. The temp name
- * starts with "." so it can never be loaded as a seat. One source of seed content: the engine
- * start and `madc doctor --init` both call this.
+ * Create `$MADC_HOME` with `seats/`, `sessions/`, `memory/` (0700) and write `seats/<seat.id>.json`
+ * (0600) with exactly `serializeSeat(seat)` if it does not exist yet. The bytes go to a private temp
+ * file first (O_EXCL, fsync), which is then hard-linked into place: `link` never replaces an
+ * existing file (an operator's file or a concurrent seeder wins), and a failed or interrupted write
+ * can never leave a partial seat file behind. The temp name starts with "." so it can never be
+ * loaded as a seat. One source of seed content: the engine start and `madc doctor --init` both call
+ * this — `seedDefaultSeat` (M0) and `seats/roster.ts` `seedRosterSeats` (M1-A7, S3) are the same
+ * writer, once per seat, so M0 Amendment 3 item 4's `created:false` proof contract binds per file
+ * and is unchanged.
  */
-export function seedDefaultSeat(home: string): SeedResult {
+export function seedSeatFile(home: string, seat: EngineSeat): SeedResult {
   mkdirSync(home, { recursive: true, mode: 0o700 });
   enforcePrivateDir(home);
   let seatsId: FileId | null = null;
@@ -292,7 +309,7 @@ export function seedDefaultSeat(home: string): SeedResult {
     }
     if (sub === "seats") seatsId = { dev: st.dev, ino: st.ino };
   }
-  const path = seatFilePath(home, MADC_DEFAULT_SEAT.id);
+  const path = seatFilePath(home, seat.id);
   // Every file the seed creates must sit in this real seats/ directory (the one lstat-checked
   // above, pinned by dev + inode), strictly under the real home. Node has no openat / linkat, so
   // the pin is re-checked immediately before each path-based open and link, then again on the
@@ -336,10 +353,10 @@ export function seedDefaultSeat(home: string): SeedResult {
     const st = lstatSync(p, { bigint: true });
     return st.isFile() && st.dev === id.dev && st.ino === id.ino;
   };
-  const bytes = Buffer.from(serializeSeat(MADC_DEFAULT_SEAT), "utf8");
+  const bytes = Buffer.from(serializeSeat(seat), "utf8");
   const tmp = join(
     seatsDir,
-    `.${MADC_DEFAULT_SEAT.id}.json.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
+    `.${seat.id}.json.${process.pid}.${randomBytes(6).toString("hex")}.tmp`,
   );
   seedHooks.beforeOpen?.();
   const written = writeNewFile(tmp, bytes, isAt, seatsPinned);
@@ -413,6 +430,16 @@ export function seedDefaultSeat(home: string): SeedResult {
       // best effort; the counts above already ran
     }
   }
+}
+
+/**
+ * The M0 default-seat seed (seat pin §1 "Seed"), unchanged in behavior and bytes: one call to the
+ * shared per-file writer for `MADC_DEFAULT_SEAT`. M1-A7 seeds the full roster through the same
+ * writer (`seats/roster.ts`); this stays exported for the M0 surface and the Amendment 3 tests that
+ * pin its `created` / proof contract.
+ */
+export function seedDefaultSeat(home: string): SeedResult {
+  return seedSeatFile(home, MADC_DEFAULT_SEAT);
 }
 
 function seatNotFound(seatId: string, path: string): RpcError {
@@ -544,5 +571,10 @@ export function loadSeat(home: string, seatId: string, opts: LoadSeatTestOptions
       throw invalid(["memory.path resolves outside MADC_HOME"]);
     }
   }
-  return { seat, path };
+  // Seat-load warning (seat pin §2, D-M1-7): a listed fallback whose registry status or billing
+  // class differs from the assigned backing's can never serve, on any turn, in any mode.
+  const warnings = neverEligibleFallbacks(seat.preferredBacking, seat.fallbacks).map((entry) =>
+    neverEligibleWarning(seat.id, entry),
+  );
+  return { seat, path, warnings };
 }

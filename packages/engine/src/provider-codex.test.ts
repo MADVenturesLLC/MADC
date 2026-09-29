@@ -17,6 +17,7 @@ import {
   expectRpcError,
   handshake,
   makeHome,
+  seatFileBody,
   startEngineCapturingStderr,
   writeSeatFile,
 } from "./testing/harness.ts";
@@ -79,7 +80,8 @@ async function withCodexEngine(setup: Setup, fn: (run: Run) => Promise<void>): P
 /** A codex backed seat file body (madc-default fields with the backing swapped). */
 function codexSeat(id: string, overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
-    ...MADC_DEFAULT_SEAT,
+    // File projection: a v1 FILE must not carry S2's migrated `fallbacks` (M1-A7).
+    ...seatFileBody(MADC_DEFAULT_SEAT),
     id,
     preferredBacking: "codex",
     pinnedModel: CODEX_MODEL,
@@ -372,7 +374,7 @@ test("the kimi and claude-code backings still work on the same engine (A3/A5 una
     {
       seats: [
         {
-          ...MADC_DEFAULT_SEAT,
+          ...seatFileBody(MADC_DEFAULT_SEAT),
           id: "claude-seat",
           preferredBacking: "claude-code",
           pinnedModel: CLAUDE_MODEL,
