@@ -90,9 +90,10 @@ export type CredentialStore = {
    */
   source(providerId: string): Promise<CredentialSource | null>;
   /**
-   * Engine-internal only — never exposed via the protocol. An existing keychain record (even an
-   * empty one) is returned as-is and BLOCKS the env fallback; callers validate usability. Null
-   * only when no record exists and the `MADC_DEV_ENV_KEYS=1` fallback has no value either.
+   * Engine-internal only — never exposed via the protocol. An existing keychain record wins:
+   * a readable one (even empty) is returned as-is; an UNREADABLE one (failed or timed-out read
+   * while the probe says present) answers null. The `MADC_DEV_ENV_KEYS=1` env fallback applies
+   * ONLY when the keychain probe says absent. Callers validate usability.
    */
   get(providerId: string): Promise<string | null>;
   set(providerId: string, secret: string): Promise<void>;
@@ -142,6 +143,11 @@ function defaultRunCommand(
 type KeychainBackend = {
   /** Presence only — implementations must not print the secret (`find-generic-password` without `-w`). */
   probe(providerId: string): Promise<boolean>;
+  /**
+   * Readable record → its value (an empty record reads as `""`). ABSENT or UNREADABLE (non-zero
+   * exit, timeout → code null) → null; null therefore does NOT prove absence — `get` consults
+   * `probe` before any env fallback so status/source/get stay in agreement (PR #34 hold).
+   */
   read(providerId: string): Promise<string | null>;
   write(providerId: string, secret: string): Promise<void>;
   /** Idempotent: removing an absent entry succeeds. */
@@ -285,12 +291,18 @@ export function createCredentialStore(deps: CredentialStoreDeps = {}): Credentia
       return envValue(providerId) !== null ? "env" : null;
     },
     async get(providerId) {
-      // An EXISTING record always wins — even an empty one (M1-A2 fix, Copilot 4126239668):
-      // `read` answers null only for "absent", so any non-null result short-circuits the env
-      // fallback and keeps get/status/source in agreement. An empty record is returned as-is;
-      // usability is the caller's check (readKimiCredential rejects "" → -32008 no-credentials).
+      // Agreement rules (PR #34 Witness hold 5345049106 + Copilot 4126239668):
+      // 1. A successfully read record always wins — even an empty one (returned as-is; usability
+      //    is the caller's check: readKimiCredential rejects "" → -32008 no-credentials).
+      // 2. A FAILED read is not absence. The darwin `read` (`find-generic-password -w`) is a
+      //    different command from `probe` (the same lookup without `-w`) and can fail (exit ≠ 0,
+      //    timeout → code null) on an EXISTING record. The probe — the same call status() and
+      //    source() answer from — decides: record present but unreadable → null. The env
+      //    fallback NEVER supersedes an existing record, readable or not.
+      // 3. Only when the probe says absent does the MADC_DEV_ENV_KEYS=1 env fallback apply.
       const stored = await backend.read(providerId);
       if (stored !== null) return stored;
+      if (await backend.probe(providerId)) return null;
       return envValue(providerId);
     },
     set(providerId, secret) {

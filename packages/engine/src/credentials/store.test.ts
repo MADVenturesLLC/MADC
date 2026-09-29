@@ -237,6 +237,96 @@ test("A2 fix 4126239668: an empty record without the flag stays consistently unu
   }
 });
 
+// --------------------------------------- Witness hold (PR #34 review 5345049106): probe/read split
+
+/**
+ * The Darwin disagreement seam: `probe` (find-generic-password WITHOUT -w) exits 0 — a record
+ * exists — while `read` (find-generic-password -w) fails (e.g. exit 36 user-interaction-not-
+ * allowed, or a timeout). Pre-fix, get() treated the failed read as absence and served the
+ * MADC_DEV_ENV_KEYS=1 env value while status/source still answered from the probe. Driven
+ * entirely through the runCommand seam: no children spawn, no keychain exists.
+ */
+function disagreeingDarwinRun(readCode: number | null): RunCommand {
+  return async (spec) =>
+    spec.args.includes("-w")
+      ? { code: readCode, stdout: "", stderr: "user interaction not allowed" }
+      : { code: 0, stdout: "", stderr: "" };
+}
+
+test("A2 hold fix: probe 0 / read 36 — status true, source keychain, get null (never the env value)", async () => {
+  const store = createCredentialStore({
+    platform: "darwin",
+    env: { [MADC_DEV_ENV_KEYS]: "1", KIMI_API_KEY: SYNTHETIC },
+    runCommand: disagreeingDarwinRun(36),
+  });
+  assert.equal(await store.status("kimi-code"), true);
+  assert.equal(await store.source("kimi-code"), "keychain");
+  const got = await store.get("kimi-code");
+  assert.equal(got, null, "a failed read on an existing record must never fall through to env");
+  assert.ok(!(got ?? "").includes(SYNTHETIC), "the env value is absent from the get result");
+});
+
+test("A2 hold fix: a timed-out read (code null) on an existing record behaves the same", async () => {
+  const store = createCredentialStore({
+    platform: "darwin",
+    env: { [MADC_DEV_ENV_KEYS]: "1", KIMI_API_KEY: SYNTHETIC },
+    runCommand: disagreeingDarwinRun(null),
+  });
+  assert.equal(await store.status("kimi-code"), true);
+  assert.equal(await store.source("kimi-code"), "keychain");
+  assert.equal(await store.get("kimi-code"), null);
+});
+
+test("A2 hold fix: with the flag unset, get stays null while status stays true", async () => {
+  const store = createCredentialStore({
+    platform: "darwin",
+    env: { KIMI_API_KEY: SYNTHETIC }, // env set, flag NOT set
+    runCommand: disagreeingDarwinRun(36),
+  });
+  assert.equal(await store.status("kimi-code"), true);
+  assert.equal(await store.source("kimi-code"), "keychain");
+  assert.equal(await store.get("kimi-code"), null);
+});
+
+test("A2 hold fix preserves: env fallback ONLY when the probe says absent; an empty record still blocks it; linux stays one lookup", async () => {
+  // Darwin absent (probe and read both fail) + flag → the env value still resolves, and
+  // presence/source honestly report the env fallback (the pinned D-M1-5 behavior).
+  const absentRun: RunCommand = async () => ({ code: 44, stdout: "", stderr: "" });
+  const absent = createCredentialStore({
+    platform: "darwin",
+    env: { [MADC_DEV_ENV_KEYS]: "1", KIMI_API_KEY: SYNTHETIC },
+    runCommand: absentRun,
+  });
+  assert.equal(await absent.status("kimi-code"), true, "env fallback counts as presence");
+  assert.equal(await absent.source("kimi-code"), "env");
+  assert.equal(await absent.get("kimi-code"), SYNTHETIC);
+
+  // Empty record (read succeeds with "") + flag → the record blocks env (4126239668 preserved).
+  const emptyRun: RunCommand = async (spec) =>
+    spec.args.includes("-w")
+      ? { code: 0, stdout: "\n", stderr: "" }
+      : { code: 0, stdout: "", stderr: "" };
+  const empty = createCredentialStore({
+    platform: "darwin",
+    env: { [MADC_DEV_ENV_KEYS]: "1", KIMI_API_KEY: SYNTHETIC },
+    runCommand: emptyRun,
+  });
+  assert.equal(await empty.status("kimi-code"), true);
+  assert.equal(await empty.source("kimi-code"), "keychain");
+  assert.equal(await empty.get("kimi-code"), "");
+
+  // Linux keeps ONE `lookup` command for probe and read: absent lookup + flag → env fallback.
+  const linuxRun: RunCommand = async () => ({ code: 1, stdout: "", stderr: "" });
+  const linux = createCredentialStore({
+    platform: "linux",
+    env: { [MADC_DEV_ENV_KEYS]: "1", MADC_API_KEY_XAI_API: SYNTHETIC_2 },
+    runCommand: linuxRun,
+  });
+  assert.equal(await linux.status("xai-api"), true, "env fallback counts as presence");
+  assert.equal(await linux.source("xai-api"), "env");
+  assert.equal(await linux.get("xai-api"), SYNTHETIC_2);
+});
+
 test("A2 credentialEnvVar: M0's KIMI_API_KEY is preserved; every other id derives MADC_API_KEY_<ID>", () => {
   assert.equal(credentialEnvVar("kimi-code"), "KIMI_API_KEY");
   assert.equal(credentialEnvVar("xai-api"), "MADC_API_KEY_XAI_API");
