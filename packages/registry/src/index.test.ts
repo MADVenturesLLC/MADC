@@ -82,13 +82,14 @@ test("catalog v2: every roadmap §3 row, the forbidden sub-paths, and the M1 ids
     assert.ok(entry.verifiedAt.length > 0, `${id} missing verifiedAt`);
   }
 
-  // Live wiring is exactly the M0 three; every other lane is a stub until its adapter act.
+  // Live wiring is the M0 three plus the lanes whose adapter acts have landed (M1-A3:
+  // ollama-cloud); every other lane is a stub until its adapter act.
   assert.deepEqual(
     listCatalog()
       .filter((e) => e.wired)
       .map((e) => e.id)
       .sort(),
-    ["claude-code", "codex", "kimi-code"],
+    ["claude-code", "codex", "kimi-code", "ollama-cloud"],
   );
 
   // The PAYG ids carry an honest "never verified" date and no terms page (fail-closed stale).
@@ -152,7 +153,7 @@ test("headless policy: ollama-cloud refuses headless with headless-not-permitted
     ),
     "headless-not-permitted",
   );
-  // Policy denial beats the unwired stub state when both apply.
+  // Policy denial applies with requireLive too (the headless gate does not depend on wiring).
   assert.equal(
     denialReason(() =>
       assertAllowed({
@@ -164,24 +165,20 @@ test("headless policy: ollama-cloud refuses headless with headless-not-permitted
     ),
     "headless-not-permitted",
   );
-  // Interactive use with the key stays allowed; live wiring lands in M1-A3.
+  // Interactive use with the key stays allowed — and live since M1-A3 wired the adapter.
   const interactive = assertAllowed({
     providerId: "ollama-cloud",
     mode: "interactive",
     connect: "direct",
   });
   assert.equal(interactive.id, "ollama-cloud");
-  assert.equal(
-    denialReason(() =>
-      assertAllowed({
-        providerId: "ollama-cloud",
-        mode: "interactive",
-        connect: "direct",
-        requireLive: true,
-      }),
-    ),
-    "unwired",
-  );
+  const interactiveLive = assertAllowed({
+    providerId: "ollama-cloud",
+    mode: "interactive",
+    connect: "direct",
+    requireLive: true,
+  });
+  assert.equal(interactiveLive.id, "ollama-cloud");
 
   // D-M1-3: headless flips only as a reviewed catalog change carrying headlessPermission.
   const ollama = getById("ollama-cloud");
@@ -458,7 +455,8 @@ test("lanesFor / canServe: mode policy per lane", () => {
 });
 
 test("catalog entries are frozen; mutation cannot poison assertAllowed", () => {
-  const unwired = getById("ollama-cloud");
+  // mistral-pro is an unwired stub until M1-A4 (ollama-cloud was wired by M1-A3).
+  const unwired = getById("mistral-pro");
   assert.ok(unwired);
   assert.equal(unwired.wired, false);
   assert.throws(
@@ -467,7 +465,7 @@ test("catalog entries are frozen; mutation cannot poison assertAllowed", () => {
     },
     (err: unknown) => err instanceof TypeError,
   );
-  assert.equal(getById("ollama-cloud")?.wired, false);
+  assert.equal(getById("mistral-pro")?.wired, false);
 
   const headlessDenied = getById("ollama-cloud");
   assert.ok(headlessDenied && headlessDenied.status === "allowed-direct");

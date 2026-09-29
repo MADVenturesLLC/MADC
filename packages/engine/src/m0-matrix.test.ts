@@ -132,6 +132,11 @@ test("matrix happy path: thread → turn → items → servedModel receipt → s
         servedModel: "kimi-for-coding-2026-09",
         backing: "kimi-code",
         providerId: "kimi-code",
+        // M1 P2 fields (protocol pin §5): upstream reported a different model.
+        lane: "allowed-direct",
+        mode: "headless",
+        fallbackFrom: null,
+        vendorReported: true,
       },
     );
     assert.deepEqual(client.protocolViolations, []);

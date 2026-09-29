@@ -1,8 +1,11 @@
 /**
- * @madc/adapters — provider seam + backings: Kimi Code over pinned pi-ai (Act M0-A3), the
- * unmodified Claude Code vendor binary (Act M0-A5), and the unmodified Codex vendor binary via
+ * @madc/adapters — provider seam + backings: the generic direct-key port (Act M1-A3) with the
+ * Kimi Code lane over pinned pi-ai (Act M0-A3) and the Ollama Cloud lane (Act M1-A3), plus the
+ * unmodified Claude Code vendor binary (Act M0-A5) and the unmodified Codex vendor binary via
  * `codex app-server` (Act M0-A6). Only this package imports `@earendil-works/pi-ai` (exact pin
- * 0.87.1, plan §6) — and only `kimi-code.ts` does.
+ * 0.87.1, plan §6) — the pi-ai importers are `kimi-code.ts`, `direct/generic.ts` and
+ * `providers/ollama-cloud.ts` (M1-A3 generalizes the M0 "only kimi-code.ts" rule to the
+ * direct-key lane modules).
  */
 export {
   CLAUDE_BINARY_NAME,
@@ -25,6 +28,14 @@ export {
   resolveCodexPinnedModel,
 } from "./codex.ts";
 export {
+  createDirectKeyPort,
+  type DirectKeyPortConfig,
+  type DirectWireApi,
+  leadingHttpStatus,
+  type PinnedModelResolution,
+  QUOTA_OR_UNREACHABLE_STATUSES,
+} from "./direct/generic.ts";
+export {
   createKimiCodePort,
   honestUserAgent,
   KIMI_API_KEY_ENV,
@@ -35,7 +46,6 @@ export {
   type KimiCredential,
   kimiCatalogModelIds,
   PI_AI_VERSION,
-  type PinnedModelResolution,
   readKimiCredential,
   resolveKimiPinnedModel,
 } from "./kimi-code.ts";
@@ -46,3 +56,16 @@ export {
   type ProviderTurnRequest,
   type ProviderTurnResult,
 } from "./provider-port.ts";
+export {
+  createOllamaCloudPort,
+  type ListedOllamaModel,
+  listOllamaCloudModels,
+  OLLAMA_API_KEY_ENV,
+  OLLAMA_CLOUD_BASE_URL,
+  OLLAMA_CLOUD_PROVIDER_ID,
+  OLLAMA_PI_PROVIDER,
+  OLLAMA_TAGS_PATH,
+  type OllamaCloudPortOptions,
+  type OllamaListOptions,
+  resolveOllamaPinnedModel,
+} from "./providers/ollama-cloud.ts";

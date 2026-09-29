@@ -483,13 +483,15 @@ rl.on("line", (line) => {
         return;
       }
       if (scenario === "n6-backing-notify" || scenario === "n6-backing-snapshot") {
-        // §3b N6 (D-188): a servedModel backing outside the pinned three → exit 3.
+        // §3b N6 (D-188), widened by M1-A3 (seat pin S1): a servedModel backing that is not a
+        // WIRED registry id → exit 3. ("ollama-cloud" was the M0 example; it is wired now, so
+        // the outside example is an id that is not in the catalog at all.)
         append("turn.start", { turnId, inputText: "hi" });
         send({ id: msg.id, result: { turn: inProgress() } });
         if (scenario === "n6-backing-notify") {
           send({
             method: "item/completed",
-            params: { threadId, turnId, item: receipt("item_s1", "model-a", "ollama-cloud") },
+            params: { threadId, turnId, item: receipt("item_s1", "model-a", "not-a-lane") },
           });
           return;
         }
@@ -498,7 +500,7 @@ rl.on("line", (line) => {
           method: "turn/completed",
           params: {
             turn: completedTurn(
-              [agentItem("q"), receipt("item_s1", "model-a", "ollama-cloud")],
+              [agentItem("q"), receipt("item_s1", "model-a", "not-a-lane")],
               null,
             ),
           },

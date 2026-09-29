@@ -3,11 +3,14 @@ import {
   createClaudeCodePort,
   createCodexCodePort,
   createKimiCodePort,
+  createOllamaCloudPort,
   honestUserAgent,
   KIMI_API_KEY_ENV,
   KIMI_CODE_PROVIDER_ID,
   type KimiCredential,
+  OLLAMA_CLOUD_PROVIDER_ID,
   readKimiCredential,
+  resolveOllamaPinnedModel,
 } from "@madc/adapters";
 import type { Agent } from "./agent.ts";
 import { createCredentialStore } from "./credentials/store.ts";
@@ -30,26 +33,44 @@ function kimiCredentialFromStore(secret: string | null): KimiCredential {
   return readKimiCredential({ [KIMI_API_KEY_ENV]: secret });
 }
 
+/** A generic direct lane's credential: the trimmed store value, or null when absent/blank. */
+function directCredential(secret: string | null): string | null {
+  const trimmed = secret?.trim() ?? "";
+  return trimmed === "" ? null : trimmed;
+}
+
 /**
- * Production agent: the thread's seat file (seeded `madc-default` by default) on Kimi Code (plan
- * D2), the unmodified Claude Code binary (A5), or the unmodified Codex binary via `codex
- * app-server` (A6) per the seat's `preferredBacking`. The Kimi API key is resolved once from the
- * engine-owned credential store (M1-A2): the OS keychain, or — only under the
- * `MADC_DEV_ENV_KEYS=1` development exception (D-M1-5) — the `KIMI_API_KEY` environment variable.
- * Without one, kimi turns answer -32008 `no-credentials`; the resolved key is registered with the
- * session redactor by exact value (the redactor learns every stored key, seat pin §4.2).
- * claude-code / codex read no MAD credential — the detected vendor binary (PATH lookup at
- * preflight; -32008 `binary-missing` when absent) inherits the environment and finds its own
- * auth. No base-URL or transport override exists here: production only talks to the pinned
- * catalog endpoint, and only spawns the detected vendor binary.
+ * Production agent: the thread's seat file (seeded `madc-default` by default) on a registry-driven
+ * direct lane — Kimi Code (plan D2) or Ollama Cloud (M1-A3, D-M1-2; headless denied by D-M1-3) —
+ * or the unmodified Claude Code binary (A5) / Codex binary via `codex app-server` (A6) per the
+ * seat's `preferredBacking`. Direct-lane API keys are resolved once from the engine-owned
+ * credential store (M1-A2): the OS keychain, or — only under the `MADC_DEV_ENV_KEYS=1`
+ * development exception (D-M1-5) — the lane's environment variable. Without one, that lane's
+ * turns answer -32008 `no-credentials`; every resolved key is registered with the session
+ * redactor by exact value (the redactor learns every stored key, seat pin §4.2). claude-code /
+ * codex read no MAD credential — the detected vendor binary (PATH lookup at preflight; -32008
+ * `binary-missing` when absent) inherits the environment and finds its own auth. No base-URL or
+ * transport override exists here: production only talks to the pinned catalog endpoint (kimi) and
+ * the documented Ollama Cloud endpoints, and only spawns the detected vendor binary.
  */
 export const defaultAgentFactory: AgentFactory = async () => {
   const credentials = createCredentialStore({ env: process.env });
-  const secret = await credentials.get(KIMI_CODE_PROVIDER_ID);
+  const [kimiSecret, ollamaSecret] = await Promise.all([
+    credentials.get(KIMI_CODE_PROVIDER_ID),
+    credentials.get(OLLAMA_CLOUD_PROVIDER_ID),
+  ]);
   return createProviderAgent({
-    credential: kimiCredentialFromStore(secret),
+    credential: kimiCredentialFromStore(kimiSecret),
     createPort: (apiKey) =>
       createKimiCodePort({ apiKey, userAgent: honestUserAgent(ENGINE_VERSION) }),
+    directLanes: [
+      {
+        providerId: OLLAMA_CLOUD_PROVIDER_ID,
+        credential: directCredential(ollamaSecret),
+        createPort: (apiKey) => createOllamaCloudPort({ apiKey }),
+        resolvePinnedModel: resolveOllamaPinnedModel,
+      },
+    ],
     createClaudePort: (binaryPath) => createClaudeCodePort({ binaryPath }),
     createCodexPort: (binaryPath) =>
       createCodexCodePort({ binaryPath, clientVersion: ENGINE_VERSION }),

@@ -22,6 +22,14 @@ export type ProviderTurnResult = {
   readonly requestedModelId: string;
   /** Upstream-reported model (`responseModel`) when it differs, else `requestedModelId`. */
   readonly servedModel: string;
+  /**
+   * Set to `true` only when the adapter KNOWS the vendor reported a model identity — including
+   * when it equals the requested id (OpenAI-compat lanes: pi-ai fills `responseModel` from the
+   * first chunk's `model` field). Anthropic lanes omit it: pi-ai sets `responseModel` only when
+   * it differs, so the engine derives vendor-reporting from `servedModel !== requestedModelId`
+   * there (protocol pin §5 P2 honesty rule; M0's three-key result shape stays byte-identical).
+   */
+  readonly vendorReported?: boolean;
 };
 
 export type ProviderPort = {
@@ -40,15 +48,17 @@ export class ProviderCallError extends Error {
   readonly status: number | null;
   /**
    * Pinned -32008 reason when the failure means the provider cannot run at all (A5: the vendor
-   * binary vanished between preflight and spawn). Absent for ordinary call failures (-32603).
+   * binary vanished between preflight and spawn), or the recorded quota-or-unreachable signal
+   * (M1-A3, protocol pin P5: HTTP 429/502 from a direct lane, which the fallback logic consumes).
+   * Absent for ordinary call failures (-32603).
    */
-  readonly reason?: "binary-missing";
+  readonly reason?: "binary-missing" | "quota-or-unreachable";
 
   constructor(
     kind: "aborted" | "failed",
     status: number | null,
     message: string,
-    reason?: "binary-missing",
+    reason?: "binary-missing" | "quota-or-unreachable",
   ) {
     super(message);
     this.name = "ProviderCallError";

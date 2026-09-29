@@ -9,6 +9,10 @@ import type { InitializeResult } from "../protocol/types.ts";
 
 export const ECHO_ENGINE = fileURLToPath(new URL("./echo-engine.ts", import.meta.url));
 export const KIMI_FAKE_ENGINE = fileURLToPath(new URL("./kimi-fake-engine.ts", import.meta.url));
+/** M1-A3: both direct lanes (kimi + ollama-cloud) against in-process fake transports. */
+export const DIRECT_FAKE_ENGINE = fileURLToPath(
+  new URL("./direct-fake-engine.ts", import.meta.url),
+);
 export const CLAUDE_FAKE_ENGINE = fileURLToPath(
   new URL("./claude-fake-engine.ts", import.meta.url),
 );

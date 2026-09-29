@@ -158,6 +158,11 @@ test("A6 happy path: a codex seat runs a turn; receipt on the wire and in sessio
           servedModel: CODEX_MODEL,
           backing: "codex",
           providerId: "codex",
+          // M1 P2 fields (see the claude happy path): echo = not vendor-reported.
+          lane: "allowed-via-vendor-agent",
+          mode: "headless",
+          fallbackFrom: null,
+          vendorReported: false,
         },
       );
       // Dual write (seat pin §4.2): the JSONL servedModel event equals the protocol receipt.
@@ -170,6 +175,10 @@ test("A6 happy path: a codex seat runs a turn; receipt on the wire and in sessio
         servedModel: CODEX_MODEL,
         backing: "codex",
         providerId: "codex",
+        lane: "allowed-via-vendor-agent",
+        mode: "headless",
+        fallbackFrom: null,
+        vendorReported: false,
       });
       assert.equal(lines.at(-1)?.type, "turn.end");
       assert.deepEqual(lines.at(-1)?.payload, {

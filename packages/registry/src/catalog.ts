@@ -70,14 +70,19 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     sourceUrl: "docs/plan/ROADMAP-madc-post-M0.md#3-subscription-table-all-lanes",
   },
 
-  // --- M1 direct-key lanes (wired: false until M1-A3 / M1-A4 land the adapters) ---
+  // --- M1 direct-key lanes (each flips to wired: true in the act that lands its adapter;
+  // M1-A4 lands Mistral / DeepSeek / Gemini / xAI) ---
   {
     id: "ollama-cloud",
     status: "allowed-direct",
     connect: "direct",
     wire: "openai-compat",
     clientIdentity: "default",
-    wired: false,
+    // Wired by M1-A3 (roadmap §3 row 1: Ollama Cloud — allowed-direct, Bearer key against
+    // https://ollama.com/v1, live model list from /api/tags). Headless stays DENIED (D-M1-3):
+    // the Terms bar automated access "without permission"; the flip needs a reviewed catalog
+    // change carrying headlessPermission.
+    wired: true,
     credentialClass: "payg",
     headless: "denied",
     verifiedAt: "2026-09-24",

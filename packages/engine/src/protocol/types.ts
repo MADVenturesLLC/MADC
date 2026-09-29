@@ -3,6 +3,7 @@
  * frozen M0 pin for M1 work). Wire is camelCase everywhere. The engine omits `jsonrpc` on output;
  * parsers accept it either way.
  */
+import type { ProviderStatus } from "@madc/registry";
 
 /** P1: the M1-only methods of §3.5 exist only under `madc-m1/1`; all M0 methods and codes are unchanged. */
 export const PROTOCOL_VERSION = "madc-m1/1" as const;
@@ -105,15 +106,32 @@ export type ErrorItem = ItemBase & {
   code?: number;
 };
 
-export type ServedModelBacking = "kimi-code" | "claude-code" | "codex";
+export type ServedModelBacking = string;
 
-/** MAD receipt — not a Codex field. One per model invocation in the turn. */
+/** The turn's mode until M1-A5 lands mode attestation: engine turns are headless, fail-closed. */
+export type TurnMode = "interactive" | "headless";
+
+/**
+ * MAD receipt — not a Codex field. One per model invocation in the turn. (M1 protocol pin §5, P2:
+ * `backing` widened to any wired registry id per seat pin S1 — M0 was the 3-literal union — and
+ * `lane` / `mode` / `fallbackFrom` / `vendorReported` added. `vendorReported` is true only when
+ * the vendor/adapter reported a model identity; `fallbackFrom` names the previous backing on a
+ * fallback hop and is null on the primary — never cleared to disguise a fallback.)
+ */
 export type ServedModelItem = ItemBase & {
   kind: "servedModel";
   requestedModel: string;
   servedModel: string;
   backing: ServedModelBacking;
   providerId: string;
+  /** Registry status of the serving lane (P2). */
+  lane: ProviderStatus;
+  /** The turn's mode (P2; §3.3 — always "headless" until M1-A5 attestation). */
+  mode: TurnMode;
+  /** Previous backing id when this receipt follows a fallback hop; null on the primary (P2). */
+  fallbackFrom: string | null;
+  /** True only if the vendor/agent reported a model identity (P2 honesty rule). */
+  vendorReported: boolean;
 };
 
 export type Item =

@@ -27,6 +27,11 @@ export type FakeKimiTransport = {
   readonly fetch: typeof globalThis.fetch;
   readonly requests: FakeKimiRequest[];
   setReply(reply: FakeKimiReply): void;
+  /**
+   * Queue one reply ahead of the sticky reply (M1-A3: 429-then-success fallback sequences).
+   * Additive — M0 tests only ever use `setReply`.
+   */
+  queueReply(reply: FakeKimiReply): void;
 };
 
 export const DEFAULT_FAKE_REPLY: FakeKimiReply = Object.freeze({
@@ -99,6 +104,7 @@ export function createFakeKimiTransport(
 ): FakeKimiTransport {
   const requests: FakeKimiRequest[] = [];
   let reply = initial;
+  const queue: FakeKimiReply[] = [];
   const encoder = new TextEncoder();
 
   const fakeFetch = async (
@@ -125,7 +131,7 @@ export function createFakeKimiTransport(
     });
     if (signal?.aborted) throw abortError();
 
-    const current = reply;
+    const current = queue.length > 0 ? (queue.shift() as FakeKimiReply) : reply;
     if (current.type === "status") {
       return new Response(current.body, {
         status: current.status,
@@ -156,6 +162,9 @@ export function createFakeKimiTransport(
     requests,
     setReply: (next) => {
       reply = next;
+    },
+    queueReply: (next) => {
+      queue.push(next);
     },
   };
 }

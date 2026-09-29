@@ -19,3 +19,13 @@ export {
   type FakeKimiRequest,
   type FakeKimiTransport,
 } from "./fake-kimi-transport.ts";
+/** Test helpers (not for production use): fake Ollama Cloud endpoints (M1-A3). */
+export {
+  createFakeOllamaTransport,
+  DEFAULT_FAKE_OLLAMA_REPLY,
+  DEFAULT_FAKE_OLLAMA_TAGS,
+  type FakeOllamaReply,
+  type FakeOllamaRequest,
+  type FakeOllamaTransport,
+  type FakeOllamaTransportOptions,
+} from "./fake-ollama-transport.ts";
