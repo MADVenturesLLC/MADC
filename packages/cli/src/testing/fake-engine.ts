@@ -141,7 +141,7 @@ rl.on("line", (line) => {
             id: msg.id,
             result: {
               serverInfo: { name: "madc-engine", version: "0.0.0" },
-              protocolVersion: "madc-m0/1",
+              protocolVersion: "madc-m1/1",
             },
           });
         }, 10_000);
@@ -165,7 +165,7 @@ rl.on("line", (line) => {
         return;
       }
       if (scenario === "n7-serverinfo-missing") {
-        send({ id: msg.id, result: { protocolVersion: "madc-m0/1" } });
+        send({ id: msg.id, result: { protocolVersion: "madc-m1/1" } });
         return;
       }
       if (scenario === "n7-serverinfo-name") {
@@ -173,7 +173,7 @@ rl.on("line", (line) => {
           id: msg.id,
           result: {
             serverInfo: { name: "other-engine", version: "0.0.0" },
-            protocolVersion: "madc-m0/1",
+            protocolVersion: "madc-m1/1",
           },
         });
         return;
@@ -189,7 +189,7 @@ rl.on("line", (line) => {
           id: msg.id,
           result: {
             serverInfo: { name: "madc-engine", version: "0.0.0" },
-            protocolVersion: "madc-m0/1",
+            protocolVersion: "madc-m1/1",
           },
         });
         keepAlive();
@@ -199,7 +199,7 @@ rl.on("line", (line) => {
         id: msg.id,
         result: {
           serverInfo: { name: "madc-engine", version: "0.0.0" },
-          protocolVersion: scenario === "bad-protocol" ? "madc-m0/999" : "madc-m0/1",
+          protocolVersion: scenario === "bad-protocol" ? "madc-m0/999" : "madc-m1/1",
         },
       });
       return;

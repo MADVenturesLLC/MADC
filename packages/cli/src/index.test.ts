@@ -129,10 +129,10 @@ test("A7 §3 colour: only on a TTY, never with NO_COLOR (any value)", () => {
   assert.equal(colorEnabled(fakeIO({ stdoutIsTTY: false })), false);
 });
 
-test("A7 §1 --version prints madc <version> (protocol madc-m0/1); --help exits 0", async () => {
+test("A7 §1 --version prints madc <version> (protocol madc-m1/1); --help exits 0", async () => {
   const v = fakeIO();
   assert.equal(await main(["--version"], v), 0);
-  assert.equal(v.out(), "madc 0.0.0 (protocol madc-m0/1)\n");
+  assert.equal(v.out(), "madc 0.0.0 (protocol madc-m1/1)\n");
   const h = fakeIO();
   assert.equal(await main(["--help"], h), 0);
   assert.match(h.out(), /madc doctor \[--json\] \[--init\]/);

@@ -1,9 +1,11 @@
 /**
- * MAD native protocol types — docs/plan/PIN-madc-M0-protocol-messages.md §3 and §5.
- * Wire is camelCase everywhere. The engine omits `jsonrpc` on output; parsers accept it either way.
+ * MAD native protocol types — docs/plan/PIN-madc-M1-protocol-messages.md §3 and §5 (supersedes the
+ * frozen M0 pin for M1 work). Wire is camelCase everywhere. The engine omits `jsonrpc` on output;
+ * parsers accept it either way.
  */
 
-export const PROTOCOL_VERSION = "madc-m0/1" as const;
+/** P1: the M1-only methods of §3.5 exist only under `madc-m1/1`; all M0 methods and codes are unchanged. */
+export const PROTOCOL_VERSION = "madc-m1/1" as const;
 export const SERVER_NAME = "madc-engine" as const;
 /** D4: built-in seat used when `thread/start.seatId` is omitted. */
 export const DEFAULT_SEAT_ID = "madc-default" as const;
@@ -152,7 +154,21 @@ export type TurnStartResult = { turn: Turn };
 export type TurnInterruptParams = { threadId: string; turnId: string };
 export type TurnInterruptResult = Record<string, never>;
 
-/** Client → server requests (complete M0 list). */
+export type AuthStatusParams = { providerId: string };
+/**
+ * §3.5, exact pinned shape: presence only, NEVER a value (and no other field — where a credential
+ * resolves from, `keychain` vs the `MADC_DEV_ENV_KEYS=1` env fallback, stays engine-internal;
+ * `madc doctor` discloses the fallback from its own environment).
+ */
+export type AuthStatusResult = {
+  providerId: string;
+  present: boolean;
+};
+
+export type AuthRemoveParams = { providerId: string };
+export type AuthRemoveResult = Record<string, never>;
+
+/** Client → server requests (complete M0 list plus the M1-A2 `auth/*` presence methods). */
 export type ClientRequests = {
   initialize: { params: InitializeParams; result: InitializeResult };
   "thread/start": { params: ThreadStartParams; result: ThreadStartResult };
@@ -160,6 +176,8 @@ export type ClientRequests = {
   "thread/list": { params: ThreadListParams; result: ThreadListResult };
   "turn/start": { params: TurnStartParams; result: TurnStartResult };
   "turn/interrupt": { params: TurnInterruptParams; result: TurnInterruptResult };
+  "auth/status": { params: AuthStatusParams; result: AuthStatusResult };
+  "auth/remove": { params: AuthRemoveParams; result: AuthRemoveResult };
 };
 
 export type ClientRequestMethod = keyof ClientRequests;
@@ -197,7 +215,26 @@ export const CLIENT_REQUEST_METHODS: readonly ClientRequestMethod[] = Object.fre
   "thread/list",
   "turn/start",
   "turn/interrupt",
+  "auth/status",
+  "auth/remove",
 ]);
+
+/**
+ * Declared top-level params fields per request method (M1-A2 schema test, protocol pin §3.5: "No
+ * `auth/set` over JSONL … No JSONL method accepts a secret value"). Keys are exactly
+ * `CLIENT_REQUEST_METHODS`; no field may carry a secret.
+ */
+export const CLIENT_REQUEST_PARAM_FIELDS: Readonly<Record<ClientRequestMethod, readonly string[]>> =
+  Object.freeze({
+    initialize: ["clientInfo"],
+    "thread/start": ["seatId", "cwd"],
+    "thread/resume": ["threadId"],
+    "thread/list": ["limit", "cursor"],
+    "turn/start": ["threadId", "input"],
+    "turn/interrupt": ["threadId", "turnId"],
+    "auth/status": ["providerId"],
+    "auth/remove": ["providerId"],
+  });
 
 // ---------------------------------------------------------------------------
 // Wire envelopes (JSON-RPC 2.0 shape; `jsonrpc` optional on input, omitted on output)

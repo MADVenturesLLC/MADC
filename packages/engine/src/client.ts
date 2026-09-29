@@ -264,3 +264,32 @@ export function spawnEngine(opts: SpawnEngineOptions = {}): EngineClient {
   });
   return new EngineClient(child);
 }
+
+export type SpawnAuthSetOptions = {
+  /** Merged over `process.env`; an `undefined` value removes the variable. */
+  env?: Record<string, string | undefined>;
+  /** Alternate engine entry script (tests use fixtures); default `ENGINE_ENTRY`. */
+  entry?: string;
+  /** Runtime binary; defaults to the current one (`node` or `bun`). */
+  runtime?: string;
+};
+
+/**
+ * Spawn the one-shot `madc-engine auth-set <providerId>` (M1-A2; protocol pin §2): a SEPARATE
+ * process, NOT a JSONL session. stdio is fully inherited so the child owns the terminal for its
+ * no-echo prompt and writes its confirmation to stderr; stdout stays empty. Only the provider id
+ * (never a secret) is passed on the command line. The caller waits for the child's exit code
+ * (0 stored · 1 keychain failure · 2 usage/no-TTY · 4 policy refusal · 130 interrupted).
+ */
+export function spawnAuthSet(providerId: string, opts: SpawnAuthSetOptions = {}): ChildProcess {
+  const runtime = opts.runtime ?? process.execPath;
+  const isBun = runtime === process.execPath && process.versions.bun !== undefined;
+  const entry = opts.entry ?? ENGINE_ENTRY;
+  const args = isBun
+    ? [entry, "auth-set", providerId]
+    : ["--disable-warning=ExperimentalWarning", entry, "auth-set", providerId];
+  return spawn(runtime, args, {
+    stdio: "inherit",
+    env: withoutUndefined({ ...process.env, ...opts.env }),
+  });
+}

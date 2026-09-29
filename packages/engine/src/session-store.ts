@@ -117,11 +117,15 @@ export function sessionEventHash(
 
 // ---------------------------------------------------------------- redaction
 
-/** Token shapes redacted from every payload string (seat pin §4.2). */
+/** Token shapes redacted from every payload string (seat pin §4.2, plus the M1 shapes of S6). */
 export const TOKEN_PATTERNS: readonly RegExp[] = Object.freeze([
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
   /\bBearer\s+[A-Za-z0-9._~+/-]{8,}=*/g,
   /\bsk-[A-Za-z0-9_-]{16,}/g,
+  // S6 (M1-A2): the new providers' key shapes — xAI (`xai-…`) and the Alibaba plan (`sk-sp-…`,
+  // which the generic `sk-…` shape above only catches from 16 chars after `sk-`).
+  /\bxai-[A-Za-z0-9_-]{8,}/g,
+  /\bsk-sp-[A-Za-z0-9_-]{8,}/g,
   /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
   /\bxox[abp]-[A-Za-z0-9-]{10,}/g,
   /\bAKIA[0-9A-Z]{16}\b/g,

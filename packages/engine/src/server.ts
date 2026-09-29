@@ -2,7 +2,9 @@ import { lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
+import { getById } from "@madc/registry";
 import type { Agent, AgentTurnContext, TurnSink } from "./agent.ts";
+import { type CredentialStore, createCredentialStore } from "./credentials/store.ts";
 import { confinedPath, sessionsOwnerReadUnsupported } from "./home.ts";
 import { acquireThreadLock, holdsThreadLock, type LockHandle, releaseThreadLock } from "./lock.ts";
 import {
@@ -21,6 +23,7 @@ import {
 } from "./protocol/errors.ts";
 import { isValidId, newId } from "./protocol/ids.ts";
 import {
+  type AuthStatusResult,
   DEFAULT_SEAT_ID,
   type InitializeResult,
   type Item,
@@ -61,6 +64,12 @@ export type EngineOptions = {
   log?: (message: string) => void;
   /** Test seam: thread id generator for `thread/start` (default `newId("thr")`). */
   newThreadId?: () => string;
+  /**
+   * M1-A2: engine-owned credential store backing `auth/status` and `auth/remove`. Default: the
+   * real OS keychain via `createCredentialStore()` (created on first auth call). Tests inject a
+   * store backed by a fake keychain.
+   */
+  credentials?: CredentialStore;
 };
 
 type TurnRecord = {
@@ -83,6 +92,9 @@ type ThreadRecord = {
 const THREAD_LIST_DEFAULT_LIMIT = 50;
 const THREAD_LIST_MAX_LIMIT = 200;
 
+/** One dispatched request's response value plus an optional post-response hook. */
+type DispatchResult = { value: unknown; after?: () => void };
+
 function paramsObject(params: unknown): Record<string, unknown> {
   if (params === undefined) return {};
   if (!isPlainObject(params)) throw invalidParams(["params must be an object"]);
@@ -104,6 +116,21 @@ function requireId(p: Record<string, unknown>, key: string, issues: string[]): s
 
 function throwIfIssues(issues: string[]): void {
   if (issues.length > 0) throw invalidParams(issues);
+}
+
+/**
+ * `auth/*` providerId (M1-A2): the protocol id grammar first, then a known registry catalog id —
+ * anything else is `-32602 InvalidParams` (there is no provider lookup on these methods).
+ */
+function authProviderId(params: unknown): string {
+  const p = paramsObject(params);
+  const issues: string[] = [];
+  const providerId = requireId(p, "providerId", issues);
+  if (issues.length === 0 && getById(providerId) === undefined) {
+    issues.push("providerId is not a registry catalog id");
+  }
+  throwIfIssues(issues);
+  return providerId;
 }
 
 function parseUserInput(value: unknown, issues: string[]): UserInput[] {
@@ -149,6 +176,8 @@ export class EngineConnection {
    * answers for a poisoned thread carries this entry's `path` and `seq`.
    */
   readonly #poisoned = new Map<string, { path: string; seq: number }>();
+  /** M1-A2 credential store, created on the first `auth/*` call (never at construction). */
+  #credentials: CredentialStore | null = null;
 
   constructor(opts: EngineOptions) {
     this.#opts = opts;
@@ -240,14 +269,27 @@ export class EngineConnection {
       // Only `initialized` is defined client → server; unknown notifications are ignored (no id to answer).
       return;
     }
-    let result: { value: unknown; after?: () => void };
+    let result: DispatchResult | Promise<DispatchResult>;
     try {
       result = this.#dispatch(msg.method, msg.params);
     } catch (err) {
       this.#sendError(msg.id, err);
       return;
     }
-    this.#send({ id: msg.id, result: result.value });
+    if (result instanceof Promise) {
+      // auth/* are the only async methods (keychain child processes). JSON-RPC imposes no
+      // response order, so a slow probe never blocks the lines behind it.
+      result.then(
+        (r) => this.#answer(msg.id, r),
+        (err: unknown) => this.#sendError(msg.id, err),
+      );
+      return;
+    }
+    this.#answer(msg.id, result);
+  }
+
+  #answer(id: RequestId, result: DispatchResult): void {
+    this.#send({ id, result: result.value });
     try {
       result.after?.();
     } catch (err) {
@@ -265,7 +307,7 @@ export class EngineConnection {
     this.#send({ id, error: internalError().toBody() });
   }
 
-  #dispatch(method: string, params: unknown): { value: unknown; after?: () => void } {
+  #dispatch(method: string, params: unknown): DispatchResult | Promise<DispatchResult> {
     if (method === "initialize") return { value: this.#initialize(params) };
     if (method === "initialized") throw invalidRequest("initialized is a notification");
     if (!this.#initialized) throw notInitialized(method);
@@ -280,9 +322,39 @@ export class EngineConnection {
         return this.#turnStart(params);
       case "turn/interrupt":
         return this.#turnInterrupt(params);
+      case "auth/status":
+        return this.#authStatus(params);
+      case "auth/remove":
+        return this.#authRemove(params);
       default:
         throw methodNotFound(method);
     }
+  }
+
+  // -------------------------------------------------------------------- auth
+
+  /** Lazily created so an engine that never serves an auth call never touches the keychain. */
+  #credentialStore(): CredentialStore {
+    this.#credentials ??= this.#opts.credentials ?? createCredentialStore();
+    return this.#credentials;
+  }
+
+  /**
+   * M1-A2 (protocol pin §3.5): the exact pinned shape `{ providerId, present }` — presence only,
+   * NEVER a value. Where the credential resolves from (keychain vs the `MADC_DEV_ENV_KEYS=1` env
+   * fallback, D-M1-5) stays engine-internal; `madc doctor` discloses the fallback from its own env.
+   */
+  async #authStatus(params: unknown): Promise<{ value: AuthStatusResult }> {
+    const providerId = authProviderId(params);
+    const present = await this.#credentialStore().status(providerId);
+    return { value: { providerId, present } };
+  }
+
+  /** M1-A2: removes through the store (idempotent). There is no `auth/set` over JSONL (§3.5). */
+  async #authRemove(params: unknown): Promise<{ value: Record<string, never> }> {
+    const providerId = authProviderId(params);
+    await this.#credentialStore().remove(providerId);
+    return { value: {} };
   }
 
   // ---------------------------------------------------------------- handshake
