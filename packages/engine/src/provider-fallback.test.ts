@@ -52,7 +52,9 @@ type Captured = {
   rejections: FallbackRejectedPayload[];
 };
 
-function captureSink(): TurnSink & { captured: Captured } {
+function captureSink(options: { rejectionRecorded?: boolean } = {}): TurnSink & {
+  captured: Captured;
+} {
   const captured: Captured = { started: [], items: [], deltas: [], rejections: [] };
   const controller = new AbortController();
   let n = 0;
@@ -74,6 +76,9 @@ function captureSink(): TurnSink & { captured: Captured } {
     },
     fallbackRejected: (payload) => {
       captured.rejections.push(payload);
+      // false simulates the server sink whose fallback.rejected append failed: the session is
+      // poisoned and the turn is already finalized (Copilot 4131965600).
+      return options.rejectionRecorded ?? true;
     },
   };
 }
@@ -281,6 +286,58 @@ test("A3: a candidate without credentials is skipped; when nobody can serve, the
   assert.deepEqual(err.data, { providerId: "kimi-code", reason: "quota-or-unreachable" });
   assert.equal(calls(), 1, "only the primary was ever called");
   assert.deepEqual(sink.captured.rejections, [], "an unwired skip is not a lane mismatch");
+});
+
+test("A3 fix 4131965600: a failed fallback.rejected append halts the walk — no further item, no candidate port built or called", async () => {
+  // The defect on 5a4ad38: the server sink poisons the session and FINALIZES the turn when the
+  // fallback.rejected append fails, but the callback returned void and the agent walked on —
+  // emitting the paired error item into a dead turn and building/calling the next candidate
+  // (for a dynamic lane, even its model-list fetch) after the turn had already failed.
+  const { port, calls } = scriptedPort("kimi-code", [
+    { quota: 429 },
+    { ok: "must never serve after the failed record" },
+  ]);
+  const agent = createProviderAgent({ directLanes: [kimiLane(port)] });
+  const sink = captureSink({ rejectionRecorded: false });
+  const seat = seatWith({
+    fallbacks: [
+      "claude-code", // lane mismatch → rejection append "fails" → the walk must STOP here
+      "kimi-code", // eligible: pre-fix this candidate was still attempted and served
+    ],
+  });
+  // The turn is already finalized server-side in this scenario: run() must stop quietly, not
+  // throw a second terminal error at a dead turn.
+  await agent.run(ctxFor(seat), sink);
+
+  assert.equal(calls(), 1, "no candidate port call after the failed record");
+  assert.equal(sink.captured.rejections.length, 1, "the failed rejection was still reported once");
+  assert.equal(sink.captured.rejections[0]?.candidate, "claude-code");
+  // Started items: agentMessage#1 (primary attempt) + the quota error item — and nothing after
+  // the halt: no lane-mismatch error item, no second agentMessage, no receipt.
+  assert.equal(
+    sink.captured.started.length,
+    2,
+    `walk continued: ${sink.captured.started.length} items started`,
+  );
+  assert.deepEqual(
+    sink.captured.started.map((i) => i.kind),
+    ["agentMessage", "error"],
+  );
+  assert.equal(
+    sink.captured.items.some((i) => i.kind === "servedModel"),
+    false,
+    "no receipt is written for a walk that halted",
+  );
+  assert.equal(
+    sink.captured.items.some((i) => i.kind === "agentMessage"),
+    false,
+    "no agentMessage completed after the failed record",
+  );
+  assert.equal(
+    sink.captured.items.filter((i) => i.kind === "error").length,
+    1,
+    "only the quota error item; the mismatch item is not emitted into a dead turn",
+  );
 });
 
 test("A3: non-quota failures keep the M0 path — no fallback, -32603", async () => {

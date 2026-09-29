@@ -970,14 +970,18 @@ export class EngineConnection {
       fallbackRejected: (payload) => {
         // Durable same-lane rejection (seat pin §4.2) — recorded before the paired error item so
         // the JSONL order is event-then-item. A failed append poisons and fails the turn, exactly
-        // like #persistItem: a rejection that is not durable is not claimed.
-        if (!live()) return;
+        // like #persistItem: a rejection that is not durable is not claimed. The `false` returns
+        // halt the agent's fallback walk immediately (Copilot 4131965600): the turn is finalized,
+        // so no further candidate may be built or called and no further item may be emitted.
+        if (!live()) return false;
         try {
           record.session.append("fallback.rejected", payload);
+          return true;
         } catch (err) {
           if (!(err instanceof RpcError)) throw err;
           this.#notePoisoned(record.thread.id, record.session);
           this.#finishTurn(record, tr, "failed", err.toBody());
+          return false;
         }
       },
     };

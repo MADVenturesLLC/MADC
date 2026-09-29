@@ -133,6 +133,20 @@ type TurnPlan =
     };
 
 /**
+ * Outcome of considering the seat's fallback list (Copilot 4131965600): `attempt` carries the
+ * next candidate worth a call; `none` means the list is exhausted (the primary's error stands);
+ * `halt` means a `fallback.rejected` record failed to persist — the session is poisoned and the
+ * turn is already finalized, so the walk stops without emitting, building or calling anything.
+ */
+type Walk =
+  | { readonly kind: "attempt"; readonly plan: TurnPlan }
+  | { readonly kind: "none" }
+  | { readonly kind: "halt" };
+
+const NONE: Walk = Object.freeze({ kind: "none" });
+const HALT: Walk = Object.freeze({ kind: "halt" });
+
+/**
  * Engine turns are non-interactive provider calls until M1-A5 lands mode attestation: `headless`
  * is the fail-closed mode for every `assertAllowed` check and every receipt.
  */
@@ -304,13 +318,15 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
       let nextIndex = 0;
 
       /**
-       * The next fallback candidate worth a call, or null. Same-lane mismatches are rejected
-       * BEFORE any call with the pinned event + error item (D-M1-7); denied lanes, missing
+       * The next fallback candidate worth a call. Same-lane mismatches are rejected BEFORE any
+       * call with the pinned event + error item (D-M1-7); denied lanes, missing
        * adapters/credentials/binaries and unresolvable pinned models are skipped with a log line
        * (a seat carries ONE pinnedModel; a candidate whose lane cannot resolve it is not usable —
-       * per-seat fallback model locking lands with the A7 roster).
+       * per-seat fallback model locking lands with the A7 roster). `halt` stops the walk at once
+       * (Copilot 4131965600): the rejection record failed to persist, the session is poisoned and
+       * the turn is already finalized — nothing further may be emitted, built or called.
        */
-      const nextCandidate = (): TurnPlan | null => {
+      const nextCandidate = (): Walk => {
         const assigned = getById(seat.preferredBacking);
         while (nextIndex < fallbacks.length) {
           const candidate = fallbacks[nextIndex];
@@ -334,14 +350,18 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
               credentialClass: credentialClassOf(entry),
             };
             // Pinned dual record (seat pin §2 / §4.2): the durable JSONL event first, then the
-            // error-style item naming the seat, the candidate and both lanes.
-            sink.fallbackRejected?.({
-              turnId: ctx.turnId,
-              candidate,
-              assignedLane,
-              candidateLane,
-              reason: "fallback-lane-mismatch",
-            });
+            // error-style item naming the seat, the candidate and both lanes. If the event is not
+            // durable, the turn is already failed server-side: stop before the paired item and
+            // before any further candidate (a missing sink method counts as recorded — M0 sinks).
+            const recorded =
+              sink.fallbackRejected?.({
+                turnId: ctx.turnId,
+                candidate,
+                assignedLane,
+                candidateLane,
+                reason: "fallback-lane-mismatch",
+              }) ?? true;
+            if (!recorded) return HALT;
             emitErrorItem(
               sink,
               `fallback ${candidate} rejected for seat ${seat.id}: fallback-lane-mismatch ` +
@@ -352,7 +372,7 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
             continue;
           }
           try {
-            return planFor(candidate, ctx);
+            return { kind: "attempt", plan: planFor(candidate, ctx) };
           } catch (err) {
             // -32007/-32008/-32006 on a candidate mean "cannot serve this turn": skip, never
             // fall into a denied lane, and let the primary's error stand if nobody serves.
@@ -365,7 +385,7 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
             throw err;
           }
         }
-        return null;
+        return NONE;
       };
 
       let current: TurnPlan = primary;
@@ -399,11 +419,18 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
             );
             fallbackFrom = current.providerId;
             const next = nextCandidate();
-            if (next === null) {
+            if (next.kind === "halt") {
+              // Copilot 4131965600: the fallback.rejected append failed — the server poisoned the
+              // session and already finalized the turn failed. Stop at once: no paired item, no
+              // further candidate planned, built or called. run() resolves quietly; the server's
+              // completion handler sees the finalized turn and does nothing.
+              return;
+            }
+            if (next.kind === "none") {
               // "If none is eligible, the turn fails with the primary's error."
               throw providerUnavailable(primary.providerId, "quota-or-unreachable");
             }
-            current = next;
+            current = next.plan;
             continue;
           }
           if (err instanceof ProviderCallError) {

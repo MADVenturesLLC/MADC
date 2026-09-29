@@ -33,10 +33,14 @@ export type TurnSink = {
   completeItem(item: Item): void;
   /**
    * Durably records the pinned `fallback.rejected` session event (seat pin §4.2, same-lane rule
-   * D-M1-7). Optional so M0-era fake sinks stay valid; the server sink always implements it.
-   * The agent pairs each call with an `error`-style item naming both lanes.
+   * D-M1-7). Returns true only when the rejection was recorded. `false` means the session is
+   * unusable — the server poisoned the writer and already finalized the turn failed — and the
+   * fallback walk MUST stop immediately: no paired item, no further candidate built or called
+   * (Copilot 4131965600). Optional so M0-era fake sinks stay valid; a sink without the method is
+   * treated as "recorded". The agent pairs each RECORDED rejection with an `error`-style item
+   * naming both lanes.
    */
-  fallbackRejected?(payload: FallbackRejectedPayload): void;
+  fallbackRejected?(payload: FallbackRejectedPayload): boolean;
 };
 
 /**
