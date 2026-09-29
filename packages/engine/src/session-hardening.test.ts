@@ -241,17 +241,30 @@ test("R-append-nofollow: without O_NOFOLLOW an append never follows a symlink, e
   }
 });
 
-test("R-shape backing: a hash-valid session.open or servedModel event with a non-SeatBacking backing is never loaded", async () => {
+test("R-shape backing: a hash-valid session.open or servedModel event with a non-wired backing is never loaded", async () => {
+  // M1-A3 (seat pin S1): backing validity is registry-driven — any WIRED registry id. The forged
+  // outside examples are an id absent from the catalog and a catalog id that is not wired
+  // ("ollama-cloud" was the M0 example; M1-A3 wired it, so it moved to the accepted list below).
   const open = { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" };
-  const served = { turnId: "turn_1", requestedModel: "a", servedModel: "b", providerId: "p" };
+  const served = {
+    turnId: "turn_1",
+    requestedModel: "a",
+    servedModel: "b",
+    providerId: "p",
+    lane: "allowed-direct",
+    mode: "headless",
+    fallbackFrom: null,
+    vendorReported: false,
+  };
   const cases: Array<[string, Array<[string, Record<string, unknown>]>]> = [
-    ["open-bad-backing", [["session.open", { ...open, backing: "ollama-cloud" }]]],
+    ["open-bad-backing", [["session.open", { ...open, backing: "not-a-lane" }]]],
+    ["open-unwired-backing", [["session.open", { ...open, backing: "mistral-pro" }]]],
     ["open-no-backing", [["session.open", { cwd: null, providerId: "p", pinnedModel: "m" }]]],
     [
       "served-event-bad-backing",
       [
         ["session.open", open],
-        ["servedModel", { ...served, backing: "ollama-cloud" }],
+        ["servedModel", { ...served, backing: "not-a-lane" }],
       ],
     ],
   ];
@@ -264,8 +277,8 @@ test("R-shape backing: a hash-valid session.open or servedModel event with a non
       name,
     );
   }
-  // Every SeatBacking value still rebuilds, in both places.
-  for (const backing of ["kimi-code", "claude-code", "codex"]) {
+  // Every wired backing still rebuilds, in both places.
+  for (const backing of ["kimi-code", "claude-code", "codex", "ollama-cloud"]) {
     const r = verifySessionText(
       forgeSession("thr_ok", [
         ["session.open", { ...open, backing }],

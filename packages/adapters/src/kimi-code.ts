@@ -1,5 +1,8 @@
 /**
- * Kimi Code backing (plan D2): the only module in MADC that imports `@earendil-works/pi-ai`.
+ * Kimi Code backing (plan D2; M0-A3). Since M1-A3 this module is the kimi LANE CONFIG over the
+ * generic direct-key port (`direct/generic.ts`): the pinned pi-ai provider, the anthropic-messages
+ * wire, the honest-UA requirement and the key-shape refusals are kimi-specific; the streaming,
+ * failure and quota-signal mechanics are the shared generic port.
  *
  * Honesty rules enforced here:
  * - The request identifies itself as MADC (`User-Agent: madc/…`); pi-ai's default UA is replaced and
@@ -9,14 +12,12 @@
  * - The key is passed explicitly per request; pi-ai's ambient credential lookup is never relied on
  *   and error messages never carry upstream text or the key.
  */
-import { type AssistantMessage, createModels, type Model } from "@earendil-works/pi-ai";
+import { createModels, type Model } from "@earendil-works/pi-ai";
 import { kimiCodingProvider } from "@earendil-works/pi-ai/providers/kimi-coding";
-import {
-  ProviderCallError,
-  type ProviderPort,
-  type ProviderTurnRequest,
-  type ProviderTurnResult,
-} from "./provider-port.ts";
+import { createDirectKeyPort, type PinnedModelResolution } from "./direct/generic.ts";
+import { ProviderCallError, type ProviderPort } from "./provider-port.ts";
+
+export type { PinnedModelResolution };
 
 /** Exact pinned pi-ai version (plan §6). Asserted against package.json by tests. */
 export const PI_AI_VERSION = "0.87.1";
@@ -41,10 +42,6 @@ function catalogModel(modelId: string): Model<"anthropic-messages"> | undefined 
 export function kimiCatalogModelIds(): string[] {
   return catalog.getModels(KIMI_PI_PROVIDER).map((model) => model.id);
 }
-
-export type PinnedModelResolution =
-  | { readonly ok: true; readonly modelId: string }
-  | { readonly ok: false; readonly issue: string };
 
 /**
  * `pinnedModel` must be `kimi-coding/<id>` with `<id>` in the pinned catalog. Anything else (another
@@ -117,83 +114,14 @@ export function createKimiCodePort(options: KimiCodePortOptions): ProviderPort {
   if (!options.userAgent.startsWith("madc/")) {
     throw new ProviderCallError("failed", null, "kimi-code requires an honest madc User-Agent");
   }
-  return Object.freeze({
+  return createDirectKeyPort({
     providerId: KIMI_CODE_PROVIDER_ID,
-    streamTurn: (request: ProviderTurnRequest) => streamKimiTurn(options, request),
+    piProvider: KIMI_PI_PROVIDER,
+    api: "anthropic-messages",
+    apiKey: options.apiKey,
+    buildProvider: () => kimiCodingProvider(),
+    userAgent: options.userAgent,
+    ...(options.baseUrl === undefined ? {} : { baseUrl: options.baseUrl }),
+    ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });
-}
-
-async function streamKimiTurn(
-  options: KimiCodePortOptions,
-  request: ProviderTurnRequest,
-): Promise<ProviderTurnResult> {
-  const model = catalogModel(request.modelId);
-  if (model === undefined) {
-    throw new ProviderCallError("failed", null, `Unknown kimi-coding model "${request.modelId}"`);
-  }
-  const target = options.baseUrl === undefined ? model : { ...model, baseUrl: options.baseUrl };
-  let status: number | null = null;
-  const timestamp = Date.now();
-  const stream = catalog.stream(
-    target,
-    {
-      ...(request.systemPrompt === undefined ? {} : { systemPrompt: request.systemPrompt }),
-      messages: request.messages.map((m) => ({ role: "user", content: m.text, timestamp })),
-    },
-    {
-      apiKey: options.apiKey,
-      ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-      // Provider-scoped env: keeps pi-ai from consulting ambient process env for this request.
-      env: {},
-      signal: request.signal,
-      headers: { "User-Agent": options.userAgent },
-      onResponse: (response) => {
-        status = response.status;
-      },
-    },
-  );
-
-  let final: AssistantMessage | undefined;
-  try {
-    for await (const event of stream) {
-      if (event.type === "text_delta") request.onTextDelta(event.delta);
-    }
-    final = await stream.result();
-  } catch {
-    // Never surface the underlying error text: it can carry upstream bodies.
-    throw failure(request.signal, status);
-  }
-  if (final.stopReason === "error" || final.stopReason === "aborted") {
-    throw failure(
-      request.signal,
-      status ?? leadingHttpStatus(final.errorMessage),
-      final.stopReason === "aborted",
-    );
-  }
-  const text = final.content
-    .filter((part) => part.type === "text")
-    .map((part) => part.text)
-    .join("");
-  return {
-    text,
-    requestedModelId: model.id,
-    servedModel: final.responseModel ?? model.id,
-  };
-}
-
-/**
- * pi-ai's `errorMessage` is `"<status> <upstream body>"` for HTTP errors. Only the leading status
- * code is kept; the upstream body (which may echo request content) is discarded.
- */
-function leadingHttpStatus(errorMessage: string | undefined): number | null {
-  const match = /^([1-5]\d\d)\b/.exec(errorMessage ?? "");
-  return match?.[1] === undefined ? null : Number(match[1]);
-}
-
-function failure(signal: AbortSignal, status: number | null, aborted = false): ProviderCallError {
-  if (aborted || signal.aborted) {
-    return new ProviderCallError("aborted", status, "kimi-code request aborted");
-  }
-  const suffix = status !== null && (status < 200 || status >= 300) ? ` (HTTP ${status})` : "";
-  return new ProviderCallError("failed", status, `kimi-code request failed${suffix}`);
 }

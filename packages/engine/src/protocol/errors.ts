@@ -42,7 +42,8 @@ export type SeatInvalidData = { seatId: string; path: string; issues: string[] }
 export type ProviderDeniedData = { providerId: string; status: string | null; reason: string };
 export type ProviderUnavailableData = {
   providerId: string;
-  reason: "unwired" | "binary-missing" | "no-credentials";
+  /** P5 (M1 protocol pin §4.1): `quota-or-unreachable` joins in M1-A3 (429/502-style signals). */
+  reason: "unwired" | "binary-missing" | "no-credentials" | "quota-or-unreachable";
 };
 export type SessionWriteFailedData = { threadId: string; path: string; seq: number };
 

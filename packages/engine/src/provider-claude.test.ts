@@ -150,6 +150,12 @@ test("A5 happy path: a claude-code seat runs a turn; receipt on the wire and in 
         servedModel: CLAUDE_MODEL,
         backing: "claude-code",
         providerId: "claude-code",
+        // M1 P2 fields: the vendor fake echoes the requested model, so nothing was
+        // vendor-reported; the lane is the vendor-agent one; mode is headless until A5.
+        lane: "allowed-via-vendor-agent",
+        mode: "headless",
+        fallbackFrom: null,
+        vendorReported: false,
       },
     );
     // Dual write (seat pin §4.2): the JSONL servedModel event equals the protocol receipt.
@@ -162,6 +168,10 @@ test("A5 happy path: a claude-code seat runs a turn; receipt on the wire and in 
       servedModel: CLAUDE_MODEL,
       backing: "claude-code",
       providerId: "claude-code",
+      lane: "allowed-via-vendor-agent",
+      mode: "headless",
+      fallbackFrom: null,
+      vendorReported: false,
     });
     assert.equal(lines.at(-1)?.type, "turn.end");
     assert.deepEqual(lines.at(-1)?.payload, { turnId: turn.id, status: "completed", error: null });

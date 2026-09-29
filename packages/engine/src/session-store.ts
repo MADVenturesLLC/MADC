@@ -18,19 +18,20 @@ import {
   writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import { getById, type ProviderStatus } from "@madc/registry";
 import { isStrictlyUnder } from "./home.ts";
 import { type OpenNoFollowOptions, openNoFollow } from "./lock.ts";
 import { ErrorCode, RpcError, type SessionWriteFailedData } from "./protocol/errors.ts";
 import { isValidId } from "./protocol/ids.ts";
-import type { Item, RpcErrorBody, Thread, Turn, TurnStatus } from "./protocol/types.ts";
-import type { SeatBacking } from "./seat.ts";
+import type { Item, RpcErrorBody, Thread, Turn, TurnMode, TurnStatus } from "./protocol/types.ts";
 
 export const GENESIS_HASH = "0".repeat(64);
 export const REDACTED = "[REDACTED]";
 
 export type SessionOpenPayload = {
   cwd: string | null;
-  backing: SeatBacking;
+  /** Any wired registry id (seat pin S1, widened in M1-A3; M0 was the SeatBacking union). */
+  backing: string;
   providerId: string;
   pinnedModel: string;
 };
@@ -40,8 +41,26 @@ export type ServedModelPayload = {
   turnId: string;
   requestedModel: string;
   servedModel: string;
-  backing: SeatBacking;
+  backing: string;
   providerId: string;
+  /** P2 (M1 protocol pin §5 / seat pin §4.2): registry status of the serving lane. */
+  lane: ProviderStatus;
+  /** P2: the turn's mode — always "headless" until M1-A5 attestation. */
+  mode: TurnMode;
+  /** P2: previous backing id on a fallback hop; null on the primary. */
+  fallbackFrom: string | null;
+  /** P2: true only if the vendor/adapter reported a model identity. */
+  vendorReported: boolean;
+};
+/** One lane identity for the same-lane rule (D-M1-7). Forbidden entries have no billing class. */
+export type FallbackLane = { status: ProviderStatus; credentialClass: string };
+/** Seat pin §4.2 (S4): a fallback candidate rejected before any call under the same-lane rule. */
+export type FallbackRejectedPayload = {
+  turnId: string;
+  candidate: string;
+  assignedLane: FallbackLane;
+  candidateLane: FallbackLane;
+  reason: "fallback-lane-mismatch";
 };
 export type TurnEndPayload = {
   turnId: string;
@@ -55,6 +74,7 @@ export type SessionPayloads = {
   "turn.start": TurnStartPayload;
   item: ItemPayload;
   servedModel: ServedModelPayload;
+  "fallback.rejected": FallbackRejectedPayload;
   "turn.end": TurnEndPayload;
   "session.close": SessionClosePayload;
 };
@@ -64,6 +84,7 @@ export const SESSION_EVENT_TYPES: readonly SessionEventType[] = Object.freeze([
   "turn.start",
   "item",
   "servedModel",
+  "fallback.rejected",
   "turn.end",
   "session.close",
 ]);
@@ -844,7 +865,22 @@ const isStr = (v: unknown): v is string => typeof v === "string";
 const TURN_END_STATUSES: readonly unknown[] = ["completed", "interrupted", "failed"];
 
 const ITEM_STATUSES: readonly unknown[] = ["inProgress", "completed", "failed"];
-const SERVED_BACKINGS: readonly unknown[] = ["kimi-code", "claude-code", "codex"];
+/** Registry statuses (M1 seat pin §4.2 `lane` / same-lane payloads). */
+const PROVIDER_STATUSES: readonly unknown[] = [
+  "allowed-direct",
+  "allowed-via-vendor-agent",
+  "interactive-only",
+  "forbidden",
+];
+const TURN_MODES: readonly unknown[] = ["interactive", "headless"];
+
+/**
+ * A receipt / `session.open` backing is any WIRED registry id (seat pin S1; M0's three-literal
+ * list widened in M1-A3 — `ollama-cloud` joined when its adapter landed).
+ */
+function isWiredBacking(v: unknown): boolean {
+  return isStr(v) && getById(v)?.wired === true;
+}
 
 /** Each M0 `Item` variant (protocol/types.ts) with its required fields. Extra fields are allowed. */
 function isM0Item(item: unknown): boolean {
@@ -876,8 +912,12 @@ function isM0Item(item: unknown): boolean {
       return (
         isStr(item.requestedModel) &&
         isStr(item.servedModel) &&
-        SERVED_BACKINGS.includes(item.backing) &&
-        isStr(item.providerId)
+        isWiredBacking(item.backing) &&
+        isStr(item.providerId) &&
+        PROVIDER_STATUSES.includes(item.lane) &&
+        TURN_MODES.includes(item.mode) &&
+        (item.fallbackFrom === null || isStr(item.fallbackFrom)) &&
+        typeof item.vendorReported === "boolean"
       );
     default:
       return false;
@@ -893,7 +933,7 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
   switch (type) {
     case "session.open":
       return (p.cwd === null || isStr(p.cwd)) &&
-        SERVED_BACKINGS.includes(p.backing) &&
+        isWiredBacking(p.backing) &&
         isStr(p.providerId) &&
         isStr(p.pinnedModel)
         ? null
@@ -906,10 +946,27 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
       return isValidId(p.turnId) &&
         isStr(p.requestedModel) &&
         isStr(p.servedModel) &&
-        SERVED_BACKINGS.includes(p.backing) &&
-        isStr(p.providerId)
+        isWiredBacking(p.backing) &&
+        isStr(p.providerId) &&
+        PROVIDER_STATUSES.includes(p.lane) &&
+        TURN_MODES.includes(p.mode) &&
+        (p.fallbackFrom === null || isStr(p.fallbackFrom)) &&
+        typeof p.vendorReported === "boolean"
         ? null
         : "malformed servedModel payload";
+    case "fallback.rejected": {
+      const laneOk = (lane: unknown): boolean =>
+        isPlainRecord(lane) &&
+        PROVIDER_STATUSES.includes(lane.status) &&
+        isStr(lane.credentialClass);
+      return isValidId(p.turnId) &&
+        isStr(p.candidate) &&
+        laneOk(p.assignedLane) &&
+        laneOk(p.candidateLane) &&
+        p.reason === "fallback-lane-mismatch"
+        ? null
+        : "malformed fallback.rejected payload";
+    }
     case "turn.end": {
       const err = p.error;
       const errOk =

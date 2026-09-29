@@ -39,7 +39,6 @@ import {
   type UserInput,
 } from "./protocol/types.ts";
 import { encodeMessage, isPlainObject, parseLine } from "./protocol/wire.ts";
-import type { SeatBacking } from "./seat.ts";
 import { type LoadedSeat, loadSeat, seedDefaultSeat } from "./seat-store.ts";
 import {
   type RebuiltSession,
@@ -432,7 +431,7 @@ export class EngineConnection {
         seatId,
         {
           cwd,
-          backing: seat.seat.preferredBacking as SeatBacking,
+          backing: seat.seat.preferredBacking,
           providerId: seat.seat.preferredBacking,
           pinnedModel: seat.seat.pinnedModel,
         },
@@ -880,6 +879,10 @@ export class EngineConnection {
               servedModel: item.servedModel,
               backing: item.backing,
               providerId: item.providerId,
+              lane: item.lane,
+              mode: item.mode,
+              fallbackFrom: item.fallbackFrom,
+              vendorReported: item.vendorReported,
             },
           },
         ]);
@@ -963,6 +966,23 @@ export class EngineConnection {
           item: completed,
         });
         this.#persistItem(record, tr, completed);
+      },
+      fallbackRejected: (payload) => {
+        // Durable same-lane rejection (seat pin §4.2) — recorded before the paired error item so
+        // the JSONL order is event-then-item. A failed append poisons and fails the turn, exactly
+        // like #persistItem: a rejection that is not durable is not claimed. The `false` returns
+        // halt the agent's fallback walk immediately (Copilot 4131965600): the turn is finalized,
+        // so no further candidate may be built or called and no further item may be emitted.
+        if (!live()) return false;
+        try {
+          record.session.append("fallback.rejected", payload);
+          return true;
+        } catch (err) {
+          if (!(err instanceof RpcError)) throw err;
+          this.#notePoisoned(record.thread.id, record.session);
+          this.#finishTurn(record, tr, "failed", err.toBody());
+          return false;
+        }
       },
     };
 

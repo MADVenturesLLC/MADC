@@ -16,7 +16,7 @@ import {
 import { join } from "node:path";
 import { test } from "node:test";
 import { DEFAULT_SEAT_ID } from "./protocol/types.ts";
-import { MADC_DEFAULT_SEAT, memoryPathIssue, validateSeat } from "./seat.ts";
+import { MADC_DEFAULT_SEAT, memoryPathIssue, seatBackingIssue, validateSeat } from "./seat.ts";
 import { loadSeat, seedDefaultSeat, serializeSeat } from "./seat-store.ts";
 import {
   expectRpcError,
@@ -242,10 +242,28 @@ const BAD_SEATS: Array<{
     issues: ['id "someone-else" must equal the filename stem "id-mismatch"'],
   },
   { name: "version-2", seat: { version: 2 }, issues: ["version must be 1"] },
+  // M1-A3 (seat pin S1): backing validity is registry-driven. "ollama-cloud" — the M0
+  // counter-example — is a valid backing since M1-A3 wired it (positive case below); the bad
+  // cases are an unknown id, a forbidden lane and an unwired stub.
   {
-    name: "ollama",
-    seat: { preferredBacking: "ollama-cloud" },
-    issues: ["preferredBacking must be one of kimi-code, claude-code, codex"],
+    name: "backing-unknown",
+    seat: { preferredBacking: "no-such-provider" },
+    issues: ['preferredBacking "no-such-provider" is not a registry provider id'],
+  },
+  {
+    name: "backing-forbidden",
+    seat: { preferredBacking: "zai-glm-coding-plan" },
+    issues: ['preferredBacking "zai-glm-coding-plan" is a forbidden lane'],
+  },
+  {
+    name: "backing-unwired",
+    seat: { preferredBacking: "mistral-pro" },
+    issues: ['preferredBacking "mistral-pro" is not wired in this build'],
+  },
+  {
+    name: "fallbacks-in-v1",
+    seat: { fallbacks: ["kimi-code"] },
+    issues: ["fallbacks is not a seat field"],
   },
   {
     name: "handoffs-on",
@@ -490,6 +508,24 @@ test("validateSeat / memoryPathIssue units: the built-in seat is valid; lexical 
   assert.notEqual(memoryPathIssue("memory/"), null);
   assert.notEqual(memoryPathIssue("C:/memory/x.md"), null);
   assert.notEqual(memoryPathIssue("./memory/x.md"), null);
+});
+
+test("M1-A3 (S1): a wired non-M0 backing validates through the registry", () => {
+  // ollama-cloud: wired by M1-A3 → a valid seat-file backing although it is not in the M0
+  // three-literal list (the file-level v2 schema and the seeded roster remain M1-A7).
+  const ollama = validateSeat(
+    { ...PIN_MADC_DEFAULT, id: "sa", preferredBacking: "ollama-cloud" },
+    "sa",
+  );
+  assert.equal(ollama.ok, true, ollama.ok ? "" : ollama.issues.join("; "));
+  // The registry-driven rule itself: exists + wired + not forbidden.
+  assert.equal(seatBackingIssue("kimi-code"), null);
+  assert.equal(seatBackingIssue("claude-code"), null);
+  assert.equal(seatBackingIssue("codex"), null);
+  assert.equal(seatBackingIssue("ollama-cloud"), null);
+  assert.match(seatBackingIssue("mistral-pro") ?? "", /not wired in this build/);
+  assert.match(seatBackingIssue("zai-glm-coding-plan") ?? "", /forbidden lane/);
+  assert.match(seatBackingIssue("no-such-provider") ?? "", /not a registry provider id/);
 });
 
 test("R-seat-swap: a seat file swapped after the realpath check is never read (-32006)", () => {

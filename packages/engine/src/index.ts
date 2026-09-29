@@ -64,7 +64,11 @@ export * from "./protocol/errors.ts";
 export { ID_PATTERN, isValidId, newId } from "./protocol/ids.ts";
 export * from "./protocol/types.ts";
 export { encodeMessage, type Incoming, parseLine } from "./protocol/wire.ts";
-export { createProviderAgent, type ProviderAgentOptions } from "./provider-agent.ts";
+export {
+  createProviderAgent,
+  type DirectLane,
+  type ProviderAgentOptions,
+} from "./provider-agent.ts";
 export {
   type EngineSeat,
   MADC_DEFAULT_SEAT,
@@ -75,6 +79,7 @@ export {
   type SeatMemory,
   type SeatToolsPolicy,
   type SeatValidation,
+  seatBackingIssue,
   validateSeat,
 } from "./seat.ts";
 export {
@@ -88,11 +93,14 @@ export {
 export { ENGINE_VERSION, EngineConnection, type EngineOptions, runEngine } from "./server.ts";
 export {
   createRedactor,
+  type FallbackLane,
+  type FallbackRejectedPayload,
   GENESIS_HASH,
   REDACTED,
   type RebuiltSession,
   rebuildSession,
   SESSION_EVENT_TYPES,
+  type ServedModelPayload,
   type SessionEvent,
   type SessionEventType,
   type SessionPayloads,

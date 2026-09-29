@@ -444,9 +444,17 @@ test("A7 §7.4 madc -p hi --json against the fake Kimi engine: one JSON object, 
       );
     const receipt = events.find((e) => e.type === "servedModel");
     assert.ok(receipt);
-    const { turnId, ...fields } = receipt.payload;
+    const { turnId, requestedModel, servedModel, backing, providerId, ...p2 } = receipt.payload;
     assert.equal(turnId, out.turn.id);
-    assert.deepEqual(out.servedModel, fields, "servedModel equals the JSONL servedModel event");
+    // M1-A3 (protocol pin §5 P2): the JSONL receipt also records lane/mode/fallbackFrom/
+    // vendorReported; the CLI receipt summary keeps the frozen M0 four fields — it reports a
+    // subset of what the JSONL records, and the two must agree on those four.
+    assert.deepEqual(Object.keys(p2).sort(), ["fallbackFrom", "lane", "mode", "vendorReported"]);
+    assert.deepEqual(
+      out.servedModel,
+      { requestedModel, servedModel, backing, providerId },
+      "servedModel equals the JSONL servedModel event's summary fields",
+    );
     assert.equal(out.session.seq, events.at(-1)?.seq);
     assert.equal(out.session.headHash, events.at(-1)?.hash);
     assert.equal(

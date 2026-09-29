@@ -1,12 +1,20 @@
 /**
  * Seat schema (seat pin §2) and the built-in `madc-default` seat (seat pin §3, plan D4).
  * Pure: no I/O. File loading, confinement, and seeding live in `seat-store.ts`.
+ *
+ * M1-A3: backing validity is registry-driven per seat pin S1 (an entry exists, is `wired: true`
+ * and is not `forbidden`) instead of the M0 closed three-id list. `SEAT_BACKINGS` remains as the
+ * historical M0 list. The full v2 FILE schema (`version: 2`, `displayName`, persisted
+ * `fallbacks`) and seed roster land in M1-A7; this act adds the in-memory `fallbacks` field the
+ * turn-time fallback logic (D-M1-7) consumes — a v1 file can never carry it, and v1 files stay
+ * byte-identical.
  */
 import { posix } from "node:path";
+import { getById } from "@madc/registry";
 import { isValidId } from "./protocol/ids.ts";
 import { DEFAULT_SEAT_ID } from "./protocol/types.ts";
 
-/** Exactly the three registry entries with `wired: true` (seat pin §2). */
+/** The M0 wired three (historical list; backing validity is registry-driven since M1-A3, S1). */
 export const SEAT_BACKINGS = Object.freeze(["kimi-code", "claude-code", "codex"] as const);
 export type SeatBacking = (typeof SEAT_BACKINGS)[number];
 
@@ -30,11 +38,17 @@ export type EngineSeat = {
   /** `<pi-ai provider>/<model id>` for kimi-code; vendor model name for claude-code / codex. */
   readonly pinnedModel: string;
   /**
-   * Registry provider id passed to `assertAllowed`. A validated seat file only ever carries a
-   * `SeatBacking`; the type stays a plain string so the agent's registry check remains fail-closed
-   * for seats built in code.
+   * Registry provider id passed to `assertAllowed`. Validated against the registry (S1): the
+   * entry must exist, be `wired: true` and not `forbidden`. The type stays a plain string so the
+   * agent's registry check remains fail-closed for seats built in code.
    */
   readonly preferredBacking: string;
+  /**
+   * Ordered fallback candidates (seat pin §2 S2, D-M1-7). In-memory only in M1-A3: v1 files
+   * never carry it (the v2 file schema lands in M1-A7); code-built seats may set it, and the
+   * turn-time fallback logic treats a missing list as empty.
+   */
+  readonly fallbacks?: readonly string[];
   readonly memory: SeatMemory;
   readonly tools: SeatToolsPolicy;
   readonly policy: { readonly headlessOk: boolean };
@@ -112,6 +126,20 @@ export function memoryPathIssue(path: string): string | null {
 }
 
 /**
+ * Backing validity per seat pin S1 (registry-driven since M1-A3): the entry must exist, be
+ * `wired: true` and not be `forbidden`. Pure — the registry is frozen catalog data. Adapter
+ * availability is NOT checked here; a registry-wired backing without an adapter in this build
+ * fails at turn preflight with -32008 `unwired` (provider-agent).
+ */
+export function seatBackingIssue(backing: string): string | null {
+  const entry = getById(backing);
+  if (entry === undefined) return `preferredBacking "${backing}" is not a registry provider id`;
+  if (entry.status === "forbidden") return `preferredBacking "${backing}" is a forbidden lane`;
+  if (!entry.wired) return `preferredBacking "${backing}" is not wired in this build`;
+  return null;
+}
+
+/**
  * Validate a parsed seat file against seat pin §2. Strict: unknown keys are rejected at every level
  * (schema `version: 1` is closed). `expectedId` is the filename stem.
  */
@@ -135,11 +163,12 @@ export function validateSeat(raw: unknown, expectedId: string): SeatValidation {
   if (typeof raw.pinnedModel !== "string" || raw.pinnedModel.trim() === "") {
     issues.push("pinnedModel must be a non-empty string");
   }
-  if (
-    typeof raw.preferredBacking !== "string" ||
-    !(SEAT_BACKINGS as readonly string[]).includes(raw.preferredBacking)
-  ) {
-    issues.push(`preferredBacking must be one of ${SEAT_BACKINGS.join(", ")}`);
+  // Backing validity is registry-driven (seat pin S1, M1-A3): exists, wired, not forbidden.
+  if (typeof raw.preferredBacking !== "string") {
+    issues.push("preferredBacking must be a registry provider id");
+  } else {
+    const backingIssue = seatBackingIssue(raw.preferredBacking);
+    if (backingIssue !== null) issues.push(backingIssue);
   }
 
   const memory = raw.memory;

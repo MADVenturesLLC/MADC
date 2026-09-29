@@ -139,6 +139,11 @@ test("A3 happy path: userMessage → agentMessage (streamed) → servedModel →
           servedModel: "kimi-for-coding-2026-09",
           backing: "kimi-code",
           providerId: "kimi-code",
+          // M1 P2 fields: upstream reported a DIFFERENT model → vendorReported true.
+          lane: "allowed-direct",
+          mode: "headless",
+          fallbackFrom: null,
+          vendorReported: true,
         },
       );
       const wire = run.wire();
@@ -309,25 +314,54 @@ test("defense in depth: the agent's registry check still refuses seats built in 
   assert.deepEqual(blankModel?.data?.issues, ["pinnedModel must be a non-empty vendor model name"]);
 });
 
-test("A4: a seat file with a non-M0 backing (ollama-cloud, forbidden, unknown) → -32006 at thread/start", async () => {
+test("A4/M1-A3 (S1): seat-file backings validate against the registry — forbidden, unknown and unwired → -32006 at thread/start", async () => {
+  // M1 seat pin S1 (realized here in M1-A3): a backing is valid iff its registry entry exists,
+  // is wired and is not forbidden. "ollama-cloud" — the M0 counter-example — is a VALID backing
+  // since M1-A3 wired it; its headless denial is a turn-preflight matter, asserted below.
+  const badSeats: Array<[Record<string, unknown>, string]> = [
+    [
+      seatJson("zai", { preferredBacking: "zai-glm-coding-plan" }),
+      'preferredBacking "zai-glm-coding-plan" is a forbidden lane',
+    ],
+    [
+      seatJson("nope", { preferredBacking: "no-such-provider" }),
+      'preferredBacking "no-such-provider" is not a registry provider id',
+    ],
+    [
+      seatJson("mist", { preferredBacking: "mistral-pro" }),
+      'preferredBacking "mistral-pro" is not wired in this build',
+    ],
+  ];
   const seats = [
+    ...badSeats.map(([seat]) => seat),
     seatJson("oll", { preferredBacking: "ollama-cloud" }),
-    seatJson("zai", { preferredBacking: "zai-glm-coding-plan" }),
-    seatJson("nope", { preferredBacking: "no-such-provider" }),
   ];
   await withKimiEngine({ key: KEY, seats }, async (run) => {
-    for (const seat of seats) {
+    for (const [seat, issue] of badSeats) {
       const err = await expectRpcError(
         run.client.request("thread/start", { seatId: seat.id as string }),
       );
       assert.equal(err.code, -32006, String(seat.id));
       assert.equal(err.data?.path, join(run.home, "seats", `${String(seat.id)}.json`));
-      assert.deepEqual(err.data?.issues, [
-        "preferredBacking must be one of kimi-code, claude-code, codex",
-      ]);
+      assert.deepEqual(err.data?.issues, [issue]);
     }
     assert.equal(run.wire().length, 0);
     assert.deepEqual(readdirSync(join(run.home, "sessions")), [], "no session or lock written");
+
+    // D-M1-3/D-M1-4: the wired headless-denied lane LOADS (the seat is valid; interactive use is
+    // allowed by the registry), but every engine turn is headless until A5, so the turn is
+    // refused -32007 headless-not-permitted before any provider request.
+    const threadId = await startThread(run.client, "oll");
+    const turnErr = await expectRpcError(
+      run.client.request("turn/start", { threadId, input: [{ type: "text", text: "x" }] }),
+    );
+    assert.equal(turnErr.code, -32007);
+    assert.deepEqual(turnErr.data, {
+      providerId: "ollama-cloud",
+      status: "allowed-direct",
+      reason: "headless-not-permitted",
+    });
+    assert.equal(run.wire().length, 0, "refused before any provider request");
   });
 });
 
@@ -505,7 +539,18 @@ test("production engine entry defaults to the Kimi agent: no key → -32008 no-c
 /** Static `from`, side-effect `import "…"`, dynamic `import(…)`, and `require(…)` of any pi-ai entry. */
 const PI_AI_IMPORT = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)["']@earendil-works\/pi-ai/;
 
-test("plan §6: only packages/adapters imports @earendil-works/pi-ai, and only kimi-code.ts there", () => {
+/**
+ * The only files allowed to import pi-ai (plan §6, generalized by M1-A3): the direct-key lane
+ * modules inside packages/adapters. The package-level rule is unchanged — core/engine/registry/cli
+ * never import pi-ai — and fakes/tests never do either.
+ */
+const PI_AI_IMPORTERS: readonly string[] = [
+  "adapters/src/kimi-code.ts",
+  "adapters/src/direct/generic.ts",
+  "adapters/src/providers/ollama-cloud.ts",
+];
+
+test("plan §6: only packages/adapters imports @earendil-works/pi-ai, and only its direct-key lane modules", () => {
   const packagesDir = new URL("../../", import.meta.url);
   const packagesPath = fileURLToPath(packagesDir);
   const offenders: string[] = [];
@@ -513,7 +558,7 @@ test("plan §6: only packages/adapters imports @earendil-works/pi-ai, and only k
   for (const pkg of readdirSync(packagesDir)) {
     const src = new URL(`${pkg}/src/`, packagesDir);
     if (!existsSync(src)) continue;
-    // Test sources count too: nothing but kimi-code.ts may import pi-ai directly.
+    // Test sources count too: nothing but the lane modules may import pi-ai directly.
     for (const file of readdirSync(src, { recursive: true, withFileTypes: true })) {
       if (!file.isFile() || !file.name.endsWith(".ts")) continue;
       const path = join(file.parentPath, file.name);
@@ -521,7 +566,7 @@ test("plan §6: only packages/adapters imports @earendil-works/pi-ai, and only k
       if (!PI_AI_IMPORT.test(readFileSync(path, "utf8"))) continue;
       // Platform-independent: compare POSIX-style paths relative to packages/ (Windows uses `\`).
       const rel = relative(packagesPath, path).split(sep).join("/");
-      if (rel !== "adapters/src/kimi-code.ts") offenders.push(rel);
+      if (!PI_AI_IMPORTERS.includes(rel)) offenders.push(rel);
     }
   }
   assert.ok(scanned > 20, `importer scan saw only ${scanned} files`);
