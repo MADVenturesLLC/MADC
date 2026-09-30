@@ -17,6 +17,7 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
   chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   realpathSync,
@@ -53,26 +54,35 @@ function git(dir: string, ...args: string[]): void {
   execFileSync("git", args, { cwd: dir, stdio: ["ignore", "ignore", "pipe"] });
 }
 
+/**
+ * Every config write goes through `git config --local`, which forces THIS repository's own config
+ * and errors out when `dir` is not inside one. Without `--local`, a fixture whose `git init` did
+ * not land would silently write `remote.origin.url` into an ancestor repository — or, worse, into
+ * the developer's global config.
+ */
+function setConfig(dir: string, key: string, value: string): void {
+  execFileSync("git", ["config", "--local", key, value], {
+    cwd: dir,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+}
+
+function addConfig(dir: string, key: string, value: string): void {
+  execFileSync("git", ["config", "--local", "--add", key, value], {
+    cwd: dir,
+    stdio: ["ignore", "ignore", "pipe"],
+  });
+}
+
 /** A real repository with one `origin` fetch URL. Returns its realpath'd top-level. */
 function makeRepo(parent: string, name: string, originUrl: string): string {
   const dir = join(parent, name);
   git(dir, "init", "--quiet");
-  execFileSync("git", ["config", "remote.origin.url", originUrl], {
-    cwd: dir,
-    stdio: ["ignore", "ignore", "pipe"],
-  });
+  // Fail loudly here rather than later: if `init` did not create a repository, the config write
+  // below would resolve to some ANCESTOR repository instead of this fixture.
+  assert.ok(existsSync(join(dir, ".git")), `git init created no repository at ${dir}`);
+  setConfig(dir, "remote.origin.url", originUrl);
   return realpathSync(dir);
-}
-
-function setConfig(dir: string, key: string, value: string): void {
-  execFileSync("git", ["config", key, value], { cwd: dir, stdio: ["ignore", "ignore", "pipe"] });
-}
-
-function addConfig(dir: string, key: string, value: string): void {
-  execFileSync("git", ["config", "--add", key, value], {
-    cwd: dir,
-    stdio: ["ignore", "ignore", "pipe"],
-  });
 }
 
 let policyHomeSeq = 0;

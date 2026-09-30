@@ -18,6 +18,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -66,7 +67,10 @@ function makeRepo(parent: string, name: string, originUrl: string): string {
   const dir = join(parent, name);
   mkdirSync(dir, { recursive: true });
   execFileSync("git", ["init", "--quiet"], { cwd: dir, stdio: ["ignore", "ignore", "pipe"] });
-  execFileSync("git", ["config", "remote.origin.url", originUrl], {
+  // Fail loudly here rather than later: if `init` did not create a repository, the `git config`
+  // below would resolve to some ANCESTOR repository and write there instead.
+  assert.ok(existsSync(join(dir, ".git")), `git init created no repository at ${dir}`);
+  execFileSync("git", ["config", "--local", "--replace-all", "remote.origin.url", originUrl], {
     cwd: dir,
     stdio: ["ignore", "ignore", "pipe"],
   });
