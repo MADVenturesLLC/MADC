@@ -59,7 +59,12 @@ export {
   releaseThreadLock,
   threadLockPath,
 } from "./lock.ts";
-export { type AgentFactory, defaultAgentFactory, startStdioEngine } from "./main.ts";
+export {
+  type AgentFactory,
+  defaultAgentFactory,
+  type StdioEngineOptions,
+  startStdioEngine,
+} from "./main.ts";
 export {
   type GitCommandResult,
   type GitRunner,
@@ -85,6 +90,18 @@ export {
   type RepoPolicy,
   type RepoPolicyLoad,
 } from "./policy/store.ts";
+export {
+  effectiveLaneMode,
+  type Presence,
+  presenceRequired,
+  sameTerminal,
+  type TerminalFacts,
+} from "./presence/policy.ts";
+export {
+  createSystemTerminal,
+  type PresenceTerminal,
+  type SystemTerminalDeps,
+} from "./presence/terminal.ts";
 export * from "./protocol/errors.ts";
 export { ID_PATTERN, isValidId, newId } from "./protocol/ids.ts";
 export * from "./protocol/types.ts";
@@ -157,6 +174,8 @@ export {
   sessionEventHash,
   sortedKeyJson,
   TOKEN_PATTERNS,
+  type TurnStartPayload,
+  type TurnStartTty,
   verifySessionFile,
   verifySessionText,
 } from "./session-store.ts";

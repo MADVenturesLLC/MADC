@@ -216,7 +216,14 @@ test("§6.3 / §6.4: a seat run writes session.open → turn.start → items →
       providerId: "kimi-code",
       pinnedModel: "kimi-coding/kimi-for-coding",
     });
-    assert.deepEqual(lines[1]?.payload, { turnId: turn.id, inputText: "say hi" });
+    // M1-A5 (seat pin §4.2 S4): turn.start carries the mode claim and the presence result. This
+    // turn/start sent no `mode`, so it is recorded as headless (P3, fail-closed) with no presence.
+    assert.deepEqual(lines[1]?.payload, {
+      turnId: turn.id,
+      inputText: "say hi",
+      mode: "headless",
+      presence: "absent",
+    });
     assert.deepEqual(lines[6]?.payload, { turnId: turn.id, status: "completed", error: null });
     // Items on disk are the item/completed items, in order.
     assert.deepEqual(

@@ -83,25 +83,35 @@ test("catalog v2: every roadmap §3 row, the forbidden sub-paths, and the M1 ids
   }
 
   // Live wiring is the M0 three plus the lanes whose adapter acts have landed (M1-A3:
-  // ollama-cloud; M1-A4: mistral-pro, deepseek-payg, gemini-api-key, xai-api); every other lane
-  // is a stub until its adapter act. `deepseek-payg` being wired does not open the lane: it is
-  // repo-gated with an empty allowlist on a clean install (D-M1-8, seat pin §5).
+  // ollama-cloud; M1-A4: mistral-pro, deepseek-payg, gemini-api-key, xai-api; M1-A5: the two
+  // interactive-only plans); every other lane is a stub until its adapter act. `deepseek-payg`
+  // being wired does not open the lane: it is repo-gated with an empty allowlist on a clean install
+  // (D-M1-8, seat pin §5). The two plans being wired does not open them headless: their status
+  // still denies every headless turn, and interactive turns need the engine presence check.
   assert.deepEqual(
     listCatalog()
       .filter((e) => e.wired)
       .map((e) => e.id)
       .sort(),
     [
+      "alibaba-coding-plan",
       "claude-code",
       "codex",
       "deepseek-payg",
       "gemini-api-key",
       "kimi-code",
+      "minimax-token-plan",
       "mistral-pro",
       "ollama-cloud",
       "xai-api",
     ],
   );
+  // M1-A5: the plan ids stay in the plan billing class; wiring them never moved them to PAYG.
+  for (const id of ["minimax-token-plan", "alibaba-coding-plan"] as const) {
+    const entry = getById(id);
+    assert.ok(entry && entry.status === "interactive-only", id);
+    assert.equal(entry.credentialClass, "plan-interactive", id);
+  }
 
   // The PAYG ids carry an honest "never verified" date and no terms page (fail-closed stale).
   for (const id of ["minimax-payg", "alibaba-model-studio-payg"] as const) {

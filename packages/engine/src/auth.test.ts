@@ -213,6 +213,8 @@ test("A2 schema test: no JSONL method accepts a secret value (pin §8.3)", () =>
     "limit",
     "cursor",
     "input",
+    // M1-A5 (protocol pin §3.3 P3): the turn's mode claim, the enum "interactive" | "headless".
+    "mode",
     "turnId",
     "providerId",
   ]);

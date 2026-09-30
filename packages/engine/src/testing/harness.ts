@@ -23,6 +23,12 @@ export const HANG_ENGINE = fileURLToPath(new URL("./hang-agent-engine.ts", impor
 export const FAILING_ENGINE = fileURLToPath(new URL("./failing-agent-engine.ts", import.meta.url));
 export const EXIT_ENGINE = fileURLToPath(new URL("./exit-engine.ts", import.meta.url));
 export const GATED_ENGINE = fileURLToPath(new URL("./gated-agent-engine.ts", import.meta.url));
+/** M1-A5: the interactive-only plan lanes on fake transports, with the REAL system terminal. */
+export const INTERACTIVE_FAKE_ENGINE = fileURLToPath(
+  new URL("./interactive-fake-engine.ts", import.meta.url),
+);
+/** M1-A5: the real system terminal in its own process (`script` pty / detached spawn tests). */
+export const PRESENCE_PROBE = fileURLToPath(new URL("./presence-probe.ts", import.meta.url));
 
 export function makeHome(): { home: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), "madc-a2-"));

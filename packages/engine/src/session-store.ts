@@ -21,6 +21,7 @@ import { dirname } from "node:path";
 import { getById, type ProviderStatus } from "@madc/registry";
 import { isStrictlyUnder } from "./home.ts";
 import { type OpenNoFollowOptions, openNoFollow } from "./lock.ts";
+import type { Presence } from "./presence/policy.ts";
 import { ErrorCode, RpcError, type SessionWriteFailedData } from "./protocol/errors.ts";
 import { isValidId } from "./protocol/ids.ts";
 import type { Item, RpcErrorBody, Thread, Turn, TurnMode, TurnStatus } from "./protocol/types.ts";
@@ -35,7 +36,29 @@ export type SessionOpenPayload = {
   providerId: string;
   pinnedModel: string;
 };
-export type TurnStartPayload = { turnId: string; inputText: string };
+/**
+ * M1-A5 TTY facts of the presence check that verified a turn (M1 plan §7 M1-A5: "TTY facts … go
+ * into `turn.start`"): the terminal's `device` (`major/minor`), its `session` id where the OS
+ * exposes one (else null), and whether this turn's presence came from a fresh `keypress` or was
+ * `carried` from an earlier confirmation on the same terminal. Present only with presence `verified`.
+ */
+export type TurnStartTty = {
+  device: string;
+  session: string | null;
+  confirmation: "keypress" | "carried";
+};
+/**
+ * `turn.start` (seat pin §4.2). M1-A5 writes `mode` (the claim; P3: absent → `headless`) and
+ * `presence` on every new line, and `tty` when presence is verified. They are optional in this type
+ * because lines written before M1-A5 carry neither; such a line reads as `headless` / `absent`.
+ */
+export type TurnStartPayload = {
+  turnId: string;
+  inputText: string;
+  mode?: TurnMode;
+  presence?: Presence;
+  tty?: TurnStartTty;
+};
 export type ItemPayload = { turnId: string; item: Item };
 export type ServedModelPayload = {
   turnId: string;
@@ -45,7 +68,7 @@ export type ServedModelPayload = {
   providerId: string;
   /** P2 (M1 protocol pin §5 / seat pin §4.2): registry status of the serving lane. */
   lane: ProviderStatus;
-  /** P2: the turn's mode — always "headless" until M1-A5 attestation. */
+  /** P2: the turn's mode — the claim (§3.3), `headless` when absent. */
   mode: TurnMode;
   /** P2: previous backing id on a fallback hop; null on the primary. */
   fallbackFrom: string | null;
@@ -163,6 +186,9 @@ export const TOKEN_PATTERNS: readonly RegExp[] = Object.freeze([
   // which the generic `sk-…` shape above only catches from 16 chars after `sk-`).
   /\bxai-[A-Za-z0-9_-]{8,}/g,
   /\bsk-sp-[A-Za-z0-9_-]{8,}/g,
+  // S6 (M1-A5): the MiniMax Token Plan Subscription Key (`sk-cp-…`, planning record MM-32..39), for
+  // the same reason as `sk-sp-…`: the generic `sk-…` shape only catches it from 16 characters.
+  /\bsk-cp-[A-Za-z0-9_-]{8,}/g,
   // S6 (M1-A4): the Gemini lane's standard Google API-key shape. `gemini-api-key` accepts AUTH keys
   // only and the auth-key shape is not documented in any pinned source, so this catches the shape
   // Google's page names as the one being retired — and the planning record's own secret grep lists
@@ -894,6 +920,8 @@ const PROVIDER_STATUSES: readonly unknown[] = [
   "forbidden",
 ];
 const TURN_MODES: readonly unknown[] = ["interactive", "headless"];
+const PRESENCES: readonly unknown[] = ["verified", "absent"];
+const TTY_CONFIRMATIONS: readonly unknown[] = ["keypress", "carried"];
 /** M1 seat pin §4.2 `repo.decision` (added by M1-A4). */
 const REPO_DECISIONS: readonly unknown[] = ["allow", "deny"];
 const REPO_ALLOW_REASONS: readonly unknown[] = ["repo-allowed", "not-repo-gated"];
@@ -963,8 +991,24 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
         isStr(p.pinnedModel)
         ? null
         : "malformed session.open payload";
-    case "turn.start":
-      return isValidId(p.turnId) && isStr(p.inputText) ? null : "malformed turn.start payload";
+    case "turn.start": {
+      // M1-A5 fields are checked when present only: lines written before M1-A5 carry none of them.
+      const tty = p.tty;
+      const ttyOk =
+        tty === undefined ||
+        (isPlainRecord(tty) &&
+          isStr(tty.device) &&
+          (tty.session === null || isStr(tty.session)) &&
+          TTY_CONFIRMATIONS.includes(tty.confirmation) &&
+          p.presence === "verified");
+      return isValidId(p.turnId) &&
+        isStr(p.inputText) &&
+        (p.mode === undefined || TURN_MODES.includes(p.mode)) &&
+        (p.presence === undefined || PRESENCES.includes(p.presence)) &&
+        ttyOk
+        ? null
+        : "malformed turn.start payload";
+    }
     case "item":
       return isValidId(p.turnId) && isM0Item(p.item) ? null : "malformed item payload";
     case "servedModel":

@@ -1,4 +1,5 @@
-import type { Item, UserInput } from "./protocol/types.ts";
+import type { Presence } from "./presence/policy.ts";
+import type { Item, TurnMode, UserInput } from "./protocol/types.ts";
 import type { EngineSeat } from "./seat.ts";
 import type { FallbackRejectedPayload, RepoDecisionPayload } from "./session-store.ts";
 
@@ -18,6 +19,16 @@ export type TurnPreflightContext = {
    * §5, fixing Copilot r4101049517.
    */
   readonly cwd: string | null;
+  /**
+   * M1-A5 (protocol pin §3.3 P3): the turn's mode CLAIM. Absent reads as `headless` (fail-closed),
+   * which keeps M0-era contexts valid. The claim alone never unlocks a lane that needs presence.
+   */
+  readonly mode?: TurnMode;
+  /**
+   * M1-A5: the engine's presence check for this turn. `verified` only when the engine confirmed a
+   * person at its own controlling terminal; absent reads as `absent` (fail-closed).
+   */
+  readonly presence?: Presence;
 };
 
 /** What the engine hands an agent for one turn. */
