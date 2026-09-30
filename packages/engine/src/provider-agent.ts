@@ -10,7 +10,7 @@
  *    `/api/tags` list for ollama-cloud (shape-checked here, membership at call time), a non-empty
  *    vendor model name for claude-code (else -32006 with the seat file path);
  * 4. the backing can run: direct lanes need a usable credential (else -32008 `no-credentials`);
- *    claude-code / codex need their unmodified binary detected on PATH (else -32008
+ *    claude-code / codex / grok-build need their unmodified binary detected on PATH (else -32008
  *    `binary-missing`).
  *
  * Preflight is side-effect free (no port, no child process; binary detection is a read-only PATH
@@ -30,7 +30,15 @@
  * Non-quota failures keep the M0 path (no fallback): -32603, or -32008 for `binary-missing`.
  *
  * A `-32008` raised after `turn/start` has returned (e.g. the vendor binary vanishes between
- * preflight and spawn) ends the turn `failed` per protocol pin §4.2.
+ * preflight and spawn, or Grok Build reports no usable sign-in) ends the turn `failed` per protocol
+ * pin §4.2.
+ *
+ * M1-A6 (Grok Build over the generic ACP client): the vendor agent's own tool activity becomes
+ * `toolCall` / `toolResult` items — a `toolCall` opens at the first sight of a call and completes
+ * with its final input when the call reaches a terminal status, immediately followed by its
+ * `toolResult` (`callId` = the toolCall item id). A call still open when the vendor turn ends is
+ * completed without a result, before the `agentMessage`, so the happy-path order stays
+ * `userMessage` → tool items → `agentMessage` → `servedModel` (protocol pin §5).
  *
  * M1-A5: every `assertAllowed` check uses the turn's mode claim, except that a lane needing a person
  * (interactive-only, or direct with headless denied) is checked as `headless` unless the engine
@@ -42,14 +50,18 @@ import {
   CODEX_PROVIDER_ID,
   findClaudeBinary,
   findCodexBinary,
+  findGrokBinary,
+  GROK_BUILD_PROVIDER_ID,
   KIMI_CODE_PROVIDER_ID,
   type KimiCredential,
   type PinnedModelResolution,
   ProviderCallError,
   type ProviderPort,
+  type ProviderToolEvent,
   type ProviderTurnResult,
   resolveClaudePinnedModel,
   resolveCodexPinnedModel,
+  resolveGrokPinnedModel,
   resolveKimiPinnedModel,
 } from "@madc/adapters";
 import {
@@ -123,6 +135,17 @@ export type ProviderAgentOptions = {
    * Tests inject a fixed answer.
    */
   readonly detectCodexBinary?: () => string | null;
+  /**
+   * M1-A6: builds the Grok Build port (generic ACP client) for a detected binary path. Its presence
+   * means the grok-build adapter is in this build (production always passes it; fixtures without
+   * it keep the -32008 `unwired` path honest).
+   */
+  readonly createGrokPort?: (binaryPath: string) => ProviderPort;
+  /**
+   * M1-A6: how the `grok` binary is detected. Default: read-only PATH lookup at preflight time.
+   * Tests inject a fixed answer.
+   */
+  readonly detectGrokBinary?: () => string | null;
   /** stderr logger (never receives secrets or upstream text). */
   readonly log?: (line: string) => void;
   /**
@@ -152,6 +175,12 @@ type TurnPlan =
   | {
       readonly kind: "vendor";
       readonly providerId: typeof CODEX_PROVIDER_ID;
+      readonly binaryPath: string;
+      readonly modelId: string;
+    }
+  | {
+      readonly kind: "vendor";
+      readonly providerId: typeof GROK_BUILD_PROVIDER_ID;
       readonly binaryPath: string;
       readonly modelId: string;
     };
@@ -203,6 +232,7 @@ function providerUnavailable(
 export function createProviderAgent(options: ProviderAgentOptions): Agent {
   const detectClaudeBinary = options.detectClaudeBinary ?? (() => findClaudeBinary(process.env));
   const detectCodexBinary = options.detectCodexBinary ?? (() => findCodexBinary(process.env));
+  const detectGrokBinary = options.detectGrokBinary ?? (() => findGrokBinary(process.env));
 
   // Effective direct lanes: the M0 legacy kimi options synthesize a kimi lane (so M0 fixtures and
   // tests behave identically); explicit directLanes entries win over the synthesis.
@@ -222,6 +252,7 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
   const directPorts = new Map<string, ProviderPort>();
   let claudePort: { readonly binaryPath: string; readonly port: ProviderPort } | undefined;
   let codexPort: { readonly binaryPath: string; readonly port: ProviderPort } | undefined;
+  let grokPort: { readonly binaryPath: string; readonly port: ProviderPort } | undefined;
 
   const seatInvalid = (ctx: TurnPreflightContext, issue: string): RpcError =>
     new RpcError(ErrorCode.SeatInvalid, "Seat invalid", {
@@ -283,6 +314,21 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
       return { kind: "vendor", providerId: CODEX_PROVIDER_ID, binaryPath, modelId: model.modelId };
     }
 
+    if (providerId === GROK_BUILD_PROVIDER_ID) {
+      // Registry-allowed but no adapter in this build (fixtures that omit the grok-build adapter).
+      if (options.createGrokPort === undefined) throw providerUnavailable(providerId, "unwired");
+      const model = resolveGrokPinnedModel(ctx.seat.pinnedModel);
+      if (!model.ok) throw seatInvalid(ctx, model.issue);
+      const binaryPath = detectGrokBinary();
+      if (binaryPath === null) throw providerUnavailable(providerId, "binary-missing");
+      return {
+        kind: "vendor",
+        providerId: GROK_BUILD_PROVIDER_ID,
+        binaryPath,
+        modelId: model.modelId,
+      };
+    }
+
     // Registry-allowed but no adapter in this build.
     throw providerUnavailable(providerId, "unwired");
   };
@@ -307,6 +353,14 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
       }
       return claudePort.port;
     }
+    if (planned.providerId === GROK_BUILD_PROVIDER_ID) {
+      const createGrokPort = options.createGrokPort;
+      if (createGrokPort === undefined) throw providerUnavailable(planned.providerId, "unwired");
+      if (grokPort?.binaryPath !== planned.binaryPath) {
+        grokPort = { binaryPath: planned.binaryPath, port: createGrokPort(planned.binaryPath) };
+      }
+      return grokPort.port;
+    }
     const createCodexPort = options.createCodexPort;
     if (createCodexPort === undefined) throw providerUnavailable(planned.providerId, "unwired");
     if (codexPort?.binaryPath !== planned.binaryPath) {
@@ -325,6 +379,71 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
     };
     sink.startItem(item);
     sink.completeItem(item);
+  };
+
+  /**
+   * M1-A6: maps one attempt's vendor tool events onto `toolCall` / `toolResult` items. `callId`s
+   * are adapter-scoped; the engine mints its own item ids. `closeOpen` completes every call that
+   * never reached a result (no `toolResult` is invented for it).
+   */
+  const toolItemsFor = (sink: TurnSink) => {
+    const calls = new Map<
+      string,
+      { readonly itemId: string; name: string; arguments: unknown; done: boolean }
+    >();
+    const completeCall = (call: { itemId: string; name: string; arguments: unknown }): void => {
+      sink.completeItem({
+        id: call.itemId,
+        kind: "toolCall",
+        status: "completed",
+        name: call.name,
+        arguments: call.arguments,
+      });
+    };
+    return {
+      onToolEvent(event: ProviderToolEvent): void {
+        let call = calls.get(event.callId);
+        if (call === undefined) {
+          call = {
+            itemId: sink.newItemId(),
+            name: event.name,
+            arguments: event.arguments,
+            done: false,
+          };
+          calls.set(event.callId, call);
+          sink.startItem({
+            id: call.itemId,
+            kind: "toolCall",
+            status: "inProgress",
+            name: call.name,
+            arguments: call.arguments,
+          });
+        }
+        if (event.kind !== "result" || call.done) return;
+        call.done = true;
+        call.name = event.name;
+        call.arguments = event.arguments;
+        completeCall(call);
+        const result: Item = {
+          id: sink.newItemId(),
+          kind: "toolResult",
+          status: "completed",
+          callId: call.itemId,
+          name: event.name,
+          output: event.output,
+          isError: event.isError,
+        };
+        sink.startItem(result);
+        sink.completeItem(result);
+      },
+      closeOpen(): void {
+        for (const call of calls.values()) {
+          if (call.done) continue;
+          call.done = true;
+          completeCall(call);
+        }
+      },
+    };
   };
 
   // M1-A4: deny-everywhere when nothing was loaded, so an unwired policy can never widen a lane.
@@ -458,6 +577,7 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
         const turnPort = portFor(current);
         const id = sink.newItemId();
         sink.startItem({ id, kind: "agentMessage", status: "inProgress", text: "" });
+        const toolItems = toolItemsFor(sink);
         let result: ProviderTurnResult;
         try {
           result = await turnPort.streamTurn({
@@ -466,6 +586,7 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
             messages: [{ role: "user", text: ctx.input.map((part) => part.text).join("\n") }],
             signal: sink.signal,
             onTextDelta: (delta) => sink.delta(id, delta),
+            onToolEvent: toolItems.onToolEvent,
           });
         } catch (err) {
           if (sink.signal.aborted) return;
@@ -499,8 +620,8 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
           }
           if (err instanceof ProviderCallError) {
             options.log?.(`provider ${turnPort.providerId}: ${err.message}`);
-            if (err.reason === "binary-missing") {
-              throw providerUnavailable(turnPort.providerId, "binary-missing");
+            if (err.reason === "binary-missing" || err.reason === "no-credentials") {
+              throw providerUnavailable(turnPort.providerId, err.reason);
             }
             throw internalError(err.message);
           }
@@ -508,6 +629,7 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
           throw internalError("Provider request failed");
         }
         if (sink.signal.aborted) return;
+        toolItems.closeOpen();
         sink.completeItem({ id, kind: "agentMessage", status: "completed", text: result.text });
         const servingEntry = getById(current.providerId);
         const receipt: ServedModelItem = {

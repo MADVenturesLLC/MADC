@@ -19,6 +19,8 @@ export const CLAUDE_FAKE_ENGINE = fileURLToPath(
   new URL("./claude-fake-engine.ts", import.meta.url),
 );
 export const CODEX_FAKE_ENGINE = fileURLToPath(new URL("./codex-fake-engine.ts", import.meta.url));
+/** M1-A6: grok-build over the generic ACP client and the fake ACP agent child. */
+export const GROK_FAKE_ENGINE = fileURLToPath(new URL("./grok-fake-engine.ts", import.meta.url));
 export const HANG_ENGINE = fileURLToPath(new URL("./hang-agent-engine.ts", import.meta.url));
 export const FAILING_ENGINE = fileURLToPath(new URL("./failing-agent-engine.ts", import.meta.url));
 export const EXIT_ENGINE = fileURLToPath(new URL("./exit-engine.ts", import.meta.url));
