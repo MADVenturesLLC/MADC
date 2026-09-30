@@ -1635,11 +1635,8 @@ export class WitnessApp {
     // R-g: one final verify after the engine exits, bounded (O-1) — except when there is no
     // thread (R-g) or a signal arrives during the verify (O-2, below).
     let finalVerifyFailed = false;
-<<<<<<< HEAD
     // Round 7 / remote autofix bb13744: the initializer is dead — every path that reads
     // finalVerify reassigns it first. Start at null, matching the merged remote head.
-=======
->>>>>>> bb13744fc2a7a3ec5661fd7744b2054992b732cd
     let finalVerify: ChainVerify | null = null;
     if (this.threadId !== null && this.sessionPath !== null) {
       // §5.8.1 O-2 window: a signal while this verify (or the exit write below) runs takes the
