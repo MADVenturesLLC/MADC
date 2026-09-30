@@ -47,6 +47,14 @@ export type PinnedModelResolution =
   | { readonly ok: true; readonly modelId: string }
   | { readonly ok: false; readonly issue: string };
 
+/**
+ * A lane's credential-class verdict (M1-A5, Founder ruling 12). `issue` names the lane and the rule
+ * and NEVER the credential value, so it is safe for stderr.
+ */
+export type CredentialCheck =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly issue: string };
+
 export type DirectKeyPortConfig = {
   /** Registry provider id (== seat backing); used in error messages and receipts. */
   readonly providerId: string;
@@ -63,6 +71,13 @@ export type DirectKeyPortConfig = {
    * model list is never the truth (plan A3 forbidden list).
    */
   readonly refreshProvider?: () => Promise<Provider<Api>>;
+  /**
+   * M1-A5: the model record for a lane that has NEITHER a pinned pi-ai catalog NOR a listing
+   * endpoint (the Alibaba Coding Plan). The requested id is passed through as-is and the vendor's
+   * reply is the only model truth; the record carries no invented metadata. Consulted only when
+   * the static catalog does not list the id; a lane never sets both this and `refreshProvider`.
+   */
+  readonly unlistedModel?: (modelId: string) => Model<DirectWireApi>;
   /** Honest madc UA (registry `clientIdentity: "honest-ua-required"`); omit for pi-ai default. */
   readonly userAgent?: string;
   /** Test seam: override the catalog base URL. Production never sets it. */
@@ -132,9 +147,9 @@ export function createDirectKeyPort(config: DirectKeyPortConfig): ProviderPort {
 
   const resolveModel = (modelId: string): Model<DirectWireApi> | undefined => {
     const model = catalog.getModel(config.piProvider, modelId);
-    return model !== undefined && model.api === config.api
-      ? (model as Model<DirectWireApi>)
-      : undefined;
+    if (model !== undefined && model.api === config.api) return model as Model<DirectWireApi>;
+    const unlisted = config.unlistedModel?.(modelId);
+    return unlisted !== undefined && unlisted.api === config.api ? unlisted : undefined;
   };
 
   /** One dynamic refresh at a time; failures propagate to the caller (mapped to ProviderCallError). */

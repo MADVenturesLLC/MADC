@@ -564,6 +564,8 @@ const PI_AI_IMPORTERS: readonly string[] = [
   "adapters/src/providers/deepseek.ts",
   "adapters/src/providers/gemini.ts",
   "adapters/src/providers/xai.ts",
+  "adapters/src/providers/minimax.ts",
+  "adapters/src/providers/alibaba-coding.ts",
   "adapters/src/providers/direct-key-conformance.test.ts",
 ];
 

@@ -3,7 +3,9 @@
  * Kimi Code lane over pinned pi-ai (Act M0-A3), the Ollama Cloud lane (Act M1-A3) and the M1-A4
  * direct-key batch — Mistral, DeepSeek, Gemini (auth key) and the xAI API — plus the unmodified
  * Claude Code vendor binary (Act M0-A5) and the unmodified Codex vendor binary via
- * `codex app-server` (Act M0-A6). Only this package imports `@earendil-works/pi-ai` (exact pin
+ * `codex app-server` (Act M0-A6), plus the M1-A5 interactive-only plans — MiniMax Token Plan and the
+ * Alibaba Cloud Coding Plan — whose credential-class rules live here and whose presence gate lives in
+ * the engine. Only this package imports `@earendil-works/pi-ai` (exact pin
  * 0.87.1, plan §6) — the pi-ai importers are `kimi-code.ts`, `direct/generic.ts` and the lane
  * modules under `providers/` (M1-A3 generalizes the M0 "only kimi-code.ts" rule to the
  * direct-key lane modules; M1-A4 adds four more).
@@ -29,6 +31,7 @@ export {
   resolveCodexPinnedModel,
 } from "./codex.ts";
 export {
+  type CredentialCheck,
   createDirectKeyPort,
   type DirectKeyPortConfig,
   type DirectWireApi,
@@ -63,6 +66,22 @@ export {
   type ProviderTurnResult,
 } from "./provider-port.ts";
 export {
+  ALIBABA_CODING_PLAN_API_KEY_ENV,
+  ALIBABA_CODING_PLAN_BASE_URL,
+  ALIBABA_CODING_PLAN_PI_PROVIDER,
+  ALIBABA_CODING_PLAN_PROVIDER_ID,
+  ALIBABA_CODING_PLAN_WIRE_API,
+  ALIBABA_PAYG_PROVIDER_ID,
+  ALIBABA_PLAN_KEY_PREFIX,
+  type AlibabaClass,
+  type AlibabaCodingPlanPortOptions,
+  alibabaEndpointClass,
+  alibabaKeyClass,
+  checkAlibabaCredential,
+  createAlibabaCodingPlanPort,
+  resolveAlibabaCodingPlanPinnedModel,
+} from "./providers/alibaba-coding.ts";
+export {
   buildDeepseekProvider,
   createDeepseekPort,
   DEEPSEEK_API_KEY_ENV,
@@ -89,6 +108,20 @@ export {
   looksLikeStandardGeminiKey,
   resolveGeminiPinnedModel,
 } from "./providers/gemini.ts";
+export {
+  checkMinimaxCredential,
+  createMinimaxTokenPlanPort,
+  MINIMAX_BASE_URL,
+  MINIMAX_PAYG_PROVIDER_ID,
+  MINIMAX_PI_PROVIDER,
+  MINIMAX_PLAN_KEY_PREFIX,
+  MINIMAX_TOKEN_PLAN_API_KEY_ENV,
+  MINIMAX_TOKEN_PLAN_PROVIDER_ID,
+  MINIMAX_WIRE_API,
+  type MinimaxTokenPlanPortOptions,
+  minimaxCatalogModelIds,
+  resolveMinimaxPinnedModel,
+} from "./providers/minimax.ts";
 export {
   buildMistralProvider,
   createMistralPort,
