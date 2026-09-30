@@ -5,6 +5,29 @@
 
 export type ProviderMessage = { readonly role: "user"; readonly text: string };
 
+/**
+ * A vendor agent's own tool activity, reported by adapters that can see it (M1-A6: the ACP client
+ * maps `tool_call` / `tool_call_update`). `callId` is adapter-scoped and stable for one call; the
+ * engine turns a `call` into a `toolCall` item and the matching `result` into a `toolResult` item
+ * (protocol pin §5). `arguments` is the latest JSON-serializable input the vendor reported (or
+ * null), and a `result` carries it again so the engine can close the call with its final input.
+ */
+export type ProviderToolEvent =
+  | {
+      readonly kind: "call";
+      readonly callId: string;
+      readonly name: string;
+      readonly arguments: unknown;
+    }
+  | {
+      readonly kind: "result";
+      readonly callId: string;
+      readonly name: string;
+      readonly arguments: unknown;
+      readonly output: string;
+      readonly isError: boolean;
+    };
+
 export type ProviderTurnRequest = {
   /** Bare catalog model id for the backing's pi-ai provider, e.g. `kimi-for-coding`. */
   readonly modelId: string;
@@ -13,6 +36,11 @@ export type ProviderTurnRequest = {
   readonly signal: AbortSignal;
   /** Called for every streamed assistant text chunk, in order. */
   onTextDelta(delta: string): void;
+  /**
+   * M1-A6: called for every vendor tool event, in order, by adapters that surface them (the ACP
+   * client). Optional: direct lanes and the M0 vendor adapters never call it.
+   */
+  onToolEvent?(event: ProviderToolEvent): void;
 };
 
 export type ProviderTurnResult = {
@@ -38,6 +66,9 @@ export type ProviderPort = {
   streamTurn(request: ProviderTurnRequest): Promise<ProviderTurnResult>;
 };
 
+/** The pinned -32008 reasons an adapter can attach to a failed call (protocol pin §4.1). */
+export type ProviderCallErrorReason = "binary-missing" | "quota-or-unreachable" | "no-credentials";
+
 /**
  * A provider call that did not produce a result. `message` is written by MAD and never contains
  * upstream response text, request headers, or credentials — safe for the wire and for logs.
@@ -49,16 +80,18 @@ export class ProviderCallError extends Error {
   /**
    * Pinned -32008 reason when the failure means the provider cannot run at all (A5: the vendor
    * binary vanished between preflight and spawn), or the recorded quota-or-unreachable signal
-   * (M1-A3, protocol pin P5: HTTP 429/502 from a direct lane, which the fallback logic consumes).
-   * Absent for ordinary call failures (-32603).
+   * (M1-A3, protocol pin P5: HTTP 429/502 from a direct lane, which the fallback logic consumes),
+   * or `no-credentials` when a vendor agent that owns its login reports it has none usable (M1-A6:
+   * an ACP agent offering no usable auth method, or refusing `authenticate`). Absent for ordinary
+   * call failures (-32603).
    */
-  readonly reason?: "binary-missing" | "quota-or-unreachable";
+  readonly reason?: ProviderCallErrorReason;
 
   constructor(
     kind: "aborted" | "failed",
     status: number | null,
     message: string,
-    reason?: "binary-missing" | "quota-or-unreachable",
+    reason?: ProviderCallErrorReason,
   ) {
     super(message);
     this.name = "ProviderCallError";

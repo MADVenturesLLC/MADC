@@ -21,8 +21,8 @@ function deepFreeze<T extends object>(value: T): T {
  * `wired: true` only where the lane is actually wired in this build: kimi-code, claude-code and
  * codex from M0, ollama-cloud from M1-A3, mistral-pro / deepseek-payg / gemini-api-key / xai-api
  * from M1-A4, and the interactive-only plans minimax-token-plan / alibaba-coding-plan from M1-A5
- * (roadmap §3 rows 8 and 9). The two PAYG ids stay unwired until a PAYG terms source is cited, and
- * Grok Build flips in M1-A6. `ollama-cloud` ships
+ * (roadmap §3 rows 8 and 9), and grok-build from M1-A6 (vendor agent via the generic ACP client). The
+ * two PAYG ids stay unwired until a PAYG terms source is cited. `ollama-cloud` ships
  * headless: "denied" (D-M1-3): headless flips only with a reviewed catalog change adding
  * headlessPermission. `deepseek-payg` being wired does NOT open the lane: it is repo-gated with an
  * empty allowlist on a clean install (D-M1-8, seat pin §5), so every repo denies.
@@ -178,7 +178,13 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     connect: "vendor-agent",
     wire: "vendor-cli",
     clientIdentity: "default",
-    wired: false,
+    // Wired by M1-A6 (roadmap §3 row 11 (c): Grok Build — allowed-via-vendor-agent): the unmodified
+    // `grok` binary spawned as `grok --no-auto-update agent --no-leader --model=<id> stdio` and
+    // driven over ACP by the generic client. Grok authenticates itself (its own login, or
+    // XAI_API_KEY if the Founder chooses the API-key class); madc never reads ~/.grok, never uses
+    // pi-ai's xAI OAuth, and never passes --always-approve. D-R4 default: only this path and the
+    // xai-api key path are wired until the Founder reads the xAI AUP compete clause.
+    wired: true,
     credentialClass: "vendor-session",
     verifiedAt: "2026-09-24",
     termsUrl: "https://docs.x.ai/build/cli/headless-scripting.md",

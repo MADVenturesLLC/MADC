@@ -84,9 +84,9 @@ test("catalog v2: every roadmap §3 row, the forbidden sub-paths, and the M1 ids
 
   // Live wiring is the M0 three plus the lanes whose adapter acts have landed (M1-A3:
   // ollama-cloud; M1-A4: mistral-pro, deepseek-payg, gemini-api-key, xai-api; M1-A5: the two
-  // interactive-only plans); every other lane is a stub until its adapter act. `deepseek-payg`
-  // being wired does not open the lane: it is repo-gated with an empty allowlist on a clean install
-  // (D-M1-8, seat pin §5). The two plans being wired does not open them headless: their status
+  // interactive-only plans; M1-A6: grok-build via the generic ACP client); every other lane is a
+  // stub until its adapter act. `deepseek-payg` being wired does not open the lane: it is
+  // repo-gated with an empty allowlist on a clean install (D-M1-8, seat pin §5). The two plans being wired does not open them headless: their status
   // still denies every headless turn, and interactive turns need the engine presence check.
   assert.deepEqual(
     listCatalog()
@@ -99,6 +99,7 @@ test("catalog v2: every roadmap §3 row, the forbidden sub-paths, and the M1 ids
       "codex",
       "deepseek-payg",
       "gemini-api-key",
+      "grok-build",
       "kimi-code",
       "minimax-token-plan",
       "mistral-pro",
@@ -106,6 +107,16 @@ test("catalog v2: every roadmap §3 row, the forbidden sub-paths, and the M1 ids
       "xai-api",
     ],
   );
+  // M1-A6: grok-build is wired as a vendor agent only — the consumer sign-in path stays forbidden
+  // and unwired (D-R4: xAI API key + Grok Build only), and wiring kept its vendor-session class.
+  const grok = getById("grok-build");
+  assert.ok(grok && grok.status === "allowed-via-vendor-agent");
+  assert.equal(grok.connect, "vendor-agent");
+  assert.equal(grok.credentialClass, "vendor-session");
+  const consumer = getById("xai-consumer-signin");
+  assert.ok(consumer);
+  assert.equal(consumer.status, "forbidden");
+  assert.equal(consumer.wired, false);
   // M1-A5: the plan ids stay in the plan billing class; wiring them never moved them to PAYG.
   for (const id of ["minimax-token-plan", "alibaba-coding-plan"] as const) {
     const entry = getById(id);

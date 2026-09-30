@@ -5,7 +5,8 @@
  * Claude Code vendor binary (Act M0-A5) and the unmodified Codex vendor binary via
  * `codex app-server` (Act M0-A6), plus the M1-A5 interactive-only plans — MiniMax Token Plan and the
  * Alibaba Cloud Coding Plan — whose credential-class rules live here and whose presence gate lives in
- * the engine. Only this package imports `@earendil-works/pi-ai` (exact pin
+ * the engine, plus the M1-A6 generic ACP client (`vendor/acp-client/`) driving the unmodified Grok
+ * Build binary (`vendor/grok-build.ts`, `grok agent stdio`). Only this package imports `@earendil-works/pi-ai` (exact pin
  * 0.87.1, plan §6) — the pi-ai importers are `kimi-code.ts`, `direct/generic.ts` and the lane
  * modules under `providers/` (M1-A3 generalizes the M0 "only kimi-code.ts" rule to the
  * direct-key lane modules; M1-A4 adds four more).
@@ -60,8 +61,10 @@ export {
 } from "./kimi-code.ts";
 export {
   ProviderCallError,
+  type ProviderCallErrorReason,
   type ProviderMessage,
   type ProviderPort,
+  type ProviderToolEvent,
   type ProviderTurnRequest,
   type ProviderTurnResult,
 } from "./provider-port.ts";
@@ -160,3 +163,31 @@ export {
   type XaiPortOptions,
   xaiCatalogModelIds,
 } from "./providers/xai.ts";
+export {
+  ACP_PROTOCOL_VERSION,
+  type AcpAgentSpec,
+  type AcpAuthChoice,
+  type AcpAuthMethod,
+  type AcpPortOptions,
+  type AcpSpawn,
+  createAcpPort,
+  findAgentBinary,
+} from "./vendor/acp-client/index.ts";
+export {
+  createGrokBuildPort,
+  findGrokBinary,
+  GROK_API_KEY_ENV,
+  GROK_AUTH_API_KEY,
+  GROK_AUTH_CACHED_TOKEN,
+  GROK_BINARY_NAME,
+  GROK_BUILD_PROVIDER_ID,
+  GROK_TRAILING_MAX_MS,
+  GROK_TRAILING_QUIET_MS,
+  type GrokBuildPortOptions,
+  type GrokPinnedModelResolution,
+  grokApiKeyPresent,
+  grokBuildArgs,
+  grokBuildSpec,
+  resolveGrokPinnedModel,
+  selectGrokAuth,
+} from "./vendor/grok-build.ts";
