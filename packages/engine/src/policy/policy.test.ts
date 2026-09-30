@@ -20,6 +20,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -49,9 +50,29 @@ function makeRoot(): string {
   return mkdtempSync(join(realpathSync(tmpdir()), "madc-m1a4-"));
 }
 
+/**
+ * Create a repository at `dir` (`git` is only ever called with `init` here). The path is passed to
+ * `git init` EXPLICITLY rather than only through the child's cwd, and the result is VERIFIED, with
+ * one bounded retry: under the full parallel suite `git init` has been observed to exit 0 without
+ * producing `.git`. That matters beyond test hygiene — the `git config` calls that follow would
+ * otherwise resolve into whatever repository git could find instead, which is how a fixture value
+ * reached this repository's own shared config during this act.
+ */
 function git(dir: string, ...args: string[]): void {
   mkdirSync(dir, { recursive: true });
-  execFileSync("git", args, { cwd: dir, stdio: ["ignore", "ignore", "pipe"] });
+  for (let attempt = 1; ; attempt += 1) {
+    execFileSync("git", [...args, "--", dir], {
+      cwd: dir,
+      stdio: ["ignore", "ignore", "pipe"],
+    });
+    if (existsSync(join(dir, ".git"))) return;
+    assert.ok(
+      attempt < 2,
+      `git init created no repository at ${dir} after ${attempt} attempts (listing: ${JSON.stringify(
+        readdirSync(dir),
+      )})`,
+    );
+  }
 }
 
 /**

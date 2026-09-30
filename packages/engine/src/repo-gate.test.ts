@@ -21,6 +21,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -62,14 +63,50 @@ function makeRoot(): string {
   return mkdtempSync(join(realpathSync(tmpdir()), "madc-a4-gate-"));
 }
 
+/**
+ * `git init` with the target path passed EXPLICITLY rather than through the child's `cwd`, and one
+ * bounded retry. Under the full parallel suite `git init` has been observed to exit 0 without
+ * producing `.git`; the retry absorbs that transient, and a persistent failure still fails loudly
+ * with diagnostics. That matters beyond test hygiene: the `git config` that follows would otherwise
+ * resolve into whatever repository git could find instead, which is how a fixture value ended up
+ * written into this repository's own shared config during this act.
+ */
+function initRepo(dir: string): void {
+  mkdirSync(dir, { recursive: true });
+  for (let attempt = 1; ; attempt += 1) {
+    execFileSync("git", ["init", "--quiet", "--", dir], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    if (existsSync(join(dir, ".git"))) return;
+    if (attempt >= 2) {
+      let gitDir = "(git rev-parse --absolute-git-dir failed)";
+      try {
+        gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], {
+          cwd: dir,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "pipe"],
+        }).trim();
+      } catch {
+        // An unusable git-dir is itself part of the finding.
+      }
+      assert.fail(
+        [
+          `git init created no repository at ${dir} after ${attempt} attempts`,
+          `git-dir resolves to: ${gitDir}`,
+          `dir listing: ${JSON.stringify(readdirSync(dir))}`,
+          `GIT_DIR=${process.env.GIT_DIR ?? "(unset)"}`,
+          `GIT_WORK_TREE=${process.env.GIT_WORK_TREE ?? "(unset)"}`,
+        ].join("\n"),
+      );
+    }
+  }
+}
+
 /** A real git checkout with one `origin`. Returns its realpath'd top-level. */
 function makeRepo(parent: string, name: string, originUrl: string): string {
   const dir = join(parent, name);
-  mkdirSync(dir, { recursive: true });
-  execFileSync("git", ["init", "--quiet"], { cwd: dir, stdio: ["ignore", "ignore", "pipe"] });
-  // Fail loudly here rather than later: if `init` did not create a repository, the `git config`
-  // below would resolve to some ANCESTOR repository and write there instead.
-  assert.ok(existsSync(join(dir, ".git")), `git init created no repository at ${dir}`);
+  initRepo(dir);
   execFileSync("git", ["config", "--local", "--replace-all", "remote.origin.url", originUrl], {
     cwd: dir,
     stdio: ["ignore", "ignore", "pipe"],
