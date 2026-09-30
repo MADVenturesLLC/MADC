@@ -31,6 +31,11 @@
  *
  * A `-32008` raised after `turn/start` has returned (e.g. the vendor binary vanishes between
  * preflight and spawn) ends the turn `failed` per protocol pin §4.2.
+ *
+ * M1-A5: every `assertAllowed` check uses the turn's mode claim, except that a lane needing a person
+ * (interactive-only, or direct with headless denied) is checked as `headless` unless the engine
+ * verified presence for this turn — so it is refused with its own headless reason. The receipt's
+ * `mode` is the claim (`headless` when absent). This agent never probes the terminal itself.
  */
 import {
   CLAUDE_CODE_PROVIDER_ID,
@@ -58,6 +63,7 @@ import {
 import type { Agent, AgentTurnContext, TurnPreflightContext, TurnSink } from "./agent.ts";
 import { type RepoIdentityDeps, resolveRepoIdentity } from "./policy/identity.ts";
 import { denyAllRepoPolicy, isRepoGated, type RepoPolicy } from "./policy/store.ts";
+import { effectiveLaneMode } from "./presence/policy.ts";
 import {
   ErrorCode,
   internalError,
@@ -66,7 +72,12 @@ import {
   RpcError,
   type SeatInvalidData,
 } from "./protocol/errors.ts";
-import { ENGINE_TURN_MODE, type Item, type ServedModelItem } from "./protocol/types.ts";
+import {
+  DEFAULT_TURN_MODE,
+  type Item,
+  type ServedModelItem,
+  type TurnMode,
+} from "./protocol/types.ts";
 import { laneMismatch } from "./seats/lane.ts";
 
 /**
@@ -159,12 +170,20 @@ type Walk =
 const NONE: Walk = Object.freeze({ kind: "none" });
 const HALT: Walk = Object.freeze({ kind: "halt" });
 
+/** The turn's mode claim (P3): absent → `headless`, fail-closed (M0-era contexts carry none). */
+function turnMode(ctx: TurnPreflightContext): TurnMode {
+  return ctx.mode ?? DEFAULT_TURN_MODE;
+}
+
 /**
- * Engine turns are non-interactive provider calls until M1-A5 lands mode attestation: `headless`
- * is the fail-closed mode for every `assertAllowed` check and every receipt. Shared with the
- * server's M1-A4 repo gate so the two cannot disagree (protocol types, `ENGINE_TURN_MODE`).
+ * M1-A5: the mode a lane is asked to serve on this turn — the claim, except that a lane needing a
+ * person sees `headless` unless the ENGINE verified presence for this turn (`presence/policy.ts`).
+ * One rule for the primary, every fallback candidate and the fallback repo gate, so a claim alone
+ * can never move a turn into an interactive-only or headless-denied lane.
  */
-const TURN_MODE = ENGINE_TURN_MODE;
+function laneMode(entry: ProviderEntry | undefined, ctx: TurnPreflightContext): TurnMode {
+  return effectiveLaneMode(entry, turnMode(ctx), ctx.presence ?? "absent");
+}
 
 /** Intent `connect` per seat pin §2: from the registry entry; unknown ids fail closed as direct. */
 function connectFor(entry: ProviderEntry | undefined): ConnectPreference {
@@ -216,7 +235,7 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
     try {
       assertAllowed({
         providerId,
-        mode: TURN_MODE,
+        mode: laneMode(entry, ctx),
         connect: connectFor(entry),
         requireLive: true,
       });
@@ -343,7 +362,7 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
       const repoGateFor = (candidate: string): "proceed" | "skip" | "halt" => {
         if (!isRepoGated(candidate)) return "proceed";
         const entry = getById(candidate);
-        if (entry === undefined || !canServe(entry, TURN_MODE)) return "proceed";
+        if (entry === undefined || !canServe(entry, laneMode(entry, ctx))) return "proceed";
         const decision = repoPolicy.decide(
           candidate,
           resolveRepoIdentity(ctx.cwd, options.repoIdentityDeps ?? {}),
@@ -502,7 +521,9 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
           // planFor passed assertAllowed for this id, so the entry exists; "forbidden" is the
           // fail-closed default for the impossible case.
           lane: servingEntry?.status ?? "forbidden",
-          mode: TURN_MODE,
+          // P2: the turn's mode. A lane that needs presence only serves with presence verified, so
+          // for every served turn this is also the mode the lane was asked to serve.
+          mode: turnMode(ctx),
           fallbackFrom,
           // P2 honesty rule: adapters set vendorReported when they KNOW the vendor reported an
           // identity (OpenAI-compat lanes); elsewhere pi-ai sets responseModel only when it

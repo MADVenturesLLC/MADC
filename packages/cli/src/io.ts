@@ -10,6 +10,11 @@ export type CliIO = {
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly stdoutIsTTY: boolean;
   readonly stderrIsTTY: boolean;
+  /**
+   * M1-A5: stdin is a TTY (one of the facts behind the turn mode claim, `mode.ts`). Optional so
+   * existing IO fixtures keep working; absent reads as `false`, which can only claim `headless`.
+   */
+  readonly stdinIsTTY?: boolean;
   readonly cwd: string;
   /**
    * Engine entry script. Undefined = the real engine (`@madc/engine/client` default). Only the
@@ -26,12 +31,39 @@ export function processIO(engineEntry?: string): CliIO {
     env: process.env,
     stdoutIsTTY: process.stdout.isTTY === true,
     stderrIsTTY: process.stderr.isTTY === true,
+    stdinIsTTY: process.stdin.isTTY === true,
     // §3e E16 F-130: read lazily — only the one-shot needs cwd, and a deleted current directory
     // must not break `--version`, `--help`, usage errors or doctor.
     get cwd() {
       return process.cwd();
     },
     engineEntry,
+  };
+}
+
+/**
+ * The real process IO with guarded stdout/stderr. Every TTY fact is forwarded, including
+ * `stdinIsTTY`, which the M1-A5 mode claim needs (Copilot review of PR #39: `bin.ts` dropped it, so
+ * no non-`-p` surface could ever claim `interactive`).
+ */
+export function wrapProcessIO(
+  base: CliIO,
+  stdout: CliIO["stdout"],
+  stderr: CliIO["stderr"],
+): CliIO {
+  return {
+    stdout,
+    stderr,
+    stdin: base.stdin,
+    env: base.env,
+    stdoutIsTTY: base.stdoutIsTTY,
+    stderrIsTTY: base.stderrIsTTY,
+    ...(base.stdinIsTTY !== undefined ? { stdinIsTTY: base.stdinIsTTY } : {}),
+    // F-130: lazy on purpose — only the one-shot reads cwd, and a deleted cwd must not throw here.
+    get cwd() {
+      return base.cwd;
+    },
+    ...(base.engineEntry !== undefined ? { engineEntry: base.engineEntry } : {}),
   };
 }
 

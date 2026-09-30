@@ -19,9 +19,10 @@ function deepFreeze<T extends object>(value: T): T {
  * §7 M1-A1 (PAYG terms not re-verified on 2026-09-24 → wired: false, verifiedAt: "").
  *
  * `wired: true` only where the lane is actually wired in this build: kimi-code, claude-code and
- * codex from M0, ollama-cloud from M1-A3, and mistral-pro / deepseek-payg / gemini-api-key /
- * xai-api from M1-A4. The MiniMax and Alibaba plans and Grok Build flip to wired: true in the act
- * that lands their adapter (M1-A5/A6), each PR citing its roadmap §3 row. `ollama-cloud` ships
+ * codex from M0, ollama-cloud from M1-A3, mistral-pro / deepseek-payg / gemini-api-key / xai-api
+ * from M1-A4, and the interactive-only plans minimax-token-plan / alibaba-coding-plan from M1-A5
+ * (roadmap §3 rows 8 and 9). The two PAYG ids stay unwired until a PAYG terms source is cited, and
+ * Grok Build flips in M1-A6. `ollama-cloud` ships
  * headless: "denied" (D-M1-3): headless flips only with a reviewed catalog change adding
  * headlessPermission. `deepseek-payg` being wired does NOT open the lane: it is repo-gated with an
  * empty allowlist on a clean install (D-M1-8, seat pin §5), so every repo denies.
@@ -185,14 +186,20 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     sourceUrl: "docs/plan/ROADMAP-madc-post-M0.md#3-subscription-table-all-lanes",
   },
 
-  // --- Interactive-only plans (headless always denied by status; M1-A5 wires) ---
+  // --- Interactive-only plans (headless always denied by status; wired by M1-A5) ---
+  // Wiring does NOT relax the lane: a turn is served only when the client claims
+  // `mode: "interactive"` AND the engine's own presence check on the controlling terminal passes
+  // (M1 plan §7 M1-A5, protocol pin §3.3 P3). Everything else is refused before any network call.
   {
     id: "minimax-token-plan",
     status: "interactive-only",
     connect: "direct",
-    wire: "openai-compat",
+    // M1-A5 (roadmap §3 row 8: pi-ai built-in `minimax`): the pinned provider speaks
+    // anthropic-messages against https://api.minimax.io/anthropic, so the wire is anthropic-compat.
+    // Repo-gated with an empty allowlist on a clean install (ruling 13, D-M1-9, seat pin §5).
+    wire: "anthropic-compat",
     clientIdentity: "default",
-    wired: false,
+    wired: true,
     credentialClass: "plan-interactive",
     verifiedAt: "2026-09-24",
     termsUrl: "https://platform.minimax.io/docs/token-plan/intro",
@@ -203,9 +210,16 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     id: "alibaba-coding-plan",
     status: "interactive-only",
     connect: "direct",
+    // M1-A5 (roadmap §3 row 9): OpenAI-compatible Coding Plan endpoint
+    // https://coding-intl.dashscope.aliyuncs.com/v1. pi-ai's `qwen-token-plan*` catalog targets the
+    // Token Plan host instead, so the endpoint match the roadmap asked to confirm at build time
+    // failed and the lane is a `createProvider` config. The endpoint was confirmed on the termsUrl
+    // page as a build-time wiring check only; `verifiedAt` stays the roadmap §3 terms date, because
+    // re-verifying a lane's terms is a reviewed catalog change, not an adapter act's (Copilot
+    // r4145107357).
     wire: "openai-compat",
     clientIdentity: "default",
-    wired: false,
+    wired: true,
     credentialClass: "plan-interactive",
     verifiedAt: "2026-09-24",
     termsUrl: "https://www.alibabacloud.com/help/en/model-studio/coding-plan",

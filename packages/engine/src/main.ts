@@ -1,10 +1,17 @@
 import type { Writable } from "node:stream";
 import {
+  ALIBABA_CODING_PLAN_BASE_URL,
+  ALIBABA_CODING_PLAN_PROVIDER_ID,
+  type CredentialCheck,
+  checkAlibabaCredential,
+  checkMinimaxCredential,
+  createAlibabaCodingPlanPort,
   createClaudeCodePort,
   createCodexCodePort,
   createDeepseekPort,
   createGeminiPort,
   createKimiCodePort,
+  createMinimaxTokenPlanPort,
   createMistralPort,
   createOllamaCloudPort,
   createXaiPort,
@@ -14,11 +21,14 @@ import {
   KIMI_API_KEY_ENV,
   KIMI_CODE_PROVIDER_ID,
   type KimiCredential,
+  MINIMAX_TOKEN_PLAN_PROVIDER_ID,
   MISTRAL_PROVIDER_ID,
   OLLAMA_CLOUD_PROVIDER_ID,
   readKimiCredential,
+  resolveAlibabaCodingPlanPinnedModel,
   resolveDeepseekPinnedModel,
   resolveGeminiPinnedModel,
+  resolveMinimaxPinnedModel,
   resolveMistralPinnedModel,
   resolveOllamaPinnedModel,
   resolveXaiPinnedModel,
@@ -28,6 +38,7 @@ import type { Agent } from "./agent.ts";
 import { createCredentialStore } from "./credentials/store.ts";
 import { resolveMadcHome } from "./home.ts";
 import { loadRepoPolicy, type RepoPolicy } from "./policy/store.ts";
+import type { PresenceTerminal } from "./presence/terminal.ts";
 import { createProviderAgent } from "./provider-agent.ts";
 import { ENGINE_VERSION, EngineConnection } from "./server.ts";
 
@@ -57,6 +68,26 @@ function directCredential(secret: string | null): string | null {
 }
 
 /**
+ * M1-A5 (Founder ruling 12: plan keys and pay-as-you-go keys never mixed): a lane's credential only
+ * if it is of the lane's own class. A mismatch leaves the lane without a usable credential, so its
+ * turns answer -32008 `no-credentials` at preflight, before any request; stderr names the rule and
+ * never the value. The keychain already stores one credential per registry id, so a key stored
+ * under one id is never read through another — this catches a key of the wrong class stored under
+ * the right id.
+ */
+function classCheckedCredential(
+  secret: string | null,
+  check: (apiKey: string) => CredentialCheck,
+): string | null {
+  const apiKey = directCredential(secret);
+  if (apiKey === null) return null;
+  const verdict = check(apiKey);
+  if (verdict.ok) return apiKey;
+  log(`${verdict.issue}; the lane has no usable credential`);
+  return null;
+}
+
+/**
  * Production agent: the thread's seat file (seeded `madc-default` by default) on a registry-driven
  * direct lane — Kimi Code (plan D2), Ollama Cloud (M1-A3, D-M1-2; headless denied by D-M1-3), or
  * the M1-A4 batch Mistral / DeepSeek / Gemini / xAI — or the unmodified Claude Code binary (A5) /
@@ -73,19 +104,30 @@ function directCredential(secret: string | null): string | null {
  * `deepseek-payg` being wired does NOT open it: the lane is repo-gated and `repoPolicy` denies
  * every repository that `$MADC_HOME/policy.json` does not list (D-M1-8). `gemini-api-key` accepts
  * auth keys only, so a standard-shaped credential is warned about on stderr — the warning never
- * carries the value.
+ * carries the value. The M1-A5 plans (`minimax-token-plan`, `alibaba-coding-plan`) take only a key
+ * of their own plan class, and serve only presence-verified interactive turns.
  */
 export const defaultAgentFactory: AgentFactory = async ({ repoPolicy }) => {
   const credentials = createCredentialStore({ env: process.env });
-  const [kimiSecret, ollamaSecret, mistralSecret, deepseekSecret, geminiSecret, xaiSecret] =
-    await Promise.all([
-      credentials.get(KIMI_CODE_PROVIDER_ID),
-      credentials.get(OLLAMA_CLOUD_PROVIDER_ID),
-      credentials.get(MISTRAL_PROVIDER_ID),
-      credentials.get(DEEPSEEK_PROVIDER_ID),
-      credentials.get(GEMINI_PROVIDER_ID),
-      credentials.get(XAI_PROVIDER_ID),
-    ]);
+  const [
+    kimiSecret,
+    ollamaSecret,
+    mistralSecret,
+    deepseekSecret,
+    geminiSecret,
+    xaiSecret,
+    minimaxPlanSecret,
+    alibabaPlanSecret,
+  ] = await Promise.all([
+    credentials.get(KIMI_CODE_PROVIDER_ID),
+    credentials.get(OLLAMA_CLOUD_PROVIDER_ID),
+    credentials.get(MISTRAL_PROVIDER_ID),
+    credentials.get(DEEPSEEK_PROVIDER_ID),
+    credentials.get(GEMINI_PROVIDER_ID),
+    credentials.get(XAI_PROVIDER_ID),
+    credentials.get(MINIMAX_TOKEN_PLAN_PROVIDER_ID),
+    credentials.get(ALIBABA_CODING_PLAN_PROVIDER_ID),
+  ]);
   return createProviderAgent({
     credential: kimiCredentialFromStore(kimiSecret),
     createPort: (apiKey) =>
@@ -123,6 +165,29 @@ export const defaultAgentFactory: AgentFactory = async ({ repoPolicy }) => {
         createPort: (apiKey) => createXaiPort({ apiKey }),
         resolvePinnedModel: resolveXaiPinnedModel,
       },
+      // M1-A5 interactive-only plans. Wired does not mean open: the engine serves them only on a
+      // turn whose presence it verified on its own controlling terminal, and MiniMax is repo-gated
+      // with an empty allowlist on a clean install (ruling 13, D-M1-9).
+      {
+        providerId: MINIMAX_TOKEN_PLAN_PROVIDER_ID,
+        credential: classCheckedCredential(minimaxPlanSecret, (apiKey) =>
+          checkMinimaxCredential(MINIMAX_TOKEN_PLAN_PROVIDER_ID, apiKey),
+        ),
+        createPort: (apiKey) => createMinimaxTokenPlanPort({ apiKey }),
+        resolvePinnedModel: resolveMinimaxPinnedModel,
+      },
+      {
+        providerId: ALIBABA_CODING_PLAN_PROVIDER_ID,
+        credential: classCheckedCredential(alibabaPlanSecret, (apiKey) =>
+          checkAlibabaCredential(
+            ALIBABA_CODING_PLAN_PROVIDER_ID,
+            apiKey,
+            ALIBABA_CODING_PLAN_BASE_URL,
+          ),
+        ),
+        createPort: (apiKey) => createAlibabaCodingPlanPort({ apiKey }),
+        resolvePinnedModel: resolveAlibabaCodingPlanPinnedModel,
+      },
     ],
     createClaudePort: (binaryPath) => createClaudeCodePort({ binaryPath }),
     createCodexPort: (binaryPath) =>
@@ -132,12 +197,21 @@ export const defaultAgentFactory: AgentFactory = async ({ repoPolicy }) => {
   });
 };
 
+export type StdioEngineOptions = {
+  /**
+   * M1-A5: the controlling-terminal access for the presence check. Production passes nothing and
+   * gets the real `/dev/tty`; only test fixture engines inject a fake.
+   */
+  readonly terminal?: PresenceTerminal;
+};
+
 /**
  * Engine process entry: protocol on stdin/stdout (JSONL), logs on stderr only.
  * `agent` defaults to the live provider agent; tests pass fixture agents.
  */
 export async function startStdioEngine(
   agent: Agent | AgentFactory = defaultAgentFactory,
+  options: StdioEngineOptions = {},
 ): Promise<void> {
   let home: string;
   try {
@@ -169,6 +243,7 @@ export async function startStdioEngine(
     home,
     repoPolicy,
     agent: typeof agent === "function" ? await agent({ home, repoPolicy }) : agent,
+    ...(options.terminal === undefined ? {} : { terminal: options.terminal }),
   });
   process.once("exit", () => conn.releaseLocks());
   for (const [signal, code] of [

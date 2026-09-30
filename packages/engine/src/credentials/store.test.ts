@@ -395,3 +395,22 @@ test("A2 a nonzero backend exit fails the write with the exit code only", async 
     },
   );
 });
+
+test("A5 fix: a backend read resolves only after its stdout closes — output that lands after the child's `exit` is never lost", async (t) => {
+  if (process.platform === "win32") {
+    console.log("SKIP A5 stdout-after-exit: POSIX sh only");
+    return;
+  }
+  // CI flake on PR #39: Node may emit a child's `exit` before its last stdout chunk arrives, and a
+  // runner that resolved on `exit` read an EXISTING record as "". This backend makes the ordering
+  // deterministic: `security` exits at once while a background writer still holds its stdout and
+  // prints the secret later. Resolving on `close` waits for it; resolving on `exit` returns "".
+  const root = mkdtempSync(join(tmpdir(), "madc-a5-close-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const security = join(root, "late-security");
+  writeFileSync(security, `#!/bin/sh\n( sleep 0.3; printf '%s\\n' '${SYNTHETIC}' ) &\nexit 0\n`, {
+    mode: 0o755,
+  });
+  const store = createCredentialStore({ platform: "darwin", env: {}, securityCommand: security });
+  assert.equal(await store.get("minimax-token-plan"), SYNTHETIC);
+});

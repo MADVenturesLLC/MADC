@@ -108,15 +108,15 @@ export type ErrorItem = ItemBase & {
 
 export type ServedModelBacking = string;
 
-/** The turn's mode until M1-A5 lands mode attestation: engine turns are headless, fail-closed. */
+/** The turn's mode claim (protocol pin §3.3 P3). */
 export type TurnMode = "interactive" | "headless";
 
 /**
- * The one mode every engine turn runs under until M1-A5 lands mode attestation: `headless`, the
- * fail-closed default of protocol pin §3.3 (P3). A single constant so the `servedModel` receipt,
- * the registry `assertAllowed` preflight and the M1-A4 repo gate cannot disagree about the mode.
+ * P3: the mode of a `turn/start` that carries no `mode` — `headless`, fail-closed. The claim is
+ * advisory: a lane that serves only interactive turns ALSO needs the engine's own presence check
+ * (M1-A5, `presence/`), so no client value alone ever unlocks one.
  */
-export const ENGINE_TURN_MODE: TurnMode = "headless";
+export const DEFAULT_TURN_MODE: TurnMode = "headless";
 
 /**
  * MAD receipt — not a Codex field. One per model invocation in the turn. (M1 protocol pin §5, P2:
@@ -133,7 +133,7 @@ export type ServedModelItem = ItemBase & {
   providerId: string;
   /** Registry status of the serving lane (P2). */
   lane: ProviderStatus;
-  /** The turn's mode (P2; §3.3 — always "headless" until M1-A5 attestation). */
+  /** The turn's mode (P2; §3.3 — the claim, `headless` when absent). */
   mode: TurnMode;
   /** Previous backing id when this receipt follows a fallback hop; null on the primary (P2). */
   fallbackFrom: string | null;
@@ -173,7 +173,8 @@ export type ThreadResumeResult = { thread: Thread };
 export type ThreadListParams = { limit?: number; cursor?: string };
 export type ThreadListResult = { data: ThreadSummary[]; nextCursor: string | null };
 
-export type TurnStartParams = { threadId: string; input: UserInput[] };
+/** P3: `mode` is optional; absent means `headless` (fail-closed). */
+export type TurnStartParams = { threadId: string; input: UserInput[]; mode?: TurnMode };
 export type TurnStartResult = { turn: Turn };
 
 export type TurnInterruptParams = { threadId: string; turnId: string };
@@ -311,7 +312,7 @@ export const CLIENT_REQUEST_PARAM_FIELDS: Readonly<Record<ClientRequestMethod, r
     "thread/start": ["seatId", "cwd"],
     "thread/resume": ["threadId"],
     "thread/list": ["limit", "cursor"],
-    "turn/start": ["threadId", "input"],
+    "turn/start": ["threadId", "input", "mode"],
     "turn/interrupt": ["threadId", "turnId"],
     "seat/list": [],
     "auth/status": ["providerId"],

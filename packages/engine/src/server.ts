@@ -2,13 +2,27 @@ import { lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
-import { canServe, getById } from "@madc/registry";
+import {
+  canServe,
+  checkEntry,
+  getById,
+  type ProviderEntry,
+  RegistryDeniedError,
+  type RunMode,
+} from "@madc/registry";
 import type { Agent, AgentTurnContext, TurnSink } from "./agent.ts";
 import { type CredentialStore, createCredentialStore } from "./credentials/store.ts";
 import { confinedPath, sessionsOwnerReadUnsupported } from "./home.ts";
 import { acquireThreadLock, holdsThreadLock, type LockHandle, releaseThreadLock } from "./lock.ts";
 import { type RepoIdentityDeps, resolveRepoIdentity } from "./policy/identity.ts";
 import { denyAllRepoPolicy, isRepoGated, type RepoPolicy } from "./policy/store.ts";
+import {
+  type Presence,
+  presenceRequired,
+  sameTerminal,
+  type TerminalFacts,
+} from "./presence/policy.ts";
+import { createSystemTerminal, type PresenceTerminal } from "./presence/terminal.ts";
 import {
   alreadyInitialized,
   ErrorCode,
@@ -28,7 +42,7 @@ import { isValidId, newId } from "./protocol/ids.ts";
 import {
   type AuthStatusResult,
   DEFAULT_SEAT_ID,
-  ENGINE_TURN_MODE,
+  DEFAULT_TURN_MODE,
   type InitializeResult,
   type Item,
   PROTOCOL_VERSION,
@@ -40,6 +54,7 @@ import {
   type Thread,
   type ThreadListResult,
   type Turn,
+  type TurnMode,
   type TurnStatus,
   type UserInput,
 } from "./protocol/types.ts";
@@ -56,6 +71,7 @@ import {
   type SessionPayloads,
   SessionWriter,
   sessionWriteFailed,
+  type TurnStartTty,
   verifySessionFile,
 } from "./session-store.ts";
 
@@ -86,6 +102,12 @@ export type EngineOptions = {
   repoPolicy?: RepoPolicy;
   /** M1-A4 test seam: `realpath` / `git` injection for repo-identity resolution. */
   repoIdentityDeps?: RepoIdentityDeps;
+  /**
+   * M1-A5: the engine's access to its own controlling terminal for the presence check (protocol pin
+   * §3.3 P3). Default: the real `/dev/tty` (`presence/terminal.ts`), created on first need, so an
+   * engine that never serves a presence-gated turn never touches the terminal. Tests inject fakes.
+   */
+  terminal?: PresenceTerminal;
 };
 
 type TurnRecord = {
@@ -103,10 +125,51 @@ type ThreadRecord = {
   activeTurnId: string | null;
   seat: LoadedSeat;
   session: SessionWriter;
+  /**
+   * M1-A5: the terminal a person confirmed presence on for THIS thread in THIS process (never
+   * persisted, never carried to another thread or engine). Cleared the moment the terminal is gone
+   * or changed, so the next presence-gated turn needs a fresh keypress.
+   */
+  confirmedTerminal: TerminalFacts | null;
+  /** M1-A5: a `turn/start` on this thread is waiting for the presence keypress. */
+  confirming: boolean;
 };
+
+/**
+ * M1-A5 presence phase of one `turn/start` (see `#presencePhase`). `not-required`: the lane serves
+ * this claim without a person present. `verified`: the confirmed terminal is still the live one.
+ * `pending`: a live terminal nobody has confirmed on yet (a keypress is needed). `absent`: refused.
+ */
+type PresencePhase =
+  | { readonly kind: "not-required" }
+  | { readonly kind: "verified"; readonly facts: TerminalFacts }
+  | { readonly kind: "pending"; readonly facts: TerminalFacts }
+  | { readonly kind: "absent"; readonly why: string };
+
+/** The presence outcome `#beginTurn` records on `turn.start` (seat pin §4.2 S4). */
+type TurnPresence = { readonly presence: Presence; readonly tty?: TurnStartTty };
 
 const THREAD_LIST_DEFAULT_LIMIT = 50;
 const THREAD_LIST_MAX_LIMIT = 200;
+
+/** P3: `mode` is optional and fail-closed; any value other than the two modes is -32602. */
+function parseModeClaim(value: unknown, issues: string[]): TurnMode {
+  if (value === undefined) return DEFAULT_TURN_MODE;
+  if (value === "interactive" || value === "headless") return value;
+  issues.push('mode must be "interactive" or "headless"');
+  return DEFAULT_TURN_MODE;
+}
+
+/**
+ * The prompt the engine writes to its own controlling terminal. Carries only the seat id (protocol
+ * id grammar) and the registry id — never input text or a credential.
+ */
+function presencePrompt(seatId: string, providerId: string): string {
+  return (
+    `\r\nmadc: seat ${seatId} wants lane ${providerId}, which serves only a person at this terminal.` +
+    "\r\nmadc: press Enter to confirm you are here (type n then Enter to refuse): "
+  );
+}
 
 /** One dispatched request's response value plus an optional post-response hook. */
 type DispatchResult = { value: unknown; after?: () => void };
@@ -196,6 +259,16 @@ export class EngineConnection {
   #credentials: CredentialStore | null = null;
   /** M1-A4 repo allowlists (seat pin §5); deny-everywhere unless a loaded policy was supplied. */
   readonly #repoPolicy: RepoPolicy;
+  /** M1-A5 controlling-terminal access, created on the first presence-gated turn. */
+  #terminal: PresenceTerminal | null = null;
+  /** M1-A5 presence prompts still waiting for a keypress; shutdown aborts every one. */
+  readonly #pendingConfirmations = new Set<AbortController>();
+  /**
+   * M1-A5: the tail of the engine-wide confirmation queue. Every thread shares ONE controlling
+   * terminal, so prompts run one at a time: a keypress can only answer the prompt it was typed
+   * for, never another thread's seat or lane (Copilot r4145107307). Only ever resolves.
+   */
+  #confirmationTail: Promise<void> = Promise.resolve();
 
   constructor(opts: EngineOptions) {
     this.#opts = opts;
@@ -218,12 +291,16 @@ export class EngineConnection {
    * decision that is not recorded is not claimed. `turnId` is therefore minted before preflight; it
    * is a pure local id, so C3's "append `turn.start` only after preflight" ordering is unchanged.
    * A denial leaves a `repo.decision` line with no `turn.start`, which `rebuildSession` ignores.
+   *
+   * M1-A5: `mode` is the mode the lane is asked to serve. A presence-gated lane only reaches this
+   * gate once presence is verified or pending (an absent presence is refused before it), so the
+   * gate runs for an attested interactive MiniMax turn and stays out of the way of every mode denial.
    */
-  #repoGate(record: ThreadRecord, turnId: string): void {
+  #repoGate(record: ThreadRecord, turnId: string, mode: RunMode): void {
     const providerId = record.seat.seat.preferredBacking;
     if (!isRepoGated(providerId)) return;
     const entry = getById(providerId);
-    if (entry === undefined || !canServe(entry, ENGINE_TURN_MODE)) return;
+    if (entry === undefined || !canServe(entry, mode)) return;
 
     const resolution = resolveRepoIdentity(record.thread.cwd, this.#opts.repoIdentityDeps ?? {});
     const decision = this.#repoPolicy.decide(providerId, resolution);
@@ -302,6 +379,9 @@ export class EngineConnection {
   shutdown(): void {
     if (this.#shutDown) return;
     this.#shutDown = true;
+    // M1-A5: a presence prompt still waiting for a keypress is cancelled; its turn never starts.
+    for (const controller of this.#pendingConfirmations) controller.abort();
+    this.#pendingConfirmations.clear();
     for (const record of this.#threads.values()) {
       const active =
         record.activeTurnId === null ? undefined : record.turns.get(record.activeTurnId);
@@ -594,6 +674,8 @@ export class EngineConnection {
       activeTurnId: null,
       seat,
       session,
+      confirmedTerminal: null,
+      confirming: false,
     });
     return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
   }
@@ -634,8 +716,10 @@ export class EngineConnection {
       if (known.session.broken && holdsThreadLock(known.lock)) {
         // Rule 6 row (a): a broken writer is cleared only by a reload from disk through the §3
         // cold-resume path, under the lock this engine already holds (kept, not released). An
-        // active turn still answers -32004.
+        // active turn — or a turn/start still waiting for its presence keypress (M1-A5) — still
+        // answers -32004.
         if (known.activeTurnId !== null) throw turnAlreadyActive(threadId, known.activeTurnId);
+        if (known.confirming) throw turnAlreadyActive(threadId, null);
         let fresh: ThreadRecord;
         try {
           fresh = this.#loadColdThread(threadId, known.lock);
@@ -776,6 +860,9 @@ export class EngineConnection {
       activeTurnId: null,
       seat,
       session,
+      // M1-A5: a presence confirmation never survives a reload; the next gated turn asks again.
+      confirmedTerminal: null,
+      confirming: false,
     };
   }
 
@@ -869,6 +956,8 @@ export class EngineConnection {
     if (holdsThreadLock(record.lock)) return record;
     const threadId = record.thread.id;
     if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
+    // M1-A5: a turn/start waiting for its presence keypress holds this record; never swap it out.
+    if (record.confirming) throw turnAlreadyActive(threadId, null);
     const lock = acquireThreadLock(this.#opts.home, threadId);
     if (!lock.ok) throw turnAlreadyActive(threadId, null, lock.holderPid ?? undefined);
     this.#threads.delete(threadId);
@@ -887,17 +976,21 @@ export class EngineConnection {
 
   // -------------------------------------------------------------------- turns
 
-  #turnStart(params: unknown): { value: { turn: Turn }; after: () => void } {
+  #turnStart(params: unknown): DispatchResult | Promise<DispatchResult> {
     const p = paramsObject(params);
     const issues: string[] = [];
     const threadId = requireId(p, "threadId", issues);
     const input = parseUserInput(p.input, issues);
+    // M1-A5 (P3): the client's mode claim; absent → headless (fail-closed).
+    const claim = parseModeClaim(p.mode, issues);
     throwIfIssues(issues);
 
     // Parameter validation, -32002 and -32004 stay first and unchanged (Amendment 3 C3).
     let record = this.#threads.get(threadId);
     if (record === undefined) throw threadNotFound(threadId);
     if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
+    // M1-A5: one turn/start per thread at a time, including one still waiting for its keypress.
+    if (record.confirming) throw turnAlreadyActive(threadId, null);
     // C3 step 1: a poisoned thread answers -32009 with the C2 entry's path and first refused seq.
     const poisoned = this.#poisoned.get(threadId);
     if (poisoned !== undefined) throw sessionWriteFailed(threadId, poisoned.path, poisoned.seq);
@@ -918,11 +1011,60 @@ export class EngineConnection {
     // Minting an id is pure, so Amendment 3 C3's ordering (preflight at step 4, the `turn.start`
     // append at step 5) is unchanged.
     const turnId = newId("turn");
-    this.#repoGate(record, turnId);
+
+    // M1-A5 presence phase (M1 plan §7 M1-A5; protocol pin §3.3 P3). It runs before the repo gate
+    // and before preflight, so a lane that needs a person is refused before any provider call and
+    // before any repo decision when there is no terminal to check.
+    const backing = getById(record.seat.seat.preferredBacking);
+    const phase = this.#presencePhase(record, claim, backing);
+    if (phase.kind === "absent") throw this.#presenceRefusal(record, backing, phase.why);
+    // The lane serves the claim from here on: presence is verified, pending, or not needed.
+    this.#repoGate(record, turnId, claim);
+    if (phase.kind === "pending") {
+      const pendingRecord = record;
+      return this.#awaitPresence(pendingRecord, phase.facts).then((confirmed) => {
+        if (!confirmed) throw this.#presenceRefusal(pendingRecord, backing, "not confirmed");
+        return this.#beginTurn(pendingRecord, ctx, turnId, input, claim, {
+          presence: "verified",
+          tty: { ...phase.facts, confirmation: "keypress" },
+        });
+      });
+    }
+    return this.#beginTurn(
+      record,
+      ctx,
+      turnId,
+      input,
+      claim,
+      phase.kind === "verified"
+        ? { presence: "verified", tty: { ...phase.facts, confirmation: "carried" } }
+        : { presence: "absent" },
+    );
+  }
+
+  /**
+   * C3 steps 4–5 and the turn itself, once every gate before preflight has passed: preflight exactly
+   * once against the record that will append, then the durable `turn.start` (now with the claim,
+   * the presence result and — when verified — the TTY facts, seat pin §4.2 S4), then the turn.
+   */
+  #beginTurn(
+    record: ThreadRecord,
+    ctx: Omit<AgentTurnContext, "turnId">,
+    turnId: string,
+    input: UserInput[],
+    claim: TurnMode,
+    presence: TurnPresence,
+  ): DispatchResult {
+    const threadId = record.thread.id;
+    const turnCtx: Omit<AgentTurnContext, "turnId"> = {
+      ...ctx,
+      mode: claim,
+      presence: presence.presence,
+    };
     // C3 step 4: seat / registry / credential preflight, exactly once, against the record that
     // will append (the reloaded record after a re-take; D-162). A refusal after a re-take leaves
     // the re-taken lock held by this process, as any refused turn/start does.
-    this.#opts.agent.preflight?.(ctx);
+    this.#opts.agent.preflight?.(turnCtx);
 
     const now = Date.now();
     // turn.start is durable before the turn exists: an append failure is a -32009 response error.
@@ -930,7 +1072,13 @@ export class EngineConnection {
       // C3 step 5: only after preflight, append turn.start.
       record.session.append(
         "turn.start",
-        { turnId, inputText: input.map((part) => part.text).join("\n") },
+        {
+          turnId,
+          inputText: input.map((part) => part.text).join("\n"),
+          mode: claim,
+          presence: presence.presence,
+          ...(presence.tty === undefined ? {} : { tty: presence.tty }),
+        },
         now, // == turn.startedAt
       );
     } catch (err) {
@@ -963,9 +1111,137 @@ export class EngineConnection {
       value: { turn: snapshot },
       after: () => {
         this.#notify("turn/started", { turn: structuredClone(turn) });
-        this.#runTurn(record, turnRecord, { ...ctx, turnId: turn.id });
+        this.#runTurn(record, turnRecord, { ...turnCtx, turnId: turn.id });
       },
     };
+  }
+
+  // ----------------------------------------------------------------- presence
+
+  /** Lazily created so an engine that never gates a turn on presence never opens `/dev/tty`. */
+  #terminalAccess(): PresenceTerminal {
+    this.#terminal ??= this.#opts.terminal ?? createSystemTerminal();
+    return this.#terminal;
+  }
+
+  /**
+   * M1-A5: decide the presence phase of one turn on the seat's assigned backing. Only a lane that
+   * needs a person (`presence/policy.ts`) is checked, and it is checked on EVERY such turn: the
+   * engine opens its own controlling terminal, never trusting the client's claim. A terminal that
+   * is gone or differs from the confirmed one voids the confirmation — this turn is refused and the
+   * next one needs a fresh keypress on a live terminal.
+   */
+  #presencePhase(
+    record: ThreadRecord,
+    claim: TurnMode,
+    backing: ProviderEntry | undefined,
+  ): PresencePhase {
+    if (!presenceRequired(backing)) return { kind: "not-required" };
+    if (claim !== "interactive") return { kind: "absent", why: "the turn is headless" };
+    const terminal = this.#terminalAccess();
+    const facts = terminal.probe();
+    if (facts === null) {
+      record.confirmedTerminal = null;
+      return { kind: "absent", why: terminal.unsupported ?? "no controlling terminal" };
+    }
+    const confirmed = record.confirmedTerminal;
+    if (confirmed === null) return { kind: "pending", facts };
+    if (!sameTerminal(confirmed, facts)) {
+      record.confirmedTerminal = null;
+      return { kind: "absent", why: "the controlling terminal changed since confirmation" };
+    }
+    return { kind: "verified", facts };
+  }
+
+  /**
+   * The refusal for a presence-gated lane without verified presence: the lane's OWN headless denial
+   * from the registry (`interactive-only-headless` for the interactive-only plans,
+   * `headless-not-permitted` for a headless-denied direct lane), as -32007 before any network call.
+   */
+  #presenceRefusal(
+    record: ThreadRecord,
+    backing: ProviderEntry | undefined,
+    why: string,
+  ): RpcError {
+    const providerId = record.seat.seat.preferredBacking;
+    this.#log(`presence ${providerId}: absent (${why}); turn refused`);
+    if (backing !== undefined) {
+      try {
+        checkEntry(backing, {
+          providerId,
+          mode: "headless",
+          connect: backing.connect === "vendor-agent" ? "vendor-agent" : "direct",
+        });
+      } catch (err) {
+        if (err instanceof RegistryDeniedError) {
+          return providerRefusalError({
+            providerId: err.providerId,
+            reason: err.reason,
+            status: backing.status,
+          });
+        }
+        throw err;
+      }
+    }
+    // Unreachable for a presence-gated lane (it never serves headless); fail closed regardless.
+    return providerRefusalError({
+      providerId,
+      reason: "interactive-only-headless",
+      status: backing?.status ?? null,
+    });
+  }
+
+  /**
+   * M1-A5: the first presence-gated turn on a thread asks for a keypress on the engine's own
+   * controlling terminal (never over the protocol pipe). Prompts are queued engine-wide, so only one
+   * is ever on the terminal. While it waits, the thread accepts no other turn/start and cannot be
+   * reloaded; EOF or a signal aborts the wait (queued or prompting). Resolves true only when the
+   * person confirmed AND the terminal is still the one the prompt was written to — the confirmation
+   * then binds to that terminal for later turns on this thread in this process.
+   */
+  async #awaitPresence(record: ThreadRecord, facts: TerminalFacts): Promise<boolean> {
+    const threadId = record.thread.id;
+    const controller = new AbortController();
+    record.confirming = true;
+    this.#pendingConfirmations.add(controller);
+    const previous = this.#confirmationTail;
+    let release = (): void => {};
+    this.#confirmationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let confirmed: boolean;
+    try {
+      await previous; // one prompt on the terminal at a time
+      confirmed = controller.signal.aborted
+        ? false
+        : await this.#terminalAccess().confirm(
+            presencePrompt(record.seat.seat.id, record.seat.seat.preferredBacking),
+            controller.signal,
+          );
+    } catch {
+      confirmed = false;
+    } finally {
+      release();
+      record.confirming = false;
+      this.#pendingConfirmations.delete(controller);
+    }
+    // The world may have moved while the person was reading the prompt.
+    if (this.#shutDown) throw internalError("Engine is shutting down");
+    if (this.#threads.get(threadId) !== record || !holdsThreadLock(record.lock)) {
+      throw turnAlreadyActive(threadId, null);
+    }
+    if (!confirmed) {
+      record.confirmedTerminal = null;
+      return false;
+    }
+    // The keypress binds to the terminal it was typed on: re-probe after it.
+    const after = this.#terminalAccess().probe();
+    if (after === null || !sameTerminal(after, facts)) {
+      record.confirmedTerminal = null;
+      return false;
+    }
+    record.confirmedTerminal = facts;
+    return true;
   }
 
   #turnInterrupt(params: unknown): { value: Record<string, never>; after?: () => void } {
