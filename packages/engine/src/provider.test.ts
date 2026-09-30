@@ -243,6 +243,7 @@ function preflightFor(
       seat,
       seatPath: "/madc-home/seats/unit.json",
       input: [{ type: "text", text: "x" }],
+      cwd: null,
     });
     assert.equal(created, 0, "preflight is side-effect free: no port built");
     return null;
@@ -331,8 +332,9 @@ test("A4/M1-A3 (S1): seat-file backings validate against the registry — forbid
       'preferredBacking "no-such-provider" is not a registry provider id',
     ],
     [
-      seatJson("mist", { preferredBacking: "mistral-pro" }),
-      'preferredBacking "mistral-pro" is not wired in this build',
+      // openrouter is a kept stub no M1 act wires (mistral-pro was this fixture until M1-A4).
+      seatJson("unwired-stub", { preferredBacking: "openrouter" }),
+      'preferredBacking "openrouter" is not wired in this build',
     ],
   ];
   const seats = [
@@ -545,12 +547,24 @@ const PI_AI_IMPORT = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)["']@eare
 /**
  * The only files allowed to import pi-ai (plan §6, generalized by M1-A3): the direct-key lane
  * modules inside packages/adapters. The package-level rule is unchanged — core/engine/registry/cli
- * never import pi-ai — and fakes/tests never do either.
+ * never import pi-ai — and fakes never do either. M1-A4 adds its four lane modules.
+ *
+ * M1-A4 also allowlists ONE test file, a documented narrowing of the M1-A3 "tests never do either"
+ * convention: the act's acceptance adds an L1 tool round-trip, M1 commissions no direct-lane tool
+ * loop, and the Founder ruled (2026-09-30) that the round-trip is proved against the lane's own
+ * pi-ai configuration instead of by widening the shared `ProviderPort` seam. Driving pi-ai's catalog
+ * is unavoidable for that, and the file is inside `packages/adapters`, so plan §5's package rule
+ * still holds. See that file's module docs.
  */
 const PI_AI_IMPORTERS: readonly string[] = [
   "adapters/src/kimi-code.ts",
   "adapters/src/direct/generic.ts",
   "adapters/src/providers/ollama-cloud.ts",
+  "adapters/src/providers/mistral.ts",
+  "adapters/src/providers/deepseek.ts",
+  "adapters/src/providers/gemini.ts",
+  "adapters/src/providers/xai.ts",
+  "adapters/src/providers/direct-key-conformance.test.ts",
 ];
 
 test("plan §6: only packages/adapters imports @earendil-works/pi-ai, and only its direct-key lane modules", () => {

@@ -36,6 +36,7 @@ import {
 import { basename, join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
+import { listCatalog } from "@madc/registry";
 import type { Agent } from "./agent.ts";
 import { RpcError } from "./protocol/errors.ts";
 import type { Turn } from "./protocol/types.ts";
@@ -244,7 +245,8 @@ test("R-append-nofollow: without O_NOFOLLOW an append never follows a symlink, e
 test("R-shape backing: a hash-valid session.open or servedModel event with a non-wired backing is never loaded", async () => {
   // M1-A3 (seat pin S1): backing validity is registry-driven — any WIRED registry id. The forged
   // outside examples are an id absent from the catalog and a catalog id that is not wired
-  // ("ollama-cloud" was the M0 example; M1-A3 wired it, so it moved to the accepted list below).
+  // ("ollama-cloud" was the M0 example and "mistral-pro" the M1-A3 one; each moved to the accepted
+  // list below when its adapter act wired it — M1-A3 and M1-A4 respectively).
   const open = { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" };
   const served = {
     turnId: "turn_1",
@@ -258,7 +260,7 @@ test("R-shape backing: a hash-valid session.open or servedModel event with a non
   };
   const cases: Array<[string, Array<[string, Record<string, unknown>]>]> = [
     ["open-bad-backing", [["session.open", { ...open, backing: "not-a-lane" }]]],
-    ["open-unwired-backing", [["session.open", { ...open, backing: "mistral-pro" }]]],
+    ["open-unwired-backing", [["session.open", { ...open, backing: "openrouter" }]]],
     ["open-no-backing", [["session.open", { cwd: null, providerId: "p", pinnedModel: "m" }]]],
     [
       "served-event-bad-backing",
@@ -277,8 +279,11 @@ test("R-shape backing: a hash-valid session.open or servedModel event with a non
       name,
     );
   }
-  // Every wired backing still rebuilds, in both places.
-  for (const backing of ["kimi-code", "claude-code", "codex", "ollama-cloud"]) {
+  // Every wired backing still rebuilds, in both places. Derived from the catalog rather than a
+  // hand-kept list, so this assertion cannot go stale when a later act wires another lane.
+  for (const backing of listCatalog()
+    .filter((entry) => entry.wired)
+    .map((entry) => entry.id)) {
     const r = verifySessionText(
       forgeSession("thr_ok", [
         ["session.open", { ...open, backing }],

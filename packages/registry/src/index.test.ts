@@ -83,13 +83,24 @@ test("catalog v2: every roadmap §3 row, the forbidden sub-paths, and the M1 ids
   }
 
   // Live wiring is the M0 three plus the lanes whose adapter acts have landed (M1-A3:
-  // ollama-cloud); every other lane is a stub until its adapter act.
+  // ollama-cloud; M1-A4: mistral-pro, deepseek-payg, gemini-api-key, xai-api); every other lane
+  // is a stub until its adapter act. `deepseek-payg` being wired does not open the lane: it is
+  // repo-gated with an empty allowlist on a clean install (D-M1-8, seat pin §5).
   assert.deepEqual(
     listCatalog()
       .filter((e) => e.wired)
       .map((e) => e.id)
       .sort(),
-    ["claude-code", "codex", "kimi-code", "ollama-cloud"],
+    [
+      "claude-code",
+      "codex",
+      "deepseek-payg",
+      "gemini-api-key",
+      "kimi-code",
+      "mistral-pro",
+      "ollama-cloud",
+      "xai-api",
+    ],
   );
 
   // The PAYG ids carry an honest "never verified" date and no terms page (fail-closed stale).
@@ -393,8 +404,9 @@ test("claude-code and codex require vendor-agent; direct denied", () => {
 });
 
 test("unwired allowed-direct denied when live required; stub lookup ok", () => {
-  // mistral-pro ships headless: "allowed", so the unwired stub state is what a live demand hits.
-  const stub = getById("mistral-pro");
+  // openrouter is a kept M0 stub: allowed-direct with headless: "allowed", still unwired because no
+  // M1 act lands its adapter (mistral-pro / xai-api were the fixtures here until M1-A4 wired them).
+  const stub = getById("openrouter");
   assert.ok(stub);
   assert.equal(stub.status, "allowed-direct");
   assert.equal(stub.wired, false);
@@ -402,7 +414,7 @@ test("unwired allowed-direct denied when live required; stub lookup ok", () => {
   assert.equal(
     denialReason(() =>
       assertAllowed({
-        providerId: "mistral-pro",
+        providerId: "openrouter",
         mode: "headless",
         connect: "direct",
         requireLive: true,
@@ -412,11 +424,11 @@ test("unwired allowed-direct denied when live required; stub lookup ok", () => {
   );
 
   const allowedStub = assertAllowed({
-    providerId: "mistral-pro",
+    providerId: "openrouter",
     mode: "headless",
     connect: "direct",
   });
-  assert.equal(allowedStub.id, "mistral-pro");
+  assert.equal(allowedStub.id, "openrouter");
 });
 
 test("allowed-direct rejects vendor-agent intent", () => {
@@ -437,7 +449,8 @@ test("lanesFor / canServe: mode policy per lane", () => {
   assert.equal(headlessIds.has("minimax-token-plan"), false);
   assert.equal(headlessIds.has("alibaba-coding-plan"), false);
   for (const id of FORBIDDEN_IDS) assert.equal(headlessIds.has(id), false, id);
-  // Wired M0 lanes, unwired allowed-direct stubs with headless allowed, and vendor agents serve headless.
+  // Wired lanes, allowed-direct stubs with headless allowed, and vendor agents serve headless
+  // (canServe is mode policy only — it does not read `wired`; see catalog.ts).
   for (const id of ["kimi-code", "claude-code", "codex", "grok-build", "mistral-pro", "xai-api"]) {
     assert.ok(headlessIds.has(id), id);
   }
@@ -455,8 +468,8 @@ test("lanesFor / canServe: mode policy per lane", () => {
 });
 
 test("catalog entries are frozen; mutation cannot poison assertAllowed", () => {
-  // mistral-pro is an unwired stub until M1-A4 (ollama-cloud was wired by M1-A3).
-  const unwired = getById("mistral-pro");
+  // openrouter is still an unwired stub (M1-A4 wired mistral-pro, the previous fixture here).
+  const unwired = getById("openrouter");
   assert.ok(unwired);
   assert.equal(unwired.wired, false);
   assert.throws(
@@ -465,7 +478,7 @@ test("catalog entries are frozen; mutation cannot poison assertAllowed", () => {
     },
     (err: unknown) => err instanceof TypeError,
   );
-  assert.equal(getById("mistral-pro")?.wired, false);
+  assert.equal(getById("openrouter")?.wired, false);
 
   const headlessDenied = getById("ollama-cloud");
   assert.ok(headlessDenied && headlessDenied.status === "allowed-direct");

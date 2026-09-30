@@ -41,6 +41,7 @@ const DOCTOR_IDS = [
   "session",
   "locks",
   "registry",
+  "policy",
   "cred.kimi-code",
   "bin.claude",
   "bin.codex",
@@ -193,9 +194,17 @@ test("A7 §7.1 doctor exits 0 on an engine-seeded home with no KIMI_API_KEY and 
     // M1-A2: with MADC_DEV_ENV_KEYS unset the env says nothing about credentials (they live in
     // the OS keychain), so the row SKIPs instead of M0's env-presence WARN.
     assert.equal(check(report, "cred.kimi-code").status, "skip");
+    // M1-A4: a clean install has no policy.json, so every repo-gated provider denies everywhere
+    // (D-M1-8). That is the expected, healthy state — PASS, not WARN — and it says so.
+    assert.equal(check(report, "policy").status, "pass");
+    assert.match(check(report, "policy").summary, /^no policy\.json: repo-gated providers /);
+    assert.match(
+      check(report, "policy").summary,
+      /deny every repository \(D-M1-8 clean-install default\)$/,
+    );
     assert.equal(check(report, "bin.claude").summary, "not on PATH · adapter not built (A5)");
     assert.equal(check(report, "bin.codex").summary, "not on PATH · adapter not built (A6)");
-    assert.deepEqual(report.counts, { pass: 7, warn: 0, fail: 0, skip: 3 });
+    assert.deepEqual(report.counts, { pass: 8, warn: 0, fail: 0, skip: 3 });
     const text = await runCli(sb, ["doctor"]);
     assert.equal(text.code, 0);
     const rows = text.stdout.trim().split("\n");
@@ -207,6 +216,58 @@ test("A7 §7.1 doctor exits 0 on an engine-seeded home with no KIMI_API_KEY and 
     );
     assert.match(rows.at(-1) ?? "", /^RESULT {2}0 FAIL · 0 WARN · 3 SKIP · \d+ ms {3}exit 0$/);
     assert.doesNotMatch(text.stdout + text.stderr, ANSI, "non-TTY output has no ANSI");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("A4 doctor: a policy.json entry rejected at load is a WARN that grants nothing, and never echoes the entry", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    await seedWithSession(sb);
+    // A path-only entry (rejected at load: "a path alone never grants"), an entry whose remote does
+    // not normalize, and a key that is not a registry id — plus one valid entry that must survive.
+    const secretPath = join(sb.root, "somewhere-private", "checkout");
+    // A credentialed remote that does NOT normalize (no path), so the rejection path has to prove it
+    // never echoes the userinfo it was handed.
+    const credentialed = "https://user:token@github.com";
+    mkdirSync(sb.home, { recursive: true, mode: 0o700 });
+    writeFileSync(
+      join(sb.home, "policy.json"),
+      `${JSON.stringify(
+        {
+          version: 1,
+          repoAllow: {
+            "deepseek-payg": [{ path: secretPath }, credentialed, "github.com/owner/repo"],
+            deepseek: ["github.com/other/repo"],
+          },
+        },
+        null,
+        2,
+      )}\n`,
+      { mode: 0o600 },
+    );
+    const r = await runCli(sb, ["doctor", "--json"]);
+    // WARN never fails (CLI pin §3), so doctor still exits 0.
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    const report = JSON.parse(r.stdout) as DoctorJson;
+    const row = check(report, "policy");
+    assert.equal(row.status, "warn");
+    assert.equal(row.evidence.rejected, 3, "three entries rejected at load");
+    assert.equal(row.evidence.allowEntries, 1, "the one valid entry still counts");
+    assert.match(row.summary, /deepseek-payg\[0\] rejected: a path-only entry grants nothing/);
+    assert.match(row.summary, /deepseek-payg\[1\] rejected: entry remote does not normalize/);
+    assert.match(row.summary, /deepseek rejected: not a registry provider id/);
+    assert.match(row.summary, /grants nothing/);
+    // A rejected entry is identified by provider id and position ONLY: neither the path nor a
+    // credentialed remote may reach doctor output.
+    const printed = `${r.stdout}${r.stderr}`;
+    assert.equal(row.summary.includes(secretPath), false, "the path was echoed");
+    assert.equal(printed.includes("user:token"), false, "the remote userinfo was echoed");
+    assert.equal(printed.includes(credentialed), false, "the credentialed remote was echoed");
+    assert.equal(printed.includes(secretPath), false, "the rejected path was echoed");
   } finally {
     sb.cleanup();
   }

@@ -60,6 +60,31 @@ export {
   threadLockPath,
 } from "./lock.ts";
 export { type AgentFactory, defaultAgentFactory, startStdioEngine } from "./main.ts";
+export {
+  type GitCommandResult,
+  type GitRunner,
+  type Realpath,
+  type RepoIdentity,
+  type RepoIdentityDeps,
+  type RepoIdentityResolution,
+  resolveRepoIdentity,
+} from "./policy/identity.ts";
+export {
+  denyAllRepoPolicy,
+  isRepoGated,
+  type LoadRepoPolicyOptions,
+  loadRepoPolicy,
+  POLICY_FILE_NAME,
+  POLICY_VERSION,
+  type PolicyFileIssue,
+  REPO_GATED_PROVIDER_IDS,
+  type RejectedPolicyEntry,
+  type RepoAllowEntry,
+  type RepoDecision,
+  type RepoDecisionReason,
+  type RepoPolicy,
+  type RepoPolicyLoad,
+} from "./policy/store.ts";
 export * from "./protocol/errors.ts";
 export { ID_PATTERN, isValidId, newId } from "./protocol/ids.ts";
 export * from "./protocol/types.ts";
@@ -120,6 +145,7 @@ export {
   GENESIS_HASH,
   REDACTED,
   type RebuiltSession,
+  type RepoDecisionPayload,
   rebuildSession,
   SESSION_EVENT_TYPES,
   type ServedModelPayload,

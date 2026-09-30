@@ -1,11 +1,12 @@
 /**
  * @madc/adapters — provider seam + backings: the generic direct-key port (Act M1-A3) with the
- * Kimi Code lane over pinned pi-ai (Act M0-A3) and the Ollama Cloud lane (Act M1-A3), plus the
- * unmodified Claude Code vendor binary (Act M0-A5) and the unmodified Codex vendor binary via
+ * Kimi Code lane over pinned pi-ai (Act M0-A3), the Ollama Cloud lane (Act M1-A3) and the M1-A4
+ * direct-key batch — Mistral, DeepSeek, Gemini (auth key) and the xAI API — plus the unmodified
+ * Claude Code vendor binary (Act M0-A5) and the unmodified Codex vendor binary via
  * `codex app-server` (Act M0-A6). Only this package imports `@earendil-works/pi-ai` (exact pin
- * 0.87.1, plan §6) — the pi-ai importers are `kimi-code.ts`, `direct/generic.ts` and
- * `providers/ollama-cloud.ts` (M1-A3 generalizes the M0 "only kimi-code.ts" rule to the
- * direct-key lane modules).
+ * 0.87.1, plan §6) — the pi-ai importers are `kimi-code.ts`, `direct/generic.ts` and the lane
+ * modules under `providers/` (M1-A3 generalizes the M0 "only kimi-code.ts" rule to the
+ * direct-key lane modules; M1-A4 adds four more).
  */
 export {
   CLAUDE_BINARY_NAME,
@@ -33,8 +34,13 @@ export {
   type DirectWireApi,
   leadingHttpStatus,
   type PinnedModelResolution,
+  providerErrorStatus,
   QUOTA_OR_UNREACHABLE_STATUSES,
 } from "./direct/generic.ts";
+export {
+  resolveStaticPinnedModel,
+  type StaticCatalogLane,
+} from "./direct/pinned-model.ts";
 export {
   createKimiCodePort,
   honestUserAgent,
@@ -57,6 +63,45 @@ export {
   type ProviderTurnResult,
 } from "./provider-port.ts";
 export {
+  buildDeepseekProvider,
+  createDeepseekPort,
+  DEEPSEEK_API_KEY_ENV,
+  DEEPSEEK_BASE_URL,
+  DEEPSEEK_PI_PROVIDER,
+  DEEPSEEK_PROVIDER_ID,
+  DEEPSEEK_WIRE_API,
+  type DeepseekPortOptions,
+  deepseekCatalogModelIds,
+  resolveDeepseekPinnedModel,
+} from "./providers/deepseek.ts";
+export {
+  buildGeminiProvider,
+  createGeminiPort,
+  GEMINI_API_KEY_ENV,
+  GEMINI_BASE_URL,
+  GEMINI_PI_PROVIDER,
+  GEMINI_PROVIDER_ID,
+  GEMINI_STANDARD_KEY_PREFIX,
+  GEMINI_STANDARD_KEY_WARNING,
+  GEMINI_WIRE_API,
+  type GeminiPortOptions,
+  geminiCatalogModelIds,
+  looksLikeStandardGeminiKey,
+  resolveGeminiPinnedModel,
+} from "./providers/gemini.ts";
+export {
+  buildMistralProvider,
+  createMistralPort,
+  MISTRAL_API_KEY_ENV,
+  MISTRAL_BASE_URL,
+  MISTRAL_PI_PROVIDER,
+  MISTRAL_PROVIDER_ID,
+  MISTRAL_WIRE_API,
+  type MistralPortOptions,
+  mistralCatalogModelIds,
+  resolveMistralPinnedModel,
+} from "./providers/mistral.ts";
+export {
   createOllamaCloudPort,
   type ListedOllamaModel,
   listOllamaCloudModels,
@@ -69,3 +114,16 @@ export {
   type OllamaListOptions,
   resolveOllamaPinnedModel,
 } from "./providers/ollama-cloud.ts";
+export {
+  buildXaiProvider,
+  createXaiPort,
+  resolveXaiPinnedModel,
+  stockXaiProviderHasOAuth,
+  XAI_API_KEY_ENV,
+  XAI_BASE_URL,
+  XAI_PI_PROVIDER,
+  XAI_PROVIDER_ID,
+  XAI_WIRE_API,
+  type XaiPortOptions,
+  xaiCatalogModelIds,
+} from "./providers/xai.ts";

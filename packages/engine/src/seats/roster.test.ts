@@ -506,8 +506,9 @@ test("A7: a forbidden backing gives -32006 SeatInvalid, and each fallbacks entry
       },
       {
         name: "unwired-fallback",
-        seat: { fallbacks: ["mistral-pro"] },
-        issues: ['fallbacks[0] "mistral-pro" is not wired in this build'],
+        // openrouter is a kept stub no M1 act wires (mistral-pro was this fixture until M1-A4).
+        seat: { fallbacks: ["openrouter"] },
+        issues: ['fallbacks[0] "openrouter" is not wired in this build'],
       },
       {
         name: "unknown-fallback",
@@ -516,8 +517,8 @@ test("A7: a forbidden backing gives -32006 SeatInvalid, and each fallbacks entry
       },
       {
         name: "second-fallback-only",
-        seat: { fallbacks: ["kimi-code", "mistral-pro"] },
-        issues: ['fallbacks[1] "mistral-pro" is not wired in this build'],
+        seat: { fallbacks: ["kimi-code", "openrouter"] },
+        issues: ['fallbacks[1] "openrouter" is not wired in this build'],
       },
       {
         name: "fallbacks-not-array",
@@ -955,6 +956,8 @@ function ctxFor(seat: EngineSeat, seatPath: string): AgentTurnContext {
     seat,
     seatPath,
     input: [{ type: "text", text: "hi" }],
+    // No roster seat is backed by a repo-gated lane, so identity is never resolved (M1-A4).
+    cwd: null,
     turnId: "turn_a7",
   };
 }

@@ -1,6 +1,6 @@
 import type { Item, UserInput } from "./protocol/types.ts";
 import type { EngineSeat } from "./seat.ts";
-import type { FallbackRejectedPayload } from "./session-store.ts";
+import type { FallbackRejectedPayload, RepoDecisionPayload } from "./session-store.ts";
 
 /** What `preflight` sees: the turn has not been created yet. */
 export type TurnPreflightContext = {
@@ -11,6 +11,13 @@ export type TurnPreflightContext = {
   /** The seat file the seat came from (reported in -32006 data). */
   readonly seatPath: string;
   readonly input: readonly UserInput[];
+  /**
+   * The thread's `cwd` as the client supplied it (M1-A4). It is CONTEXT ONLY for a repo-gated
+   * provider: the engine resolves the repository identity itself from this path (realpath'd git
+   * top-level + normalized `origin`) and never matches this string against an allowlist — seat pin
+   * §5, fixing Copilot r4101049517.
+   */
+  readonly cwd: string | null;
 };
 
 /** What the engine hands an agent for one turn. */
@@ -41,6 +48,18 @@ export type TurnSink = {
    * naming both lanes.
    */
   fallbackRejected?(payload: FallbackRejectedPayload): boolean;
+  /**
+   * Durably records the pinned `repo.decision` session event (seat pin §4.2 / §5, M1-A4) for a
+   * repo-gated FALLBACK CANDIDATE. The seat's assigned backing is gated by the engine inside
+   * `turn/start` (protocol pin §4.2: repo-policy checks run there, before any model call), so this
+   * covers only the candidates the fallback walk considers — a fallback never moves into a
+   * repo-denied provider.
+   *
+   * Returns true only when the decision was recorded. `false` means the session is unusable, so the
+   * candidate MUST NOT be called: a decision that is not durable is not claimed. Optional so
+   * pre-M1-A4 fake sinks stay valid; a sink without the method is treated as "recorded".
+   */
+  repoDecision?(payload: RepoDecisionPayload): boolean;
 };
 
 /**

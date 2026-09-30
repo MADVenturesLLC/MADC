@@ -112,6 +112,13 @@ export type ServedModelBacking = string;
 export type TurnMode = "interactive" | "headless";
 
 /**
+ * The one mode every engine turn runs under until M1-A5 lands mode attestation: `headless`, the
+ * fail-closed default of protocol pin §3.3 (P3). A single constant so the `servedModel` receipt,
+ * the registry `assertAllowed` preflight and the M1-A4 repo gate cannot disagree about the mode.
+ */
+export const ENGINE_TURN_MODE: TurnMode = "headless";
+
+/**
  * MAD receipt — not a Codex field. One per model invocation in the turn. (M1 protocol pin §5, P2:
  * `backing` widened to any wired registry id per seat pin S1 — M0 was the 3-literal union — and
  * `lane` / `mode` / `fallbackFrom` / `vendorReported` added. `vendorReported` is true only when

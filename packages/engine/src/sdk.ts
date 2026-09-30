@@ -38,6 +38,23 @@ export {
   type SessionReport,
 } from "./inspect.ts";
 export { isPidAlive, type LockState, readLock } from "./lock.ts";
+/**
+ * Act M1-A4: the read-only `$MADC_HOME/policy.json` loader, so `madc doctor` can report rejected
+ * allowlist entries (a path-only entry, an unparseable remote, a key that is not a registry id) and
+ * an over-permissive file mode. Reading only — like every other re-export here it never writes,
+ * creates or appends, and it never returns a credential.
+ */
+export {
+  isRepoGated,
+  loadRepoPolicy,
+  POLICY_FILE_NAME,
+  type PolicyFileIssue,
+  REPO_GATED_PROVIDER_IDS,
+  type RejectedPolicyEntry,
+  type RepoDecision,
+  type RepoPolicy,
+  type RepoPolicyLoad,
+} from "./policy/store.ts";
 export * from "./protocol/errors.ts";
 export { ID_PATTERN, isValidId } from "./protocol/ids.ts";
 export * from "./protocol/types.ts";

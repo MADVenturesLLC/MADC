@@ -285,8 +285,9 @@ const BAD_SEATS: Array<{
   },
   {
     name: "backing-unwired",
-    seat: { preferredBacking: "mistral-pro" },
-    issues: ['preferredBacking "mistral-pro" is not wired in this build'],
+    // openrouter is a kept stub no M1 act wires (mistral-pro was this fixture until M1-A4).
+    seat: { preferredBacking: "openrouter" },
+    issues: ['preferredBacking "openrouter" is not wired in this build'],
   },
   {
     name: "fallbacks-in-v1",
@@ -551,7 +552,12 @@ test("M1-A3 (S1): a wired non-M0 backing validates through the registry", () => 
   assert.equal(seatBackingIssue("claude-code"), null);
   assert.equal(seatBackingIssue("codex"), null);
   assert.equal(seatBackingIssue("ollama-cloud"), null);
-  assert.match(seatBackingIssue("mistral-pro") ?? "", /not wired in this build/);
+  // M1-A4 wired the direct-key batch, so each is now a valid backing at load.
+  for (const id of ["mistral-pro", "deepseek-payg", "gemini-api-key", "xai-api"]) {
+    assert.equal(seatBackingIssue(id), null, id);
+  }
+  // openrouter is a kept stub no M1 act wires (mistral-pro was this fixture until M1-A4).
+  assert.match(seatBackingIssue("openrouter") ?? "", /not wired in this build/);
   assert.match(seatBackingIssue("zai-glm-coding-plan") ?? "", /forbidden lane/);
   assert.match(seatBackingIssue("no-such-provider") ?? "", /not a registry provider id/);
 });

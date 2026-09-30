@@ -1,7 +1,7 @@
 /**
  * @madc/registry — rules-aware provider catalog v2 + fail-closed assertAllowed.
  * Pure data + pure functions. No network, keychain, clock, or secret I/O.
- * Act M1-A1 (was M0-A1).
+ * Act M1-A1 (was M0-A1); act M1-A4 adds the pure remote-URL normalizer (plan §5).
  */
 
 export {
@@ -17,6 +17,7 @@ export {
   listCatalog,
   PROVIDER_CATALOG,
 } from "./catalog.ts";
+export { normalizeRemote, type RemoteNormalization } from "./remote.ts";
 export {
   type AllowedDirectEntry,
   type ClientIdentity,
