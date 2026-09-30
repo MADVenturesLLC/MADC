@@ -1,5 +1,11 @@
 /** Test helpers (not for production use): in-process fake of the Kimi Code endpoint. */
 
+/** Test helpers (not for production use): fake ACP vendor agent child process (M1-A6). */
+export {
+  createFakeAcpSpawn,
+  FAKE_ACP_AGENT_ENTRY,
+  FAKE_GROK_BINARY,
+} from "./fake-acp-spawn.ts";
 /** Test helpers (not for production use): fake `claude` child process (A5). */
 export {
   createFakeClaudeSpawn,
