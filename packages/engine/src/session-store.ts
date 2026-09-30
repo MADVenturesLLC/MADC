@@ -896,6 +896,8 @@ const PROVIDER_STATUSES: readonly unknown[] = [
 const TURN_MODES: readonly unknown[] = ["interactive", "headless"];
 /** M1 seat pin §4.2 `repo.decision` (added by M1-A4). */
 const REPO_DECISIONS: readonly unknown[] = ["allow", "deny"];
+const REPO_ALLOW_REASONS: readonly unknown[] = ["repo-allowed", "not-repo-gated"];
+const REPO_DENY_REASONS: readonly unknown[] = ["repo-not-allowed", "repo-identity-ambiguous"];
 
 /**
  * A receipt / `session.open` backing is any WIRED registry id (seat pin S1; M0's three-literal
@@ -990,15 +992,19 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
         ? null
         : "malformed fallback.rejected payload";
     }
-    case "repo.decision":
+    case "repo.decision": {
+      const reasonOk =
+        (p.decision === "allow" && REPO_ALLOW_REASONS.includes(p.reason)) ||
+        (p.decision === "deny" && REPO_DENY_REASONS.includes(p.reason));
       return isValidId(p.turnId) &&
         isStr(p.providerId) &&
         (p.remote === null || isStr(p.remote)) &&
         (p.topLevel === null || isStr(p.topLevel)) &&
         REPO_DECISIONS.includes(p.decision) &&
-        isStr(p.reason)
+        reasonOk
         ? null
         : "malformed repo.decision payload";
+    }
     case "turn.end": {
       const err = p.error;
       const errOk =

@@ -20,7 +20,7 @@
  * M1: it is operator-authored. The pinned `0600` permission is therefore REPORTED for doctor rather
  * than silently chmod'ed underneath the operator.
  */
-import { closeSync, fstatSync, readFileSync, realpathSync } from "node:fs";
+import { closeSync, fstatSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { getById, normalizeRemote } from "@madc/registry";
 import { isStrictlyUnder } from "../home.ts";
@@ -56,7 +56,8 @@ export type RepoAllowEntry = {
 /**
  * A load-time rejection. `index` is null when the whole provider key was rejected (not a registry
  * id, or its value was not an array). The remote/value is NEVER echoed: an entry could carry a
- * credentialed URL, and these strings reach doctor output and engine logs.
+ * credentialed URL, and these strings reach doctor output and engine logs. Unknown keys that are
+ * not registry-shaped are redacted to `<non-registry-key>` before they leave this module.
  */
 export type RejectedPolicyEntry = {
   readonly providerId: string;
@@ -110,15 +111,53 @@ export type RepoPolicyLoad = {
   readonly permissiveMode: string | null;
 };
 
+/**
+ * Unknown `repoAllow` keys may be attacker-controlled JSON (including credentialed URLs). Safe
+ * registry-shaped ids (`deepseek`, a typo for `deepseek-payg`) stay readable for doctor; anything
+ * else is replaced with a fixed placeholder so doctor/logs never echo secrets (Copilot r4143721345).
+ */
+const SAFE_UNKNOWN_PROVIDER_KEY = /^[a-z][a-z0-9-]*$/u;
+
+function redactUnknownProviderKey(key: string): string {
+  return SAFE_UNKNOWN_PROVIDER_KEY.test(key) ? key : "<non-registry-key>";
+}
+
+/**
+ * A Map that cannot be widened after load. `Object.freeze(new Map(...))` still allows `.set` /
+ * `.delete` / `.clear` at runtime; `decide` and the exported `allow` must share a sealed view
+ * (Copilot r4143721405 on PR #38).
+ */
+function sealedAllowMap(
+  entries: Iterable<readonly [string, readonly RepoAllowEntry[]]>,
+): ReadonlyMap<string, readonly RepoAllowEntry[]> {
+  const inner = new Map(entries);
+  const view: ReadonlyMap<string, readonly RepoAllowEntry[]> = {
+    get size() {
+      return inner.size;
+    },
+    get: (key) => inner.get(key),
+    has: (key) => inner.has(key),
+    keys: () => inner.keys(),
+    values: () => inner.values(),
+    entries: () => inner.entries(),
+    forEach: (callback, thisArg) => {
+      inner.forEach(callback, thisArg);
+    },
+    [Symbol.iterator]: () => inner.entries(),
+  };
+  return Object.freeze(view);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 /** Deny-everything policy: what a clean install (no file) and every unreadable file resolve to. */
 function emptyPolicy(): RepoPolicy {
+  const allow = sealedAllowMap([]);
   return Object.freeze({
-    allow: Object.freeze(new Map<string, readonly RepoAllowEntry[]>()),
-    decide: (providerId, resolution) => decideWith(providerId, resolution, new Map()),
+    allow,
+    decide: (providerId, resolution) => decideWith(providerId, resolution, allow),
   });
 }
 
@@ -247,19 +286,32 @@ export function loadRepoPolicy(home: string, options: LoadRepoPolicyOptions = {}
   try {
     realPath = realpath(path);
   } catch {
-    // ENOENT is the clean-install case: absent, not broken.
-    return {
-      policy: emptyPolicy(),
-      rejected: [],
-      fileIssues: [],
-      present: false,
-      permissiveMode: null,
-    };
+    // Distinguish a clean-install absence from an existing-but-unresolvable path (dangling
+    // symlink, etc.): the latter is a broken file doctor must report (Copilot r4143721567).
+    try {
+      lstatSync(path);
+    } catch {
+      return {
+        policy: emptyPolicy(),
+        rejected: [],
+        fileIssues: [],
+        present: false,
+        permissiveMode: null,
+      };
+    }
+    return refuse("policy.json path could not be resolved");
   }
   if (!isStrictlyUnder(realPath, realHome)) return refuse("policy.json is not inside MADC_HOME");
 
   // Never follow a symlink for the final component, matching the sessions-file rule.
-  const fd = openNoFollow(path);
+  // openNoFollow throws for errors other than ENOENT/ELOOP (e.g. EACCES); those must become a
+  // reported unreadable issue, never an engine-startup throw (Copilot r4143721617).
+  let fd: number | null | "symlink";
+  try {
+    fd = openNoFollow(path);
+  } catch {
+    return refuse("policy.json is unreadable");
+  }
   if (fd === null) {
     return {
       policy: emptyPolicy(),
@@ -315,7 +367,11 @@ export function loadRepoPolicy(home: string, options: LoadRepoPolicyOptions = {}
   for (const [providerId, rawEntries] of Object.entries(rawAllow)) {
     // Keys are registry ids EXACTLY (seat pin §5). An unknown id grants nothing and is reported.
     if (getById(providerId) === undefined) {
-      rejected.push({ providerId, index: null, issue: "not a registry provider id" });
+      rejected.push({
+        providerId: redactUnknownProviderKey(providerId),
+        index: null,
+        issue: "not a registry provider id",
+      });
       continue;
     }
     if (!Array.isArray(rawEntries)) {
@@ -335,12 +391,12 @@ export function loadRepoPolicy(home: string, options: LoadRepoPolicyOptions = {}
     allow.set(providerId, Object.freeze(entries));
   }
 
-  const frozen = new Map([...allow].map(([k, v]) => [k, v]));
+  const sealed = sealedAllowMap(allow);
   return {
     policy: Object.freeze({
-      allow: frozen,
+      allow: sealed,
       decide: (providerId: string, resolution: RepoIdentityResolution) =>
-        decideWith(providerId, resolution, frozen),
+        decideWith(providerId, resolution, sealed),
     }),
     rejected,
     fileIssues,

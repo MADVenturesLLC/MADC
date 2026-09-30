@@ -42,11 +42,13 @@ const SCP_STYLE = /^(?:[^/@:\s]+@)?([^/:\s]+):(.+)$/u;
  * survive a second pass unchanged.
  *
  * Deliberately narrow, so that accepting it cannot swallow a local path: the first segment must
- * start alphanumeric (never `.` or `..`, never `/`), and at least one more segment must follow. So
- * `github.com/owner/repo` and `gitlab.com/group/sub/repo` are canonical, while `/srv/git/repo.git`,
- * `../other.git` and `repo.git` all stay unparseable and fail closed.
+ * start alphanumeric (never `.` or `..`, never `/`), and **at least two** path segments must follow
+ * the host (`owner` and `repo`). So `github.com/owner/repo` and `gitlab.com/group/sub/repo` are
+ * canonical, while `owner/repo` (a relative path), `github.com/repo` (a single path segment),
+ * `/srv/git/repo.git`, `../other.git` and `repo.git` all stay unparseable and fail closed
+ * (Copilot r4143721465 on PR #38).
  */
-const CANONICAL = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9._-]+)+$/u;
+const CANONICAL = /^[A-Za-z0-9][A-Za-z0-9._-]*(?:\/[A-Za-z0-9._-]+){2,}$/u;
 
 export type RemoteNormalization =
   | { readonly ok: true; readonly remote: string }
@@ -124,6 +126,14 @@ export function normalizeRemote(input: string): RemoteNormalization {
   if (collapsed === "") return unparseable();
   const remote = stripGitSuffix(collapsed);
   if (remote === "") return unparseable();
+  // host/owner/repo at minimum — a single path segment (`git@host:repo`, relative `owner/repo`
+  // after a mistaken host split) is never a repository identity.
+  if (remote.split("/").length < 2) return unparseable();
 
-  return { ok: true, remote: `${host}/${remote}` };
+  const identity = `${host}/${remote}`;
+  // Every spelling must land on the same grammar the canonical/idempotent path accepts, so a
+  // percent-encoded or otherwise non-canonical segment cannot work on first load and fail on reload
+  // (Copilot r4143721727 on PR #38).
+  if (!CANONICAL.test(identity)) return unparseable();
+  return { ok: true, remote: identity };
 }

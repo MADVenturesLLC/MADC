@@ -96,10 +96,36 @@ test("remote: accepting the canonical spelling never swallows a local path", () 
     "..",
     ".",
     "repo.git",
+    "owner/repo",
     "owner/repo/../escape",
     "-host/owner/repo",
   ]) {
     assert.equal(normalizeRemote(local).ok, false, `${local} must stay unparseable`);
+  }
+});
+
+test("remote: a host with fewer than two path segments fails closed", () => {
+  for (const input of [
+    "git@github.com:repo",
+    "git@github.com:repo.git",
+    "ssh://git@github.com/repo",
+    "https://github.com/repo",
+    "https://github.com/repo.git",
+    "github.com/repo",
+  ]) {
+    assert.equal(normalizeRemote(input).ok, false, `${input} needs owner/repo`);
+  }
+});
+
+test("remote: assembled identities must match the canonical grammar (idempotent reload)", () => {
+  // Percent-encoded / otherwise non-canonical segments must not normalize on first pass then
+  // fail on the second (policy.json stores the first result and reloads it).
+  for (const input of [
+    "https://github.com/owner/repo%20name",
+    "https://github.com/owner/repo name",
+    "git@github.com:owner/repo+plus",
+  ]) {
+    assert.equal(normalizeRemote(input).ok, false, `${input} must not normalize`);
   }
 });
 

@@ -624,10 +624,10 @@ test("A4 policy: a repo-gated decision never needs a caller-supplied cwd string 
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const repo = makeRepo(root, "no-string-match", "https://github.com/owner/repo.git");
   // An entry equal to a PREFIX / substring / superset path of the checkout must not match: matching
-  // is exact equality on the normalized remote and the realpath'd top-level.
+  // is exact equality on the normalized remote and the realpath'd top-level. (`github.com/owner`
+  // is no longer a loadable remote — host/owner alone fails closed at normalize.)
   const policy = policyWith(root, {
     [DEEPSEEK]: [
-      "github.com/owner",
       "github.com/owner/repo/extra",
       "hub.com/owner/repo",
       { remote: ALLOWED_REMOTE, path: dirname(repo) },
@@ -635,4 +635,98 @@ test("A4 policy: a repo-gated decision never needs a caller-supplied cwd string 
   });
   assert.equal(policy.rejected.length, 0, "every entry above is well-formed, just not this repo");
   assertDeny(policy.decide(DEEPSEEK, resolveRepoIdentity(repo)), "repo-not-allowed");
+});
+
+test("A4 policy load: a credential-shaped unknown key is redacted before it reaches doctor", (t) => {
+  const root = makeRoot();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const secret = "ghp_SuperSecretTokenValue";
+  const home = join(root, "home-cred-key");
+  mkdirSync(home, { recursive: true });
+  writeFileSync(
+    join(home, POLICY_FILE_NAME),
+    JSON.stringify({
+      version: 1,
+      repoAllow: { [`https://user:${secret}@evil.example`]: [ALLOWED_REMOTE] },
+    }),
+    { mode: 0o600 },
+  );
+  const loaded = loadRepoPolicy(home);
+  assert.equal(loaded.rejected.length, 1);
+  assert.equal(loaded.rejected[0]?.providerId, "<non-registry-key>");
+  assert.ok(!JSON.stringify(loaded.rejected).includes(secret));
+  assert.ok(!JSON.stringify(loaded.rejected).includes("evil.example"));
+});
+
+test("A4 policy load: the exported allow map cannot widen the effective allowlist", (t) => {
+  const root = makeRoot();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const repo = makeRepo(root, "sealed-allow", "https://github.com/owner/repo.git");
+  const loaded = loadRepoPolicy(
+    (() => {
+      const home = join(root, "home-sealed");
+      mkdirSync(home, { recursive: true });
+      writeFileSync(
+        join(home, POLICY_FILE_NAME),
+        JSON.stringify({ version: 1, repoAllow: { [DEEPSEEK]: [] } }),
+        { mode: 0o600 },
+      );
+      return home;
+    })(),
+  );
+  assertDeny(loaded.policy.decide(DEEPSEEK, resolveRepoIdentity(repo)), "repo-not-allowed");
+  const mutable = loaded.policy.allow as Map<string, { remote: string; path: string | null }[]>;
+  let mutated = false;
+  try {
+    mutable.set?.(DEEPSEEK, [{ remote: ALLOWED_REMOTE, path: null }]);
+    mutated = true;
+  } catch {
+    // A throwing set is also a correct seal.
+  }
+  if (mutated) {
+    assert.equal(
+      loaded.policy.allow.get(DEEPSEEK)?.[0]?.remote,
+      undefined,
+      "allow.set must not widen the live allowlist",
+    );
+  }
+  assertDeny(
+    loaded.policy.decide(DEEPSEEK, resolveRepoIdentity(repo)),
+    "repo-not-allowed",
+    "decide must ignore any post-load allow mutation",
+  );
+});
+
+test("A4 policy load: a dangling symlink at policy.json is reported, not treated as absent", (t) => {
+  if (!POSIX) return;
+  const root = makeRoot();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, "home-dangling");
+  mkdirSync(home, { recursive: true });
+  symlinkSync(join(home, "missing-target.json"), join(home, POLICY_FILE_NAME));
+  const loaded = loadRepoPolicy(home);
+  assert.equal(loaded.present, true);
+  assert.equal(loaded.fileIssues.length, 1);
+  assert.match(loaded.fileIssues[0]?.issue ?? "", /could not be resolved|symlink|unreadable/);
+  assert.equal(loaded.policy.allow.size, 0);
+});
+
+test("A4 identity: ambient GIT_DIR cannot retarget the gate at another repository", (t) => {
+  const root = makeRoot();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const allowed = makeRepo(root, "git-dir-allowed", "https://github.com/owner/repo.git");
+  const other = makeRepo(root, "git-dir-other", "https://github.com/other/repo.git");
+  const policy = policyWith(root, { [DEEPSEEK]: [ALLOWED_REMOTE] });
+
+  const previous = process.env.GIT_DIR;
+  process.env.GIT_DIR = join(allowed, ".git");
+  t.after(() => {
+    if (previous === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = previous;
+  });
+
+  // cwd is the OTHER repo; ambient GIT_DIR points at the allowlisted one. The gate must still
+  // resolve OTHER and deny — never authorize from the inherited GIT_DIR.
+  assertDeny(decide(policy, other), "repo-not-allowed");
+  assertAllow(decide(policy, allowed));
 });

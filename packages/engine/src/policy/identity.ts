@@ -58,12 +58,44 @@ export type RepoIdentityDeps = {
 const GIT_TIMEOUT_MS = 5_000;
 
 /**
+ * Git environment variables that retarget `rev-parse` / `config` at a different repository or
+ * config scope than `cwd`. Inherited values must not authorize a gate decision (Copilot
+ * r4143721202 on PR #38).
+ */
+const GIT_REPO_OVERRIDE_KEYS: ReadonlySet<string> = new Set([
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_INDEX_FILE",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_NAMESPACE",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_CONFIG",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_CONFIG_NOSYSTEM",
+]);
+
+/**
  * `git` child environment. `GIT_TERMINAL_PROMPT=0` stops git from blocking on a credential prompt
  * (which would otherwise burn the whole timeout); `GIT_OPTIONAL_LOCKS=0` stops opportunistic
  * background maintenance from taking locks in a repository madc is only reading identity from.
+ * Repository/config override variables from the parent process are stripped so the gate always
+ * inspects `cwd`'s checkout, never an ambient `GIT_DIR` / `GIT_CONFIG_*` pointed elsewhere.
  */
 function gitEnv(): NodeJS.ProcessEnv {
-  return { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" };
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_OPTIONAL_LOCKS: "0",
+  };
+  for (const key of Object.keys(env)) {
+    if (GIT_REPO_OVERRIDE_KEYS.has(key) || key.startsWith("GIT_CONFIG_")) {
+      delete env[key];
+    }
+  }
+  return env;
 }
 
 function defaultRunGit(args: readonly string[], cwd: string): GitCommandResult {
@@ -146,9 +178,11 @@ export function resolveRepoIdentity(
   }
   if (topLevel === "") return fail("realpath resolution of the git top-level failed");
 
-  // (b) Every configured `origin` endpoint, fetch and push alike. `git config --get-regexp` exits
-  // 1 when nothing matches, which is the "no origin remote" case.
-  const configResult = runGit(["config", "--get-regexp", "^remote\\.origin\\."], cwd);
+  // (b) Every configured `origin` endpoint, fetch and push alike — repository-LOCAL only
+  // (`--local`), so a checkout with no local origin cannot inherit an operator/global
+  // `remote.origin.*` and look allowlisted (Copilot r4143721284 on PR #38). Exits 1 when nothing
+  // matches, which is the "no origin remote" case.
+  const configResult = runGit(["config", "--local", "--get-regexp", "^remote\\.origin\\."], cwd);
   if (configResult.code !== 0) return fail("no origin remote is configured");
 
   const endpoints: string[] = [];
