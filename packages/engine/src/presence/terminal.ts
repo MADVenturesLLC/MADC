@@ -17,6 +17,11 @@
  *   keeps a destroyed `tty.ReadStream` alive). `O_NONBLOCK` is set on this open's own file
  *   description, so the shell's and the CLI's handles on the same terminal stay blocking.
  *
+ * POSIX only (macOS and Linux, the M1 platforms). Windows has no `/dev/tty` and M1 defers Windows
+ * (plan §3), so there the terminal reports `unsupported` and every presence-gated lane is refused
+ * with that reason named — an explicit limitation, not a probe that happens to fail (Copilot
+ * r4145107223).
+ *
  * Residual risk, stated plainly (M1 plan §7 M1-A5, §8): a program running inside the person's own
  * terminal session can still type into it. This check stops detached automation; it does not stop
  * a hostile local process that already shares the terminal.
@@ -27,6 +32,11 @@ import { isatty } from "node:tty";
 import type { TerminalFacts } from "./policy.ts";
 
 export type PresenceTerminal = {
+  /**
+   * Set when this platform has no presence check at all: the reason, for the refusal log. Such a
+   * terminal never probes and never confirms, so every gated turn is refused (fail-closed).
+   */
+  readonly unsupported?: string;
   /**
    * Opens the controlling terminal, checks it is a live TTY and returns its identity. `null` when
    * there is none (or it cannot be identified: fail-closed). Never prompts, never reads input.
@@ -119,8 +129,18 @@ function drainTypeAhead(fd: number): void {
   }
 }
 
+/** The M1 platforms with a presence check; anything else reports `unsupported`. */
+export const PRESENCE_PLATFORMS: readonly string[] = Object.freeze(["darwin", "linux"]);
+
 export function createSystemTerminal(deps: SystemTerminalDeps = {}): PresenceTerminal {
   const platform = deps.platform ?? process.platform;
+  if (!PRESENCE_PLATFORMS.includes(platform)) {
+    return Object.freeze({
+      unsupported: `the presence check is unsupported on ${platform} (M1 supports macOS and Linux)`,
+      probe: () => null,
+      confirm: () => Promise.resolve(false),
+    });
+  }
   const pid = deps.pid ?? process.pid;
   const ttyPath = deps.ttyPath ?? "/dev/tty";
   const pollMs = deps.pollMs ?? 50;

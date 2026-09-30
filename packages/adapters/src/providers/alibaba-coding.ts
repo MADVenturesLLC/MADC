@@ -2,8 +2,9 @@
  * Alibaba Cloud Coding Plan backing (M1-A5; roadmap §3 row 9 — `interactive-only`, VERIFIED).
  *
  * The OpenAI-compatible Coding Plan endpoint `https://coding-intl.dashscope.aliyuncs.com/v1` with a
- * Bearer `sk-sp-` plan key. Both facts were re-read on the lane's `termsUrl` page on 2026-09-30
- * ("Last Updated: Sep 28, 2026"), which also still carries the registry `sourceQuote` verbatim.
+ * Bearer `sk-sp-` plan key. Both facts were confirmed on the lane's `termsUrl` page on 2026-09-30
+ * ("Last Updated: Sep 28, 2026") as a build-time wiring check. That is not a terms re-verification:
+ * the registry `verifiedAt` stays the roadmap §3 date (Copilot r4145107357).
  *
  * **Why this is a `createProvider` config, not a pi-ai built-in.** Roadmap §3 row 9 planned the lane
  * as "pi-ai `qwen-token-plan*` catalog, endpoint match to confirm at build time". The match fails:
@@ -48,7 +49,7 @@ export const ALIBABA_PAYG_PROVIDER_ID = "alibaba-model-studio-payg";
 /** pi-ai provider id of the custom provider == the registry id (no legacy split to honor). */
 export const ALIBABA_CODING_PLAN_PI_PROVIDER = "alibaba-coding-plan";
 export const ALIBABA_CODING_PLAN_WIRE_API = "openai-completions" as const;
-/** International Coding Plan endpoint (termsUrl page, re-read 2026-09-30). */
+/** International Coding Plan endpoint (termsUrl page, confirmed 2026-09-30 as a wiring check). */
 export const ALIBABA_CODING_PLAN_BASE_URL = "https://coding-intl.dashscope.aliyuncs.com/v1";
 /** Coding Plan key prefix (termsUrl page; planning record QW-09..14 / QW-53..60). */
 export const ALIBABA_PLAN_KEY_PREFIX = "sk-sp-";

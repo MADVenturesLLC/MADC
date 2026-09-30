@@ -15,7 +15,7 @@
  * mixed).** Token Plan and pay-as-you-go share the same base URL (MM-32..39), so the endpoint cannot
  * tell the two apart; the key shape can. MiniMax's page says the Subscription Key "is not
  * interchangeable with pay-as-you-go API Keys" (roadmap §3 row 8) and the planning record gives its
- * prefix as `sk-cp-` (MM-32..39, verified 2026-09-24; the intro and FAQ pages re-read on 2026-09-30
+ * prefix as `sk-cp-` (MM-32..39, verified 2026-09-24; the intro and FAQ pages read on 2026-09-30
  * no longer print the prefix). So:
  * - `minimax-token-plan` accepts only an `sk-cp-` key;
  * - `minimax-payg` refuses an `sk-cp-` key (a plan key must never serve headless work).

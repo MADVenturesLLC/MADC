@@ -177,14 +177,22 @@ type FakeTerminal = {
   readonly prompts: string[];
   probes(): number;
   aborted(): number;
+  /** Answer the oldest held prompt (`answer: "hold"`), as a person at the terminal would. */
+  release(answer: boolean): void;
 };
 
-function fakeTerminal(facts: TerminalFacts | null = TERMINAL, answer: boolean | "hold" = true) {
+function fakeTerminal(
+  facts: TerminalFacts | null = TERMINAL,
+  answer: boolean | "hold" = true,
+  unsupported?: string,
+) {
   const state = { facts, answer };
   const prompts: string[] = [];
+  const held: Array<(answer: boolean) => void> = [];
   let probes = 0;
   let aborted = 0;
   const terminal: PresenceTerminal = {
+    ...(unsupported === undefined ? {} : { unsupported }),
     probe: () => {
       probes += 1;
       return state.facts === null ? null : { ...state.facts };
@@ -193,6 +201,7 @@ function fakeTerminal(facts: TerminalFacts | null = TERMINAL, answer: boolean | 
       prompts.push(prompt);
       if (state.answer !== "hold") return Promise.resolve(state.answer);
       return new Promise((resolve) => {
+        held.push(resolve);
         signal.addEventListener(
           "abort",
           () => {
@@ -210,6 +219,7 @@ function fakeTerminal(facts: TerminalFacts | null = TERMINAL, answer: boolean | 
     prompts,
     probes: () => probes,
     aborted: () => aborted,
+    release: (confirmed) => held.shift()?.(confirmed),
   };
   return fake;
 }
@@ -227,7 +237,11 @@ function startEngine(
   home: string,
   agent: Agent,
   terminal: PresenceTerminal,
-  options: { repoPolicy?: RepoPolicy; repoIdentityDeps?: RepoIdentityDeps } = {},
+  options: {
+    repoPolicy?: RepoPolicy;
+    repoIdentityDeps?: RepoIdentityDeps;
+    log?: (line: string) => void;
+  } = {},
 ) {
   const input = new PassThrough();
   const received: Wire[] = [];
@@ -245,7 +259,7 @@ function startEngine(
     home,
     agent,
     terminal,
-    log: () => {},
+    log: options.log ?? (() => {}),
     ...(options.repoPolicy === undefined ? {} : { repoPolicy: options.repoPolicy }),
     ...(options.repoIdentityDeps === undefined
       ? {}
@@ -696,6 +710,74 @@ test("A5: while a keypress is pending the thread takes no other turn/start, and 
   assert.equal(fakes.total(), 0);
 });
 
+test("A5 (Copilot r4145107307): confirmations are serialized engine-wide — one prompt on the terminal at a time, each answered for its own seat", async (t) => {
+  const home = withHome(t);
+  writeSeatFile(home, SEATS.alibaba());
+  writeSeatFile(
+    home,
+    seatBody("coder2", ALIBABA_CODING_PLAN_PROVIDER_ID, "alibaba-coding-plan/qwen3-coder-plus"),
+  );
+  const fakes = makeFakes();
+  const term = fakeTerminal(TERMINAL, "hold");
+  const e = startEngine(home, laneAgent(fakes), term.terminal);
+  try {
+    await handshake(e);
+    const first = await startThread(e, "coder");
+    const second = await startThread(e, "coder2");
+    const idA = e.send("turn/start", turnParams(first, "interactive"));
+    const idB = e.send("turn/start", turnParams(second, "interactive"));
+    const until = Date.now() + 5_000;
+    while (term.prompts.length === 0 && Date.now() < until)
+      await new Promise((r) => setTimeout(r, 5));
+    // Let the second request reach the engine and wait in the queue.
+    await new Promise((r) => setTimeout(r, 100));
+    assert.equal(term.prompts.length, 1, "the second thread's prompt waits for the first");
+    assert.match(term.prompts[0] ?? "", /seat coder wants lane/);
+
+    term.release(true); // the person answers the prompt on screen: thread one's
+    const replyA = await e.reply(idA);
+    assert.equal(replyA.error, undefined);
+    while (term.prompts.length < 2 && Date.now() < until)
+      await new Promise((r) => setTimeout(r, 5));
+    assert.equal(term.prompts.length, 2, "only now is the second prompt shown");
+    assert.match(term.prompts[1] ?? "", /seat coder2 wants lane/);
+
+    term.release(false); // and refuses the second one
+    const replyB = await e.reply(idB);
+    assert.equal(replyB.error?.data?.reason, "interactive-only-headless");
+    const turnA = replyA.result?.turn?.id;
+    assert.ok(typeof turnA === "string");
+    assert.equal((await e.completed(turnA)).params?.turn?.status, "completed");
+    assert.equal(fakes.alibaba.requests.length, 1, "only the confirmed thread reached the lane");
+  } finally {
+    await e.close();
+  }
+});
+
+test("A5 (Copilot r4145107223): on a platform without a presence check the refusal names the limitation", async (t) => {
+  const home = withHome(t);
+  writeSeatFile(home, SEATS.alibaba());
+  const fakes = makeFakes();
+  const reason = "the presence check is unsupported on win32 (M1 supports macOS and Linux)";
+  const term = fakeTerminal(null, true, reason);
+  const logs: string[] = [];
+  const e = startEngine(home, laneAgent(fakes), term.terminal, { log: (line) => logs.push(line) });
+  try {
+    await handshake(e);
+    const threadId = await startThread(e, "coder");
+    const reply = await e.request("turn/start", turnParams(threadId, "interactive"));
+    assert.equal(reply.error?.data?.reason, "interactive-only-headless");
+    assert.ok(
+      logs.includes(`presence alibaba-coding-plan: absent (${reason}); turn refused`),
+      logs.join("\n"),
+    );
+    assert.deepEqual(term.prompts, []);
+    assert.equal(fakes.total(), 0);
+  } finally {
+    await e.close();
+  }
+});
+
 // --------------------------------------------------------------------- MiniMax repo gate (D-M1-9)
 
 const ALLOWED_REMOTE = "github.com/owner/repo";
@@ -1055,6 +1137,7 @@ test("A5: turn.start mode/presence/tty are validated when present; a pre-A5 line
   const ok = [
     { turnId: "turn_1", inputText: "legacy line, no mode" },
     { turnId: "turn_1", inputText: "x", mode: "headless", presence: "absent" },
+    { turnId: "turn_1", inputText: "x", mode: "interactive", presence: "absent" },
     {
       turnId: "turn_1",
       inputText: "x",
@@ -1067,24 +1150,32 @@ test("A5: turn.start mode/presence/tty are validated when present; a pre-A5 line
     assert.equal(rebuildSession([sessionOpen(), turnStart(payload)]).turns.length, 1);
   }
   const bad = [
-    { turnId: "turn_1", inputText: "x", mode: "sideways" },
-    { turnId: "turn_1", inputText: "x", presence: "maybe" },
+    { turnId: "turn_1", inputText: "x", mode: "sideways", presence: "absent" },
+    { turnId: "turn_1", inputText: "x", mode: "headless", presence: "maybe" },
+    // `mode` and `presence` travel together: half an A5 record is malformed, not a weaker claim.
+    { turnId: "turn_1", inputText: "x", mode: "headless" },
+    { turnId: "turn_1", inputText: "x", presence: "absent" },
+    // Verified presence always carries its TTY evidence.
+    { turnId: "turn_1", inputText: "x", mode: "interactive", presence: "verified" },
     // TTY facts only ever accompany a verified presence.
     {
       turnId: "turn_1",
       inputText: "x",
+      mode: "interactive",
       presence: "absent",
       tty: { device: "1/1", session: null, confirmation: "keypress" },
     },
     {
       turnId: "turn_1",
       inputText: "x",
+      mode: "interactive",
       presence: "verified",
       tty: { device: "1/1", session: null, confirmation: "guess" },
     },
     {
       turnId: "turn_1",
       inputText: "x",
+      mode: "interactive",
       presence: "verified",
       tty: { device: 7, session: null, confirmation: "carried" },
     },

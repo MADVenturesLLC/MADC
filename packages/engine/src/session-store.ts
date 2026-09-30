@@ -49,8 +49,9 @@ export type TurnStartTty = {
 };
 /**
  * `turn.start` (seat pin §4.2). M1-A5 writes `mode` (the claim; P3: absent → `headless`) and
- * `presence` on every new line, and `tty` when presence is verified. They are optional in this type
- * because lines written before M1-A5 carry neither; such a line reads as `headless` / `absent`.
+ * `presence` on every new line, and `tty` exactly when presence is verified. They are optional in
+ * this type because lines written before M1-A5 carry none of them; such a line reads as
+ * `headless` / `absent`. A partial set is refused by `checkPayload`.
  */
 export type TurnStartPayload = {
   turnId: string;
@@ -992,20 +993,21 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
         ? null
         : "malformed session.open payload";
     case "turn.start": {
-      // M1-A5 fields are checked when present only: lines written before M1-A5 carry none of them.
+      // M1-A5: a pre-A5 line carries none of `mode` / `presence` / `tty`; an A5 line carries
+      // `mode` AND `presence` together, and `tty` exactly when presence is `verified`. A partial
+      // set is malformed, never read as a weaker claim.
+      const legacy = p.mode === undefined && p.presence === undefined && p.tty === undefined;
       const tty = p.tty;
-      const ttyOk =
-        tty === undefined ||
-        (isPlainRecord(tty) &&
-          isStr(tty.device) &&
-          (tty.session === null || isStr(tty.session)) &&
-          TTY_CONFIRMATIONS.includes(tty.confirmation) &&
-          p.presence === "verified");
-      return isValidId(p.turnId) &&
-        isStr(p.inputText) &&
-        (p.mode === undefined || TURN_MODES.includes(p.mode)) &&
-        (p.presence === undefined || PRESENCES.includes(p.presence)) &&
-        ttyOk
+      const a5 =
+        TURN_MODES.includes(p.mode) &&
+        PRESENCES.includes(p.presence) &&
+        (p.presence === "verified"
+          ? isPlainRecord(tty) &&
+            isStr(tty.device) &&
+            (tty.session === null || isStr(tty.session)) &&
+            TTY_CONFIRMATIONS.includes(tty.confirmation)
+          : tty === undefined);
+      return isValidId(p.turnId) && isStr(p.inputText) && (legacy || a5)
         ? null
         : "malformed turn.start payload";
     }

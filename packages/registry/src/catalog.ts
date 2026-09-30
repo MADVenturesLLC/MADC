@@ -211,9 +211,12 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     status: "interactive-only",
     connect: "direct",
     // M1-A5 (roadmap §3 row 9): OpenAI-compatible Coding Plan endpoint
-    // https://coding-intl.dashscope.aliyuncs.com/v1 (termsUrl page, re-read 2026-09-30). pi-ai's
-    // `qwen-token-plan*` catalog targets the Token Plan host instead, so the endpoint match the
-    // roadmap asked to confirm at build time failed and the lane is a `createProvider` config.
+    // https://coding-intl.dashscope.aliyuncs.com/v1. pi-ai's `qwen-token-plan*` catalog targets the
+    // Token Plan host instead, so the endpoint match the roadmap asked to confirm at build time
+    // failed and the lane is a `createProvider` config. The endpoint was confirmed on the termsUrl
+    // page as a build-time wiring check only; `verifiedAt` stays the roadmap §3 terms date, because
+    // re-verifying a lane's terms is a reviewed catalog change, not an adapter act's (Copilot
+    // r4145107357).
     wire: "openai-compat",
     clientIdentity: "default",
     wired: true,

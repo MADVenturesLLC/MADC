@@ -263,6 +263,12 @@ export class EngineConnection {
   #terminal: PresenceTerminal | null = null;
   /** M1-A5 presence prompts still waiting for a keypress; shutdown aborts every one. */
   readonly #pendingConfirmations = new Set<AbortController>();
+  /**
+   * M1-A5: the tail of the engine-wide confirmation queue. Every thread shares ONE controlling
+   * terminal, so prompts run one at a time: a keypress can only answer the prompt it was typed
+   * for, never another thread's seat or lane (Copilot r4145107307). Only ever resolves.
+   */
+  #confirmationTail: Promise<void> = Promise.resolve();
 
   constructor(opts: EngineOptions) {
     this.#opts = opts;
@@ -1132,10 +1138,11 @@ export class EngineConnection {
   ): PresencePhase {
     if (!presenceRequired(backing)) return { kind: "not-required" };
     if (claim !== "interactive") return { kind: "absent", why: "the turn is headless" };
-    const facts = this.#terminalAccess().probe();
+    const terminal = this.#terminalAccess();
+    const facts = terminal.probe();
     if (facts === null) {
       record.confirmedTerminal = null;
-      return { kind: "absent", why: "no controlling terminal" };
+      return { kind: "absent", why: terminal.unsupported ?? "no controlling terminal" };
     }
     const confirmed = record.confirmedTerminal;
     if (confirmed === null) return { kind: "pending", facts };
@@ -1186,8 +1193,9 @@ export class EngineConnection {
 
   /**
    * M1-A5: the first presence-gated turn on a thread asks for a keypress on the engine's own
-   * controlling terminal (never over the protocol pipe). While it waits, the thread accepts no other
-   * turn/start and cannot be reloaded; EOF or a signal aborts the wait. Resolves true only when the
+   * controlling terminal (never over the protocol pipe). Prompts are queued engine-wide, so only one
+   * is ever on the terminal. While it waits, the thread accepts no other turn/start and cannot be
+   * reloaded; EOF or a signal aborts the wait (queued or prompting). Resolves true only when the
    * person confirmed AND the terminal is still the one the prompt was written to — the confirmation
    * then binds to that terminal for later turns on this thread in this process.
    */
@@ -1196,15 +1204,24 @@ export class EngineConnection {
     const controller = new AbortController();
     record.confirming = true;
     this.#pendingConfirmations.add(controller);
+    const previous = this.#confirmationTail;
+    let release = (): void => {};
+    this.#confirmationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
     let confirmed: boolean;
     try {
-      confirmed = await this.#terminalAccess().confirm(
-        presencePrompt(record.seat.seat.id, record.seat.seat.preferredBacking),
-        controller.signal,
-      );
+      await previous; // one prompt on the terminal at a time
+      confirmed = controller.signal.aborted
+        ? false
+        : await this.#terminalAccess().confirm(
+            presencePrompt(record.seat.seat.id, record.seat.seat.preferredBacking),
+            controller.signal,
+          );
     } catch {
       confirmed = false;
     } finally {
+      release();
       record.confirming = false;
       this.#pendingConfirmations.delete(controller);
     }

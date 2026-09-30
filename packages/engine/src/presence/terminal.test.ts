@@ -50,6 +50,18 @@ test("A5 isConfirmation: Enter, y or yes confirms; anything else refuses", () =>
     assert.equal(isConfirmation(no), false, no);
 });
 
+test("A5 (Copilot r4145107223): the presence check is POSIX-only and says so; other platforms never probe", async () => {
+  for (const platform of ["win32", "freebsd"]) {
+    const terminal = createSystemTerminal({ platform });
+    assert.match(terminal.unsupported ?? "", new RegExp(`unsupported on ${platform}`));
+    assert.equal(terminal.probe(), null);
+    assert.equal(await terminal.confirm("x> ", new AbortController().signal), false);
+  }
+  for (const platform of ["darwin", "linux"]) {
+    assert.equal(createSystemTerminal({ platform }).unsupported, undefined, platform);
+  }
+});
+
 test("A5 system terminal: a path that is not a terminal (or does not exist) probes null and never confirms", async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "madc-a5-tty-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
