@@ -8,8 +8,10 @@ import { spawn } from "node:child_process";
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
+import { type CliIO, wrapProcessIO } from "./io.ts";
 import { claimMode } from "./mode.ts";
 
 const LAUNCHER = fileURLToPath(new URL("./testing/cli-launcher.ts", import.meta.url));
@@ -29,6 +31,36 @@ test("A5 claimMode: interactive only with stdin and stdout on a TTY and no -p", 
       }
     }
   }
+});
+
+test("A5 (Copilot review of PR #39): the real-process IO wrapper forwards every TTY fact, stdinIsTTY included", () => {
+  let cwdReads = 0;
+  const out = { write: () => true };
+  const base = (stdinIsTTY: boolean | undefined): CliIO => ({
+    stdout: out,
+    stderr: out,
+    stdin: new PassThrough(),
+    env: {},
+    stdoutIsTTY: true,
+    stderrIsTTY: false,
+    ...(stdinIsTTY === undefined ? {} : { stdinIsTTY }),
+    get cwd() {
+      cwdReads += 1;
+      return "/work";
+    },
+  });
+  for (const stdinIsTTY of [true, false]) {
+    const io = wrapProcessIO(base(stdinIsTTY), out, out);
+    assert.equal(io.stdinIsTTY, stdinIsTTY);
+    assert.equal(io.stdoutIsTTY, true);
+    assert.equal(io.stderrIsTTY, false);
+    // With both TTYs forwarded, a non-print surface can claim interactive; `-p` never can.
+    const facts = { stdinIsTTY: io.stdinIsTTY === true, stdoutIsTTY: io.stdoutIsTTY };
+    assert.equal(claimMode({ ...facts, print: false }), stdinIsTTY ? "interactive" : "headless");
+    assert.equal(claimMode({ ...facts, print: true }), "headless");
+  }
+  assert.equal(wrapProcessIO(base(undefined), out, out).stdinIsTTY, undefined);
+  assert.equal(cwdReads, 0, "cwd stays lazy (F-130)");
 });
 
 test("A5 madc -p: the one-shot claims headless, and the session JSONL records it", async (t) => {

@@ -41,6 +41,32 @@ export function processIO(engineEntry?: string): CliIO {
   };
 }
 
+/**
+ * The real process IO with guarded stdout/stderr. Every TTY fact is forwarded, including
+ * `stdinIsTTY`, which the M1-A5 mode claim needs (Copilot review of PR #39: `bin.ts` dropped it, so
+ * no non-`-p` surface could ever claim `interactive`).
+ */
+export function wrapProcessIO(
+  base: CliIO,
+  stdout: CliIO["stdout"],
+  stderr: CliIO["stderr"],
+): CliIO {
+  return {
+    stdout,
+    stderr,
+    stdin: base.stdin,
+    env: base.env,
+    stdoutIsTTY: base.stdoutIsTTY,
+    stderrIsTTY: base.stderrIsTTY,
+    ...(base.stdinIsTTY !== undefined ? { stdinIsTTY: base.stdinIsTTY } : {}),
+    // F-130: lazy on purpose — only the one-shot reads cwd, and a deleted cwd must not throw here.
+    get cwd() {
+      return base.cwd;
+    },
+    ...(base.engineEntry !== undefined ? { engineEntry: base.engineEntry } : {}),
+  };
+}
+
 /** Colour only on a TTY, never when `NO_COLOR` is set (any value), CLI pin §3. */
 export function colorEnabled(io: CliIO): boolean {
   return io.stdoutIsTTY && io.env.NO_COLOR === undefined;
