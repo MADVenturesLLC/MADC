@@ -504,7 +504,7 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
           const text = `… ${seatId} · ${((Date.now() - startedAt) / 1000).toFixed(1)}s`;
           // P-7: the same pinned text, drawn as a filled pill in tier W; the \r\x1b[K clear is
           // unchanged in every tier (IQ-14).
-          io.stderr.write(`\r\u001b[K${statusPill(text, io.env)}`);
+          io.stderr.write(`\r\u001b[K${statusPill(text, io)}`);
         }, 200);
       }
       if (sigintPending) throw new Forced();
@@ -900,15 +900,18 @@ function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** §6.1 P-7: the status text unchanged; tier W adds the accent fill, tier A stays plain. */
-function statusPill(text: string, env: Readonly<Record<string, string | undefined>>): string {
+/** §6.1 P-7: the status text unchanged; tier W adds the accent fill, tier A stays plain.
+ * Round 8: the tier decision uses the REAL CliIO terminal facts (TTY flags, columns, rows,
+ * env) — the previous call supplied undefined dimensions and forced stdin non-TTY, which
+ * selected Level A on every terminal, so the pill never got its tier-W fill. */
+export function statusPill(text: string, io: CliIO): string {
   const tier = decideTier({
-    stdoutIsTTY: true,
-    stderrIsTTY: true,
-    stdinIsTTY: false,
-    columns: undefined,
-    rows: undefined,
-    env,
+    stdoutIsTTY: io.stdoutIsTTY,
+    stderrIsTTY: io.stderrIsTTY,
+    stdinIsTTY: io.stdinIsTTY === true,
+    columns: io.columns,
+    rows: io.rows,
+    env: io.env,
     json: false,
     human: true,
   });

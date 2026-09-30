@@ -217,16 +217,27 @@ export class EngineClient {
     this.sendRaw(JSON.stringify({ method, params }));
   }
 
-  /** Resolve with the first message (already received or future) matching `match`. */
-  waitFor(match: (m: WireMessage) => boolean, timeoutMs = 10_000): Promise<WireMessage> {
-    const seen = this.messages.find(match);
-    if (seen !== undefined) return Promise.resolve(seen);
+  /**
+   * Resolve with the first message (already received or future) matching `match`. `since`
+   * (default 0) starts the history scan at that message index: a caller that already consumed
+   * the prior messages (its own turn's scan cursor) passes its message count so historical
+   * notifications are ignored rather than replayed into the new wait. Newly received messages
+   * are matched regardless of `since`.
+   */
+  waitFor(match: (m: WireMessage) => boolean, timeoutMs = 10_000, since = 0): Promise<WireMessage> {
+    for (let i = Math.max(0, Math.floor(since)); i < this.messages.length; i++) {
+      const m = this.messages[i];
+      if (m !== undefined && match(m)) return Promise.resolve(m);
+    }
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.#waiterTimers.delete(timer);
         this.#waiters = this.#waiters.filter((w) => w !== waiter);
         reject(new Error(`timed out after ${timeoutMs}ms waiting for engine message`));
       }, timeoutMs);
+      // An unref'd timer still fires; it just never holds the parent's event loop alive for
+      // what can be a very long wait (the app's turn waits use a ~24-day ceiling).
+      timer.unref?.();
       this.#waiterTimers.add(timer);
       const waiter: Waiter = {
         match,
@@ -256,6 +267,7 @@ export class EngineClient {
     method: M,
     predicate: (params: ServerNotifications[M]) => boolean = () => true,
     timeoutMs?: number,
+    since?: number,
   ): Promise<ServerNotifications[M]> {
     const m = await this.waitFor(
       (msg) =>
@@ -263,6 +275,7 @@ export class EngineClient {
         !Object.hasOwn(msg, "id") &&
         predicate(msg.params as ServerNotifications[M]),
       timeoutMs,
+      since,
     );
     return m.params as ServerNotifications[M];
   }

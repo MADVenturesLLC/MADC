@@ -16,14 +16,6 @@ import {
   wordWrap,
 } from "./style.ts";
 
-const STATUS_GLYPH: Readonly<Record<CheckStatus, string>> = {
-  pass: "✓",
-  warn: "▲",
-  fail: "✕",
-  skip: "○",
-  init: "◆",
-};
-
 const STATUS_ROLE: Readonly<Record<CheckStatus, "ok" | "warn" | "err" | "dim" | "accent2">> = {
   pass: "ok",
   warn: "warn",
@@ -32,9 +24,25 @@ const STATUS_ROLE: Readonly<Record<CheckStatus, "ok" | "warn" | "err" | "dim" | 
   init: "accent2",
 };
 
-/** `✓ PASS  runtime       node 22.19.0 (floor 22.19)` with the hanging indent 23 (§8). */
-export function doctorRowW(c: Check, style: Style, _g: Glyphs, width: number): string[] {
-  const glyph = style.role(STATUS_ROLE[c.status], STATUS_GLYPH[c.status]);
+/** The selected glyph set's status glyph (§4): ASCII mode renders `v PASS`, never `✓ PASS`. */
+function statusGlyph(g: Glyphs, status: CheckStatus): string {
+  switch (status) {
+    case "pass":
+      return g.check;
+    case "warn":
+      return g.warn;
+    case "fail":
+      return g.cross;
+    case "skip":
+      return g.idle;
+    case "init":
+      return g.diamond;
+  }
+}
+
+/** `✓ PASS  runtime       node 22.19.0 (floor 22.19.0)` with the hanging indent 23 (§8). */
+export function doctorRowW(c: Check, style: Style, g: Glyphs, width: number): string[] {
+  const glyph = style.role(STATUS_ROLE[c.status], statusGlyph(g, c.status));
   const word = style.role(STATUS_ROLE[c.status], c.status.toUpperCase().padEnd(4));
   const head = `${glyph} ${word}  ${c.id.padEnd(14)} `;
   // The --init row is `INIT  seeded <path>` / `INIT  already present (…)` (CLI pin §3).
@@ -44,8 +52,8 @@ export function doctorRowW(c: Check, style: Style, _g: Glyphs, width: number): s
 }
 
 /** The pending placeholder row: `○ ···· <id> running` dim, replaced in place when done (§8). */
-export function doctorPendingRowW(id: string, style: Style): string {
-  return `${style.role("dim", "○ ····")} ${id.padEnd(14)} ${style.role("dim", "running")}`;
+export function doctorPendingRowW(id: string, style: Style, g: Glyphs): string {
+  return `${style.role("dim", `${g.idle} ····`)} ${id.padEnd(14)} ${style.role("dim", "running")}`;
 }
 
 /** Header band: `▌ madc doctor · madc <v> · protocol <p>` (§8). */

@@ -27,6 +27,7 @@ import { overlayWidth, renderOverlay } from "./doctor-view.ts";
 import {
   type AppStateView,
   type BannerData,
+  type DoctorRow,
   type DoctorSummary,
   renderBanner,
   renderHeader,
@@ -34,10 +35,11 @@ import {
   renderHints,
   renderPills,
   renderTurn,
+  summarizeDoctor,
 } from "./frames.ts";
 import { receiptPlain } from "./receipt.ts";
 import { sanitizeItem, sanitizeText, stripControls } from "./sanitize.ts";
-import { type ChainVerify, railOf, type SessionCode, type TurnRecord, worstExit } from "./state.ts";
+import { type ChainVerify, type SessionCode, type TurnRecord, worstExit } from "./state.ts";
 import { type Glyphs, glyphsFor, padVisible, Style, truncateChrome } from "./style.ts";
 import { asciiForced, colorDepth } from "./tiers.ts";
 import { renderSessionStartFailedCard, renderVerdictCard, type Verdict } from "./verdict.ts";
@@ -197,12 +199,21 @@ export class WitnessApp {
   evidenceOpen = false;
   doctorOverlayOpen = false;
   doctorOverlayRows: string[] = [];
+  /** Kill hook for the /doctor overlay's probe engine (round 7: app-owned signal state). */
+  #doctorSignal: { exit: number | null; kill: (() => void) | null } = {
+    exit: null,
+    kill: null,
+  };
   input = "";
   turns: TurnRecord[] = [];
   sessionCodes: SessionCode[] = [];
   threadId: string | null = null;
   threadStatus: string | null = null;
   served: import("./receipt.ts").ServedModel | null = null;
+  /** Seq of the servedModel event, learned from a passing disk verify (§5.7); null until then. */
+  #servedSeq: number | null = null;
+  /** The launch note from the banner (persistent: §5.0's unrecognised-MADC_UI wording). */
+  readonly #launchNote: string | null;
   sessionPath: string | null = null;
   lastVerify: ChainVerify | null = null;
   lastEndNamesTurn = false;
@@ -217,6 +228,12 @@ export class WitnessApp {
   #firstPrompt: string | null;
   #doctorRunning = true;
   #streamSeconds: number | null = null;
+  /**
+   * Tick-latched total elapsed (§5.5/§10: displayed elapsed values update at ≤5 Hz). Both the
+   * clock and the idle pill read this sample, never a fresh clock read: event-triggered paints
+   * (keystrokes, doctor rows, deltas) must not advance a displayed elapsed value.
+   */
+  #elapsedSample = 0;
   #signalDuringFinalVerify = false;
   /** True while the §5.8.1 final verify (or the exit write) runs — the O-2 window. */
   #finalVerifyInFlight = false;
@@ -234,6 +251,10 @@ export class WitnessApp {
     this.#onFinalVerifySignal = opts.onFinalVerifySignal ?? null;
     this.#startedAt = this.#now();
     this.#banner = opts.banner;
+    // The launch note (§5.0 IQW-12's unrecognised-MADC_UI wording) owns its own slot: it
+    // must survive transient prompt warnings (oversize) in the banner and the evidence pane.
+    // `uiNote` below stays the transient slot (set/cleared by prompt handling).
+    this.#launchNote = opts.banner.uiNote;
     this.#firstPrompt = opts.firstPrompt;
     // §3.3: NO_COLOR (any value) or TERM=dumb → zero SGR; otherwise the colour rules.
     this.#style = Style.forDepth(
@@ -449,7 +470,10 @@ export class WitnessApp {
         "served",
         this.served === null
           ? s.role("warn", "▲ NO RECEIPT yet")
-          : s.role("accent2", this.served.servedModel),
+          : s.role(
+              "accent2",
+              `${this.served.servedModel}${this.#servedSeq === null ? "" : ` · seq ${this.#servedSeq}`}`,
+            ),
       ),
       "",
       s.role("accent", "THREAD"),
@@ -477,14 +501,17 @@ export class WitnessApp {
         this.turns
           .map(
             (t, i) =>
-              `${i + 1}:${railOf(t) === "solid" ? "solid" : railOf(t) === "break" ? "break" : "dotted"}`,
+              // §5.7: numeric per-turn seq ranges, learned from passing verifies (R-a); a
+              // turn the client never learned a range for shows "—", never a rail word.
+              `${i + 1}:${t.seqStart === null ? "—" : `${t.seqStart}-${t.seqEnd ?? "?"}`}`,
           )
           .join(" ") || "—",
       ),
       "",
       s.role("accent", "DOCTOR AT LAUNCH"),
-      ...this.doctor.rowLines.slice(0, 8),
+      ...this.doctor.allRows.map((r) => dim(r.id, r.summary)),
       "",
+      ...(this.#launchNote === null ? [] : [s.role("warn", this.#launchNote)]),
       ...(this.uiNote === null ? [] : [s.role("warn", this.uiNote)]),
       ...this.stderrRows.slice(-4).map((r) => s.role("faint", `engine stderr: ${r}`)),
     ];
@@ -512,7 +539,7 @@ export class WitnessApp {
       ...this.#banner,
       doctor: this.doctor,
       threadId: this.threadId,
-      uiNote: this.uiNote,
+      uiNote: this.#launchNote,
     };
   }
 
@@ -612,8 +639,8 @@ export class WitnessApp {
       served: this.served,
       lastVerify: this.lastVerify,
       streamSeconds: this.#streamSeconds,
-      elapsedSeconds: (this.#now() - this.#startedAt) / 1000,
-      idleSeconds: this.#streamSeconds === null ? (this.#now() - this.#startedAt) / 1000 : null,
+      elapsedSeconds: this.#elapsedSample,
+      idleSeconds: this.#streamSeconds === null ? this.#elapsedSample : null,
       doctor: this.doctor,
       turnCount: this.turns.length,
       lastEndNamesTurn: this.lastEndNamesTurn,
@@ -639,6 +666,9 @@ export class WitnessApp {
     this.#tick = setInterval(() => {
       if (this.#quit !== null) return;
       const current = this.#currentTurn;
+      // The one place displayed elapsed values advance (§5.5/§10): a 200 ms sample, so no
+      // event-triggered paint can move them faster than the 5 Hz ceiling.
+      this.#elapsedSample = (this.#now() - this.#startedAt) / 1000;
       if (this.phase === "turn" && current !== null) {
         this.#streamSeconds = Math.max(0, (this.#now() - current.startTime) / 1000);
       }
@@ -650,20 +680,19 @@ export class WitnessApp {
 
   /** Launch doctor rows arrive here as they finish (§5.1: WARN/FAIL rows print in full). */
   onDoctorRow(check: Check): void {
-    const counts = { ...this.doctor };
-    if (check.status === "pass") counts.pass++;
-    if (check.status === "warn") {
-      counts.warn++;
-      counts.warnRows = [...counts.warnRows, `${check.id}: ${check.summary}`];
-      counts.rowLines = [...counts.rowLines, `${check.id} ${check.summary}`];
-    }
-    if (check.status === "fail") {
-      counts.fail++;
-      counts.failAtLaunch = true;
-      counts.rowLines = [...counts.rowLines, `${check.id} ${check.summary}`];
-    }
-    if (check.status === "skip") counts.skip++;
-    this.doctor = counts;
+    const row: DoctorRow = {
+      id: check.id,
+      status: check.status,
+      summary: stripControls(check.summary),
+    };
+    // Retain every row once (§5.1/§5.7): the counts, the banner's WARN/FAIL detail and the
+    // evidence pane's DOCTOR AT LAUNCH section all derive from this one complete list.
+    this.doctor = summarizeDoctor(
+      [...this.doctor.allRows, row],
+      this.doctor.running,
+      this.doctor.ms,
+    );
+    if (row.status === "fail") this.bannerExpanded = true; // §5.1: a FAIL keeps the banner expanded
     this.paint();
   }
 
@@ -728,9 +757,16 @@ export class WitnessApp {
     }
   }
 
-  /** `madc "<text>"`: the first turn is sent once the launch doctor has finished (§5.1). */
+  /** `madc "<text>"`: the first turn is sent once the launch doctor has finished (§5.1) —
+   * and when a launch row FAILED, only after the Enter acknowledgement (§5.1: the supplied
+   * prompt must not silently bypass the FAIL gate the interactive path enforces). */
   async onFirstPrompt(): Promise<void> {
     if (this.#firstPromptSent || this.#firstPrompt === null) return;
+    if (this.#doctorRunning) return; // the doctor is still streaming: launch.ts re-calls on finish
+    if (this.doctor.failAtLaunch && this.phase === "launching") {
+      this.#firstPromptHeld = true; // held until Enter acknowledges the FAIL
+      return;
+    }
     this.#firstPromptSent = true;
     await this.#send(this.#firstPrompt);
   }
@@ -741,6 +777,12 @@ export class WitnessApp {
     if (this.doctor.failAtLaunch && this.phase === "launching") {
       this.phase = "idle";
       this.doctor = { ...this.doctor, failAtLaunch: false };
+      // A held first prompt (§5.1) is released by this acknowledgement — the same gate the
+      // interactive path just passed.
+      if (this.#firstPromptHeld) {
+        this.#firstPromptHeld = false;
+        void this.#send(this.#firstPrompt ?? "");
+      }
       this.paint();
       return;
     }
@@ -847,18 +889,25 @@ export class WitnessApp {
     this.paint();
     const { collectDoctor } = await import("../doctor.ts");
     const rows: string[] = [];
+    // PR #35 round 7 (Copilot r4136803283): the app owns the process signals while it runs —
+    // the overlay's doctor run reuses the APP's signal state (externalSig) instead of
+    // installing a second SIGINT/SIGTERM pair. The kill hook stays armed for the whole run;
+    // the app's own quit flow is untouched, and no listener is left behind to race it.
     await collectDoctor(
       this.#io,
       { json: false, init: false },
       {
         onRow: (c) => {
+          // A quit already ran: the terminal is restored — no row, no repaint, ever.
+          if (this.#quit !== null) return;
           rows.push(`${c.status.toUpperCase().padEnd(4)} ${c.id.padEnd(14)} ${c.summary}`);
           this.doctorOverlayRows = rows;
           this.paint();
         },
       },
+      this.#doctorSignal,
     );
-    this.paint();
+    if (this.#quit === null) this.paint();
   }
 
   async #restartEngine(): Promise<void> {
@@ -873,6 +922,9 @@ export class WitnessApp {
     this.threadId = null;
     this.sessionPath = null;
     this.lastVerify = null;
+    // The interrupt-stop state is left behind with its engine; a fresh engine's turns must
+    // settle by their own outcome again.
+    this.#engineStoppedAfterInterrupt = false;
     this.phase = "idle";
     this.paint();
   }
@@ -992,9 +1044,14 @@ export class WitnessApp {
     }
     // A failed verify puts the app into a terminal chain state; only a clean verify returns to
     // idle (§5.8: input disabled until /new). applyVerify may have widened the phase beyond the
-    // flow-narrowed "verifying", so the widened union is asserted here.
+    // flow-narrowed "verifying", so the widened union is asserted here. An unanswered-interrupt
+    // stop stays in engine-stopped (Enter restarts) unless the verify widened it further.
     const phaseNow = this.phase as AppStateView["phase"];
-    if (phaseNow !== "chain-failed" && phaseNow !== "torn-tail") {
+    if (phaseNow === "chain-failed" || phaseNow === "torn-tail") {
+      // the chain-failure state stands
+    } else if (this.#engineStoppedAfterInterrupt) {
+      this.phase = "engine-stopped";
+    } else {
       this.phase = "idle";
     }
     this.#streamSeconds = null;
@@ -1034,8 +1091,14 @@ export class WitnessApp {
         turn.unverified = `torn tail at line ${v.line}: crash residue, not tamper`;
         this.phase = "torn-tail";
       } else {
-        // R-b: revoke solid for every turn at or after the failed line.
-        for (const t of this.turns) t.revoked = true;
+        // R-b (§5.3): a failure at line N (seq N−1) revokes every turn whose remembered
+        // range contains or follows it; a verified turn that ended before seq N−1 keeps its
+        // solid rail. A turn with no learned range cannot prove it ended earlier, so it revokes.
+        const failSeq = v.line - 1;
+        for (const t of this.turns) {
+          const end = t.seqEnd ?? t.seqStart;
+          t.revoked = t.seqStart === null || (end !== null && end >= failSeq);
+        }
         turn.unverified = `chain FAILED line ${v.line}: ${v.reason}`;
         this.phase = "chain-failed";
         this.sessionCodes = [...this.sessionCodes, { code: EXIT.session, reason: "chain FAILED" }];
@@ -1047,14 +1110,47 @@ export class WitnessApp {
     for (const e of v.events) {
       if (e.type === "turn.end") lastEnd = String((e.payload as { turnId?: unknown }).turnId);
     }
+    // §5.7/R-a: this turn's OWN range — its turn.start, and the turn.end that temporally
+    // bounds it (a late-end's differently-named end still bounds the turn on disk). Never the
+    // file's first turn.start: on a multi-turn file that would pair the wrong range.
+    let startSeq: number | null = null;
+    for (const e of v.events) {
+      if (
+        e.type === "turn.start" &&
+        String((e.payload as { turnId?: unknown }).turnId ?? "") === turn.realTurnId
+      ) {
+        startSeq = e.seq;
+        break;
+      }
+    }
+    let endSeq: number | null = null;
+    if (startSeq !== null) {
+      for (const e of v.events) {
+        if (e.type === "turn.end" && e.seq > startSeq) {
+          endSeq = e.seq;
+          break;
+        }
+      }
+    }
+    // §5.7: the servedModel seq inside THIS turn's range only — one turn's served model is
+    // never paired with another turn's sequence, and no seq shows without a verified pair.
+    let servedInRange: number | null = null;
+    if (startSeq !== null) {
+      for (const e of v.events) {
+        if (e.type === "servedModel" && e.seq >= startSeq && (endSeq === null || e.seq <= endSeq)) {
+          servedInRange = e.seq;
+        }
+      }
+    }
+    this.#servedSeq = servedInRange;
     if (lastEnd !== null && lastEnd === turn.realTurnId) {
       turn.verify = {
         kind: "verified",
         seq: v.events[v.events.length - 1]?.seq ?? 0,
         headHash: v.lastHash,
       };
-      turn.seqStart = v.events.find((e) => e.type === "turn.start")?.seq ?? null;
-      turn.seqEnd = v.events[v.events.length - 1]?.seq ?? null;
+      turn.seqStart = startSeq;
+      turn.seqEnd = endSeq;
       this.lastVerify = turn.verify;
       this.lastEndNamesTurn = true;
       turn.unverified = null;
@@ -1064,9 +1160,16 @@ export class WitnessApp {
         seq: v.events[v.events.length - 1]?.seq ?? 0,
         headHash: v.lastHash,
       };
+      // The verify passed, so the turn's range is learned knowledge even when the last
+      // turn.end names another turn (late-end stays UNVERIFIED, dotted). A reason the turn
+      // already carries (e.g. the unanswered-interrupt timeout, §5.8) is preserved.
+      turn.seqStart = startSeq;
+      turn.seqEnd = endSeq;
       this.lastVerify = turn.verify;
       this.lastEndNamesTurn = false;
-      turn.unverified = "the chain's last turn.end does not name this turn";
+      if (turn.unverified === null) {
+        turn.unverified = "the chain's last turn.end does not name this turn";
+      }
     }
   }
 
@@ -1215,71 +1318,90 @@ export class WitnessApp {
           );
         }
         turn.realTurnId = t.id;
+        // Round 7: the tier-W matcher gets the same settlement guard line-mode and inline
+        // already carry — after the wait settles (quit, violation, interrupt), a late engine
+        // message runs NO matcher code: no re-armed timer, no record mutation, no repaint.
+        let settled = false;
         // Observe the listed notifications (deltas display-only; E3 served-model matching).
-        const done = client.waitFor((m: WireMessage) => {
-          const params = m.params as Record<string, unknown> | undefined;
-          if (m.method === "item/agentMessage/delta") {
-            if (
-              params === undefined ||
-              params === null ||
-              typeof params !== "object" ||
-              params.threadId !== threadId ||
-              !isDomainId(params.turnId) ||
-              !isDomainId(params.itemId) ||
-              typeof params.delta !== "string"
-            ) {
-              violate("protocol violation: malformed or foreign item/completed or delta");
-            } else if (params.turnId !== turn.realTurnId) {
-              violate("protocol violation: malformed or foreign item/completed or delta");
-            } else {
-              armIdle();
-              turn.deltaText = (turn.deltaText ?? "") + sanitizeText(params.delta as string);
-              this.paint();
-            }
-          } else if (m.method === "item/completed" || m.method === "item/started") {
-            if (
-              params === undefined ||
-              params === null ||
-              typeof params !== "object" ||
-              params.threadId !== threadId ||
-              !isDomainId(params.turnId) ||
-              !isItemShape(params.item) ||
-              (m.method === "item/started" && (params.item as Item).status !== "inProgress")
-            ) {
-              violate("protocol violation: malformed or foreign item/completed or delta");
-            } else if (params.turnId !== turn.realTurnId) {
-              violate("protocol violation: malformed or foreign item/completed or delta");
-            } else {
-              armIdle();
-              const item = sanitizeItem(params.item as Item);
-              if (m.method === "item/completed") {
-                turn.items = [...turn.items.filter((i) => i.id !== item.id), item];
-                if (item.kind === "servedModel") {
-                  this.served = {
-                    requestedModel: item.requestedModel,
-                    servedModel: item.servedModel,
-                    backing: item.backing,
-                    providerId: item.providerId,
-                  };
-                }
+        const done = client.waitFor(
+          (m: WireMessage) => {
+            if (settled) return false; // the wait is over: late messages are inert
+            const params = m.params as Record<string, unknown> | undefined;
+            if (m.method === "item/agentMessage/delta") {
+              if (
+                params === undefined ||
+                params === null ||
+                typeof params !== "object" ||
+                params.threadId !== threadId ||
+                !isDomainId(params.turnId) ||
+                !isDomainId(params.itemId) ||
+                typeof params.delta !== "string"
+              ) {
+                violate("protocol violation: malformed or foreign item/completed or delta");
+              } else if (params.turnId !== turn.realTurnId) {
+                violate("protocol violation: malformed or foreign item/completed or delta");
+              } else {
+                armIdle();
+                turn.deltaText = (turn.deltaText ?? "") + sanitizeText(params.delta as string);
                 this.paint();
               }
+            } else if (m.method === "item/completed" || m.method === "item/started") {
+              if (
+                params === undefined ||
+                params === null ||
+                typeof params !== "object" ||
+                params.threadId !== threadId ||
+                !isDomainId(params.turnId) ||
+                !isItemShape(params.item) ||
+                (m.method === "item/started" && (params.item as Item).status !== "inProgress")
+              ) {
+                violate("protocol violation: malformed or foreign item/completed or delta");
+              } else if (params.turnId !== turn.realTurnId) {
+                violate("protocol violation: malformed or foreign item/completed or delta");
+              } else {
+                armIdle();
+                const item = sanitizeItem(params.item as Item);
+                if (m.method === "item/completed") {
+                  turn.items = [...turn.items.filter((i) => i.id !== item.id), item];
+                  if (item.kind === "servedModel") {
+                    this.served = {
+                      requestedModel: item.requestedModel,
+                      servedModel: item.servedModel,
+                      backing: item.backing,
+                      providerId: item.providerId,
+                    };
+                    // Unverified served display: the seq only pairs after this turn's verify.
+                    this.#servedSeq = null;
+                  }
+                  this.paint();
+                }
+              }
+            } else if (m.method === "turn/started") {
+              const t2 = params?.turn;
+              if (!isTurnShape(t2) || t2.threadId !== threadId || t2.status !== "inProgress") {
+                violate("protocol violation: malformed turn/started");
+              } else {
+                armIdle(); // a validated turn/started is activity
+              }
+            } else if (m.method === "turn/completed" && !Object.hasOwn(m, "id")) {
+              // E-d: the completion must be THIS turn's on THIS thread; a foreign or malformed
+              // one is a live violation. Historical messages never reach here (`since` below).
+              const tEnd = (params as { turn?: unknown } | undefined)?.turn;
+              if (!isTurnShape(tEnd) || tEnd.threadId !== threadId || tEnd.id !== turn.realTurnId) {
+                violate("protocol violation: malformed or foreign turn/completed");
+              } else {
+                disarmIdle();
+                return true;
+              }
             }
-          } else if (m.method === "turn/started") {
-            const t2 = params?.turn;
-            if (!isTurnShape(t2) || t2.threadId !== threadId || t2.status !== "inProgress") {
-              violate("protocol violation: malformed turn/started");
-            } else {
-              armIdle();
-            }
-          } else if (m.method === "turn/completed" && !Object.hasOwn(m, "id")) {
-            disarmIdle();
-            return true;
-          }
-          return false;
-        }, 2_147_483_647);
+            return false;
+          },
+          2_147_483_647,
+          scannedStart,
+        );
         done.catch(() => undefined);
         const outcome = await Promise.race([done, violation, soft]);
+        settled = true; // the wait is over: no matcher side effects from late messages
         if (outcome === "soft") {
           result = await this.#interruptFlow(client, threadId, turn, violation);
           return result;
@@ -1298,6 +1420,8 @@ export class WitnessApp {
                 backing: last.backing,
                 providerId: last.providerId,
               };
+              // Unverified until this turn's own verify pairs name and seq again.
+              this.#servedSeq = null;
             }
           }
           result =
@@ -1368,15 +1492,31 @@ export class WitnessApp {
     const turnId = turn.realTurnId;
     if (turnId === undefined) return "interrupted";
     client.request("turn/interrupt", { threadId, turnId }).catch(() => undefined);
+    // Only a completion for THIS turn answers the grace, and only messages that arrive from
+    // now on: a historical completion from an earlier turn must not answer (replay guard).
+    const sinceInterrupt = client.messages.length;
     const answered = await Promise.race([
       client
-        .waitForNotification("turn/completed", () => true, INTERRUPT_GRACE_MS)
+        .waitForNotification(
+          "turn/completed",
+          (p) => {
+            const t = (p as { turn?: unknown } | undefined)?.turn;
+            return isTurnShape(t) && t.id === turnId && t.threadId === threadId;
+          },
+          INTERRUPT_GRACE_MS,
+          sinceInterrupt,
+        )
         .then(() => true)
         .catch(() => false),
       violation,
     ]);
     if (!answered) {
-      // Grace ran out: engine stopped, class 3 (§5.8 interrupt rules).
+      // Grace ran out (§5.8 interrupt rules): the turn's wait is over, then the ENGINE is
+      // stopped — stdin closed, SIGKILL after KILL_AFTER_MS (1 s), the exit awaited — so
+      // the app settles in engine-stopped over a dead child, never idle over a live one.
+      // Class 3 and the timeout reason are preserved; the post-turn verify still runs
+      // after the exit (the caller narrows to verifying once this returns).
+      client.cancelWaiters();
       this.sessionCodes = [
         ...this.sessionCodes,
         { code: EXIT.engine, reason: "interrupt not answered in 2 s · engine stopped" },
@@ -1384,6 +1524,9 @@ export class WitnessApp {
       turn.status = "unknown";
       turn.unverified = "interrupt not answered in 2 s · engine stopped";
       this.#engineStoppedAfterInterrupt = true;
+      await client.close(KILL_AFTER_MS).catch(() => null);
+      this.phase = "engine-stopped";
+      this.#streamSeconds = null;
       return "timeout";
     }
     turn.status = "interrupted";
@@ -1394,6 +1537,8 @@ export class WitnessApp {
 
   #interruptTurn: (() => void) | null = null;
   #engineStoppedAfterInterrupt = false;
+  /** True when a supplied first prompt is held pending the launch-FAIL acknowledgement. */
+  #firstPromptHeld = false;
 
   // ------------------------------------------------------------------ quit + signals
   #onCtrlC(): void {
@@ -1416,6 +1561,13 @@ export class WitnessApp {
   #onQuit(kind: QuitPlan["kind"], signal: QuitPlan["signal"]): void {
     if (this.#quit !== null) return;
     this.#quit = { kind, signal };
+    // Round 7: the overlay doctor's probe engine dies with the quit — its signal state is
+    // app-owned, so no second listener pair ever races the exit flow.
+    this.#doctorSignal.exit =
+      this.#doctorSignal.exit ??
+      (signal === null ? null : signal === "SIGINT" ? 130 : signal === "SIGTERM" ? 143 : null);
+    this.#doctorSignal.kill?.();
+    this.doctorOverlayOpen = false;
     void this.#finish(kind, signal);
   }
 
@@ -1467,6 +1619,10 @@ export class WitnessApp {
 
   async #finish(kind: QuitPlan["kind"], signal: QuitPlan["signal"]): Promise<void> {
     // Stop the engine: close stdin; kill after 1 s when we signalled (§5.8.1), 5 s otherwise.
+    // Round 7 (Copilot r4136804305): cancel the client's waiters FIRST — a quit during a
+    // turn leaves the unbounded (2,147,483,647 ms) waiter's timer holding the parent's
+    // event loop alive after runWitnessApp returned, even though the engine child is gone.
+    this.#client?.cancelWaiters();
     const client = this.#client;
     if (client !== null) {
       this.#client = null;
@@ -1479,7 +1635,9 @@ export class WitnessApp {
     // R-g: one final verify after the engine exits, bounded (O-1) — except when there is no
     // thread (R-g) or a signal arrives during the verify (O-2, below).
     let finalVerifyFailed = false;
-    let finalVerify: ChainVerify | null = this.lastVerify;
+    // Round 7 / remote autofix bb13744: the initializer is dead — every path that reads
+    // finalVerify reassigns it first. Start at null, matching the merged remote head.
+    let finalVerify: ChainVerify | null = null;
     if (this.threadId !== null && this.sessionPath !== null) {
       // §5.8.1 O-2 window: a signal while this verify (or the exit write below) runs takes the
       // F-102 path via #signalDuringFinalVerifyInterrupt — restore, re-raise, no receipt.

@@ -11,6 +11,8 @@
  *   so a test can land a SECOND signal inside the §5.8.1 O-2 window deterministically.
  */
 
+import { readdirSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 import type { WitnessApp } from "../app/app.ts";
 import { runWitnessApp } from "../app/launch.ts";
 import { ProcessTty } from "../app/tty.ts";
@@ -36,6 +38,10 @@ if (simEnv.MADC_TEST_TERM !== undefined) {
   simEnv.TERM = simEnv.MADC_TEST_TERM;
 } else if (simEnv.TERM === undefined || simEnv.TERM === "dumb") {
   simEnv.TERM = "xterm-256color";
+}
+// Level A mode: force TERM=dumb AFTER the above so the tier gate selects line mode.
+if (process.env.MADC_TEST_LEVEL_A === "1") {
+  simEnv.TERM = "dumb";
 }
 if (simEnv.LANG === undefined && simEnv.LC_ALL === undefined && simEnv.LC_CTYPE === undefined) {
   simEnv.LANG = "en_US.UTF-8";
@@ -66,9 +72,21 @@ const tty = new ProcessTty(
 );
 
 let app: WitnessApp | null = null;
-const onSigint = (): void => app?.onSigint();
-const onSigterm = (): void => app?.onSigterm();
-const onSighup = (): void => app?.onSighup();
+// Round 8: Level A exposes a handler TRIplet (not a WitnessApp) — a wider union.
+let modeHandlers: { onSigint(): void; onSigterm(): void; onSighup(): void } | null = null;
+const onSigint = (): void => {
+  // Tier W forwards to the app; Level A's exposed handlers arrive via exposeSignals.
+  if (app !== null) app.onSigint();
+  else modeHandlers?.onSigint();
+};
+const onSigterm = (): void => {
+  if (app !== null) app.onSigterm();
+  else modeHandlers?.onSigterm();
+};
+const onSighup = (): void => {
+  if (app !== null) app.onSighup();
+  else modeHandlers?.onSighup();
+};
 process.on("SIGINT", onSigint);
 process.on("SIGTERM", onSigterm);
 process.on("SIGHUP", onSighup);
@@ -96,6 +114,11 @@ const exitPromise = runWitnessApp({
   onApp: (a) => {
     app = a;
   },
+  exposeSignals: (h) => {
+    // Round 8: Level A (or whichever non-tier-W mode was selected) exposed its handlers —
+    // they ARE the process-signal behaviour from here on, exactly as main.ts wires it.
+    modeHandlers = h;
+  },
   onSighup: () => {
     // O-4, exactly as main.ts wires it: remove the listener, then re-raise.
     process.removeListener("SIGHUP", onSighup);
@@ -110,10 +133,42 @@ const exitPromise = runWitnessApp({
   ...(wrappedVerify !== undefined ? { verify: wrappedVerify } : {}),
 });
 
-// Deliver the signal once the first turn has been sent and verified on disk.
+// Deliver the signal once the first turn has been sent and verified on disk. In Level A
+// mode (MADC_TEST_LEVEL_A=1) the tier gate selects line mode (TERM=dumb), the mode exposes
+// its handlers through exposeSignals, and the deferred status prints after the run settles.
+const levelA = process.env.MADC_TEST_LEVEL_A === "1";
+// Level A readiness: the app object only carries turn state in tier W; in Level A the
+// exposed handlers exist and the session file on disk has its turn.end (the engine wrote
+// it) — probe the receipt marker instead of app state.
+let lineModeSettled = false;
+if (levelA) {
+  const tSettle = Date.now();
+  const settlePoll = setInterval(() => {
+    try {
+      const sessions = join(home, "sessions");
+      const files = readdirSync(sessions);
+      for (const f of files) {
+        if (f.endsWith(".jsonl") && readFileSync(join(sessions, f), "utf8").includes("turn.end")) {
+          lineModeSettled = true;
+          clearInterval(settlePoll);
+          return;
+        }
+      }
+    } catch {
+      // not yet
+    }
+    if (Date.now() - tSettle > 30_000) {
+      clearInterval(settlePoll);
+      process.exit(9);
+    }
+  }, 25);
+  settlePoll.unref?.();
+}
 const t0 = Date.now();
 const poll = setInterval(() => {
-  const done = app !== null && app.turns.length === 1 && app.turns[0]?.verify != null;
+  const done =
+    (levelA && lineModeSettled) ||
+    (!levelA && app !== null && app.turns.length === 1 && app.turns[0]?.verify != null);
   if (done) {
     clearInterval(poll);
     const sig = signal === "sighup" ? "SIGHUP" : signal === "sigterm" ? "SIGTERM" : "SIGINT";

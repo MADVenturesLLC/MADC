@@ -18,6 +18,7 @@ const DRIVER = fileURLToPath(new URL("../testing/signal-driver.ts", import.meta.
 function runDriver(
   signal: "sighup" | "sigint" | "sigterm",
   env: Record<string, string> = {},
+  opts: { readonly levelA?: boolean } = {},
 ): Promise<{
   code: number | null;
   childSignal: NodeJS.Signals | null;
@@ -35,8 +36,17 @@ function runDriver(
         TMPDIR: process.env.TMPDIR ?? "/tmp",
         ...env,
       },
-      stdio: ["ignore", "ignore", "pipe"],
+      // Level A runs hold stdin OPEN (a pipe the test never writes): the mode waits at its
+      // input loop like production, so the delivered signal lands mid-run, not after exit.
+      stdio: [opts.levelA === true ? "pipe" : "ignore", "ignore", "pipe"],
     });
+    if (opts.levelA === true) {
+      // The signal handler closes the child's readline but cannot close OUR end of the
+      // pipe: end it shortly after the signal is delivered (the driver sends it once the
+      // session settles), so the drained queue completes and the child exits with the
+      // deferred status. Generous window: the driver waits for turn.end first.
+      setTimeout(() => child.stdin?.end(), 4_000).unref?.();
+    }
     let stderr = "";
     child.stderr?.on("data", (c: Buffer) => {
       stderr += c.toString("utf8");
@@ -131,5 +141,30 @@ describe("§5.8.1 O-2: a second signal during the final verify (F-102 path)", ()
     assert.equal(result.code, null);
     assert.ok(!result.stderr.includes("─ receipt"), "no receipt on the F-102 path");
     assert.ok(!result.stderr.includes("madc: interrupted (SIGINT)"), "no §5.13 line");
+  });
+});
+
+describe("round 8: Level A signal wiring through the production entry (§5.13, O-3/O-4)", () => {
+  it("Level A SIGINT: the exit status prints ONCE after settlement (130 when nothing outranks it)", {
+    timeout: 60_000,
+  }, async () => {
+    const r = await runDriver("sigint", { MADC_TEST_LEVEL_A: "1" }, { levelA: true });
+    // The §5.13 line pair, printed after the run settled (deferred status).
+    assert.match(r.stderr, /madc: interrupted \(SIGINT\)\n/);
+    assert.match(r.stderr, /exit 130\n$/);
+    // Exactly ONE exit line: no premature print before the verify settled.
+    assert.equal(r.stderr.match(/exit \d+\n/g)?.length, 1, "one exit line only");
+    assert.equal(r.code, 130);
+  });
+
+  it("Level A SIGHUP: best-effort line, then the entry re-raises — death by the signal (129)", {
+    timeout: 60_000,
+  }, async () => {
+    const r = await runDriver("sighup", { MADC_TEST_LEVEL_A: "1" }, { levelA: true });
+    assert.equal(r.childSignal, "SIGHUP");
+    assert.equal(r.code, null);
+    assert.match(r.stderr, /madc: interrupted \(SIGHUP\)\n$/);
+    // O-4: no exit line ever follows the SIGHUP marker.
+    assert.doesNotMatch(r.stderr, /madc: interrupted \(SIGHUP\)\nexit \d+\n/);
   });
 });

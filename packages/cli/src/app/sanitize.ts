@@ -41,3 +41,14 @@ export function sanitizeItem(
   }
   return base as unknown as import("@madc/engine/client").Item;
 }
+
+/**
+ * E11 for a caught error's message (PR #35 round 7, Copilot r4136803580 / Cursor a631a142):
+ * an engine RPC/protocol error's message is engine-supplied text. Every consumer that stores
+ * it into a turn record or session code sanitises it HERE, at the boundary, before any render
+ * path (rail lines, verdict cards, receipts) can pass it through `style.role`, which does not
+ * strip inner control characters.
+ */
+export function sanitizeErrorLike(err: unknown): string {
+  return sanitizeText(err instanceof Error ? err.message : String(err));
+}

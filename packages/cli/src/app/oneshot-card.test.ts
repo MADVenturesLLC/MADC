@@ -11,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import type { Check } from "../doctor.ts";
 import { collectDoctor } from "../doctor.ts";
 import type { CliIO } from "../io.ts";
-import { runOneShot } from "../oneshot.ts";
+import { runOneShot, statusPill } from "../oneshot.ts";
 import { doctorHeaderW, doctorPendingRowW, doctorResultW, doctorRowW } from "./doctor-view.ts";
 import { glyphsFor, Style } from "./style.ts";
 import { renderSessionStartFailedCard } from "./verdict.ts";
@@ -225,8 +225,31 @@ describe("§8 doctor tier-W presentation", () => {
 
   it("the pending row is the dim ○ ···· <id> running placeholder", () => {
     // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping the SGR spans under test.
-    const bare = doctorPendingRowW("engine", style).replace(/\u001b\[[0-9;]*m/g, "");
+    const bare = doctorPendingRowW("engine", style, g).replace(/\u001b\[[0-9;]*m/g, "");
     assert.match(bare, /○ ···· +engine +running/);
+  });
+
+  it("round 8: ASCII mode renders the selected glyph set — `v PASS` and `- ····`, never `✓`/`○`", () => {
+    const asciiStyle = Style.forDepth("true", true);
+    const asciiG = glyphsFor(true);
+    const bareRow = doctorRowW(check({}), asciiStyle, asciiG, 110)
+      .join("\n")
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping the SGR spans under test.
+      .replace(/\u001b\[[0-9;]*m/g, "");
+    assert.match(bareRow, /^v PASS {2}runtime/);
+    assert.ok(!bareRow.includes("✓"), "no Unicode check glyph in ASCII mode");
+    const barePending = doctorPendingRowW("engine", asciiStyle, asciiG).replace(
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping the SGR spans under test.
+      /\u001b\[[0-9;]*m/g,
+      "",
+    );
+    assert.match(barePending, /- ···· +engine +running/);
+    // Ordinary Unicode rendering is preserved.
+    const uniRow = doctorRowW(check({}), style, g, 110)
+      .join("\n")
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping the SGR spans under test.
+      .replace(/\u001b\[[0-9;]*m/g, "");
+    assert.match(uniRow, /^✓ PASS {2}runtime/);
   });
 
   it("the header band carries madc doctor · madc <v> · protocol <p>", () => {
@@ -334,5 +357,21 @@ describe("§7 EXIT 5 card for -32009 on thread/start", () => {
       glyphsFor(true),
     );
     assert.match(asciiRows.join("\n"), /#### EXIT 5 ####/);
+  });
+});
+
+describe("round 8: statusPill uses the REAL terminal facts (P-7)", () => {
+  it("a capable terminal gets the tier-W filled pill; a limited terminal stays plain", () => {
+    const text = "… madc-default · 2.3s";
+    const capable = statusPill(text, io({}, new Rec(), new Rec(), newHome()));
+    const limited = statusPill(
+      text,
+      io({ columns: 40, rows: 10, stdoutIsTTY: false }, new Rec(), new Rec(), newHome()),
+    );
+    // The capable io (TTY, 110 cols) wraps the SAME text in the tier-W fill.
+    assert.ok(capable.includes("\u001b["), "tier-W fill styles the pill");
+    assert.ok(capable.includes(text), "the P-7 text is unchanged inside the fill");
+    // The limited io keeps the pill plain — no SGR anywhere.
+    assert.equal(limited, text, "limited terminal: plain text, no SGR");
   });
 });

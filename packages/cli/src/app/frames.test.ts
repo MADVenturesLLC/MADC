@@ -28,7 +28,13 @@ const doctor: DoctorSummary = {
   skip: 2,
   ms: 214,
   warnRows: ["locks thr_ed00 · pid 48121 · age 912s: pid 48121 not visible in this PID namespace"],
-  rowLines: ["locks thr_ed00 · pid 48121 · age 912s"],
+  allRows: [
+    {
+      id: "locks",
+      status: "warn",
+      summary: "locks thr_ed00 · pid 48121 · age 912s: pid 48121 not visible in this PID namespace",
+    },
+  ],
   failAtLaunch: false,
 };
 
@@ -116,7 +122,7 @@ describe("§5.1 pre-conversation banner (110×32)", () => {
   });
   it("carries the doctor summary with counts and the /doctor hint", () => {
     assert.match(text, /Doctor at launch/);
-    assert.match(text, /✓ 7 PASS · ▲ 1 WARN · 0 FAIL · ○ 2 SKIP/);
+    assert.match(text, /✓ 7 PASS · ▲ 1 WARN · ✕ 0 FAIL · ○ 2 SKIP/);
     assert.match(text, /\/doctor for rows/);
   });
   it("prints every WARN row in full under the banner (pinned locks wording)", () => {
@@ -133,7 +139,7 @@ describe("§5.1 pre-conversation banner (110×32)", () => {
   });
   it("carries the identity lines: protocol, home, cwd, thread none yet", () => {
     assert.match(text, /madc 0\.0\.0 · madc-m0\/1/);
-    assert.match(text, /home \(default\)/);
+    assert.match(text, /home \/home\/mike\/\.madc \(default\)/);
     assert.match(text, /~\/code\/madc/);
     assert.match(text, /thread none yet/);
   });
@@ -145,6 +151,108 @@ describe("§5.1 pre-conversation banner (110×32)", () => {
   });
   it("NO_COLOR emits zero SGR", () => {
     for (const line of lines) assert.ok(!line.includes("\u001b["), `SGR leaked: ${line}`);
+  });
+});
+
+describe("W-1 responsive banner geometry (§5.1 mandatory fields, §9 widths, §14 text over image)", () => {
+  // Registry-v2 magnitudes (origin/main @ 2e5f068: 21 entries — 10 direct / 4 vendor /
+  // 2 interactive / 5 forbidden) and an env-set MADC_HOME, so the widest realistic right
+  // column is exercised, not the v1 16-entry shape.
+  const v2banner: BannerData = {
+    ...banner,
+    home: "/synthetic/madc-home",
+    homeSource: "env",
+    registry: {
+      entries: 21,
+      wired: ["kimi-code", "claude-code", "codex"],
+      direct: 10,
+      vendor: 4,
+      interactive: 2,
+      forbidden: 5,
+    },
+  };
+  const widths = [80, 100, 105, 109, 110, 120, 143, 200];
+
+  it("keeps every box row exactly on the border; pinned under-box rows stay uncut", () => {
+    for (const w of widths) {
+      const lines = renderBanner(v2banner, w, style, g);
+      const boxW = visibleWidth(lines[0] ?? "");
+      assert.ok(boxW >= 40 && boxW <= w, `width ${w}: box is ${boxW} wide`);
+      let pastBox = false;
+      for (const [i, line] of lines.entries()) {
+        const lw = visibleWidth(line);
+        if (pastBox) {
+          // §2 rule 10: pinned doctor wording under the box is soft-wrapped by the terminal,
+          // never re-wrapped or truncated by the app — so it is asserted complete, not narrow.
+          assert.ok(lw > 0, `width ${w} line ${i}: under-box row lost`);
+        } else {
+          assert.equal(lw, boxW, `width ${w} line ${i} breaks the box border (${lw} vs ${boxW})`);
+          if (/^╰─*╯$/.test(line)) pastBox = true;
+        }
+      }
+      assert.ok(pastBox, `width ${w}: the box never closes`);
+    }
+    // The pinned WARN wording renders in full under the box at the narrowest width.
+    const t80 = renderBanner(v2banner, 80, style, g).join("\n");
+    assert.match(
+      t80,
+      /locks thr_ed00 · pid 48121 · age 912s: pid 48121 not visible in this PID namespace/,
+    );
+  });
+
+  it("shows the actual home path plus its source label (§5.1 home field)", () => {
+    for (const w of widths) {
+      const t = renderBanner(v2banner, w, style, g).join("\n");
+      assert.match(t, /home \/synthetic\/madc-home \(MADC_HOME\)/, `width ${w}`);
+    }
+    const t = renderBanner(banner, 110, style, g).join("\n");
+    assert.match(t, /home \/home\/mike\/\.madc \(default\)/);
+  });
+
+  it("renders the full registry-v2 policy row, complete and uncut", () => {
+    for (const w of widths) {
+      const t = renderBanner(v2banner, w, style, g).join("\n");
+      assert.match(t, /10 direct · 4 via vendor · 2 interactive · 5 forbidden/, `width ${w}`);
+    }
+  });
+
+  it("keeps two columns where the right column fits and stacks when it cannot", () => {
+    // At 143 the 46-column left column and the v2 right column fit side by side; at 110 the
+    // v2 policy row cannot fit beside them, so §9's stacking presentation must take over.
+    const wide = renderBanner(v2banner, 143, style, g);
+    const narrow = renderBanner(v2banner, 110, style, g);
+    const rowsOf = (ls: readonly string[]): number => ls.filter((l) => visibleWidth(l) > 0).length;
+    assert.ok(
+      rowsOf(wide) + 8 <= rowsOf(narrow),
+      `two-column 143 (${rowsOf(wide)} rows) must be much shorter than stacked 110 (${rowsOf(narrow)} rows)`,
+    );
+  });
+
+  it("stacks identity before registry at 80 columns (§9 order)", () => {
+    const t = renderBanner(v2banner, 80, style, g).join("\n");
+    assert.ok(
+      t.indexOf("thread none yet") < t.indexOf("Registry"),
+      "identity lines must precede the stacked registry section",
+    );
+  });
+
+  it("keeps the same geometry under the ASCII glyph set (§4 fallback)", () => {
+    const asciiStyle = Style.forDepth("none", true);
+    const asciiGlyphs = glyphsFor(true);
+    for (const w of [80, 110, 143]) {
+      const lines = renderBanner(v2banner, w, asciiStyle, asciiGlyphs);
+      const boxW = visibleWidth(lines[0] ?? "");
+      assert.ok(boxW >= 40 && boxW <= w, `width ${w}: ASCII box is ${boxW} wide`);
+      let pastBox = false;
+      for (const [i, line] of lines.entries()) {
+        if (pastBox) continue; // pinned under-box wording: terminal-soft-wrapped, never cut
+        const lw = visibleWidth(line);
+        assert.ok(lw <= boxW, `width ${w} ASCII line ${i} breaks the box: ${lw} > ${boxW}`);
+        if (/^[+-]+$/.test(line) && line.includes("--")) pastBox = true;
+      }
+      assert.ok(pastBox, `width ${w}: the ASCII box never closes`);
+      assert.match(lines[0] ?? "", /^\+/, "ASCII box opens with + corners");
+    }
   });
 });
 
@@ -518,5 +626,41 @@ describe("§9 width helpers", () => {
     const m = middleEllipsize(`${red}12345${green}67890${reset}`, 8);
     assert.equal(m, `${red}1234…${green}890${reset}`);
     assert.equal(visibleWidth(m), 8);
+  });
+});
+
+describe("round 9: banner status chrome uses the SELECTED glyph set (§4)", () => {
+  const asciiStyle = Style.forDepth("none", true);
+  const asciiG = glyphsFor(true);
+  const uniStyle = Style.forDepth("none", false);
+  const uniG = glyphsFor(false);
+
+  it("ASCII banner: doctor counts, awaiting-receipt and warn detail render ASCII glyphs", () => {
+    const lines = renderBanner(banner, 110, asciiStyle, asciiG);
+    const bare = lines
+      .join("\n")
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping the SGR spans under test.
+      .replace(/\u001b\[[0-9;]*m/g, "");
+    // Doctor counts: `v 7 PASS · ! 1 WARN · x 0 FAIL · - 2 SKIP` with the pinned · separators.
+    assert.match(bare, /v 7 PASS · ! 1 WARN · x 0 FAIL · - 2 SKIP/);
+    // Awaiting-receipt status uses the ASCII idle glyph.
+    assert.match(bare, /served +- awaiting servedModel receipt/);
+    // The warn-detail rows under the banner use the ASCII warn glyph.
+    assert.match(bare, /^! locks thr_ed00/m);
+    // No Unicode status chrome anywhere in the ASCII banner.
+    assert.ok(!bare.includes("✓"), "no Unicode check glyph");
+    assert.ok(!bare.includes("▲"), "no Unicode warn glyph");
+    assert.ok(!bare.includes("○"), "no Unicode idle glyph");
+  });
+
+  it("Unicode banner: ordinary rendering is preserved (✓/▲/○ and the same rows)", () => {
+    const lines = renderBanner(banner, 110, uniStyle, uniG);
+    const bare = lines
+      .join("\n")
+      // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping the SGR spans under test.
+      .replace(/\u001b\[[0-9;]*m/g, "");
+    assert.match(bare, /✓ 7 PASS · ▲ 1 WARN · ✕ 0 FAIL · ○ 2 SKIP/);
+    assert.match(bare, /served +○ awaiting servedModel receipt/);
+    assert.match(bare, /^▲ locks thr_ed00/m);
   });
 });

@@ -46,7 +46,37 @@ export function isItemShape(i: unknown): i is Item {
   // Copilot r4109396318: `kind` and `status` must be members of the pinned unions.
   if (!(ITEM_KINDS as readonly string[]).includes(r.kind)) return false;
   if (!(ITEM_STATUSES as readonly string[]).includes(r.status)) return false;
+  // Per-kind fields (PR #35 round 7, Copilot r4136804197): every field the renderers read must
+  // have its pinned type, so a malformed toolCall/toolResult/error/userMessage is classified as
+  // a protocol violation by the wait matchers — never pushed into a turn record where the
+  // renderers call e.g. `output.split` on a non-string.
   if (r.kind === "agentMessage") return typeof r.text === "string";
+  if (r.kind === "userMessage") {
+    return (
+      Array.isArray(r.content) &&
+      r.content.every(
+        (c) =>
+          c !== null &&
+          typeof c === "object" &&
+          (c as Record<string, unknown>).type === "text" &&
+          typeof (c as Record<string, unknown>).text === "string",
+      )
+    );
+  }
+  if (r.kind === "toolCall") {
+    return typeof r.name === "string" && r.arguments !== undefined;
+  }
+  if (r.kind === "toolResult") {
+    return (
+      typeof r.callId === "string" &&
+      typeof r.name === "string" &&
+      typeof r.output === "string" &&
+      typeof r.isError === "boolean"
+    );
+  }
+  if (r.kind === "error") {
+    return typeof r.message === "string" && (r.code === undefined || Number.isInteger(r.code));
+  }
   if (r.kind === "servedModel") {
     return (
       typeof r.requestedModel === "string" &&
@@ -56,7 +86,7 @@ export function isItemShape(i: unknown): i is Item {
       typeof r.providerId === "string"
     );
   }
-  return true;
+  return false;
 }
 
 export function isErrorBody(e: unknown): boolean {

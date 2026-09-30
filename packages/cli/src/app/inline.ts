@@ -21,8 +21,8 @@ import { EXIT } from "../exit-codes.ts";
 import type { CliIO } from "../io.ts";
 import { buildReceiptData } from "./app-receipt.ts";
 import { renderHelp } from "./frames.ts";
-import { receiptPlain } from "./receipt.ts";
-import { sanitizeItem, stripControls } from "./sanitize.ts";
+import { receiptPlain, sanitizeReceiptData } from "./receipt.ts";
+import { sanitizeErrorLike, sanitizeItem, sanitizeText, stripControls } from "./sanitize.ts";
 import type { ChainVerify, TurnRecord } from "./state.ts";
 import { worstExit } from "./state.ts";
 import { glyphsFor, Style } from "./style.ts";
@@ -55,6 +55,15 @@ export type InlineOptions = {
   readonly onSighup?: (() => void) | undefined;
   readonly verify?: ((req: VerifyRequest) => Promise<VerifyOutcome>) | undefined;
 };
+
+/** Round 7: the tier-W failed-turn error-code classification, shared by inline. */
+function failedTurnExitOf(code: number | undefined): number {
+  if (code === undefined) return EXIT.failure;
+  if (code === -32007 || code === -32008) return EXIT.provider;
+  if (code === -32009) return EXIT.session;
+  if (code === -32005 || code === -32006 || code === -32602) return EXIT.usage;
+  return EXIT.failure;
+}
 
 export async function runInlineApp(opts: InlineOptions): Promise<number> {
   const io = opts.io;
@@ -100,27 +109,52 @@ export async function runInlineApp(opts: InlineOptions): Promise<number> {
     out.write(
       `${style.role("warn", g.railDotted)} ${style.role("dim", `○ turn/started ${turn.realTurnId ?? ""}`)}\n`,
     );
-    for (const item of turn.items) {
-      if (item.kind === "agentMessage") {
-        out.write(
-          `${style.role("warn", g.railDotted)} ${style.role("accent2", g.diamond)} ${style.role("accent", "madc-default")} ${style.role("dim", "· agentMessage · item/completed")}\n`,
-        );
-        for (const line of stripControls(item.text).split("\n")) {
-          out.write(`${style.role("warn", g.railDotted)}   ${line}\n`);
-        }
-      }
-      if (item.kind === "toolCall") {
-        out.write(
-          `${style.role("warn", g.railDotted)} ${style.role("accent2", g.band)} ${style.role("accent2", `◆ ${item.name}`)}\n`,
-        );
-      }
-      if (item.kind === "error") {
-        out.write(
-          `${style.role("err", `${g.cross} error${item.code === undefined ? "" : ` ${item.code}`}`)} ${stripControls(item.message)}\n`,
-        );
+    renderTurnItems(turn);
+    // The end line carries the verified state; the dotted rows above stay dotted (§5.10).
+    renderTurnEndLine(turn);
+  };
+
+  /** Every recorded item's rows (the turn/start append; the list is empty that early). */
+  const renderTurnItems = (turn: TurnRecord): void => {
+    for (const item of turn.items) renderItemRows(item);
+  };
+
+  /**
+   * ONE item's rows (§5.10 mock-up 12: "items print as they complete"). Called from the wait
+   * matcher as each validated item/completed lands — append-only, so the completed snapshot
+   * later prints only items whose id was never printed (no duplication).
+   */
+  const renderItemRows = (item: import("@madc/engine/client").Item): void => {
+    if (item.kind === "agentMessage") {
+      out.write(
+        `${style.role("warn", g.railDotted)} ${style.role("accent2", g.diamond)} ${style.role("accent", "madc-default")} ${style.role("dim", "· agentMessage · item/completed")}\n`,
+      );
+      for (const line of stripControls(item.text).split("\n")) {
+        out.write(`${style.role("warn", g.railDotted)}   ${line}\n`);
       }
     }
-    // The end line carries the verified state; the dotted rows above stay dotted (§5.10).
+    if (item.kind === "toolCall") {
+      out.write(
+        `${style.role("warn", g.railDotted)} ${style.role("accent2", g.band)} ${style.role("accent2", `◆ ${item.name}`)}\n`,
+      );
+    }
+    if (item.kind === "toolResult") {
+      out.write(
+        `${style.role("warn", g.railDotted)}   ${style.role("dim", `toolCall → toolResult · ${item.name} · isError=${String(item.isError)}`)}\n`,
+      );
+      for (const line of stripControls(item.output).split("\n").slice(0, 2)) {
+        out.write(`${style.role("warn", g.railDotted)}   ${line}\n`);
+      }
+    }
+    if (item.kind === "error") {
+      out.write(
+        `${style.role("err", `${g.cross} error${item.code === undefined ? "" : ` ${item.code}`}`)} ${stripControls(item.message)}\n`,
+      );
+    }
+  };
+
+  /** The end line only: after the per-turn verify, printed below the appended rows (§5.10). */
+  const renderTurnEndLine = (turn: TurnRecord): void => {
     const v = turn.verify;
     if (turn.revoked || v?.kind === "failed") {
       out.write(`${style.role("err", `${g.railBreak} ${turn.unverified ?? "chain FAILED"}`)}\n`);
@@ -169,6 +203,18 @@ export async function runInlineApp(opts: InlineOptions): Promise<number> {
     const v = turn.verify;
     if (path === null || v === null) return null;
     if (v.kind === "verified") {
+      // The verified chain row binds to THIS turn like line mode's sessionFromOutcome: when
+      // the turn carries an unverified reason (foreign last turn.end, a live violation), the
+      // row stays UNVERIFIED with the seq/head evidence — never green for foreign ends.
+      if (turn.unverified !== null) {
+        return {
+          path,
+          seq: v.seq,
+          headHash: v.headHash,
+          chain: "unverified",
+          reason: turn.unverified,
+        };
+      }
       return { path, seq: v.seq, headHash: v.headHash, chain: "verified" };
     }
     if (v.kind === "failed") {
@@ -260,7 +306,69 @@ export async function runInlineApp(opts: InlineOptions): Promise<number> {
       items: [],
     };
     turns.push(turn);
+    // Append-only dedup (PR #35 round 7, Copilot r4136803428): item ids whose rows already
+    // printed — the completed snapshot re-prints none of them.
+    const printedIds = new Set<string>();
+    // Correction round: same shared shape as line mode — the matcher never throws (a throw
+    // escapes through the readline listener), the idle deadline is an inactivity deadline
+    // rearmed only on validated notifications, and the timeout reason is honest.
+    let rejectViolation: ((m: string) => void) | null = null;
+    const violation = new Promise<never>((_, reject) => {
+      rejectViolation = (m: string) => reject(new EngineProtocolError(m));
+    });
+    violation.catch(() => undefined);
+    const violate = (m: string): void => {
+      rejectViolation?.(m);
+    };
+    // A holder, not a plain local: the promise executor assigns on a later tick, which TS's
+    // control-flow analysis cannot see (the same idiom as the app's violatedRef).
+    const idleRef: { current: (() => void) | null } = { current: null };
+    const idleFired = new Promise<"idle">((resolve) => {
+      idleRef.current = () => resolve("idle");
+    });
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    let idleDidFire = false;
+    let settled = false; // the turn wait is over: no matcher side effects, no rearm
+    const armIdle = (): void => {
+      if (settled || idleDidFire || idleRef.current === null) return;
+      if (idleTimer !== null) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        idleDidFire = true;
+        sessionCodes.push({
+          code: EXIT.engine,
+          reason: `timeout: no engine message for ${opts.turnIdleMs} ms`,
+        });
+        turn.status = "unknown";
+        turn.unverified = `timeout: no engine message for ${opts.turnIdleMs} ms`;
+        idleRef.current?.();
+      }, opts.turnIdleMs);
+      idleTimer.unref?.();
+    };
+    const disarmIdle = (): void => {
+      if (idleTimer !== null) clearTimeout(idleTimer);
+      idleTimer = null;
+    };
+    // Engine-exit race (PR #35 round 7, Copilot r4136803517-family): the child dying mid-turn
+    // must settle THIS wait as a class-3 engine failure — never leave the 2,147,483,647 ms
+    // waiter pending for a dead child.
+    const engineGone = c.exited.then((code) => {
+      if (settled) return "engine-gone" as const;
+      sessionCodes.push({
+        code: EXIT.engine,
+        reason: `engine exited (code ${String(code)}) before responding`,
+      });
+      turn.status = "unknown";
+      turn.unverified = `engine exited (code ${String(code)}) before responding`;
+      return "engine-gone" as const;
+    });
+    engineGone.catch(() => undefined);
     try {
+      // The cutoff snapshot is taken BEFORE the request: the engine may batch the
+      // turn/start response and this turn's notifications into one stdout write, and those
+      // notifications must land AFTER the cutoff — a post-request snapshot would discard
+      // the whole batch as history and the wait would never see the completion.
+      const waitSince = c.messages.length;
+      let scanned = waitSince;
       const ts = await c.request("turn/start", {
         threadId: tid,
         input: [{ type: "text", text: prompt }],
@@ -271,31 +379,65 @@ export async function runInlineApp(opts: InlineOptions): Promise<number> {
       }
       turn.realTurnId = t.id;
       renderTurnAppend(turn);
-      let scanned = c.messages.length;
-      const done = c.waitFor((m) => {
-        const params = m.params as Record<string, unknown> | undefined;
-        if (m.method === "item/completed" || m.method === "item/started") {
-          if (
-            params === null ||
-            typeof params !== "object" ||
-            params.threadId !== tid ||
-            !isDomainId(params.turnId) ||
-            !isItemShape(params.item)
-          ) {
-            throw new EngineProtocolError("protocol violation: malformed item");
+      armIdle();
+      const done = c.waitFor(
+        (m) => {
+          if (settled) return false; // the wait is over: late messages are inert
+          const params = m.params as Record<string, unknown> | undefined;
+          if (m.method === "item/agentMessage/delta") {
+            // A validated delta for THIS turn is activity (identity first, then rearm).
+            if (
+              params === null ||
+              typeof params !== "object" ||
+              params.threadId !== tid ||
+              params.turnId !== turn.realTurnId ||
+              !isDomainId(params.itemId) ||
+              typeof params.delta !== "string"
+            ) {
+              violate("protocol violation: malformed or foreign item/completed or delta");
+              return false;
+            }
+            armIdle();
+            return false;
           }
-          if (m.method === "item/completed" && params.turnId === turn.realTurnId) {
-            turn.items.push(sanitizeItem(params.item));
+          if (m.method === "item/completed" || m.method === "item/started") {
+            if (
+              params === null ||
+              typeof params !== "object" ||
+              params.threadId !== tid ||
+              !isDomainId(params.turnId) ||
+              !isItemShape(params.item)
+            ) {
+              // Correction round: recorded, never thrown (live messages run this matcher
+              // inside the engine's readline listener).
+              violate("protocol violation: malformed item");
+              return false;
+            }
+            if (m.method === "item/completed" && params.turnId === turn.realTurnId) {
+              turn.items.push(sanitizeItem(params.item));
+              // Append-only (§5.10): the item's rows print NOW, as it completes.
+              renderItemRows(
+                turn.items[turn.items.length - 1] as import("@madc/engine/client").Item,
+              );
+              printedIds.add(params.item.id);
+            }
+            armIdle(); // a validated item is activity
+          } else if (m.method === "turn/completed" && !Object.hasOwn(m, "id")) {
+            // E-d: only THIS turn's completion ends the wait; historical messages are skipped
+            // via `since`, and a live foreign or malformed completion stays a violation.
+            const tEnd = (params as { turn?: unknown } | undefined)?.turn;
+            if (!isTurnShape(tEnd) || tEnd.threadId !== tid || tEnd.id !== turn.realTurnId) {
+              violate("protocol violation: malformed or foreign turn/completed");
+              return false;
+            }
+            disarmIdle();
+            return true;
           }
-        } else if (m.method === "turn/completed" && !Object.hasOwn(m, "id")) {
-          return true;
-        }
-        return false;
-      }, 2_147_483_647);
-      const idleFired = new Promise<"idle">((resolve) => {
-        const t2 = setTimeout(() => resolve("idle"), opts.turnIdleMs);
-        t2.unref?.();
-      });
+          return false; // unknown notifications are not activity: the deadline is not rearmed
+        },
+        2_147_483_647,
+        waitSince,
+      );
       const poll = setInterval(() => {
         if (c.protocolViolations.length > 0) {
           sessionCodes.push({
@@ -315,13 +457,31 @@ export async function runInlineApp(opts: InlineOptions): Promise<number> {
         }
       }, 100);
       poll.unref?.();
-      const raced = await Promise.race([done, idleFired, quitting]);
-      clearInterval(poll);
+      let raced: Awaited<typeof done> | "idle" | "quit" | "engine-gone";
+      try {
+        raced = await Promise.race([done, violation, idleFired, quitting, engineGone]);
+      } finally {
+        // Unconditional settlement cleanup (same as line mode): runs when the race RESOLVES
+        // and when the violation REJECTS through it (the throw must not skip cleanup).
+        settled = true;
+        clearInterval(poll);
+        disarmIdle();
+        c.cancelWaiters();
+        done.catch(() => undefined);
+      }
       if (raced === "quit") return;
-      if (raced !== "idle") {
+      if (raced !== "idle" && raced !== "engine-gone") {
         const t2 = (raced.params as { turn?: unknown } | undefined)?.turn;
         if (isTurnShape(t2) && t2.id === turn.realTurnId) {
+          // Append-only dedup: the snapshot replaces the record, but only items whose rows
+          // have NOT printed (a repeated id never prints twice) render now.
           turn.items = t2.items.map(sanitizeItem);
+          for (const item of turn.items) {
+            if (!printedIds.has(item.id)) {
+              renderItemRows(item);
+              printedIds.add(item.id);
+            }
+          }
           turn.status =
             t2.status === "completed"
               ? "completed"
@@ -330,24 +490,37 @@ export async function runInlineApp(opts: InlineOptions): Promise<number> {
                 : t2.status === "failed"
                   ? "failed"
                   : "unknown";
+          // Round 7: the tier-W error-code classification (a -32007/-32008 turn error is a
+          // PROVIDER failure, exit 4) — the same classes the full app rules for failed turns.
+          if (t2.status === "failed") turn.exitCode = failedTurnExitOf(t2.error?.code);
+          // Round 7 (tier-W parity): a failed completion's error body becomes a turn error
+          // ITEM (E11-sanitised) so the rail error row and /receipt render it. The wait has
+          // settled by now, so the row prints HERE (the matcher will never deliver it).
+          if (t2.status === "failed" && t2.error !== null) {
+            const errorItem = {
+              id: `${t2.id}-error`,
+              kind: "error",
+              status: "completed",
+              message: sanitizeText(t2.error.message),
+              code: t2.error.code,
+            } as TurnRecord["items"][number];
+            turn.items = [...turn.items, errorItem];
+            renderItemRows(errorItem);
+          }
         } else {
           turn.status = "unknown";
           turn.unverified = "the chain's last turn.end does not name this turn";
         }
-      } else {
-        turn.status = "unknown";
-        turn.unverified = `timeout: no engine message for ${opts.turnIdleMs} ms`;
-        sessionCodes.push({
-          code: EXIT.engine,
-          reason: `timeout: no engine message for ${opts.turnIdleMs} ms`,
-        });
       }
     } catch (err) {
+      // E11 (round 7): the caught message is engine-supplied — sanitised at THIS boundary,
+      // before it is stored into the turn record or a session code (Copilot r4136803580).
+      const reason = sanitizeErrorLike(err);
       turn.status = "unknown";
-      turn.unverified = err instanceof Error ? err.message : String(err);
+      turn.unverified = reason;
       sessionCodes.push({
         code: EXIT.engine,
-        reason: err instanceof Error ? err.message : String(err),
+        reason,
       });
     }
     // R-a: read-only verify after the turn, then the end line + verdict card print below (§5.10).
@@ -385,7 +558,9 @@ export async function runInlineApp(opts: InlineOptions): Promise<number> {
           headHash: outcome.result.lastHash,
         };
         turn.verify = v;
-        if (lastEnd !== turn.realTurnId) {
+        // A reason the turn already carries (a violation, a timeout) is PRESERVED across the
+        // verify — the same rule as the tier-W app (W-4): the verify never rewrites history.
+        if (lastEnd !== turn.realTurnId && turn.unverified === null) {
           turn.unverified = "the chain's last turn.end does not name this turn";
         }
       }
@@ -395,13 +570,18 @@ export async function runInlineApp(opts: InlineOptions): Promise<number> {
       if (verdict !== null) {
         const card = renderVerdictCard(
           verdict,
-          buildReceiptData({
-            turn,
-            served: servedOf(turn),
-            session: sessionOf(turn),
-            error: null,
-            exit: verdict.kind === "completed" ? 0 : turn.exitCode,
-          }),
+          // E11 at the data boundary (§5.10 E-a, round 7): sessionOf can carry a raw verifier
+          // reason into the styled card; the card's chrome must never run through the
+          // control-char replacer, so the DATA is sanitised before assembly.
+          sanitizeReceiptData(
+            buildReceiptData({
+              turn,
+              served: servedOf(turn),
+              session: sessionOf(turn),
+              error: null,
+              exit: verdict.kind === "completed" ? 0 : turn.exitCode,
+            }),
+          ),
           io.columns ?? 80,
           style,
           g,
@@ -420,10 +600,10 @@ export async function runInlineApp(opts: InlineOptions): Promise<number> {
   const chainPill = (turn: TurnRecord): string => {
     const v = turn.verify;
     if (turn.revoked || v?.kind === "failed") {
-      return style.filled("err", `✕ chain FAILED`);
+      return style.filled("err", `${g.cross} chain FAILED`);
     }
     if (v?.kind === "verified" && turn.unverified === null) {
-      return style.filled("ok", `seq ${v.seq} · ✓ chain VERIFIED`);
+      return style.filled("ok", `seq ${v.seq} · ${g.check} chain VERIFIED`);
     }
     return style.tint("warnbg", style.role("warn", "▲ UNVERIFIED"));
   };
@@ -476,6 +656,25 @@ export async function runInlineApp(opts: InlineOptions): Promise<number> {
     terminal: io.stdinIsTTY === true,
     prompt: `${g.prompt} `,
   });
+  // Track closure through the SUPPORTED close event (TS2551: `Interface` has no `closed`).
+  let rlClosed = false;
+  rl.on("close", () => {
+    rlClosed = true;
+  });
+  // §6.3/§9 (round 7, Copilot r4136803801): the prompt must be VISIBLE — readline only
+  // emits it to its OWN output stream, which this interface was never given, so rl.prompt()
+  // writes nothing. The prompt goes through the CliIO output contract instead: the bare
+  // glyph prompt (append-only, always landing below the previous output, never repainted).
+  // Re-emitted after each queued line's turn settles.
+  const showPrompt = (): void => {
+    if (rlClosed) return;
+    try {
+      io.stdout.write(`${g.prompt} `);
+    } catch {
+      // a stream that already errored: the prompt is cosmetic, never fatal
+    }
+  };
+  showPrompt();
   rl.on("SIGINT", () => {
     io.stderr.write("madc: interrupted (SIGINT)\n");
     io.stderr.write(`exit ${worst("SIGINT")}\n`);
@@ -506,14 +705,18 @@ export async function runInlineApp(opts: InlineOptions): Promise<number> {
           const last = turns[turns.length - 1];
           if (last !== undefined) {
             out.write(
+              // E11 at the data boundary (round 7, Copilot r4136803652): the receipt re-render
+              // is a second inline output path — the same sanitised data as the verdict card.
               receiptPlain(
-                buildReceiptData({
-                  turn: last,
-                  served: servedOf(last),
-                  session: sessionOf(last),
-                  error: null,
-                  exit: last.exitCode,
-                }),
+                sanitizeReceiptData(
+                  buildReceiptData({
+                    turn: last,
+                    served: servedOf(last),
+                    session: sessionOf(last),
+                    error: null,
+                    exit: last.exitCode,
+                  }),
+                ),
               ),
             );
           }
@@ -541,11 +744,20 @@ export async function runInlineApp(opts: InlineOptions): Promise<number> {
         }
         await send(text);
       })
-      .catch(() => undefined);
+      .catch(() => undefined)
+      .finally(() => {
+        // Re-prompt after each queued line settles (append-only, below the output).
+        if (!rlClosed) showPrompt();
+      });
   });
   const firstInline = opts.firstPrompt;
   if (firstInline !== null) {
-    queued = queued.then(() => send(firstInline)).catch(() => undefined);
+    queued = queued
+      .then(() => send(firstInline))
+      .catch(() => undefined)
+      .finally(() => {
+        if (!rlClosed) showPrompt();
+      });
   }
   await new Promise<void>((resolve) => {
     rl.on("close", resolve);

@@ -13,11 +13,19 @@ import type { Style } from "./style.ts";
 import {
   type Glyphs,
   glyphsFor,
+  middleEllipsize,
   padVisible,
   truncateChrome,
   visibleWidth,
   wordWrap,
 } from "./style.ts";
+
+/** One launch-doctor row, kept verbatim (id + status + sanitised summary). */
+export type DoctorRow = {
+  readonly id: string;
+  readonly status: "pass" | "warn" | "fail" | "skip" | "init";
+  readonly summary: string;
+};
 
 /** What the launch doctor reported, for the banner and the evidence pane (§5.1, §5.7). */
 export type DoctorSummary = {
@@ -29,11 +37,35 @@ export type DoctorSummary = {
   readonly ms: number | null;
   /** Full WARN/FAIL rows in their pinned wording (printed under the banner, §5.1). */
   readonly warnRows: readonly string[];
-  /** Row lines for the evidence pane's DOCTOR AT LAUNCH section (id + summary). */
-  readonly rowLines: readonly string[];
+  /** Every launch row in arrival order (the evidence pane's DOCTOR AT LAUNCH section, §5.7). */
+  readonly allRows: readonly DoctorRow[];
   /** True when a launch row ended FAIL (banner stays expanded, input disabled until Enter). */
   readonly failAtLaunch: boolean;
 };
+
+/**
+ * Derive the whole summary from the retained rows (§5.1/§5.7): counts, the WARN/FAIL banner
+ * detail and the FAIL flag all come from the one complete row list — nothing is dropped on
+ * the way in, so the evidence pane can show every row and the banner every WARN/FAIL.
+ */
+export function summarizeDoctor(
+  rows: readonly DoctorRow[],
+  running: boolean,
+  ms: number | null,
+): DoctorSummary {
+  const detail = rows.filter((r) => r.status === "warn" || r.status === "fail");
+  return {
+    running,
+    pass: rows.filter((r) => r.status === "pass").length,
+    warn: rows.filter((r) => r.status === "warn").length,
+    fail: rows.filter((r) => r.status === "fail").length,
+    skip: rows.filter((r) => r.status === "skip").length,
+    ms,
+    warnRows: detail.map((r) => `${r.id}: ${r.summary}`),
+    allRows: rows,
+    failAtLaunch: rows.some((r) => r.status === "fail"),
+  };
+}
 
 export type RegistrySummary = {
   readonly entries: number;
@@ -64,9 +96,23 @@ export type BannerData = {
   readonly uiNote: string | null;
 };
 
-const WARN = "▲";
-const OK = "✓";
-const IDLE = "○";
+/** Round 9 (§4): the banner's status chrome comes from the SELECTED glyph set — ASCII mode
+ * renders `v 7 PASS`, `! 2 WARN`, `x 1 FAIL`, `- 0 SKIP`, the awaiting-receipt `-` and the
+ * warn-detail `!` prefix, never the hard-coded Unicode marks. The pinned `·` separators
+ * stay verbatim in every mode (§4's receipt-rule carve-out). */
+const bannerStatusGlyphs = (
+  g: Glyphs,
+): {
+  readonly ok: string;
+  readonly warn: string;
+  readonly err: string;
+  readonly idle: string;
+} => ({
+  ok: g.check,
+  warn: g.warn,
+  err: g.cross,
+  idle: g.idle,
+});
 
 /** `~/code/madc` form for the banner cwd and header (§5.1); outside $HOME stays absolute. */
 export function displayCwd(cwd: string, home: string): string {
@@ -83,13 +129,24 @@ export function shortId(id: string): string {
 
 /**
  * The pre-conversation banner (§5.1): one rounded box titled `madc <version>`; wordmark and
- * identity lines on the left; Seat, Doctor at launch and Registry on the right. Below 80
- * columns of right-column room the right column stacks under the wordmark (§9).
+ * identity lines on the left; Seat, Doctor at launch and Registry on the right. Below 110
+ * columns — or whenever the right column cannot fit beside the wordmark column — the right
+ * column stacks under the wordmark (§9; at 80 columns it always stacks).
  */
 export function renderBanner(d: BannerData, width: number, style: Style, g: Glyphs): string[] {
-  const boxWidth = Math.max(40, Math.min(width - 2, 102));
+  // Responsive composition (§9, §14): the box fills its region — the montage's fixed
+  // 102-column box is an illustration, not a rule — and the layout is chosen from the actual
+  // content: two columns when the right column fits beside the wordmark column, stacked
+  // otherwise (§9's 80-column rule is the always-stack floor; widths below 110 never attempt
+  // two columns). No row may break the box border, and no mandatory field is dropped to fit.
+  const boxWidth = Math.max(40, width - 2);
   const inner = boxWidth - 2;
-  const stacked = width < 110;
+  const leftBudget = 46;
+  const homeLabel = d.homeSource === "env" ? " (MADC_HOME)" : " (default)";
+  // §5.1's home field is the actual path plus its source label; §9 lets long paths take a
+  // middle ellipsis (chrome truncation), never a dropped label.
+  const homeRoom = Math.max(8, leftBudget - "home ".length - homeLabel.length);
+  const homeText = `${middleEllipsize(d.home, homeRoom)}${homeLabel}`;
   const left: string[] = [
     "",
     "",
@@ -102,16 +159,17 @@ export function renderBanner(d: BannerData, width: number, style: Style, g: Glyp
     style.role("dim", d.backing),
     `madc ${d.version} · ${style.role("accent2", d.protocol)}`,
     style.role("dim", displayCwd(d.cwd, d.userHome)),
-    style.role("dim", `home ${d.homeSource === "env" ? "(MADC_HOME)" : "(default)"}`),
+    style.role("dim", `home ${homeText}`),
     style.role("dim", `thread ${d.threadId === null ? "none yet" : shortId(d.threadId)}`),
   ];
   const mark = wordmark(style.depth);
   for (let i = 0; i < mark.length && i < 6; i++) left[i] = mark[i] ?? "";
   const servedLine =
     d.served === null
-      ? `${style.role("dim", `${IDLE} awaiting servedModel receipt`)}`
+      ? `${style.role("dim", `${bannerStatusGlyphs(g).idle} awaiting servedModel receipt`)}`
       : style.role("accent2", d.served.servedModel);
   const right: string[] = [];
+  const bg = bannerStatusGlyphs(g);
   right.push(style.role("accent", "Seat"));
   right.push(
     `  ${style.role("dim", "seat")}      ${style.role("accent", d.seatId)}${d.seatSha === null ? "" : style.role("accent2", ` · sha256:${d.seatSha}`)}`,
@@ -127,7 +185,7 @@ export function renderBanner(d: BannerData, width: number, style: Style, g: Glyp
     `${style.role("accent", "Doctor at launch")}  ${style.role("dim", "read-only")}${doctorMs}`,
   );
   right.push(
-    `  ${style.role("ok", `${OK} ${d.doctor.pass} PASS`)} · ${style.role("warn", `${WARN} ${d.doctor.warn} WARN`)} · ${style.role("err", `${d.doctor.fail} FAIL`)} · ${style.role("dim", `${IDLE} ${d.doctor.skip} SKIP`)}  ${style.role("dim", "/doctor for rows")}`,
+    `  ${style.role("ok", `${bg.ok} ${d.doctor.pass} PASS`)} · ${style.role("warn", `${bg.warn} ${d.doctor.warn} WARN`)} · ${style.role("err", `${bg.err} ${d.doctor.fail} FAIL`)} · ${style.role("dim", `${bg.idle} ${d.doctor.skip} SKIP`)}  ${style.role("dim", "/doctor for rows")}`,
   );
   right.push("");
   if (d.registry !== null) {
@@ -151,9 +209,13 @@ export function renderBanner(d: BannerData, width: number, style: Style, g: Glyp
   );
 
   const rows: string[] = [];
+  const rightWidth = right.reduce((m, l) => Math.max(m, visibleWidth(l)), 0);
+  const stacked = width < 110 || leftBudget + rightWidth > inner;
   const title = ` ${style.role("accent", `madc ${d.version}`)} `;
   const titleWidth = visibleWidth(` madc ${d.version} `);
-  const dashCount = Math.max(0, inner - titleWidth - 2);
+  // One dash before the title, the rest after: the title zone spans exactly `inner`, so the
+  // top border closes at the same column as every content row and the bottom border.
+  const dashCount = Math.max(0, inner - titleWidth);
   rows.push(
     style.role(
       "border",
@@ -162,7 +224,7 @@ export function renderBanner(d: BannerData, width: number, style: Style, g: Glyp
   );
   const paintRow = (text: string): string =>
     style.role("border", `${g.boxVertical}`) +
-    padVisible(text, inner) +
+    padVisible(truncateChrome(text, inner), inner) +
     style.role("border", g.boxVertical);
   if (stacked) {
     for (const line of left) rows.push(paintRow(line));
@@ -171,13 +233,13 @@ export function renderBanner(d: BannerData, width: number, style: Style, g: Glyp
   } else {
     const height = Math.max(left.length, right.length);
     for (let i = 0; i < height; i++) {
-      const l = truncateChrome(left[i] ?? "", 46);
+      const l = truncateChrome(left[i] ?? "", leftBudget);
       const r = (right[i] ?? "").trimEnd();
       rows.push(
         style.role("border", g.boxVertical) +
-          padVisible(l, 46) +
+          padVisible(l, leftBudget) +
           r +
-          " ".repeat(Math.max(0, inner - 46 - visibleWidth(r))) +
+          " ".repeat(Math.max(0, inner - leftBudget - visibleWidth(r))) +
           style.role("border", g.boxVertical),
       );
     }
@@ -187,7 +249,7 @@ export function renderBanner(d: BannerData, width: number, style: Style, g: Glyp
   );
   // §5.1: every doctor WARN or FAIL row prints in full under the banner, in its pinned wording.
   for (const row of d.doctor.warnRows) {
-    rows.push(`${style.role("warn", `${WARN} `)}${row}`);
+    rows.push(`${style.role("warn", `${bg.warn} `)}${row}`);
   }
   return rows;
 }

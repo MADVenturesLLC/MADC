@@ -4,10 +4,16 @@
  * `MADC_TEST_APP_TURNS` (a JSON array); each `turn/start` pops the next entry:
  *
  *   {"kind":"ok","text":"…"}            turn completes; servedModel receipt; chain intact
+ *   {"kind":"ok-batched","text":"…"}    like ok, but the turn/start response, the item
+ *                                       notifications and turn/completed arrive in ONE stdout
+ *                                       write — a deterministic cutoff-race repro (the wait
+ *                                       snapshot must be taken before the request)
  *   {"kind":"failed","code":-32603}     turn ends failed with the given code (exit-class 1)
  *   {"kind":"interrupted"}              turn ends interrupted right away
  *   {"kind":"late-end"}                 turn.end names ANOTHER turn id (verify passes, UNVERIFIED)
  *   {"kind":"corrupt"}                  after this turn, the session file is tampered with
+ *   {"kind":"corrupt-last"}             like corrupt, but the LAST turn.end line is tampered
+ *                                       (an earlier verified turn's range stays intact)
  *   {"kind":"tool"}                     emits toolCall + toolResult items before the agent text
  *   {"kind":"engine-exit"}              the process exits 3 mid-turn (engine gone)
  *
@@ -21,13 +27,23 @@ import { createInterface } from "node:readline";
 
 type TurnScript =
   | { readonly kind: "ok"; readonly text?: string }
+  | { readonly kind: "ok-batched"; readonly text?: string }
   | { readonly kind: "ctrl" }
   | { readonly kind: "served-ctrl" }
+  | { readonly kind: "rpc-fail-ctrl"; readonly code?: number }
+  | { readonly kind: "bad-tool-item" }
   | { readonly kind: "failed"; readonly code: number }
   | { readonly kind: "interrupted" }
   | { readonly kind: "hold" }
+  | { readonly kind: "malformed-item"; readonly live?: boolean; readonly followUp?: boolean }
+  | { readonly kind: "foreign-completion"; readonly live?: boolean }
+  | { readonly kind: "delta-spaced" }
+  | { readonly kind: "sustained-unknown" }
+  | { readonly kind: "spaced" }
+  | { readonly kind: "unknown-note" }
   | { readonly kind: "late-end" }
   | { readonly kind: "corrupt" }
+  | { readonly kind: "corrupt-last" }
   | { readonly kind: "tool" }
   | { readonly kind: "engine-exit" };
 
@@ -35,9 +51,17 @@ const script: TurnScript[] = JSON.parse(process.env.MADC_TEST_APP_TURNS ?? "[]")
 /** Once-per-run thread/start failure mode: rpc-2 | rpc-5 | malformed | die (test-only). */
 const threadStartMode = process.env.MADC_TEST_THREAD_START ?? "";
 const home = process.env.MADC_HOME ?? "";
-// Per-process thread id: a restarted engine (fresh process, same home) must not append a
-// fresh seq-0 chain into the dead engine's session file.
-const threadId = `thr_app${String(process.pid % 1_000_000).padStart(6, "0")}`;
+/** True when this module is imported only for its exported helpers (a test asserts the
+ * thread-id encoding without spawning anything): the readline wiring — the module's only
+ * runtime side effect — is skipped. Spawned child engines never set this variable. */
+const helpersOnly = process.env.MADC_TEST_FIXTURE_HELPERS_ONLY === "1";
+/** Thread id minted from an engine process id: a restarted engine (fresh process, same
+ * home) must not append a fresh seq-0 chain into the dead engine's session file. The
+ * encoding is LOSSLESS — `thr_app` + the decimal pid, zero-padded to at least six digits —
+ * so tests can read the owning engine's pid back out of an app-visible thread id for any
+ * pid, seven-digit ones included (no modulo, no truncation). */
+export const fixtureThreadId = (pid: number): string => `thr_app${String(pid).padStart(6, "0")}`;
+const threadId = fixtureThreadId(process.pid);
 const seatId = "madc-default";
 const sessionFile = join(home, "sessions", `${threadId}.jsonl`);
 const send = (m: unknown): void => {
@@ -81,8 +105,8 @@ const keepAlive = (): void => {
 const interruptAnswer = process.env.MADC_TEST_APP_INTERRUPT_ANSWER === "1";
 
 let turnCounter = 0;
-const rl = createInterface({ input: process.stdin });
-rl.on("close", () => {
+const rl = helpersOnly ? null : createInterface({ input: process.stdin });
+rl?.on("close", () => {
   if (interruptAnswer) process.exit(0); // answered-interrupt sessions end cleanly on EOF
   // Stay alive after EOF like the one-shot fixtures: the CLI's close kills us.
   keepAlive();
@@ -126,7 +150,7 @@ const servedItem = (id: string): Record<string, unknown> => ({
   providerId: "kimi-code",
 });
 
-rl.on("line", (line) => {
+rl?.on("line", (line) => {
   const msg = JSON.parse(line) as { id?: number; method: string; params?: Record<string, unknown> };
   if (msg.id === undefined) return;
   switch (msg.method) {
@@ -199,6 +223,258 @@ rl.on("line", (line) => {
         keepAlive();
         return;
       }
+      if (step.kind === "malformed-item") {
+        // Correction-round repro (live delivery escape): a malformed item notification — the
+        // item id fails the domain-id grammar, so the consumers' wait matcher classifies it.
+        // live: a SEPARATE stdout write while the client's wait is already pending (delivery
+        // through the readline callback); otherwise response + malformed item arrive in ONE
+        // write (already-buffered history at the wait's cutoff).
+        // followUp: a VALID item arrives 150 ms later — post-settlement activity that must
+        // not rearm the settled turn's idle timer or mutate its record (cleanup proof).
+        append("turn.start", { turnId, inputText: "hi" });
+        const malformed = {
+          method: "item/completed",
+          params: {
+            threadId,
+            turnId,
+            item: { id: "item_../escape", kind: "agentMessage", status: "completed", text: "x" },
+          },
+        };
+        if (step.live === true) {
+          send({ id: msg.id, result: { turn: inProgress(turnId) } });
+          setTimeout(() => send(malformed), 40);
+        } else {
+          sendChunk({ id: msg.id, result: { turn: inProgress(turnId) } }, malformed);
+        }
+        if (step.followUp === true) {
+          // A VALID servedModel item arrives 150 ms later — post-settlement activity that
+          // must not rearm the settled turn's idle timer or mutate its record: a served row
+          // is observable in inline's /receipt re-render (proof the waiter still ran).
+          setTimeout(
+            () =>
+              send({
+                method: "item/completed",
+                params: {
+                  threadId,
+                  turnId,
+                  item: servedItem(`item_fu${turnCounter}`),
+                },
+              }),
+            150,
+          );
+        }
+        keepAlive();
+        return;
+      }
+      if (step.kind === "foreign-completion") {
+        // Correction-round repro: a well-ENVELOPED turn/completed naming ANOTHER turn id on
+        // this thread — foreign, so the consumer must take the controlled violation path
+        // (live delivery in its own write, or buffered in the same write as the response).
+        append("turn.start", { turnId, inputText: "hi" });
+        const foreign = {
+          method: "turn/completed",
+          params: {
+            turn: {
+              id: "turn_other999",
+              threadId,
+              status: "completed",
+              items: [agentItem(`item_o${turnCounter}`, "not this turn")],
+              error: null,
+              startedAt: 1,
+              completedAt: 2,
+            },
+          },
+        };
+        if (step.live === true) {
+          send({ id: msg.id, result: { turn: inProgress(turnId) } });
+          setTimeout(() => send(foreign), 40);
+        } else {
+          sendChunk({ id: msg.id, result: { turn: inProgress(turnId) } }, foreign);
+        }
+        keepAlive();
+        return;
+      }
+      if (step.kind === "delta-spaced") {
+        // Correction-round repro (delta activity): validated streaming deltas spaced well
+        // past a short inactivity deadline, then the completion — only consumers that reset
+        // the deadline on VALIDATED deltas (after identity checks) complete this turn.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress(turnId) } });
+        const delta = (n: 1 | 2, at: number): void => {
+          setTimeout(
+            () =>
+              send({
+                method: "item/agentMessage/delta",
+                params: { threadId, turnId, itemId: `item_x${n}`, delta: `part${n} ` },
+              }),
+            at,
+          );
+        };
+        delta(1, 250);
+        delta(2, 500);
+        const finalDelta = [
+          agentItem(`item_a${turnCounter}`, "streamed reply"),
+          servedItem(`item_s${turnCounter}`),
+        ];
+        setTimeout(() => {
+          send({
+            method: "turn/completed",
+            params: {
+              turn: {
+                id: turnId,
+                threadId,
+                status: "completed",
+                items: finalDelta,
+                error: null,
+                startedAt: 1,
+                completedAt: 2,
+              },
+            },
+          });
+          for (const item of finalDelta) {
+            if (item.kind === "servedModel") {
+              append("servedModel", {
+                turnId,
+                requestedModel: item.requestedModel,
+                servedModel: item.servedModel,
+                backing: item.backing,
+                providerId: item.providerId,
+              });
+            } else {
+              append("item", { turnId, item });
+            }
+          }
+          append("turn.end", { turnId, status: "completed", error: null });
+        }, 750);
+        keepAlive();
+        return;
+      }
+      if (step.kind === "sustained-unknown") {
+        // Correction-round companion: well-formed UNKNOWN notifications arriving
+        // continuously — none of them may extend the inactivity deadline.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress(turnId) } });
+        for (const at of [100, 200, 300]) {
+          setTimeout(() => send({ method: "thread/updated", params: { threadId } }), at);
+        }
+        keepAlive();
+        return;
+      }
+      if (step.kind === "spaced") {
+        // Correction-round repro (idle-deadline class): validated item notifications spaced
+        // so a total-turn deadline fires before the completion, while a deadline rearmed on
+        // each validated notification completes comfortably.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress(turnId) } });
+        const partNote = (n: 1 | 2) => ({
+          method: "item/completed",
+          params: {
+            threadId,
+            turnId,
+            item: agentItem(`item_d${n}_${turnCounter}`, `part ${n}`),
+          },
+        });
+        setTimeout(() => send(partNote(1)), 250);
+        setTimeout(() => send(partNote(2)), 500);
+        const finalSpaced = [
+          agentItem(`item_a${turnCounter}`, "spaced reply"),
+          servedItem(`item_s${turnCounter}`),
+        ];
+        setTimeout(() => {
+          send({
+            method: "turn/completed",
+            params: {
+              turn: {
+                id: turnId,
+                threadId,
+                status: "completed",
+                items: finalSpaced,
+                error: null,
+                startedAt: 1,
+                completedAt: 2,
+              },
+            },
+          });
+          for (const item of finalSpaced) {
+            if (item.kind === "servedModel") {
+              append("servedModel", {
+                turnId,
+                requestedModel: item.requestedModel,
+                servedModel: item.servedModel,
+                backing: item.backing,
+                providerId: item.providerId,
+              });
+            } else {
+              append("item", { turnId, item });
+            }
+          }
+          append("turn.end", { turnId, status: "completed", error: null });
+        }, 750);
+        keepAlive();
+        return;
+      }
+      if (step.kind === "unknown-note") {
+        // Correction-round companion: a well-formed UNKNOWN notification (envelope-ok, method
+        // the consumers do not handle) must NOT reset the inactivity deadline.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress(turnId) } });
+        setTimeout(() => send({ method: "thread/updated", params: { threadId } }), 100);
+        keepAlive();
+        return;
+      }
+      if (step.kind === "rpc-fail-ctrl") {
+        // E11 catch-path repro: the turn END failed with an RPC error body whose message
+        // carries C0/C1 controls — the consumers' turn-wait catch (EngineRpcError path or
+        // the malformed-completion path) stores that message into the turn record and
+        // session codes; every render of it must carry U+FFFD, never a raw ESC.
+        append("turn.start", { turnId, inputText: "hi" });
+        send({ id: msg.id, result: { turn: inProgress(turnId) } });
+        send({
+          method: "turn/completed",
+          params: {
+            turn: {
+              id: turnId,
+              threadId,
+              status: "failed",
+              items: [],
+              error: {
+                code: step.code ?? -32008,
+                message: "provider refused: \u001b[31mred\u0007bell\u001b[2Kgone",
+              },
+              startedAt: 1,
+              completedAt: 2,
+            },
+          },
+        });
+        append("turn.end", { turnId, status: "failed", error: null });
+        return;
+      }
+      if (step.kind === "bad-tool-item") {
+        // Wire-validation repro (isItemShape per-kind fields): a well-enveloped
+        // item/completed for a toolResult whose kind-specific fields are wrong types. The
+        // wait matchers must classify it as a protocol violation — never push it into the
+        // turn record where the renderers call `output.split` on a non-string.
+        append("turn.start", { turnId, inputText: "hi" });
+        const bad = {
+          method: "item/completed",
+          params: {
+            threadId,
+            turnId,
+            item: {
+              id: `item_t${turnCounter}`,
+              kind: "toolResult",
+              status: "completed",
+              callId: 7,
+              name: "read_file",
+              output: 42,
+              isError: "false",
+            },
+          },
+        };
+        sendChunk({ id: msg.id, result: { turn: inProgress(turnId) } }, bad);
+        keepAlive();
+        return;
+      }
       if (step.kind === "engine-exit") {
         // die-once: the first engine process dies; a restarted engine (fresh process, same
         // home) sees the marker and completes the turn normally — for restart tests.
@@ -257,7 +533,7 @@ rl.on("line", (line) => {
       const agentText =
         step.kind === "ctrl"
           ? "clean\u001b[31mred\u0007bell\u001b[2Kgone"
-          : step.kind === "ok"
+          : step.kind === "ok" || step.kind === "ok-batched"
             ? (step.text ??
               "Exit 2 is a usage or config error: bad flags, empty or oversize prompt.")
             : "x";
@@ -273,13 +549,19 @@ rl.on("line", (line) => {
             ];
       // The corrupt scenario tampers BEFORE turn/completed reaches the client, so the client's
       // read-only verify cannot win the race against the tamper.
-      if (step.kind === "corrupt") {
+      if (step.kind === "corrupt" || step.kind === "corrupt-last") {
         send({ id: msg.id, result: { turn: inProgress(turnId) } });
         append("turn.end", { turnId: endTurnId, status: "completed", error: null });
         try {
           const text = readFileSync(sessionFile, "utf8");
           const lines = text.split("\n");
-          const idx = lines.findIndex((l) => l.includes('"turn.end"'));
+          // corrupt hits the FIRST turn.end line; corrupt-last the LAST — the R-b test needs a
+          // tamper that lands after an earlier verified turn's remembered range.
+          const hits = lines
+            .map((l, i) => (l.includes('"turn.end"') ? i : -1))
+            .filter((i) => i >= 0);
+          const idx =
+            step.kind === "corrupt-last" ? (hits[hits.length - 1] ?? -1) : (hits[0] ?? -1);
           if (idx >= 0 && lines[idx] !== undefined) {
             lines[idx] = `${lines[idx].slice(0, -4)}beef}`;
             writeFileSync(sessionFile, lines.join("\n"));
@@ -303,27 +585,69 @@ rl.on("line", (line) => {
         });
         return;
       }
-      send({ id: msg.id, result: { turn: inProgress(turnId) } });
-      for (const item of finalItems) {
+      if (step.kind === "ok-batched") {
+        // Deterministic cutoff repro: response + item notifications + completion in ONE
+        // stdout write, so they all land before the caller's post-request code runs.
+        sendChunk(
+          { id: msg.id, result: { turn: inProgress(turnId) } },
+          ...finalItems.map((item) => ({
+            method: "item/completed",
+            params: { threadId, turnId, item },
+          })),
+          {
+            method: "turn/completed",
+            params: {
+              turn: {
+                id: turnId,
+                threadId,
+                status: "completed",
+                items: finalItems,
+                error: null,
+                startedAt: 1,
+                completedAt: 2,
+              },
+            },
+          },
+        );
+      } else {
+        send({ id: msg.id, result: { turn: inProgress(turnId) } });
+        for (const item of finalItems) {
+          send({
+            method: "item/completed",
+            params: { threadId, turnId, item },
+          });
+        }
         send({
-          method: "item/completed",
-          params: { threadId, turnId, item },
+          method: "turn/completed",
+          params: {
+            turn: {
+              id: turnId,
+              threadId,
+              status: error === null ? "completed" : "failed",
+              items: finalItems,
+              error,
+              startedAt: 1,
+              completedAt: 2,
+            },
+          },
         });
       }
-      send({
-        method: "turn/completed",
-        params: {
-          turn: {
-            id: turnId,
-            threadId,
-            status: error === null ? "completed" : "failed",
-            items: finalItems,
-            error,
-            startedAt: 1,
-            completedAt: 2,
-          },
-        },
-      });
+      // Persist the items the way the real engine does (§0.2): an `item` event per completed
+      // item and the servedModel receipt as its own event — the disk shape the app's §5.7
+      // evidence (per-turn ranges, served seq) derives from the read-only verify.
+      for (const item of finalItems) {
+        if (item.kind === "servedModel") {
+          append("servedModel", {
+            turnId,
+            requestedModel: item.requestedModel,
+            servedModel: item.servedModel,
+            backing: item.backing,
+            providerId: item.providerId,
+          });
+        } else {
+          append("item", { turnId, item });
+        }
+      }
       append("turn.end", {
         turnId: endTurnId,
         status: error === null ? "completed" : "failed",

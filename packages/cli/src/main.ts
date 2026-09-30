@@ -137,6 +137,12 @@ async function witnessEntry(io: CliIO, firstPrompt: string | null): Promise<numb
       onApp: (a) => {
         app = a;
       },
+      exposeSignals: (h) => {
+        // Round 7: Level A (or whichever non-tier-W mode runWitnessApp selected) exposed
+        // its handlers — they ARE the process-signal behaviour from here on. SIGHUP's
+        // handler performs the best-effort line and returns; THIS entry re-raises (O-4).
+        app = h;
+      },
       onSighup: () => {
         // O-4: restore default handling for SIGHUP, then re-raise so the OS reports 129.
         process.removeListener("SIGHUP", onSighup);

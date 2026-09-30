@@ -143,7 +143,7 @@ export function confinedDirId(home: string, name: string): DirId | null {
   }
 }
 
-function sameDirId(a: DirId | null, b: DirId | null): boolean {
+export function sameDirId(a: DirId | null, b: DirId | null): boolean {
   return a !== null && b !== null && a.dev === b.dev && a.ino === b.ino;
 }
 
@@ -1142,7 +1142,7 @@ export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number>
     : {
         onStart: (id) => {
           if (w) {
-            io.stdout.write(`${doctorPendingRowW(id, style)}\n`);
+            io.stdout.write(`${doctorPendingRowW(id, style, g)}\n`);
             lastPending = true;
           }
         },

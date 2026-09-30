@@ -103,7 +103,11 @@ export class Style {
   keycap(word: string): string {
     if (this.depth === "none" || this.ascii) return `[${word}]`;
     if (this.keycapReverse) return `\u001b[7m${word}\u001b[0m`;
-    return `\u001b[${ROLE_SGR.dim[this.depth]}m\u001b[48;2;34;38;56m${word}\u001b[0m`;
+    // PR #35 round 7 (Copilot r4136804281): the pill background follows the SELECTED depth —
+    // a 256-colour terminal gets `48;5;…`, never a hard-coded truecolor SGR it may not support.
+    const bg = TINT_BG.pill[this.depth];
+    if (bg === null) return `[${word}]`;
+    return `\u001b[${ROLE_SGR.dim[this.depth]}m\u001b[${bg}m${word}\u001b[0m`;
   }
 }
 
