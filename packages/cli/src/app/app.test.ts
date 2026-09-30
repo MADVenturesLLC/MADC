@@ -1,6 +1,6 @@
 /**
  * Witness-app integration tests (DESIGN-SPEC rev 6.2 §5): the real WitnessApp drives the real
- * app-engine fixture over real stdio JSONL with the REAL verify worker against the REAL session
+ * app-fixture over real stdio JSONL with the REAL verify worker against the REAL session
  * chain on disk — no injected verify, no paid keys, no network, no timing snapshots (waits poll
  * for state, bounded by a deadline). Every test gets a fresh MADC_HOME, so session chains never
  * leak between tests.
@@ -24,7 +24,7 @@ import { runWitnessApp, seatFields, uiNoteFor } from "./launch.ts";
 import { runLineModeApp } from "./line-mode.ts";
 import { visibleWidth } from "./style.ts";
 
-const APP_ENGINE = fileURLToPath(new URL("../testing/app-engine.ts", import.meta.url));
+const APP_FIXTURE = fileURLToPath(new URL("../testing/app-fixture.ts", import.meta.url));
 
 /** Module-level Level-A/inline IO rig (fresh MADC_HOME per call, fixture engine). */
 const lineIoPlain = (home: string, stdout: RecordingOut, stderr: RecordingOut): CliIO => ({
@@ -38,7 +38,7 @@ const lineIoPlain = (home: string, stdout: RecordingOut, stderr: RecordingOut): 
   columns: 110,
   rows: 32,
   cwd: home,
-  engineEntry: APP_ENGINE,
+  engineEntry: APP_FIXTURE,
 });
 
 type Rig = {
@@ -80,7 +80,7 @@ function rig(
     columns: opts.cols ?? 110,
     rows: opts.rows ?? 32,
     cwd: "/home/mike/code/madc",
-    engineEntry: APP_ENGINE,
+    engineEntry: APP_FIXTURE,
   };
   const banner: BannerData = {
     version: "0.0.0",
@@ -187,7 +187,7 @@ const probePid = (pid: number): "alive" | "absent" => {
 describe("B-2 ownership: lossless pid encoding and probe semantics", () => {
   it("fixtureThreadId round-trips every pid — seven-digit ones included, no modulo", async () => {
     process.env.MADC_TEST_FIXTURE_HELPERS_ONLY = "1";
-    const { fixtureThreadId } = await import("../testing/app-engine.ts");
+    const { fixtureThreadId } = await import("../testing/app-fixture.ts");
     delete process.env.MADC_TEST_FIXTURE_HELPERS_ONLY;
     for (const pid of [1, 9, 99_999, 999_999, 1_000_000, 1_234_567, 9_999_999]) {
       const tid = fixtureThreadId(pid);
@@ -225,7 +225,7 @@ describe("B-2 ownership: lossless pid encoding and probe semantics", () => {
     const home = mkdtempSync(join(tmpdir(), "madc-probe-"));
     const shortLived = spawnEngine({
       env: { MADC_HOME: home, MADC_TEST_APP_TURNS: "[]" },
-      entry: APP_ENGINE,
+      entry: APP_FIXTURE,
     });
     const shortLivedPid = shortLived.child.pid;
     assert.ok(
@@ -616,7 +616,7 @@ describe("§3.4 production tier routing (runWitnessApp)", () => {
         columns: 72,
         rows: 20,
         cwd: home,
-        engineEntry: APP_ENGINE,
+        engineEntry: APP_FIXTURE,
       },
       home,
       turnIdleMs: 600_000,
@@ -649,7 +649,7 @@ describe("§3.4 production tier routing (runWitnessApp)", () => {
         columns: 110,
         rows: 32,
         cwd: home,
-        engineEntry: APP_ENGINE,
+        engineEntry: APP_FIXTURE,
       },
       home,
       turnIdleMs: 600_000,
@@ -679,7 +679,7 @@ describe("§3.4 production tier routing (runWitnessApp)", () => {
         columns: 110,
         rows: 32,
         cwd: home,
-        engineEntry: APP_ENGINE,
+        engineEntry: APP_FIXTURE,
       },
       home,
       turnIdleMs: 600_000,
@@ -1236,7 +1236,7 @@ describe("thread/start classification in Level A and inline (§5.11)", () => {
     columns: 110,
     rows: 32,
     cwd: home,
-    engineEntry: APP_ENGINE,
+    engineEntry: APP_FIXTURE,
   });
 
   it("Level A: seat RPC -32005 → exit 2 with the sanitised pre-thread lines", async () => {
@@ -1358,7 +1358,7 @@ describe("E11: served-model data in Level A and inline receipts/status", () => {
     columns: 110,
     rows: 32,
     cwd: home,
-    engineEntry: APP_ENGINE,
+    engineEntry: APP_FIXTURE,
   });
 
   it("Level A receipt: the final servedModel row carries U+FFFD, never a raw ESC", async () => {
@@ -1724,7 +1724,7 @@ describe("correction round: historical replay, evidence binding, R-b (§5.3 R-b,
           columns: 110,
           rows: 32,
           cwd: home,
-          engineEntry: APP_ENGINE,
+          engineEntry: APP_FIXTURE,
         },
         home,
         turnIdleMs: 30_000,
@@ -1927,7 +1927,7 @@ describe("round 3: cutoff race and the unanswered-interrupt engine stop", () => 
     columns: 110,
     rows: 32,
     cwd: home,
-    engineEntry: APP_ENGINE,
+    engineEntry: APP_FIXTURE,
   });
 
   it("B-1 line-mode: a batched response+items+completion still completes the turn", {
@@ -2024,7 +2024,7 @@ describe("round 3: cutoff race and the unanswered-interrupt engine stop", () => 
     const decoyDir = mkdtempSync(join(tmpdir(), "madc-decoy-"));
     const decoy = spawnEngine({
       env: { MADC_HOME: decoyDir, MADC_TEST_APP_TURNS: '[{"kind":"hold"}]' },
-      entry: APP_ENGINE,
+      entry: APP_FIXTURE,
     });
     // Ownership without process scanning: the fixture encodes its OWN pid in the thread id
     // it mints (`fixtureThreadId` — lossless for any pid), and the app exposes that thread
@@ -2549,7 +2549,7 @@ describe("round 7: E11 at every render boundary (Level A + inline)", () => {
     columns: 110,
     rows: 32,
     cwd: home,
-    engineEntry: APP_ENGINE,
+    engineEntry: APP_FIXTURE,
   });
 
   it("Level A: a failed turn's RPC error message is sanitised in the receipt", {

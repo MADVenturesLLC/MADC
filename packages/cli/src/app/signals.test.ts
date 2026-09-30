@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
-const APP_ENGINE = fileURLToPath(new URL("../testing/app-engine.ts", import.meta.url));
+const APP_FIXTURE = fileURLToPath(new URL("../testing/app-fixture.ts", import.meta.url));
 const DRIVER = fileURLToPath(new URL("../testing/signal-driver.ts", import.meta.url));
 
 function runDriver(
@@ -32,7 +32,7 @@ function runDriver(
         MADC_TEST_SIGNAL: signal,
         MADC_TEST_APP_TURNS: JSON.stringify([{ kind: "ok" }]),
         MADC_HOME: home,
-        MADC_TEST_ENGINE_ENTRY: APP_ENGINE,
+        MADC_TEST_ENGINE_ENTRY: APP_FIXTURE,
         TMPDIR: process.env.TMPDIR ?? "/tmp",
         ...env,
       },
@@ -112,7 +112,7 @@ describe("§5.8.1 O-2: a second signal during the final verify (F-102 path)", ()
           MADC_TEST_VERIFY_HOLD_MS: "8000", // hold the final verify open
           MADC_TEST_APP_TURNS: JSON.stringify([{ kind: "ok" }]),
           MADC_HOME: home,
-          MADC_TEST_ENGINE_ENTRY: APP_ENGINE,
+          MADC_TEST_ENGINE_ENTRY: APP_FIXTURE,
           TMPDIR: process.env.TMPDIR ?? "/tmp",
         },
         stdio: ["ignore", "ignore", "pipe"],

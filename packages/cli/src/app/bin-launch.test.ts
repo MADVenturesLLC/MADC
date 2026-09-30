@@ -15,7 +15,7 @@ import { describe, it } from "node:test";
 import { fileURLToPath } from "node:url";
 
 const BIN = fileURLToPath(new URL("../bin.ts", import.meta.url));
-const APP_ENGINE = fileURLToPath(new URL("../testing/app-engine.ts", import.meta.url));
+const APP_FIXTURE = fileURLToPath(new URL("../testing/app-fixture.ts", import.meta.url));
 
 // The import specifier must be a LITERAL relative path (the honesty scanner flags
 // non-literal dynamic imports; the child runs with cwd at the worktree root).
@@ -55,7 +55,7 @@ describe("bin.ts TTY launch regression", () => {
             env: {
               ...process.env,
               MADC_HOME: home,
-              MADC_TEST_ENGINE_ENTRY: APP_ENGINE,
+              MADC_TEST_ENGINE_ENTRY: APP_FIXTURE,
               MADC_TEST_APP_TURNS: "[]",
               TERM: "xterm-256color",
               LANG: "en_US.UTF-8",
@@ -125,7 +125,7 @@ describe("bin.ts TTY launch regression", () => {
             env: {
               ...process.env,
               MADC_HOME: home,
-              MADC_TEST_ENGINE_ENTRY: APP_ENGINE,
+              MADC_TEST_ENGINE_ENTRY: APP_FIXTURE,
               MADC_TEST_APP_TURNS: "[]",
               MADC_UI: "inline",
               TERM: "xterm-256color",
@@ -195,10 +195,12 @@ function runLevelA(
   const home = mkdtempSync(join(tmpdir(), "madc-lae-"));
   // The prelude must run from a REAL FILE: under `node -e` the app's verify worker
   // (node:worker_threads) fails module resolution and every verify reads "worker failed".
-  // The file imports bin.ts by absolute URL, so cwd is irrelevant; resolve the worktree
-  // root from this test file's own location.
-  const binUrl = new URL("../bin.ts", import.meta.url).href;
-  const preludeFile = join(home, "level-a-prelude.mjs");
+  // Relative specifiers resolve against the prelude file's own URL (NOT cwd), so the
+  // file lives in the worktree root — where the LITERAL "./packages/cli/src/bin.ts"
+  // resolves (the honesty scanner flags non-literal dynamic imports). Unique per run
+  // and removed on every exit path; the worktree never carries a stale prelude.
+  const root = fileURLToPath(new URL("../../../..", import.meta.url));
+  const preludeFile = join(root, `.level-a-prelude-${process.pid}-${Date.now()}.mjs`);
   writeFileSync(
     preludeFile,
     `process.stdin.isTTY = true;
@@ -207,16 +209,20 @@ process.stdout.isTTY = true;
 process.stdout.columns = 110;
 process.stdout.rows = 32;
 process.stderr.isTTY = true;
-const { runBin } = await import(${JSON.stringify(binUrl)});
+const { runBin } = await import("./packages/cli/src/bin.ts");
 await runBin(process.env.MADC_TEST_ENGINE_ENTRY);
 `,
   );
+  const cleanup = (): void => {
+    rmSync(preludeFile, { force: true });
+    rmSync(home, { recursive: true, force: true });
+  };
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, ["--disable-warning=ExperimentalWarning", preludeFile], {
       env: {
         ...process.env,
         MADC_HOME: home,
-        MADC_TEST_ENGINE_ENTRY: APP_ENGINE,
+        MADC_TEST_ENGINE_ENTRY: APP_FIXTURE,
         TERM: "xterm-256color",
         LANG: "en_US.UTF-8",
         MADC_UI: "lines",
@@ -252,6 +258,7 @@ await runBin(process.env.MADC_TEST_ENGINE_ENTRY);
     });
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
+      cleanup();
       reject(
         new Error(
           `Level A child never settled: ${JSON.stringify({
@@ -263,7 +270,7 @@ await runBin(process.env.MADC_TEST_ENGINE_ENTRY);
     }, 30_000);
     child.on("exit", (code, childSignal) => {
       clearTimeout(timer);
-      rmSync(home, { recursive: true, force: true });
+      cleanup();
       resolve({ code, childSignal: childSignal ?? null, stderr, stdout });
     });
     child.on("error", reject);
