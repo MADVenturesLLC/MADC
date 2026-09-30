@@ -2,6 +2,8 @@
 
 *Surface Architect · 2026-09-27 · Venue: `MADVenturesLLC/MADC` · Status: **build pin** — gates Hephaestus Acts M1-A1 … M1-A9 (seat schema v2 and roster seeding land in M1-A7). Docs only.*
 
+*Amended by [`PIN-madc-M1-amendment-1-subscription-surface.md`](PIN-madc-M1-amendment-1-subscription-surface.md) (Founder ruling 2026-09-30: pin the subscription surface, not a model name).*
+
 *Supersedes `docs/plan/PIN-madc-M0-seat-format.md` **for M1 work**. The M0 pin stays frozen and is not edited (M1-A0; Founder, 2026-09-25). M0 Amendments 2 and 3 are separate frozen files, unedited and not superseded here; they remain binding as written (including the Amendment 3 §4 seed `created:false` proof contract, which amends the §1 "Seed" row below), and their references to M0-pin sections read against the matching sections of this pin.*
 
 *Carried forward unchanged: **M0 Amendment 1** (merged PR #8). The frozen M0 pin's record line: `*Amendment 1 (2026-09-24): lock token, fixes A2 Copilot W1 (PR #7), Founder-authorized.*` Its normative home is the M1 protocol pin §3.3 and §8; it is reproduced verbatim in §6 below because the lock file lives under `$MADC_HOME/sessions/`.*

@@ -2,6 +2,8 @@
 
 *Daedalus · 2026-09-24 · Venue: `MADVenturesLLC/MADC` only · Status: commissionable build plan for Hephaestus. It is **not** a merge authorization and it does not start until the Founder accepts it (D-M1-1) and M0 is done.*
 
+*Amended by [`PIN-madc-M1-amendment-1-subscription-surface.md`](PIN-madc-M1-amendment-1-subscription-surface.md) (Founder ruling 2026-09-30: §6 no longer locks a model generation into a seed).*
+
 *Founder rulings recorded 2026-09-25 (Founder): the D-M1 decisions in §12 are ruled (D-M1-1 still needs an explicit acceptance statement; see §12). The repo-identity rule (§9 S5, M1-A4) fixes Copilot finding [r4101049517](https://github.com/MADVenturesLLC/MADC/pull/9#discussion_r4101049517), which PR #9 merged without.*
 
 Roadmap: [`ROADMAP-madc-post-M0.md`](ROADMAP-madc-post-M0.md) (M1 row, subscription table §3).
