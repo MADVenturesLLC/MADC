@@ -18,35 +18,92 @@ import {
   writeSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import { getById, type ProviderStatus } from "@madc/registry";
 import { isStrictlyUnder } from "./home.ts";
 import { type OpenNoFollowOptions, openNoFollow } from "./lock.ts";
+import type { Presence } from "./presence/policy.ts";
 import { ErrorCode, RpcError, type SessionWriteFailedData } from "./protocol/errors.ts";
 import { isValidId } from "./protocol/ids.ts";
-import type { Item, RpcErrorBody, Thread, Turn, TurnStatus } from "./protocol/types.ts";
-import type { SeatBacking } from "./seat.ts";
+import type { Item, RpcErrorBody, Thread, Turn, TurnMode, TurnStatus } from "./protocol/types.ts";
 
 export const GENESIS_HASH = "0".repeat(64);
 export const REDACTED = "[REDACTED]";
 
 export type SessionOpenPayload = {
   cwd: string | null;
-  backing: SeatBacking;
+  /** Any wired registry id (seat pin S1, widened in M1-A3; M0 was the SeatBacking union). */
+  backing: string;
   providerId: string;
   pinnedModel: string;
 };
-export type TurnStartPayload = { turnId: string; inputText: string };
+/**
+ * M1-A5 TTY facts of the presence check that verified a turn (M1 plan §7 M1-A5: "TTY facts … go
+ * into `turn.start`"): the terminal's `device` (`major/minor`), its `session` id where the OS
+ * exposes one (else null), and whether this turn's presence came from a fresh `keypress` or was
+ * `carried` from an earlier confirmation on the same terminal. Present only with presence `verified`.
+ */
+export type TurnStartTty = {
+  device: string;
+  session: string | null;
+  confirmation: "keypress" | "carried";
+};
+/**
+ * `turn.start` (seat pin §4.2). M1-A5 writes `mode` (the claim; P3: absent → `headless`) and
+ * `presence` on every new line, and `tty` exactly when presence is verified. They are optional in
+ * this type because lines written before M1-A5 carry none of them; such a line reads as
+ * `headless` / `absent`. A partial set is refused by `checkPayload`.
+ */
+export type TurnStartPayload = {
+  turnId: string;
+  inputText: string;
+  mode?: TurnMode;
+  presence?: Presence;
+  tty?: TurnStartTty;
+};
 export type ItemPayload = { turnId: string; item: Item };
 export type ServedModelPayload = {
   turnId: string;
   requestedModel: string;
   servedModel: string;
-  backing: SeatBacking;
+  backing: string;
   providerId: string;
+  /** P2 (M1 protocol pin §5 / seat pin §4.2): registry status of the serving lane. */
+  lane: ProviderStatus;
+  /** P2: the turn's mode — the claim (§3.3), `headless` when absent. */
+  mode: TurnMode;
+  /** P2: previous backing id on a fallback hop; null on the primary. */
+  fallbackFrom: string | null;
+  /** P2: true only if the vendor/adapter reported a model identity. */
+  vendorReported: boolean;
+};
+/** One lane identity for the same-lane rule (D-M1-7). Forbidden entries have no billing class. */
+export type FallbackLane = { status: ProviderStatus; credentialClass: string };
+/** Seat pin §4.2 (S4): a fallback candidate rejected before any call under the same-lane rule. */
+export type FallbackRejectedPayload = {
+  turnId: string;
+  candidate: string;
+  assignedLane: FallbackLane;
+  candidateLane: FallbackLane;
+  reason: "fallback-lane-mismatch";
 };
 export type TurnEndPayload = {
   turnId: string;
   status: Exclude<TurnStatus, "inProgress">;
   error: { code: number; message: string } | null;
+};
+/**
+ * Seat pin §4.2 (S4, added by M1-A4): one repo-gated provider decision, recording the RESOLVED
+ * identity (normalized remote, realpath'd top-level) and the reason. `remote` / `topLevel` are null
+ * on the half that could not be resolved, so an ambiguous identity never reports a value it did not
+ * establish. Carries no credential and never the caller-supplied `cwd` string.
+ */
+export type RepoDecisionPayload = {
+  turnId: string;
+  providerId: string;
+  remote: string | null;
+  topLevel: string | null;
+  decision: "allow" | "deny";
+  reason: string;
 };
 export type SessionClosePayload = { reason: string };
 
@@ -55,6 +112,8 @@ export type SessionPayloads = {
   "turn.start": TurnStartPayload;
   item: ItemPayload;
   servedModel: ServedModelPayload;
+  "fallback.rejected": FallbackRejectedPayload;
+  "repo.decision": RepoDecisionPayload;
   "turn.end": TurnEndPayload;
   "session.close": SessionClosePayload;
 };
@@ -64,6 +123,8 @@ export const SESSION_EVENT_TYPES: readonly SessionEventType[] = Object.freeze([
   "turn.start",
   "item",
   "servedModel",
+  "fallback.rejected",
+  "repo.decision",
   "turn.end",
   "session.close",
 ]);
@@ -117,11 +178,23 @@ export function sessionEventHash(
 
 // ---------------------------------------------------------------- redaction
 
-/** Token shapes redacted from every payload string (seat pin §4.2). */
+/** Token shapes redacted from every payload string (seat pin §4.2, plus the M1 shapes of S6). */
 export const TOKEN_PATTERNS: readonly RegExp[] = Object.freeze([
   /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z0-9 ]*PRIVATE KEY-----/g,
   /\bBearer\s+[A-Za-z0-9._~+/-]{8,}=*/g,
   /\bsk-[A-Za-z0-9_-]{16,}/g,
+  // S6 (M1-A2): the new providers' key shapes — xAI (`xai-…`) and the Alibaba plan (`sk-sp-…`,
+  // which the generic `sk-…` shape above only catches from 16 chars after `sk-`).
+  /\bxai-[A-Za-z0-9_-]{8,}/g,
+  /\bsk-sp-[A-Za-z0-9_-]{8,}/g,
+  // S6 (M1-A5): the MiniMax Token Plan Subscription Key (`sk-cp-…`, planning record MM-32..39), for
+  // the same reason as `sk-sp-…`: the generic `sk-…` shape only catches it from 16 characters.
+  /\bsk-cp-[A-Za-z0-9_-]{8,}/g,
+  // S6 (M1-A4): the Gemini lane's standard Google API-key shape. `gemini-api-key` accepts AUTH keys
+  // only and the auth-key shape is not documented in any pinned source, so this catches the shape
+  // Google's page names as the one being retired — and the planning record's own secret grep lists
+  // `AIza` alongside `sk-` and `ghp_`.
+  /\bAIza[A-Za-z0-9_-]{20,}/g,
   /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
   /\bxox[abp]-[A-Za-z0-9-]{10,}/g,
   /\bAKIA[0-9A-Z]{16}\b/g,
@@ -840,7 +913,28 @@ const isStr = (v: unknown): v is string => typeof v === "string";
 const TURN_END_STATUSES: readonly unknown[] = ["completed", "interrupted", "failed"];
 
 const ITEM_STATUSES: readonly unknown[] = ["inProgress", "completed", "failed"];
-const SERVED_BACKINGS: readonly unknown[] = ["kimi-code", "claude-code", "codex"];
+/** Registry statuses (M1 seat pin §4.2 `lane` / same-lane payloads). */
+const PROVIDER_STATUSES: readonly unknown[] = [
+  "allowed-direct",
+  "allowed-via-vendor-agent",
+  "interactive-only",
+  "forbidden",
+];
+const TURN_MODES: readonly unknown[] = ["interactive", "headless"];
+const PRESENCES: readonly unknown[] = ["verified", "absent"];
+const TTY_CONFIRMATIONS: readonly unknown[] = ["keypress", "carried"];
+/** M1 seat pin §4.2 `repo.decision` (added by M1-A4). */
+const REPO_DECISIONS: readonly unknown[] = ["allow", "deny"];
+const REPO_ALLOW_REASONS: readonly unknown[] = ["repo-allowed", "not-repo-gated"];
+const REPO_DENY_REASONS: readonly unknown[] = ["repo-not-allowed", "repo-identity-ambiguous"];
+
+/**
+ * A receipt / `session.open` backing is any WIRED registry id (seat pin S1; M0's three-literal
+ * list widened in M1-A3 — `ollama-cloud` joined when its adapter landed).
+ */
+function isWiredBacking(v: unknown): boolean {
+  return isStr(v) && getById(v)?.wired === true;
+}
 
 /** Each M0 `Item` variant (protocol/types.ts) with its required fields. Extra fields are allowed. */
 function isM0Item(item: unknown): boolean {
@@ -872,8 +966,12 @@ function isM0Item(item: unknown): boolean {
       return (
         isStr(item.requestedModel) &&
         isStr(item.servedModel) &&
-        SERVED_BACKINGS.includes(item.backing) &&
-        isStr(item.providerId)
+        isWiredBacking(item.backing) &&
+        isStr(item.providerId) &&
+        PROVIDER_STATUSES.includes(item.lane) &&
+        TURN_MODES.includes(item.mode) &&
+        (item.fallbackFrom === null || isStr(item.fallbackFrom)) &&
+        typeof item.vendorReported === "boolean"
       );
     default:
       return false;
@@ -889,23 +987,70 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
   switch (type) {
     case "session.open":
       return (p.cwd === null || isStr(p.cwd)) &&
-        SERVED_BACKINGS.includes(p.backing) &&
+        isWiredBacking(p.backing) &&
         isStr(p.providerId) &&
         isStr(p.pinnedModel)
         ? null
         : "malformed session.open payload";
-    case "turn.start":
-      return isValidId(p.turnId) && isStr(p.inputText) ? null : "malformed turn.start payload";
+    case "turn.start": {
+      // M1-A5: a pre-A5 line carries none of `mode` / `presence` / `tty`; an A5 line carries
+      // `mode` AND `presence` together, and `tty` exactly when presence is `verified`. A partial
+      // set is malformed, never read as a weaker claim.
+      const legacy = p.mode === undefined && p.presence === undefined && p.tty === undefined;
+      const tty = p.tty;
+      const a5 =
+        TURN_MODES.includes(p.mode) &&
+        PRESENCES.includes(p.presence) &&
+        (p.presence === "verified"
+          ? isPlainRecord(tty) &&
+            isStr(tty.device) &&
+            (tty.session === null || isStr(tty.session)) &&
+            TTY_CONFIRMATIONS.includes(tty.confirmation)
+          : tty === undefined);
+      return isValidId(p.turnId) && isStr(p.inputText) && (legacy || a5)
+        ? null
+        : "malformed turn.start payload";
+    }
     case "item":
       return isValidId(p.turnId) && isM0Item(p.item) ? null : "malformed item payload";
     case "servedModel":
       return isValidId(p.turnId) &&
         isStr(p.requestedModel) &&
         isStr(p.servedModel) &&
-        SERVED_BACKINGS.includes(p.backing) &&
-        isStr(p.providerId)
+        isWiredBacking(p.backing) &&
+        isStr(p.providerId) &&
+        PROVIDER_STATUSES.includes(p.lane) &&
+        TURN_MODES.includes(p.mode) &&
+        (p.fallbackFrom === null || isStr(p.fallbackFrom)) &&
+        typeof p.vendorReported === "boolean"
         ? null
         : "malformed servedModel payload";
+    case "fallback.rejected": {
+      const laneOk = (lane: unknown): boolean =>
+        isPlainRecord(lane) &&
+        PROVIDER_STATUSES.includes(lane.status) &&
+        isStr(lane.credentialClass);
+      return isValidId(p.turnId) &&
+        isStr(p.candidate) &&
+        laneOk(p.assignedLane) &&
+        laneOk(p.candidateLane) &&
+        p.reason === "fallback-lane-mismatch"
+        ? null
+        : "malformed fallback.rejected payload";
+    }
+    case "repo.decision": {
+      const reasonOk =
+        (p.decision === "allow" && REPO_ALLOW_REASONS.includes(p.reason)) ||
+        (p.decision === "deny" && REPO_DENY_REASONS.includes(p.reason));
+      return isValidId(p.turnId) &&
+        isStr(p.providerId) &&
+        (p.remote === null || isStr(p.remote)) &&
+        (p.topLevel === null || isStr(p.topLevel)) &&
+        REPO_DECISIONS.includes(p.decision) &&
+        reasonOk
+        ? null
+        : "malformed repo.decision payload";
+    }
     case "turn.end": {
       const err = p.error;
       const errOk =

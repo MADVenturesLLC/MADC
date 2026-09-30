@@ -9,7 +9,7 @@ import {
   ITEM_KINDS,
   type Item,
   type ItemStatus,
-  type ServedModelBacking,
+  listCatalog,
   type Thread,
   type Turn,
   type WireMessage,
@@ -32,8 +32,17 @@ const ITEM_STATUSES: readonly ItemStatus[] = ["inProgress", "completed", "failed
 const DOMAIN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const isDomainId = (v: unknown): v is string => typeof v === "string" && DOMAIN_ID.test(v);
 
-/** Erratum §3b N6 (D-188): a servedModel `backing` is one of the protocol pin §5's three values. */
-const SERVED_MODEL_BACKINGS: readonly ServedModelBacking[] = ["kimi-code", "claude-code", "codex"];
+/**
+ * Erratum §3b N6 (D-188), widened by M1-A3 per seat pin S1 / protocol pin §5 P2: a servedModel
+ * `backing` is any WIRED registry id (M0's closed three-literal list grew `ollama-cloud` when its
+ * adapter landed; A4+ lanes join by registry flip, not by CLI edit). The catalog is frozen data,
+ * so this set is computed once. Shared with the Witness app via this module.
+ */
+const SERVED_MODEL_BACKINGS: ReadonlySet<string> = new Set(
+  listCatalog()
+    .filter((entry) => entry.wired)
+    .map((entry) => entry.id),
+);
 
 export function isItemShape(i: unknown): i is Item {
   if (i === null || typeof i !== "object") return false;
@@ -82,7 +91,7 @@ export function isItemShape(i: unknown): i is Item {
       typeof r.requestedModel === "string" &&
       typeof r.servedModel === "string" &&
       typeof r.backing === "string" &&
-      (SERVED_MODEL_BACKINGS as readonly string[]).includes(r.backing) &&
+      SERVED_MODEL_BACKINGS.has(r.backing) &&
       typeof r.providerId === "string"
     );
   }

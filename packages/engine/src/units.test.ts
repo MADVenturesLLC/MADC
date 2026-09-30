@@ -62,14 +62,26 @@ test("§4.1 error-code constants match the pin table exactly", () => {
   assert.ok(Object.isFrozen(ErrorCode));
 });
 
-test("§5 six item kinds; §3 complete M0 request list", () => {
+test("§5 six item kinds; M1 pin §3 complete request list (M0 six + §3.5 seat/list and auth presence)", () => {
   assert.deepEqual(
     [...ITEM_KINDS],
     ["userMessage", "agentMessage", "toolCall", "toolResult", "error", "servedModel"],
   );
+  // M1-A2 (protocol pin §3/§3.5) added the two presence methods; M1-A7 adds `seat/list`. The M0
+  // methods are unchanged, and there is still no `auth/set` over JSONL (P4).
   assert.deepEqual(
     [...CLIENT_REQUEST_METHODS],
-    ["initialize", "thread/start", "thread/resume", "thread/list", "turn/start", "turn/interrupt"],
+    [
+      "initialize",
+      "thread/start",
+      "thread/resume",
+      "thread/list",
+      "turn/start",
+      "turn/interrupt",
+      "seat/list",
+      "auth/status",
+      "auth/remove",
+    ],
   );
 });
 

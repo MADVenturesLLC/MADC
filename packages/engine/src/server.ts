@@ -2,9 +2,27 @@ import { lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
+import {
+  canServe,
+  checkEntry,
+  getById,
+  type ProviderEntry,
+  RegistryDeniedError,
+  type RunMode,
+} from "@madc/registry";
 import type { Agent, AgentTurnContext, TurnSink } from "./agent.ts";
+import { type CredentialStore, createCredentialStore } from "./credentials/store.ts";
 import { confinedPath, sessionsOwnerReadUnsupported } from "./home.ts";
 import { acquireThreadLock, holdsThreadLock, type LockHandle, releaseThreadLock } from "./lock.ts";
+import { type RepoIdentityDeps, resolveRepoIdentity } from "./policy/identity.ts";
+import { denyAllRepoPolicy, isRepoGated, type RepoPolicy } from "./policy/store.ts";
+import {
+  type Presence,
+  presenceRequired,
+  sameTerminal,
+  type TerminalFacts,
+} from "./presence/policy.ts";
+import { createSystemTerminal, type PresenceTerminal } from "./presence/terminal.ts";
 import {
   alreadyInitialized,
   ErrorCode,
@@ -13,6 +31,7 @@ import {
   invalidRequest,
   methodNotFound,
   notInitialized,
+  providerRefusalError,
   RpcError,
   type SessionWriteFailedData,
   threadNotFound,
@@ -21,23 +40,29 @@ import {
 } from "./protocol/errors.ts";
 import { isValidId, newId } from "./protocol/ids.ts";
 import {
+  type AuthStatusResult,
   DEFAULT_SEAT_ID,
+  DEFAULT_TURN_MODE,
   type InitializeResult,
   type Item,
   PROTOCOL_VERSION,
   type RequestId,
   type RpcErrorBody,
   SERVER_NAME,
+  type SeatListResult,
   type ServerNotifications,
   type Thread,
   type ThreadListResult,
   type Turn,
+  type TurnMode,
   type TurnStatus,
   type UserInput,
 } from "./protocol/types.ts";
 import { encodeMessage, isPlainObject, parseLine } from "./protocol/wire.ts";
-import type { SeatBacking } from "./seat.ts";
-import { type LoadedSeat, loadSeat, seedDefaultSeat } from "./seat-store.ts";
+import { type LoadedSeat, loadSeat } from "./seat-store.ts";
+import { listSeatSummaries } from "./seats/list.ts";
+import { ensureSeatMemoryFile } from "./seats/memory.ts";
+import { seedRosterSeats } from "./seats/roster.ts";
 import {
   type RebuiltSession,
   rebuildSession,
@@ -46,6 +71,7 @@ import {
   type SessionPayloads,
   SessionWriter,
   sessionWriteFailed,
+  type TurnStartTty,
   verifySessionFile,
 } from "./session-store.ts";
 
@@ -61,6 +87,27 @@ export type EngineOptions = {
   log?: (message: string) => void;
   /** Test seam: thread id generator for `thread/start` (default `newId("thr")`). */
   newThreadId?: () => string;
+  /**
+   * M1-A2: engine-owned credential store backing `auth/status` and `auth/remove`. Default: the
+   * real OS keychain via `createCredentialStore()` (created on first auth call). Tests inject a
+   * store backed by a fake keychain.
+   */
+  credentials?: CredentialStore;
+  /**
+   * M1-A4: the loaded `$MADC_HOME/policy.json` repo allowlists (seat pin §5). Default: the
+   * deny-everywhere policy, which is also what a clean install resolves to (D-M1-8) — so an engine
+   * that never loads the file cannot widen access. Production wiring in `main.ts` always passes the
+   * loaded policy.
+   */
+  repoPolicy?: RepoPolicy;
+  /** M1-A4 test seam: `realpath` / `git` injection for repo-identity resolution. */
+  repoIdentityDeps?: RepoIdentityDeps;
+  /**
+   * M1-A5: the engine's access to its own controlling terminal for the presence check (protocol pin
+   * §3.3 P3). Default: the real `/dev/tty` (`presence/terminal.ts`), created on first need, so an
+   * engine that never serves a presence-gated turn never touches the terminal. Tests inject fakes.
+   */
+  terminal?: PresenceTerminal;
 };
 
 type TurnRecord = {
@@ -78,10 +125,54 @@ type ThreadRecord = {
   activeTurnId: string | null;
   seat: LoadedSeat;
   session: SessionWriter;
+  /**
+   * M1-A5: the terminal a person confirmed presence on for THIS thread in THIS process (never
+   * persisted, never carried to another thread or engine). Cleared the moment the terminal is gone
+   * or changed, so the next presence-gated turn needs a fresh keypress.
+   */
+  confirmedTerminal: TerminalFacts | null;
+  /** M1-A5: a `turn/start` on this thread is waiting for the presence keypress. */
+  confirming: boolean;
 };
+
+/**
+ * M1-A5 presence phase of one `turn/start` (see `#presencePhase`). `not-required`: the lane serves
+ * this claim without a person present. `verified`: the confirmed terminal is still the live one.
+ * `pending`: a live terminal nobody has confirmed on yet (a keypress is needed). `absent`: refused.
+ */
+type PresencePhase =
+  | { readonly kind: "not-required" }
+  | { readonly kind: "verified"; readonly facts: TerminalFacts }
+  | { readonly kind: "pending"; readonly facts: TerminalFacts }
+  | { readonly kind: "absent"; readonly why: string };
+
+/** The presence outcome `#beginTurn` records on `turn.start` (seat pin §4.2 S4). */
+type TurnPresence = { readonly presence: Presence; readonly tty?: TurnStartTty };
 
 const THREAD_LIST_DEFAULT_LIMIT = 50;
 const THREAD_LIST_MAX_LIMIT = 200;
+
+/** P3: `mode` is optional and fail-closed; any value other than the two modes is -32602. */
+function parseModeClaim(value: unknown, issues: string[]): TurnMode {
+  if (value === undefined) return DEFAULT_TURN_MODE;
+  if (value === "interactive" || value === "headless") return value;
+  issues.push('mode must be "interactive" or "headless"');
+  return DEFAULT_TURN_MODE;
+}
+
+/**
+ * The prompt the engine writes to its own controlling terminal. Carries only the seat id (protocol
+ * id grammar) and the registry id — never input text or a credential.
+ */
+function presencePrompt(seatId: string, providerId: string): string {
+  return (
+    `\r\nmadc: seat ${seatId} wants lane ${providerId}, which serves only a person at this terminal.` +
+    "\r\nmadc: press Enter to confirm you are here (type n then Enter to refuse): "
+  );
+}
+
+/** One dispatched request's response value plus an optional post-response hook. */
+type DispatchResult = { value: unknown; after?: () => void };
 
 function paramsObject(params: unknown): Record<string, unknown> {
   if (params === undefined) return {};
@@ -104,6 +195,21 @@ function requireId(p: Record<string, unknown>, key: string, issues: string[]): s
 
 function throwIfIssues(issues: string[]): void {
   if (issues.length > 0) throw invalidParams(issues);
+}
+
+/**
+ * `auth/*` providerId (M1-A2): the protocol id grammar first, then a known registry catalog id —
+ * anything else is `-32602 InvalidParams` (there is no provider lookup on these methods).
+ */
+function authProviderId(params: unknown): string {
+  const p = paramsObject(params);
+  const issues: string[] = [];
+  const providerId = requireId(p, "providerId", issues);
+  if (issues.length === 0 && getById(providerId) === undefined) {
+    issues.push("providerId is not a registry catalog id");
+  }
+  throwIfIssues(issues);
+  return providerId;
 }
 
 function parseUserInput(value: unknown, issues: string[]): UserInput[] {
@@ -149,9 +255,77 @@ export class EngineConnection {
    * answers for a poisoned thread carries this entry's `path` and `seq`.
    */
   readonly #poisoned = new Map<string, { path: string; seq: number }>();
+  /** M1-A2 credential store, created on the first `auth/*` call (never at construction). */
+  #credentials: CredentialStore | null = null;
+  /** M1-A4 repo allowlists (seat pin §5); deny-everywhere unless a loaded policy was supplied. */
+  readonly #repoPolicy: RepoPolicy;
+  /** M1-A5 controlling-terminal access, created on the first presence-gated turn. */
+  #terminal: PresenceTerminal | null = null;
+  /** M1-A5 presence prompts still waiting for a keypress; shutdown aborts every one. */
+  readonly #pendingConfirmations = new Set<AbortController>();
+  /**
+   * M1-A5: the tail of the engine-wide confirmation queue. Every thread shares ONE controlling
+   * terminal, so prompts run one at a time: a keypress can only answer the prompt it was typed
+   * for, never another thread's seat or lane (Copilot r4145107307). Only ever resolves.
+   */
+  #confirmationTail: Promise<void> = Promise.resolve();
 
   constructor(opts: EngineOptions) {
     this.#opts = opts;
+    this.#repoPolicy = opts.repoPolicy ?? denyAllRepoPolicy();
+  }
+
+  /**
+   * M1-A4 repo-policy gate for the seat's assigned backing (protocol pin §4.2: repo-policy checks
+   * run in `turn/start` before any model or vendor call; protocol pin §2: repo identity resolution
+   * is ENGINE-owned, so the caller-supplied `cwd` string is never matched against an allowlist).
+   *
+   * Runs BEFORE the agent's preflight, because D-M1-8 must be observable on a clean install: an
+   * empty allowlist denies every repo with `-32007 repo-not-allowed`, including when no DeepSeek
+   * credential is configured. It is skipped for a lane that could not serve this turn's mode anyway,
+   * so it never pre-empts a `forbidden` / `interactive-only-headless` / `headless-not-permitted`
+   * denial that `assertAllowed` owns (M1-A5's acceptance depends on that ordering).
+   *
+   * The decision is durable BEFORE it is acted on: the pinned `repo.decision` event (seat pin §4.2)
+   * is appended first, and an append failure poisons the writer and surfaces as `-32009` — a
+   * decision that is not recorded is not claimed. `turnId` is therefore minted before preflight; it
+   * is a pure local id, so C3's "append `turn.start` only after preflight" ordering is unchanged.
+   * A denial leaves a `repo.decision` line with no `turn.start`, which `rebuildSession` ignores.
+   *
+   * M1-A5: `mode` is the mode the lane is asked to serve. A presence-gated lane only reaches this
+   * gate once presence is verified or pending (an absent presence is refused before it), so the
+   * gate runs for an attested interactive MiniMax turn and stays out of the way of every mode denial.
+   */
+  #repoGate(record: ThreadRecord, turnId: string, mode: RunMode): void {
+    const providerId = record.seat.seat.preferredBacking;
+    if (!isRepoGated(providerId)) return;
+    const entry = getById(providerId);
+    if (entry === undefined || !canServe(entry, mode)) return;
+
+    const resolution = resolveRepoIdentity(record.thread.cwd, this.#opts.repoIdentityDeps ?? {});
+    const decision = this.#repoPolicy.decide(providerId, resolution);
+    try {
+      record.session.append("repo.decision", {
+        turnId,
+        providerId,
+        remote: decision.remote,
+        topLevel: decision.topLevel,
+        decision: decision.decision,
+        reason: decision.reason,
+      });
+    } catch (err) {
+      if (!(err instanceof RpcError)) throw err;
+      this.#notePoisoned(record.thread.id, record.session);
+      throw err;
+    }
+    this.#log(`repo gate ${providerId}: ${decision.decision} (${decision.reason})`);
+    if (decision.decision === "deny") {
+      throw providerRefusalError({
+        providerId,
+        reason: decision.reason,
+        status: entry.status,
+      });
+    }
   }
 
   /**
@@ -184,12 +358,18 @@ export class EngineConnection {
   }
 
   /**
-   * Seat pin §1: on engine start, seed `seats/madc-default.json` if missing (never overwritten).
-   * A failure is logged, not fatal: `thread/start` then reports the seat error itself.
+   * Seat pin §1 / §3 (S3): on engine start, seed the five roster seats — each only when its own
+   * `seats/<id>.json` is missing, never overwriting an existing file. A failure is logged, not
+   * fatal: `thread/start` then reports that seat's error itself (-32005 for a seat that never
+   * landed). Every refused seat is named in the log — Amendment 3 item 4 forbids passing a refusal
+   * off as "already seeded".
    */
   #seedHome(): void {
     try {
-      seedDefaultSeat(this.#opts.home);
+      const report = seedRosterSeats(this.#opts.home);
+      for (const failure of report.failures) {
+        this.#log(`seed failed for seat ${failure.seatId}: ${failure.message}`);
+      }
     } catch (err) {
       this.#log(`seed failed: ${err instanceof Error ? err.message : String(err)}`);
     }
@@ -199,6 +379,9 @@ export class EngineConnection {
   shutdown(): void {
     if (this.#shutDown) return;
     this.#shutDown = true;
+    // M1-A5: a presence prompt still waiting for a keypress is cancelled; its turn never starts.
+    for (const controller of this.#pendingConfirmations) controller.abort();
+    this.#pendingConfirmations.clear();
     for (const record of this.#threads.values()) {
       const active =
         record.activeTurnId === null ? undefined : record.turns.get(record.activeTurnId);
@@ -240,14 +423,27 @@ export class EngineConnection {
       // Only `initialized` is defined client → server; unknown notifications are ignored (no id to answer).
       return;
     }
-    let result: { value: unknown; after?: () => void };
+    let result: DispatchResult | Promise<DispatchResult>;
     try {
       result = this.#dispatch(msg.method, msg.params);
     } catch (err) {
       this.#sendError(msg.id, err);
       return;
     }
-    this.#send({ id: msg.id, result: result.value });
+    if (result instanceof Promise) {
+      // auth/* are the only async methods (keychain child processes). JSON-RPC imposes no
+      // response order, so a slow probe never blocks the lines behind it.
+      result.then(
+        (r) => this.#answer(msg.id, r),
+        (err: unknown) => this.#sendError(msg.id, err),
+      );
+      return;
+    }
+    this.#answer(msg.id, result);
+  }
+
+  #answer(id: RequestId, result: DispatchResult): void {
+    this.#send({ id, result: result.value });
     try {
       result.after?.();
     } catch (err) {
@@ -265,7 +461,7 @@ export class EngineConnection {
     this.#send({ id, error: internalError().toBody() });
   }
 
-  #dispatch(method: string, params: unknown): { value: unknown; after?: () => void } {
+  #dispatch(method: string, params: unknown): DispatchResult | Promise<DispatchResult> {
     if (method === "initialize") return { value: this.#initialize(params) };
     if (method === "initialized") throw invalidRequest("initialized is a notification");
     if (!this.#initialized) throw notInitialized(method);
@@ -280,9 +476,82 @@ export class EngineConnection {
         return this.#turnStart(params);
       case "turn/interrupt":
         return this.#turnInterrupt(params);
+      case "seat/list":
+        return { value: this.#seatList(params) };
+      case "auth/status":
+        return this.#authStatus(params);
+      case "auth/remove":
+        return this.#authRemove(params);
       default:
         throw methodNotFound(method);
     }
+  }
+
+  // -------------------------------------------------------------------- seats
+
+  /**
+   * M1-A7 (protocol pin §3.5 P4): `{ data: SeatSummary[] }`, the projection this act locks
+   * (`SeatSummary`, protocol types). Read-only. Params are pinned as `{}`, so any field at all is
+   * -32602 — the method takes nothing and can therefore never be handed a secret value.
+   */
+  #seatList(params: unknown): SeatListResult {
+    const p = paramsObject(params);
+    const unexpected = Object.keys(p);
+    if (unexpected.length > 0) {
+      throw invalidParams([`seat/list takes no params (got ${unexpected.join(", ")})`]);
+    }
+    return { data: listSeatSummaries(this.#opts.home) };
+  }
+
+  /**
+   * Seat-load warnings (seat pin §2, D-M1-7): a listed fallback that can never be eligible under
+   * the same-lane rule is warned about at load, on stderr — never silently dropped, and never a
+   * load failure (the seat file is valid; that one hop just can never serve). `seat/list` reports
+   * the same warnings and `madc doctor` surfaces them in M1-A8.
+   */
+  #noteSeatWarnings(seat: LoadedSeat): void {
+    for (const warning of seat.warnings) this.#log(warning);
+  }
+
+  /**
+   * Create the seat's own memory file if it is missing (seat pin §1 `memory/<seatId>.md`). Never
+   * overwrites, never appends, never follows a symlink; a refusal is logged and the thread still
+   * serves — memory notes are optional in M1 and no act commissions their content format.
+   */
+  #materializeSeatMemory(seat: LoadedSeat): void {
+    try {
+      ensureSeatMemoryFile(this.#opts.home, seat.seat);
+    } catch (err) {
+      this.#log(
+        `seat ${seat.seat.id}: memory path unavailable (${err instanceof Error ? err.message : String(err)})`,
+      );
+    }
+  }
+
+  // -------------------------------------------------------------------- auth
+
+  /** Lazily created so an engine that never serves an auth call never touches the keychain. */
+  #credentialStore(): CredentialStore {
+    this.#credentials ??= this.#opts.credentials ?? createCredentialStore();
+    return this.#credentials;
+  }
+
+  /**
+   * M1-A2 (protocol pin §3.5): the exact pinned shape `{ providerId, present }` — presence only,
+   * NEVER a value. Where the credential resolves from (keychain vs the `MADC_DEV_ENV_KEYS=1` env
+   * fallback, D-M1-5) stays engine-internal; `madc doctor` discloses the fallback from its own env.
+   */
+  async #authStatus(params: unknown): Promise<{ value: AuthStatusResult }> {
+    const providerId = authProviderId(params);
+    const present = await this.#credentialStore().status(providerId);
+    return { value: { providerId, present } };
+  }
+
+  /** M1-A2: removes through the store (idempotent). There is no `auth/set` over JSONL (§3.5). */
+  async #authRemove(params: unknown): Promise<{ value: Record<string, never> }> {
+    const providerId = authProviderId(params);
+    await this.#credentialStore().remove(providerId);
+    return { value: {} };
   }
 
   // ---------------------------------------------------------------- handshake
@@ -324,6 +593,7 @@ export class EngineConnection {
 
     // Seat load happens in thread/start (protocol pin §4.2): -32005 / -32006 before any lock.
     const seat = loadSeat(this.#opts.home, seatId);
+    this.#noteSeatWarnings(seat);
 
     const id = this.#opts.newThreadId?.() ?? newId("thr");
     if (!isValidId(id)) throw internalError("Generated thread id is invalid");
@@ -360,7 +630,7 @@ export class EngineConnection {
         seatId,
         {
           cwd,
-          backing: seat.seat.preferredBacking as SeatBacking,
+          backing: seat.seat.preferredBacking,
           providerId: seat.seat.preferredBacking,
           pinnedModel: seat.seat.pinnedModel,
         },
@@ -388,6 +658,15 @@ export class EngineConnection {
       status: "idle",
       preview: "",
     };
+    // M1-A7 (seat pin §1, §8 item 4): a thread on a seat materializes THAT seat's own memory path
+    // — never another seat's, never a shared one (plan A7 forbidden: "shared memory between
+    // seats"). It runs here, not at turn time, so a seat whose turns this build refuses still owns
+    // its memory path: `surface-architect` cannot pass turn preflight until the Founder records
+    // Ollama headless permission (D-M1-3/D-M1-4) or M1-A5 lands interactive attestation, and
+    // neither gate is relaxed by creating an empty 0600 note file. Best effort and never fatal:
+    // memory notes are optional in M1 and no act commissions their content format, so a refusal
+    // here must not fail a thread that could otherwise serve.
+    this.#materializeSeatMemory(seat);
     this.#threads.set(id, {
       thread,
       lock: handle,
@@ -395,6 +674,8 @@ export class EngineConnection {
       activeTurnId: null,
       seat,
       session,
+      confirmedTerminal: null,
+      confirming: false,
     });
     return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
   }
@@ -435,8 +716,10 @@ export class EngineConnection {
       if (known.session.broken && holdsThreadLock(known.lock)) {
         // Rule 6 row (a): a broken writer is cleared only by a reload from disk through the §3
         // cold-resume path, under the lock this engine already holds (kept, not released). An
-        // active turn still answers -32004.
+        // active turn — or a turn/start still waiting for its presence keypress (M1-A5) — still
+        // answers -32004.
         if (known.activeTurnId !== null) throw turnAlreadyActive(threadId, known.activeTurnId);
+        if (known.confirming) throw turnAlreadyActive(threadId, null);
         let fresh: ThreadRecord;
         try {
           fresh = this.#loadColdThread(threadId, known.lock);
@@ -512,6 +795,7 @@ export class EngineConnection {
       throw internalError("Session record failed verification");
     }
     const seat = loadSeat(this.#opts.home, rebuilt.thread.seatId);
+    this.#noteSeatWarnings(seat);
     // verifySessionFile always reports the verified byte size; it is the §2 position bound.
     const verifiedSize = verified.size;
     if (verifiedSize === undefined) throw internalError("Session record failed verification");
@@ -576,6 +860,9 @@ export class EngineConnection {
       activeTurnId: null,
       seat,
       session,
+      // M1-A5: a presence confirmation never survives a reload; the next gated turn asks again.
+      confirmedTerminal: null,
+      confirming: false,
     };
   }
 
@@ -669,6 +956,8 @@ export class EngineConnection {
     if (holdsThreadLock(record.lock)) return record;
     const threadId = record.thread.id;
     if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
+    // M1-A5: a turn/start waiting for its presence keypress holds this record; never swap it out.
+    if (record.confirming) throw turnAlreadyActive(threadId, null);
     const lock = acquireThreadLock(this.#opts.home, threadId);
     if (!lock.ok) throw turnAlreadyActive(threadId, null, lock.holderPid ?? undefined);
     this.#threads.delete(threadId);
@@ -687,17 +976,21 @@ export class EngineConnection {
 
   // -------------------------------------------------------------------- turns
 
-  #turnStart(params: unknown): { value: { turn: Turn }; after: () => void } {
+  #turnStart(params: unknown): DispatchResult | Promise<DispatchResult> {
     const p = paramsObject(params);
     const issues: string[] = [];
     const threadId = requireId(p, "threadId", issues);
     const input = parseUserInput(p.input, issues);
+    // M1-A5 (P3): the client's mode claim; absent → headless (fail-closed).
+    const claim = parseModeClaim(p.mode, issues);
     throwIfIssues(issues);
 
     // Parameter validation, -32002 and -32004 stay first and unchanged (Amendment 3 C3).
     let record = this.#threads.get(threadId);
     if (record === undefined) throw threadNotFound(threadId);
     if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
+    // M1-A5: one turn/start per thread at a time, including one still waiting for its keypress.
+    if (record.confirming) throw turnAlreadyActive(threadId, null);
     // C3 step 1: a poisoned thread answers -32009 with the C2 entry's path and first refused seq.
     const poisoned = this.#poisoned.get(threadId);
     if (poisoned !== undefined) throw sessionWriteFailed(threadId, poisoned.path, poisoned.seq);
@@ -712,20 +1005,80 @@ export class EngineConnection {
     if (record.session.broken) {
       throw sessionWriteFailed(threadId, record.session.path, record.session.nextSeq);
     }
+    const ctx = this.#turnContext(record, input);
+    // M1-A4: the repo-policy gate runs before preflight (D-M1-8 must be observable on a clean
+    // install), and its pinned receipt names the turn it gated — so the turn id is minted here.
+    // Minting an id is pure, so Amendment 3 C3's ordering (preflight at step 4, the `turn.start`
+    // append at step 5) is unchanged.
+    const turnId = newId("turn");
+
+    // M1-A5 presence phase (M1 plan §7 M1-A5; protocol pin §3.3 P3). It runs before the repo gate
+    // and before preflight, so a lane that needs a person is refused before any provider call and
+    // before any repo decision when there is no terminal to check.
+    const backing = getById(record.seat.seat.preferredBacking);
+    const phase = this.#presencePhase(record, claim, backing);
+    if (phase.kind === "absent") throw this.#presenceRefusal(record, backing, phase.why);
+    // The lane serves the claim from here on: presence is verified, pending, or not needed.
+    this.#repoGate(record, turnId, claim);
+    if (phase.kind === "pending") {
+      const pendingRecord = record;
+      return this.#awaitPresence(pendingRecord, phase.facts).then((confirmed) => {
+        if (!confirmed) throw this.#presenceRefusal(pendingRecord, backing, "not confirmed");
+        return this.#beginTurn(pendingRecord, ctx, turnId, input, claim, {
+          presence: "verified",
+          tty: { ...phase.facts, confirmation: "keypress" },
+        });
+      });
+    }
+    return this.#beginTurn(
+      record,
+      ctx,
+      turnId,
+      input,
+      claim,
+      phase.kind === "verified"
+        ? { presence: "verified", tty: { ...phase.facts, confirmation: "carried" } }
+        : { presence: "absent" },
+    );
+  }
+
+  /**
+   * C3 steps 4–5 and the turn itself, once every gate before preflight has passed: preflight exactly
+   * once against the record that will append, then the durable `turn.start` (now with the claim,
+   * the presence result and — when verified — the TTY facts, seat pin §4.2 S4), then the turn.
+   */
+  #beginTurn(
+    record: ThreadRecord,
+    ctx: Omit<AgentTurnContext, "turnId">,
+    turnId: string,
+    input: UserInput[],
+    claim: TurnMode,
+    presence: TurnPresence,
+  ): DispatchResult {
+    const threadId = record.thread.id;
+    const turnCtx: Omit<AgentTurnContext, "turnId"> = {
+      ...ctx,
+      mode: claim,
+      presence: presence.presence,
+    };
     // C3 step 4: seat / registry / credential preflight, exactly once, against the record that
     // will append (the reloaded record after a re-take; D-162). A refusal after a re-take leaves
     // the re-taken lock held by this process, as any refused turn/start does.
-    const ctx = this.#turnContext(record, input);
-    this.#opts.agent.preflight?.(ctx);
+    this.#opts.agent.preflight?.(turnCtx);
 
     const now = Date.now();
-    const turnId = newId("turn");
     // turn.start is durable before the turn exists: an append failure is a -32009 response error.
     try {
       // C3 step 5: only after preflight, append turn.start.
       record.session.append(
         "turn.start",
-        { turnId, inputText: input.map((part) => part.text).join("\n") },
+        {
+          turnId,
+          inputText: input.map((part) => part.text).join("\n"),
+          mode: claim,
+          presence: presence.presence,
+          ...(presence.tty === undefined ? {} : { tty: presence.tty }),
+        },
         now, // == turn.startedAt
       );
     } catch (err) {
@@ -758,9 +1111,137 @@ export class EngineConnection {
       value: { turn: snapshot },
       after: () => {
         this.#notify("turn/started", { turn: structuredClone(turn) });
-        this.#runTurn(record, turnRecord, { ...ctx, turnId: turn.id });
+        this.#runTurn(record, turnRecord, { ...turnCtx, turnId: turn.id });
       },
     };
+  }
+
+  // ----------------------------------------------------------------- presence
+
+  /** Lazily created so an engine that never gates a turn on presence never opens `/dev/tty`. */
+  #terminalAccess(): PresenceTerminal {
+    this.#terminal ??= this.#opts.terminal ?? createSystemTerminal();
+    return this.#terminal;
+  }
+
+  /**
+   * M1-A5: decide the presence phase of one turn on the seat's assigned backing. Only a lane that
+   * needs a person (`presence/policy.ts`) is checked, and it is checked on EVERY such turn: the
+   * engine opens its own controlling terminal, never trusting the client's claim. A terminal that
+   * is gone or differs from the confirmed one voids the confirmation — this turn is refused and the
+   * next one needs a fresh keypress on a live terminal.
+   */
+  #presencePhase(
+    record: ThreadRecord,
+    claim: TurnMode,
+    backing: ProviderEntry | undefined,
+  ): PresencePhase {
+    if (!presenceRequired(backing)) return { kind: "not-required" };
+    if (claim !== "interactive") return { kind: "absent", why: "the turn is headless" };
+    const terminal = this.#terminalAccess();
+    const facts = terminal.probe();
+    if (facts === null) {
+      record.confirmedTerminal = null;
+      return { kind: "absent", why: terminal.unsupported ?? "no controlling terminal" };
+    }
+    const confirmed = record.confirmedTerminal;
+    if (confirmed === null) return { kind: "pending", facts };
+    if (!sameTerminal(confirmed, facts)) {
+      record.confirmedTerminal = null;
+      return { kind: "absent", why: "the controlling terminal changed since confirmation" };
+    }
+    return { kind: "verified", facts };
+  }
+
+  /**
+   * The refusal for a presence-gated lane without verified presence: the lane's OWN headless denial
+   * from the registry (`interactive-only-headless` for the interactive-only plans,
+   * `headless-not-permitted` for a headless-denied direct lane), as -32007 before any network call.
+   */
+  #presenceRefusal(
+    record: ThreadRecord,
+    backing: ProviderEntry | undefined,
+    why: string,
+  ): RpcError {
+    const providerId = record.seat.seat.preferredBacking;
+    this.#log(`presence ${providerId}: absent (${why}); turn refused`);
+    if (backing !== undefined) {
+      try {
+        checkEntry(backing, {
+          providerId,
+          mode: "headless",
+          connect: backing.connect === "vendor-agent" ? "vendor-agent" : "direct",
+        });
+      } catch (err) {
+        if (err instanceof RegistryDeniedError) {
+          return providerRefusalError({
+            providerId: err.providerId,
+            reason: err.reason,
+            status: backing.status,
+          });
+        }
+        throw err;
+      }
+    }
+    // Unreachable for a presence-gated lane (it never serves headless); fail closed regardless.
+    return providerRefusalError({
+      providerId,
+      reason: "interactive-only-headless",
+      status: backing?.status ?? null,
+    });
+  }
+
+  /**
+   * M1-A5: the first presence-gated turn on a thread asks for a keypress on the engine's own
+   * controlling terminal (never over the protocol pipe). Prompts are queued engine-wide, so only one
+   * is ever on the terminal. While it waits, the thread accepts no other turn/start and cannot be
+   * reloaded; EOF or a signal aborts the wait (queued or prompting). Resolves true only when the
+   * person confirmed AND the terminal is still the one the prompt was written to — the confirmation
+   * then binds to that terminal for later turns on this thread in this process.
+   */
+  async #awaitPresence(record: ThreadRecord, facts: TerminalFacts): Promise<boolean> {
+    const threadId = record.thread.id;
+    const controller = new AbortController();
+    record.confirming = true;
+    this.#pendingConfirmations.add(controller);
+    const previous = this.#confirmationTail;
+    let release = (): void => {};
+    this.#confirmationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let confirmed: boolean;
+    try {
+      await previous; // one prompt on the terminal at a time
+      confirmed = controller.signal.aborted
+        ? false
+        : await this.#terminalAccess().confirm(
+            presencePrompt(record.seat.seat.id, record.seat.seat.preferredBacking),
+            controller.signal,
+          );
+    } catch {
+      confirmed = false;
+    } finally {
+      release();
+      record.confirming = false;
+      this.#pendingConfirmations.delete(controller);
+    }
+    // The world may have moved while the person was reading the prompt.
+    if (this.#shutDown) throw internalError("Engine is shutting down");
+    if (this.#threads.get(threadId) !== record || !holdsThreadLock(record.lock)) {
+      throw turnAlreadyActive(threadId, null);
+    }
+    if (!confirmed) {
+      record.confirmedTerminal = null;
+      return false;
+    }
+    // The keypress binds to the terminal it was typed on: re-probe after it.
+    const after = this.#terminalAccess().probe();
+    if (after === null || !sameTerminal(after, facts)) {
+      record.confirmedTerminal = null;
+      return false;
+    }
+    record.confirmedTerminal = facts;
+    return true;
   }
 
   #turnInterrupt(params: unknown): { value: Record<string, never>; after?: () => void } {
@@ -785,6 +1266,9 @@ export class EngineConnection {
       seat: record.seat.seat,
       seatPath: record.seat.path,
       input,
+      // M1-A4: context only. A repo-gated provider's identity is resolved by the engine from this
+      // path (seat pin §5); the string itself is never matched against an allowlist.
+      cwd: record.thread.cwd,
     };
   }
 
@@ -808,6 +1292,10 @@ export class EngineConnection {
               servedModel: item.servedModel,
               backing: item.backing,
               providerId: item.providerId,
+              lane: item.lane,
+              mode: item.mode,
+              fallbackFrom: item.fallbackFrom,
+              vendorReported: item.vendorReported,
             },
           },
         ]);
@@ -891,6 +1379,39 @@ export class EngineConnection {
           item: completed,
         });
         this.#persistItem(record, tr, completed);
+      },
+      fallbackRejected: (payload) => {
+        // Durable same-lane rejection (seat pin §4.2) — recorded before the paired error item so
+        // the JSONL order is event-then-item. A failed append poisons and fails the turn, exactly
+        // like #persistItem: a rejection that is not durable is not claimed. The `false` returns
+        // halt the agent's fallback walk immediately (Copilot 4131965600): the turn is finalized,
+        // so no further candidate may be built or called and no further item may be emitted.
+        if (!live()) return false;
+        try {
+          record.session.append("fallback.rejected", payload);
+          return true;
+        } catch (err) {
+          if (!(err instanceof RpcError)) throw err;
+          this.#notePoisoned(record.thread.id, record.session);
+          this.#finishTurn(record, tr, "failed", err.toBody());
+          return false;
+        }
+      },
+      repoDecision: (payload) => {
+        // M1-A4: the durable `repo.decision` receipt for a repo-gated FALLBACK CANDIDATE (the
+        // assigned backing is gated inside `turn/start`). Same durability rule as
+        // `fallbackRejected`: a failed append poisons and fails the turn, and the `false` return
+        // stops the agent from building or calling that candidate.
+        if (!live()) return false;
+        try {
+          record.session.append("repo.decision", payload);
+          return true;
+        } catch (err) {
+          if (!(err instanceof RpcError)) throw err;
+          this.#notePoisoned(record.thread.id, record.session);
+          this.#finishTurn(record, tr, "failed", err.toBody());
+          return false;
+        }
       },
     };
 

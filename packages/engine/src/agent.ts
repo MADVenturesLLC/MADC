@@ -1,5 +1,7 @@
-import type { Item, UserInput } from "./protocol/types.ts";
+import type { Presence } from "./presence/policy.ts";
+import type { Item, TurnMode, UserInput } from "./protocol/types.ts";
 import type { EngineSeat } from "./seat.ts";
+import type { FallbackRejectedPayload, RepoDecisionPayload } from "./session-store.ts";
 
 /** What `preflight` sees: the turn has not been created yet. */
 export type TurnPreflightContext = {
@@ -10,6 +12,23 @@ export type TurnPreflightContext = {
   /** The seat file the seat came from (reported in -32006 data). */
   readonly seatPath: string;
   readonly input: readonly UserInput[];
+  /**
+   * The thread's `cwd` as the client supplied it (M1-A4). It is CONTEXT ONLY for a repo-gated
+   * provider: the engine resolves the repository identity itself from this path (realpath'd git
+   * top-level + normalized `origin`) and never matches this string against an allowlist — seat pin
+   * §5, fixing Copilot r4101049517.
+   */
+  readonly cwd: string | null;
+  /**
+   * M1-A5 (protocol pin §3.3 P3): the turn's mode CLAIM. Absent reads as `headless` (fail-closed),
+   * which keeps M0-era contexts valid. The claim alone never unlocks a lane that needs presence.
+   */
+  readonly mode?: TurnMode;
+  /**
+   * M1-A5: the engine's presence check for this turn. `verified` only when the engine confirmed a
+   * person at its own controlling terminal; absent reads as `absent` (fail-closed).
+   */
+  readonly presence?: Presence;
 };
 
 /** What the engine hands an agent for one turn. */
@@ -30,6 +49,28 @@ export type TurnSink = {
   delta(itemId: string, delta: string): void;
   /** Emits `item/completed`; the item joins the turn snapshot. */
   completeItem(item: Item): void;
+  /**
+   * Durably records the pinned `fallback.rejected` session event (seat pin §4.2, same-lane rule
+   * D-M1-7). Returns true only when the rejection was recorded. `false` means the session is
+   * unusable — the server poisoned the writer and already finalized the turn failed — and the
+   * fallback walk MUST stop immediately: no paired item, no further candidate built or called
+   * (Copilot 4131965600). Optional so M0-era fake sinks stay valid; a sink without the method is
+   * treated as "recorded". The agent pairs each RECORDED rejection with an `error`-style item
+   * naming both lanes.
+   */
+  fallbackRejected?(payload: FallbackRejectedPayload): boolean;
+  /**
+   * Durably records the pinned `repo.decision` session event (seat pin §4.2 / §5, M1-A4) for a
+   * repo-gated FALLBACK CANDIDATE. The seat's assigned backing is gated by the engine inside
+   * `turn/start` (protocol pin §4.2: repo-policy checks run there, before any model call), so this
+   * covers only the candidates the fallback walk considers — a fallback never moves into a
+   * repo-denied provider.
+   *
+   * Returns true only when the decision was recorded. `false` means the session is unusable, so the
+   * candidate MUST NOT be called: a decision that is not durable is not claimed. Optional so
+   * pre-M1-A4 fake sinks stay valid; a sink without the method is treated as "recorded".
+   */
+  repoDecision?(payload: RepoDecisionPayload): boolean;
 };
 
 /**

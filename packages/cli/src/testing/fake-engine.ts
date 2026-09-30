@@ -141,7 +141,7 @@ rl.on("line", (line) => {
             id: msg.id,
             result: {
               serverInfo: { name: "madc-engine", version: "0.0.0" },
-              protocolVersion: "madc-m0/1",
+              protocolVersion: "madc-m1/1",
             },
           });
         }, 10_000);
@@ -165,7 +165,7 @@ rl.on("line", (line) => {
         return;
       }
       if (scenario === "n7-serverinfo-missing") {
-        send({ id: msg.id, result: { protocolVersion: "madc-m0/1" } });
+        send({ id: msg.id, result: { protocolVersion: "madc-m1/1" } });
         return;
       }
       if (scenario === "n7-serverinfo-name") {
@@ -173,7 +173,7 @@ rl.on("line", (line) => {
           id: msg.id,
           result: {
             serverInfo: { name: "other-engine", version: "0.0.0" },
-            protocolVersion: "madc-m0/1",
+            protocolVersion: "madc-m1/1",
           },
         });
         return;
@@ -189,7 +189,7 @@ rl.on("line", (line) => {
           id: msg.id,
           result: {
             serverInfo: { name: "madc-engine", version: "0.0.0" },
-            protocolVersion: "madc-m0/1",
+            protocolVersion: "madc-m1/1",
           },
         });
         keepAlive();
@@ -199,7 +199,7 @@ rl.on("line", (line) => {
         id: msg.id,
         result: {
           serverInfo: { name: "madc-engine", version: "0.0.0" },
-          protocolVersion: scenario === "bad-protocol" ? "madc-m0/999" : "madc-m0/1",
+          protocolVersion: scenario === "bad-protocol" ? "madc-m0/999" : "madc-m1/1",
         },
       });
       return;
@@ -483,13 +483,15 @@ rl.on("line", (line) => {
         return;
       }
       if (scenario === "n6-backing-notify" || scenario === "n6-backing-snapshot") {
-        // §3b N6 (D-188): a servedModel backing outside the pinned three → exit 3.
+        // §3b N6 (D-188), widened by M1-A3 (seat pin S1): a servedModel backing that is not a
+        // WIRED registry id → exit 3. ("ollama-cloud" was the M0 example; it is wired now, so
+        // the outside example is an id that is not in the catalog at all.)
         append("turn.start", { turnId, inputText: "hi" });
         send({ id: msg.id, result: { turn: inProgress() } });
         if (scenario === "n6-backing-notify") {
           send({
             method: "item/completed",
-            params: { threadId, turnId, item: receipt("item_s1", "model-a", "ollama-cloud") },
+            params: { threadId, turnId, item: receipt("item_s1", "model-a", "not-a-lane") },
           });
           return;
         }
@@ -498,7 +500,7 @@ rl.on("line", (line) => {
           method: "turn/completed",
           params: {
             turn: completedTurn(
-              [agentItem("q"), receipt("item_s1", "model-a", "ollama-cloud")],
+              [agentItem("q"), receipt("item_s1", "model-a", "not-a-lane")],
               null,
             ),
           },

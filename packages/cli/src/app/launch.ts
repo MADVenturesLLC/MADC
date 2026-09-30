@@ -10,7 +10,7 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { listCatalog } from "@madc/engine/client";
+import { listCatalog, PROTOCOL_VERSION } from "@madc/engine/client";
 import type { Check } from "../doctor.ts";
 import { collectDoctor, confinedDirId, confinedSeatSha, sameDirId } from "../doctor.ts";
 import type { CliIO } from "../io.ts";
@@ -176,7 +176,7 @@ function bannerData(
       : null;
   return {
     version: "0.0.0",
-    protocol: "madc-m0/1",
+    protocol: PROTOCOL_VERSION,
     seatId: SEAT,
     seatSha: confinedSeatSha(home, `${SEAT}.json`)?.slice(0, 12) ?? null,
     backing: seat.backing ?? "kimi-code",

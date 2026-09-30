@@ -2,7 +2,6 @@
 import { realpathSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { installEarlySignal, takeEarlySignal } from "./early-signal.ts";
-import type { CliIO } from "./io.ts";
 
 // §3e E6/E7: the backstop must be live BEFORE the rest of the module tree is evaluated. This
 // module's static graph is deliberately tiny (node builtins + early-signal.ts); `io.ts` and
@@ -67,28 +66,13 @@ function flushed(stream: NodeJS.WriteStream, dead: () => boolean): Promise<void>
  * receipt) have flushed (Copilot r4107601166: never exit with the receipt still buffered).
  */
 export async function runBin(engineEntry?: string): Promise<void> {
-  const [{ processIO }, { main }] = await Promise.all([import("./io.ts"), import("./main.ts")]);
+  const [{ processIO, wrapProcessIO }, { main }] = await Promise.all([
+    import("./io.ts"),
+    import("./main.ts"),
+  ]);
   const stdout = guardStream(process.stdout);
   const stderr = guardStream(process.stderr);
-  const base = processIO(engineEntry);
-  const io: CliIO = {
-    stdout: stdout.out,
-    stderr: stderr.out,
-    stdin: base.stdin,
-    env: base.env,
-    stdoutIsTTY: base.stdoutIsTTY,
-    stderrIsTTY: base.stderrIsTTY,
-    // §5.0 app gate + §3.4 tier sizing: pass the TTY flags and dimensions through — dropping
-    // them here made the gate read stdinIsTTY === undefined and print USAGE instead of the app.
-    stdinIsTTY: base.stdinIsTTY,
-    columns: base.columns,
-    rows: base.rows,
-    // F-130: lazy on purpose — only the one-shot reads cwd, and a deleted cwd must not throw here.
-    get cwd() {
-      return base.cwd;
-    },
-    ...(base.engineEntry !== undefined ? { engineEntry: base.engineEntry } : {}),
-  };
+  const io = wrapProcessIO(processIO(engineEntry), stdout.out, stderr.out);
   const code = await main(process.argv.slice(2), io);
   // A command that installs no listeners of its own (--version, --help, usage failures) never
   // takes the backstop: drop it here so a signal during the flush keeps default handling (F-102).

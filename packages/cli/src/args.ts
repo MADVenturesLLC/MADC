@@ -1,17 +1,22 @@
 /**
- * Hand-rolled M0 argument parser (CLI pin §1). No dependency. Flags may come before or after the
- * subcommand; `--` ends flags. The grammar is complete for M0:
+ * Hand-rolled argument parser (CLI pin §1; `auth` added by M1-A2). No dependency. Flags may come
+ * before or after the subcommand; `--` ends flags. The grammar is complete for the M0 surface plus
+ * the M1-A2 credential commands:
  *
  *   madc --version | -V
  *   madc --help    | -h
  *   madc doctor [--json] [--init]
+ *   madc auth set|rm|status <providerId>
  *   madc -p <prompt|-> [-s <seatId>] [--json]
  */
+
+export type AuthSub = "set" | "rm" | "status";
 
 export type ParsedArgs =
   | { readonly kind: "version" }
   | { readonly kind: "help" }
   | { readonly kind: "doctor"; readonly json: boolean; readonly init: boolean }
+  | { readonly kind: "auth"; readonly sub: AuthSub; readonly providerId: string }
   | {
       readonly kind: "oneshot";
       /** The prompt text, or "-" to read it from stdin. */
@@ -26,6 +31,9 @@ export const USAGE = `usage:
   madc --version | -V                          print version and protocol
   madc --help    | -h                          this help
   madc doctor [--json] [--init]                health report (--init seeds MADC_HOME via the engine)
+  madc auth set <providerId>                   store a credential (no-echo TTY prompt; never an argument)
+  madc auth rm <providerId>                    remove the stored credential
+  madc auth status <providerId>                credential presence (never a value)
   madc -p <prompt|-> [-s <seatId>] [--json]    headless one-shot turn ("-" reads stdin)
 `;
 
@@ -52,6 +60,27 @@ export function hasJsonFlag(argv: readonly string[]): boolean {
     if (arg === "--json") return true;
   }
   return false;
+}
+
+/**
+ * The pinned credential shapes (seat pin §4.2 / S6: generic `sk-…`, plan `sk-sp-…`, `xai-…`),
+ * used ONLY to decide whether a diagnostic may echo a `-`-leading token (M1-A2 fix, Copilot
+ * 4126239496): `madc auth set kimi-code -sk-…` must be rejected WITHOUT printing the argument.
+ * Deliberately local — the CLI may not import engine redaction code (plan §6 import rules); the
+ * shapes themselves are pin-frozen.
+ */
+const CREDENTIAL_SHAPED = /^(?:sk-(?:sp-)?|xai-)/i;
+
+/**
+ * The unknown-flag diagnostic. Ordinary typos keep the M0-pinned message (`unknown flag --nope`,
+ * erratum1 §3e); inside an `auth` command, or when the token itself is credential-shaped, the raw
+ * argument is never interpolated — it may be a credential pasted on the command line.
+ */
+function unknownFlagMessage(arg: string, inAuthCommand: boolean): string {
+  if (inAuthCommand || CREDENTIAL_SHAPED.test(arg.replace(/^-+/, ""))) {
+    return "unknown flag (token not echoed: a credential on the command line is never accepted)";
+  }
+  return `unknown flag ${arg}`;
 }
 
 export function parseArgs(argv: readonly string[]): ParsedArgs {
@@ -102,7 +131,9 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
         break;
       }
       default:
-        return usage(`unknown flag ${arg}`);
+        // positionals seen SO FAR decide the auth context: `madc auth set <id> -sk-…` has
+        // positionals[0] === "auth" by the time the flag token is reached (Copilot 4126239496).
+        return usage(unknownFlagMessage(arg, positionals[0] === "auth"));
     }
   }
   if (help) return { kind: "help" };
@@ -112,6 +143,30 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     if (rest.length > 0) return usage(`unexpected argument ${rest[0] ?? ""}`);
     if (seatId !== undefined) return usage("-s is only valid with -p");
     return { kind: "doctor", json, init };
+  }
+  if (first === "auth") {
+    if (prompt !== undefined) return usage("-p is only valid as the headless one-shot");
+    if (seatId !== undefined) return usage("-s is only valid with -p");
+    if (init) return usage("--init is only valid with doctor");
+    if (json) return usage("--json is only valid with doctor or -p");
+    const [sub, providerId, ...extra] = rest;
+    // An unrecognized subcommand is NEVER echoed: `madc auth <credential>` must not print the
+    // credential back to stderr (M1-A2: a credential on the command line is rejected, not shown).
+    if (sub !== "set" && sub !== "rm" && sub !== "status") {
+      return usage(
+        sub === undefined
+          ? "auth needs a subcommand: set | rm | status <providerId>"
+          : "unknown auth subcommand (expected set, rm or status)",
+      );
+    }
+    if (providerId === undefined) return usage(`auth ${sub} needs a <providerId>`);
+    // Same no-echo rule for anything after the provider id (the classic `auth set <id> <key>`).
+    if (extra.length > 0) {
+      return usage(
+        `unexpected argument after auth ${sub} <providerId> (a credential on the command line is never accepted; use the prompt or stdin)`,
+      );
+    }
+    return { kind: "auth", sub, providerId };
   }
   if (prompt !== undefined) {
     if (positionals.length > 0) return usage(`unexpected argument ${positionals[0] ?? ""}`);

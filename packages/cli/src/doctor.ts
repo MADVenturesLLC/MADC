@@ -30,7 +30,10 @@ import {
   inspectMadcHome,
   isPidAlive,
   listCatalog,
+  loadRepoPolicy,
   PROTOCOL_VERSION,
+  REPO_GATED_PROVIDER_IDS,
+  type RepoPolicyLoad,
   readLock,
   resolveMadcHome,
   sessionsOwnerReadUnsupported,
@@ -856,22 +859,101 @@ function checkRegistry(): Check {
   }
 }
 
+/**
+ * M1-A4: the `$MADC_HOME/policy.json` repo allowlists (M1 seat pin §5). Read-only, like every other
+ * doctor row. Reports what the engine reports at start: entries rejected AT LOAD (a path-only entry,
+ * an entry whose remote does not normalize, a key that is not a registry id), a file refused
+ * outright, and a mode more permissive than the pinned `0600`.
+ *
+ * A rejected entry GRANTS NOTHING, so each one is a WARN the operator must see: the allowlist they
+ * meant to write is not the allowlist in force, and the lane silently denies. Never prints a
+ * credential value, and never prints an entry's own text — a remote can carry
+ * `https://user:token@host/…`, so rejections are identified by provider id and position only.
+ */
+function checkPolicy(home: HomeState): Check {
+  if (home.kind !== "present") return skip("policy", "MADC_HOME is not present: nothing to read");
+  const gated = [...REPO_GATED_PROVIDER_IDS];
+  let loaded: RepoPolicyLoad;
+  try {
+    loaded = loadRepoPolicy(home.path);
+  } catch (err) {
+    // loadRepoPolicy is total; this is the belt-and-braces path so doctor itself never throws.
+    return { id: "policy", status: "fail", summary: `policy.json: ${errText(err)}`, evidence: {} };
+  }
+  if (!loaded.present) {
+    return {
+      id: "policy",
+      status: "pass",
+      summary: `no policy.json: repo-gated providers (${gated.join(", ")}) deny every repository (D-M1-8 clean-install default)`,
+      evidence: { present: false, repoGated: gated, allowEntries: 0 },
+    };
+  }
+
+  let allowEntries = 0;
+  for (const list of loaded.policy.allow.values()) allowEntries += list.length;
+  const evidence: Record<string, unknown> = {
+    present: true,
+    repoGated: gated,
+    providers: [...loaded.policy.allow.keys()],
+    allowEntries,
+    rejected: loaded.rejected.length,
+  };
+
+  const warnings: string[] = [];
+  // A refused file is fail-closed (deny everywhere) but is never what the operator intended.
+  for (const { issue } of loaded.fileIssues) {
+    warnings.push(`${issue}; repo-gated providers deny every repository`);
+  }
+  for (const entry of loaded.rejected) {
+    const where = entry.index === null ? entry.providerId : `${entry.providerId}[${entry.index}]`;
+    warnings.push(`${where} rejected: ${entry.issue} (grants nothing)`);
+  }
+  if (loaded.permissiveMode !== null) {
+    evidence.mode = loaded.permissiveMode;
+    warnings.push(`mode ${loaded.permissiveMode} is more permissive than the pinned 0600`);
+  }
+
+  if (warnings.length > 0) {
+    return {
+      id: "policy",
+      status: "warn",
+      summary: `${warnings.length} policy.json problem(s): ${warnings.join("; ")}`,
+      evidence,
+    };
+  }
+  return {
+    id: "policy",
+    status: "pass",
+    summary: `${allowEntries} allowlist entries across ${loaded.policy.allow.size} repo-gated providers`,
+    evidence,
+  };
+}
+
 function checkKimiCredential(io: CliIO): Check {
-  // Presence only: never the value, its length, a prefix or a hash.
-  const set = (io.env.KIMI_API_KEY ?? "").trim() !== "";
-  return set
-    ? {
-        id: "cred.kimi-code",
-        status: "pass",
-        summary: "KIMI_API_KEY set",
-        evidence: { env: "KIMI_API_KEY", set: true },
-      }
-    : {
-        id: "cred.kimi-code",
-        status: "warn",
-        summary: "KIMI_API_KEY not set: turns answer -32008 no-credentials",
-        evidence: { env: "KIMI_API_KEY", set: false },
-      };
+  // M1-A2 (D-M1-5): credentials live in the OS keychain, resolved by the engine; the environment
+  // satisfies presence ONLY under the pinned MADC_DEV_ENV_KEYS=1 development exception, which this
+  // row must disclose loudly. Presence only: never a value, its length, a prefix or a hash.
+  // Keychain presence per provider is queried by `madc auth status <providerId>`; the full lanes
+  // report (every lane's credentials/binary presence) lands in M1-A8.
+  const devEnvKeys = io.env.MADC_DEV_ENV_KEYS === "1";
+  const envSet = (io.env.KIMI_API_KEY ?? "").trim() !== "";
+  if (devEnvKeys) {
+    return {
+      id: "cred.kimi-code",
+      status: "warn",
+      summary: envSet
+        ? "MADC_DEV_ENV_KEYS=1 dev exception (D-M1-5): KIMI_API_KEY set — env fallback ACTIVE; the keychain wins when present; unset the flag for keychain-only"
+        : "MADC_DEV_ENV_KEYS=1 dev exception (D-M1-5): env fallback ACTIVE but KIMI_API_KEY empty; credentials resolve from the OS keychain (madc auth status kimi-code)",
+      evidence: { devEnvKeys: true, env: "KIMI_API_KEY", set: envSet, store: "os-keychain" },
+    };
+  }
+  return {
+    id: "cred.kimi-code",
+    status: "skip",
+    summary:
+      "credentials resolve from the OS keychain (MADC_DEV_ENV_KEYS unset; env KIMI_API_KEY ignored): madc auth status kimi-code",
+    evidence: { devEnvKeys: false, env: "KIMI_API_KEY", set: envSet, store: "os-keychain" },
+  };
 }
 
 /** PATH lookup only (PATHEXT on Windows). Never executes anything. */
@@ -1072,6 +1154,7 @@ export async function collectDoctor(
       await new Promise((resolve) => setImmediate(resolve));
     }
     if (start("registry")) emit(checkRegistry());
+    if (start("policy")) emit(checkPolicy(home));
     if (start("cred.kimi-code")) emit(checkKimiCredential(io));
     if (start("bin.claude")) emit(checkBin(io, "claude", "A5"));
     if (start("bin.codex")) emit(checkBin(io, "codex", "A6"));

@@ -16,12 +16,13 @@ import {
 import { join } from "node:path";
 import { test } from "node:test";
 import { DEFAULT_SEAT_ID } from "./protocol/types.ts";
-import { MADC_DEFAULT_SEAT, memoryPathIssue, validateSeat } from "./seat.ts";
+import { MADC_DEFAULT_SEAT, memoryPathIssue, seatBackingIssue, validateSeat } from "./seat.ts";
 import { loadSeat, seedDefaultSeat, serializeSeat } from "./seat-store.ts";
 import {
   expectRpcError,
   handshake,
   makeHome,
+  seatFileBody,
   startEngine,
   withEngine,
   writeSeatFile,
@@ -56,7 +57,9 @@ test("honesty §6.1: first engine start seeds seats/madc-default.json exactly as
     const path = join(home, "seats", "madc-default.json");
     const seeded = JSON.parse(readFileSync(path, "utf8"));
     assert.deepEqual(seeded, PIN_MADC_DEFAULT, "seed content is pin §3");
-    assert.deepEqual(seeded, JSON.parse(JSON.stringify(MADC_DEFAULT_SEAT)), "seed == built-in");
+    // The FILE projection of the built-in seat, not the in-memory object: since M1-A7 the
+    // in-memory v1 seat carries S2's migrated `fallbacks: []`, which the v1 file must not.
+    assert.deepEqual(seeded, seatFileBody(MADC_DEFAULT_SEAT), "seed == built-in");
     assert.deepEqual(Object.keys(seeded), Object.keys(PIN_MADC_DEFAULT), "pin key order");
     for (const sub of ["seats", "sessions", "memory"]) {
       assert.ok(statSync(join(home, sub)).isDirectory(), sub);
@@ -241,11 +244,55 @@ const BAD_SEATS: Array<{
     seat: { id: "someone-else" },
     issues: ['id "someone-else" must equal the filename stem "id-mismatch"'],
   },
-  { name: "version-2", seat: { version: 2 }, issues: ["version must be 1"] },
+  // M1-A7 (seat pin S2) supersedes the M0 "version must be 1" refusal: `version: 2` is a valid
+  // schema, but it REQUIRES `displayName` and `fallbacks`, and any other version still fails.
   {
-    name: "ollama",
-    seat: { preferredBacking: "ollama-cloud" },
-    issues: ["preferredBacking must be one of kimi-code, claude-code, codex"],
+    name: "version-2-no-displayname",
+    seat: { version: 2, fallbacks: [] },
+    issues: ["displayName must be a non-empty string at version 2"],
+  },
+  {
+    name: "version-2-no-fallbacks",
+    seat: { version: 2, displayName: "No Fallbacks" },
+    issues: ["fallbacks must be an array of registry provider ids at version 2"],
+  },
+  {
+    name: "version-2-neither",
+    seat: { version: 2 },
+    issues: [
+      "displayName must be a non-empty string at version 2",
+      "fallbacks must be an array of registry provider ids at version 2",
+    ],
+  },
+  {
+    name: "version-2-blank-displayname",
+    seat: { version: 2, displayName: "   ", fallbacks: [] },
+    issues: ["displayName must be a non-empty string at version 2"],
+  },
+  { name: "version-3", seat: { version: 3 }, issues: ["version must be 1 or 2"] },
+  // M1-A3 (seat pin S1): backing validity is registry-driven. "ollama-cloud" — the M0
+  // counter-example — is a valid backing since M1-A3 wired it (positive case below); the bad
+  // cases are an unknown id, a forbidden lane and an unwired stub.
+  {
+    name: "backing-unknown",
+    seat: { preferredBacking: "no-such-provider" },
+    issues: ['preferredBacking "no-such-provider" is not a registry provider id'],
+  },
+  {
+    name: "backing-forbidden",
+    seat: { preferredBacking: "zai-glm-coding-plan" },
+    issues: ['preferredBacking "zai-glm-coding-plan" is a forbidden lane'],
+  },
+  {
+    name: "backing-unwired",
+    // openrouter is a kept stub no M1 act wires (mistral-pro was this fixture until M1-A4).
+    seat: { preferredBacking: "openrouter" },
+    issues: ['preferredBacking "openrouter" is not wired in this build'],
+  },
+  {
+    name: "fallbacks-in-v1",
+    seat: { fallbacks: ["kimi-code"] },
+    issues: ["fallbacks is not a seat field"],
   },
   {
     name: "handoffs-on",
@@ -490,6 +537,29 @@ test("validateSeat / memoryPathIssue units: the built-in seat is valid; lexical 
   assert.notEqual(memoryPathIssue("memory/"), null);
   assert.notEqual(memoryPathIssue("C:/memory/x.md"), null);
   assert.notEqual(memoryPathIssue("./memory/x.md"), null);
+});
+
+test("M1-A3 (S1): a wired non-M0 backing validates through the registry", () => {
+  // ollama-cloud: wired by M1-A3 → a valid seat-file backing although it is not in the M0
+  // three-literal list (the file-level v2 schema and the seeded roster remain M1-A7).
+  const ollama = validateSeat(
+    { ...PIN_MADC_DEFAULT, id: "sa", preferredBacking: "ollama-cloud" },
+    "sa",
+  );
+  assert.equal(ollama.ok, true, ollama.ok ? "" : ollama.issues.join("; "));
+  // The registry-driven rule itself: exists + wired + not forbidden.
+  assert.equal(seatBackingIssue("kimi-code"), null);
+  assert.equal(seatBackingIssue("claude-code"), null);
+  assert.equal(seatBackingIssue("codex"), null);
+  assert.equal(seatBackingIssue("ollama-cloud"), null);
+  // M1-A4 wired the direct-key batch, so each is now a valid backing at load.
+  for (const id of ["mistral-pro", "deepseek-payg", "gemini-api-key", "xai-api"]) {
+    assert.equal(seatBackingIssue(id), null, id);
+  }
+  // openrouter is a kept stub no M1 act wires (mistral-pro was this fixture until M1-A4).
+  assert.match(seatBackingIssue("openrouter") ?? "", /not wired in this build/);
+  assert.match(seatBackingIssue("zai-glm-coding-plan") ?? "", /forbidden lane/);
+  assert.match(seatBackingIssue("no-such-provider") ?? "", /not a registry provider id/);
 });
 
 test("R-seat-swap: a seat file swapped after the realpath check is never read (-32006)", () => {

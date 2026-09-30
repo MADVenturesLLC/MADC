@@ -12,8 +12,8 @@ export type CliIO = {
   readonly stderrIsTTY: boolean;
   /**
    * stdin TTY gate for the app (DESIGN-SPEC §5.0: the app needs all three TTYs or it does not
-   * start). Undefined counts as not a TTY, so existing constructors that omit it never launch
-   * the app in tests.
+   * start) and a fact behind the M1-A5 turn mode claim (`mode.ts`). Undefined counts as not a
+   * TTY, so existing constructors that omit it never launch the app and can only claim `headless`.
    */
   readonly stdinIsTTY?: boolean | undefined;
   /** Output-stream width (§3.4/§9); undefined counts as below 80 columns. */
@@ -44,6 +44,34 @@ export function processIO(engineEntry?: string): CliIO {
       return process.cwd();
     },
     engineEntry,
+  };
+}
+
+/**
+ * The real process IO with guarded stdout/stderr. Every TTY fact is forwarded: `stdinIsTTY`
+ * (M1-A5 mode claim; dropping it meant no non-`-p` surface could claim `interactive`) and
+ * `columns` / `rows` (DESIGN-SPEC §5.0: dropping them made the app gate print USAGE).
+ */
+export function wrapProcessIO(
+  base: CliIO,
+  stdout: CliIO["stdout"],
+  stderr: CliIO["stderr"],
+): CliIO {
+  return {
+    stdout,
+    stderr,
+    stdin: base.stdin,
+    env: base.env,
+    stdoutIsTTY: base.stdoutIsTTY,
+    stderrIsTTY: base.stderrIsTTY,
+    ...(base.stdinIsTTY !== undefined ? { stdinIsTTY: base.stdinIsTTY } : {}),
+    ...(base.columns !== undefined ? { columns: base.columns } : {}),
+    ...(base.rows !== undefined ? { rows: base.rows } : {}),
+    // F-130: lazy on purpose — only the one-shot reads cwd, and a deleted cwd must not throw here.
+    get cwd() {
+      return base.cwd;
+    },
+    ...(base.engineEntry !== undefined ? { engineEntry: base.engineEntry } : {}),
   };
 }
 

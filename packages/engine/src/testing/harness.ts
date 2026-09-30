@@ -6,9 +6,15 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { EngineClient, spawnEngine, withoutUndefined } from "../client.ts";
 import type { InitializeResult } from "../protocol/types.ts";
+import type { EngineSeat } from "../seat.ts";
+import { serializeSeat } from "../seat-store.ts";
 
 export const ECHO_ENGINE = fileURLToPath(new URL("./echo-engine.ts", import.meta.url));
 export const KIMI_FAKE_ENGINE = fileURLToPath(new URL("./kimi-fake-engine.ts", import.meta.url));
+/** M1-A3: both direct lanes (kimi + ollama-cloud) against in-process fake transports. */
+export const DIRECT_FAKE_ENGINE = fileURLToPath(
+  new URL("./direct-fake-engine.ts", import.meta.url),
+);
 export const CLAUDE_FAKE_ENGINE = fileURLToPath(
   new URL("./claude-fake-engine.ts", import.meta.url),
 );
@@ -17,6 +23,12 @@ export const HANG_ENGINE = fileURLToPath(new URL("./hang-agent-engine.ts", impor
 export const FAILING_ENGINE = fileURLToPath(new URL("./failing-agent-engine.ts", import.meta.url));
 export const EXIT_ENGINE = fileURLToPath(new URL("./exit-engine.ts", import.meta.url));
 export const GATED_ENGINE = fileURLToPath(new URL("./gated-agent-engine.ts", import.meta.url));
+/** M1-A5: the interactive-only plan lanes on fake transports, with the REAL system terminal. */
+export const INTERACTIVE_FAKE_ENGINE = fileURLToPath(
+  new URL("./interactive-fake-engine.ts", import.meta.url),
+);
+/** M1-A5: the real system terminal in its own process (`script` pty / detached spawn tests). */
+export const PRESENCE_PROBE = fileURLToPath(new URL("./presence-probe.ts", import.meta.url));
 
 export function makeHome(): { home: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), "madc-a2-"));
@@ -31,6 +43,19 @@ export function writeSeatFile(home: string, seat: Record<string, unknown>, raw?:
   const path = join(dir, `${String(seat.id)}.json`);
   writeFileSync(path, raw ?? `${JSON.stringify(seat, null, 2)}\n`, { mode: 0o600 });
   return path;
+}
+
+/**
+ * The FILE body of an in-memory seat — the projection `serializeSeat` writes, as a plain object.
+ *
+ * Since M1-A7 the two shapes differ: an in-memory seat always carries `fallbacks` (S2's v1 → v2
+ * migration), while a v1 FILE must not, because the v1 schema is the closed M0 key set and a v1
+ * file carrying `fallbacks` or `displayName` fails load with -32006. A fixture that spreads
+ * `MADC_DEFAULT_SEAT` into a file body therefore has to go through this, or it writes a v1 file
+ * with a v2 key in it and the seat it meant to create is refused.
+ */
+export function seatFileBody(seat: EngineSeat): Record<string, unknown> {
+  return JSON.parse(serializeSeat(seat)) as Record<string, unknown>;
 }
 
 /** Credential-looking names never reach a test engine unless a test sets them explicitly. */

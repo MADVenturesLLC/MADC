@@ -216,14 +216,22 @@ test("§6.3 / §6.4: a seat run writes session.open → turn.start → items →
       providerId: "kimi-code",
       pinnedModel: "kimi-coding/kimi-for-coding",
     });
-    assert.deepEqual(lines[1]?.payload, { turnId: turn.id, inputText: "say hi" });
+    // M1-A5 (seat pin §4.2 S4): turn.start carries the mode claim and the presence result. This
+    // turn/start sent no `mode`, so it is recorded as headless (P3, fail-closed) with no presence.
+    assert.deepEqual(lines[1]?.payload, {
+      turnId: turn.id,
+      inputText: "say hi",
+      mode: "headless",
+      presence: "absent",
+    });
     assert.deepEqual(lines[6]?.payload, { turnId: turn.id, status: "completed", error: null });
     // Items on disk are the item/completed items, in order.
     assert.deepEqual(
       lines.filter((l) => l.type === "item").map((l) => l.payload.item),
       turn.items,
     );
-    // §6.4 dual write: the JSONL servedModel event equals the protocol servedModel item.
+    // §6.4 dual write: the JSONL servedModel event equals the protocol servedModel item
+    // (including the M1 P2 fields — lane, mode, fallbackFrom, vendorReported).
     const item = turn.items.find((i) => i.kind === "servedModel") as ServedModelItem;
     const event = lines.find((l) => l.type === "servedModel")?.payload;
     assert.deepEqual(event, {
@@ -232,6 +240,10 @@ test("§6.3 / §6.4: a seat run writes session.open → turn.start → items →
       servedModel: item.servedModel,
       backing: item.backing,
       providerId: item.providerId,
+      lane: item.lane,
+      mode: item.mode,
+      fallbackFrom: item.fallbackFrom,
+      vendorReported: item.vendorReported,
     });
     assert.equal(item.servedModel, "kimi-for-coding-2026-09");
     // §6.5: chain verifies (engine verifier and an independent implementation of pin §4.3).
@@ -1034,6 +1046,10 @@ test("R-shape: every M0 item variant with its required fields rebuilds", () => {
       servedModel: "b",
       backing: "codex",
       providerId: "codex",
+      lane: "allowed-via-vendor-agent",
+      mode: "headless",
+      fallbackFrom: null,
+      vendorReported: false,
     },
   ];
   const r = verifySessionText(
@@ -1268,6 +1284,10 @@ test("R-dual: the receipt pair is one append; a failed receipt append leaves nei
         servedModel: "kimi-for-coding",
         backing: "kimi-code" as const,
         providerId: "kimi-code",
+        lane: "allowed-direct" as const,
+        mode: "headless" as const,
+        fallbackFrom: null,
+        vendorReported: false,
       };
       sink.startItem({ ...receipt, status: "inProgress" });
       sink.completeItem({ ...receipt, status: "completed" });

@@ -626,7 +626,7 @@ describe("§3.4 production tier routing (runWitnessApp)", () => {
     assert.equal(code, 0);
     assert.match(
       out.text(),
-      /madc 0\.0\.0 · madc-m0\/1 · madc-default · line mode \(72×20 < 80×24\)/,
+      /madc 0\.0\.0 · madc-m1\/1 · madc-default · line mode \(72×20 < 80×24\)/,
     );
     rmSync(home, { recursive: true, force: true });
   });

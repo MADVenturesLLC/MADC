@@ -130,6 +130,14 @@ const agentItem = (id: string, text: string): Record<string, unknown> => ({
   status: "completed",
   text,
 });
+/** M1 protocol pin §5 P2 fields the session verifier requires on every servedModel receipt. */
+const RECEIPT_P2 = {
+  lane: "allowed-direct",
+  mode: "headless",
+  fallbackFrom: null,
+  vendorReported: true,
+} as const;
+
 const servedItemCtrl = (id: string): Record<string, unknown> => ({
   id,
   kind: "servedModel",
@@ -138,6 +146,7 @@ const servedItemCtrl = (id: string): Record<string, unknown> => ({
   servedModel: "kimi-for-\u001b[31mcoding\u0007",
   backing: "kimi-code",
   providerId: "kimi-code",
+  ...RECEIPT_P2,
 });
 
 const servedItem = (id: string): Record<string, unknown> => ({
@@ -148,7 +157,22 @@ const servedItem = (id: string): Record<string, unknown> => ({
   servedModel: "kimi-for-coding",
   backing: "kimi-code",
   providerId: "kimi-code",
+  ...RECEIPT_P2,
 });
+
+function servedDiskPayload(turnId: string, item: Record<string, unknown>): Record<string, unknown> {
+  return {
+    turnId,
+    requestedModel: item.requestedModel,
+    servedModel: item.servedModel,
+    backing: item.backing,
+    providerId: item.providerId,
+    lane: item.lane,
+    mode: item.mode,
+    fallbackFrom: item.fallbackFrom,
+    vendorReported: item.vendorReported,
+  };
+}
 
 rl?.on("line", (line) => {
   const msg = JSON.parse(line) as { id?: number; method: string; params?: Record<string, unknown> };
@@ -159,7 +183,7 @@ rl?.on("line", (line) => {
         id: msg.id,
         result: {
           serverInfo: { name: "madc-engine", version: "0.0.0" },
-          protocolVersion: "madc-m0/1",
+          protocolVersion: "madc-m1/1",
         },
       });
       return;
@@ -333,13 +357,7 @@ rl?.on("line", (line) => {
           });
           for (const item of finalDelta) {
             if (item.kind === "servedModel") {
-              append("servedModel", {
-                turnId,
-                requestedModel: item.requestedModel,
-                servedModel: item.servedModel,
-                backing: item.backing,
-                providerId: item.providerId,
-              });
+              append("servedModel", servedDiskPayload(turnId, item));
             } else {
               append("item", { turnId, item });
             }
@@ -397,13 +415,7 @@ rl?.on("line", (line) => {
           });
           for (const item of finalSpaced) {
             if (item.kind === "servedModel") {
-              append("servedModel", {
-                turnId,
-                requestedModel: item.requestedModel,
-                servedModel: item.servedModel,
-                backing: item.backing,
-                providerId: item.providerId,
-              });
+              append("servedModel", servedDiskPayload(turnId, item));
             } else {
               append("item", { turnId, item });
             }
@@ -637,13 +649,7 @@ rl?.on("line", (line) => {
       // evidence (per-turn ranges, served seq) derives from the read-only verify.
       for (const item of finalItems) {
         if (item.kind === "servedModel") {
-          append("servedModel", {
-            turnId,
-            requestedModel: item.requestedModel,
-            servedModel: item.servedModel,
-            backing: item.backing,
-            providerId: item.providerId,
-          });
+          append("servedModel", servedDiskPayload(turnId, item));
         } else {
           append("item", { turnId, item });
         }

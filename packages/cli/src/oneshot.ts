@@ -46,6 +46,7 @@ import {
   EXIT,
 } from "./exit-codes.ts";
 import { type CliIO, sleep, TimeoutError, withTimeout } from "./io.ts";
+import { claimMode } from "./mode.ts";
 
 /** `classifyMessage` moved to app/wire.ts (shared with the app); re-exported for importers. */
 export { classifyMessage };
@@ -514,6 +515,12 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
       const tsRequest = c.request("turn/start", {
         threadId: tid,
         input: [{ type: "text", text: opts.prompt }],
+        // M1-A5 (P3): the one-shot is `-p`, so its claim is always `headless` (`mode.ts`).
+        mode: claimMode({
+          stdinIsTTY: io.stdinIsTTY === true,
+          stdoutIsTTY: io.stdoutIsTTY,
+          print: true,
+        }),
       });
       turnStartSent = true;
       tsRequest.then(
