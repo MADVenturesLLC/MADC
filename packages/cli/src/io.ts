@@ -11,10 +11,14 @@ export type CliIO = {
   readonly stdoutIsTTY: boolean;
   readonly stderrIsTTY: boolean;
   /**
-   * M1-A5: stdin is a TTY (one of the facts behind the turn mode claim, `mode.ts`). Optional so
-   * existing IO fixtures keep working; absent reads as `false`, which can only claim `headless`.
+   * stdin TTY gate for the app (DESIGN-SPEC §5.0: the app needs all three TTYs or it does not
+   * start) and a fact behind the M1-A5 turn mode claim (`mode.ts`). Undefined counts as not a
+   * TTY, so existing constructors that omit it never launch the app and can only claim `headless`.
    */
-  readonly stdinIsTTY?: boolean;
+  readonly stdinIsTTY?: boolean | undefined;
+  /** Output-stream width (§3.4/§9); undefined counts as below 80 columns. */
+  readonly columns?: number | undefined;
+  readonly rows?: number | undefined;
   readonly cwd: string;
   /**
    * Engine entry script. Undefined = the real engine (`@madc/engine/client` default). Only the
@@ -32,6 +36,8 @@ export function processIO(engineEntry?: string): CliIO {
     stdoutIsTTY: process.stdout.isTTY === true,
     stderrIsTTY: process.stderr.isTTY === true,
     stdinIsTTY: process.stdin.isTTY === true,
+    columns: process.stdout.columns,
+    rows: process.stdout.rows,
     // §3e E16 F-130: read lazily — only the one-shot needs cwd, and a deleted current directory
     // must not break `--version`, `--help`, usage errors or doctor.
     get cwd() {
@@ -42,9 +48,9 @@ export function processIO(engineEntry?: string): CliIO {
 }
 
 /**
- * The real process IO with guarded stdout/stderr. Every TTY fact is forwarded, including
- * `stdinIsTTY`, which the M1-A5 mode claim needs (Copilot review of PR #39: `bin.ts` dropped it, so
- * no non-`-p` surface could ever claim `interactive`).
+ * The real process IO with guarded stdout/stderr. Every TTY fact is forwarded: `stdinIsTTY`
+ * (M1-A5 mode claim; dropping it meant no non-`-p` surface could claim `interactive`) and
+ * `columns` / `rows` (DESIGN-SPEC §5.0: dropping them made the app gate print USAGE).
  */
 export function wrapProcessIO(
   base: CliIO,
@@ -59,6 +65,8 @@ export function wrapProcessIO(
     stdoutIsTTY: base.stdoutIsTTY,
     stderrIsTTY: base.stderrIsTTY,
     ...(base.stdinIsTTY !== undefined ? { stdinIsTTY: base.stdinIsTTY } : {}),
+    ...(base.columns !== undefined ? { columns: base.columns } : {}),
+    ...(base.rows !== undefined ? { rows: base.rows } : {}),
     // F-130: lazy on purpose — only the one-shot reads cwd, and a deleted cwd must not throw here.
     get cwd() {
       return base.cwd;

@@ -40,6 +40,9 @@ import {
   spawnEngine,
   verifySessionFile,
 } from "@madc/engine/client";
+import { doctorHeaderW, doctorPendingRowW, doctorResultW, doctorRowW } from "./app/doctor-view.ts";
+import { glyphsFor, Style } from "./app/style.ts";
+import { asciiForced, colorDepth } from "./app/tiers.ts";
 import { takeEarlySignal } from "./early-signal.ts";
 import { EXIT } from "./exit-codes.ts";
 import { type CliIO, colorEnabled, paint, TimeoutError, withTimeout } from "./io.ts";
@@ -143,7 +146,7 @@ export function confinedDirId(home: string, name: string): DirId | null {
   }
 }
 
-function sameDirId(a: DirId | null, b: DirId | null): boolean {
+export function sameDirId(a: DirId | null, b: DirId | null): boolean {
   return a !== null && b !== null && a.dev === b.dev && a.ino === b.ino;
 }
 
@@ -1062,18 +1065,46 @@ function renderRow(c: Check, color: boolean): string {
   return `${word}  ${c.id.padEnd(14)} ${c.summary}\n`;
 }
 
-export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number> {
+/** Hook set for `collectDoctor`: rows delivered as they finish, without writing anything. */
+export type DoctorHooks = {
+  readonly onStart?: (id: string) => void;
+  readonly onRow?: (c: Check) => void;
+};
+
+export type DoctorRun = {
+  readonly checks: readonly Check[];
+  readonly exitCode: number;
+  readonly ms: number;
+  readonly counts: {
+    readonly pass: number;
+    readonly warn: number;
+    readonly fail: number;
+    readonly skip: number;
+  };
+};
+
+/**
+ * The doctor check sequence with no I/O of its own: the caller renders. `runDoctor` (below)
+ * keeps its pinned stdout bytes on top of this; the Witness app uses it for the launch doctor
+ * and the /doctor overlay (DESIGN-SPEC §5.1, §5.9). When `externalSig` is given the caller owns
+ * the SIGINT/SIGTERM listeners and the probe kill (the app's case); otherwise this installs the
+ * §3e E7 listeners for the run.
+ */
+export async function collectDoctor(
+  io: CliIO,
+  opts: DoctorOptions,
+  hooks: DoctorHooks = {},
+  externalSig?: DoctorSignal,
+): Promise<DoctorRun> {
   const t0 = Date.now();
-  const color = !opts.json && colorEnabled(io);
   const checks: Check[] = [];
   const emit = (c: Check) => {
     checks.push(c);
-    if (!opts.json) io.stdout.write(renderRow(c, color));
+    hooks.onRow?.(c);
   };
-  // §3e E7: doctor installs SIGINT/SIGTERM listeners for its whole run. On a signal it kills the
-  // probe engine if one is running (no EOF wait), still removes the temp dir, runs no further
-  // rows, and exits 130/143 with the rows so far.
-  const sig: DoctorSignal = { exit: null, kill: null };
+  const sig: DoctorSignal = externalSig ?? { exit: null, kill: null };
+  let ownListeners = false;
+  let homeInvalid = false;
   const onSigint = () => {
     sig.exit = sig.exit ?? EXIT.sigint;
     sig.kill?.();
@@ -1082,69 +1113,169 @@ export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number>
     sig.exit = EXIT.sigterm;
     sig.kill?.();
   };
-  process.on("SIGINT", onSigint);
-  process.on("SIGTERM", onSigterm);
-  // §3e E7: a signal recorded by the bin.ts backstop during module load applies to the whole run:
-  // no rows run, and the run exits 130/143 with the (empty) rows so far.
-  const earlySignal = takeEarlySignal();
-  if (earlySignal !== null) sig.exit = earlySignal;
-  // MADC_HOME set but not absolute: exit-2 class, and nothing spawns (CLI pin §1).
-  let home = resolveHome(io);
-  const homeInvalid = home.kind === "invalid";
+  if (externalSig === undefined) {
+    // §3e E7: doctor installs SIGINT/SIGTERM listeners for its whole run. On a signal it kills
+    // the probe engine if one is running (no EOF wait), still removes the temp dir, runs no
+    // further rows, and exits 130/143 with the rows so far.
+    process.on("SIGINT", onSigint);
+    process.on("SIGTERM", onSigterm);
+    ownListeners = true;
+    // §3e E7: a signal recorded by the bin.ts backstop during module load applies to the whole
+    // run: no rows run, and the run exits 130/143 with the (empty) rows so far.
+    const earlySignal = takeEarlySignal();
+    if (earlySignal !== null) sig.exit = earlySignal;
+  }
   try {
-    if (!opts.json)
-      io.stdout.write(`madc doctor · madc ${MADC_VERSION} · protocol ${PROTOCOL_VERSION}\n`);
-
-    if (opts.init && home.kind !== "invalid" && sig.exit === null) {
+    // MADC_HOME set but not absolute: exit-2 class, and nothing spawns (CLI pin §1).
+    let home = resolveHome(io);
+    homeInvalid = home.kind === "invalid";
+    const start = (id: string): boolean => {
+      if (sig.exit !== null) return false;
+      hooks.onStart?.(id);
+      return true;
+    };
+    if (opts.init && home.kind !== "invalid" && start("init")) {
       emit(await runInit(io, home.path, sig));
       home = resolveHome(io);
     }
-    if (sig.exit === null) emit(checkRuntime());
-    if (sig.exit === null) {
+    if (start("runtime")) emit(checkRuntime());
+    if (start("engine")) {
       emit(
         homeInvalid
           ? skip("engine", "MADC_HOME is invalid: nothing spawned")
           : await checkEngine(io, sig),
       );
     }
-    if (sig.exit === null) emit(checkHome(home));
-    if (sig.exit === null) {
+    if (start("home")) emit(checkHome(home));
+    if (start("seat")) {
       for (const row of localRowsBounded(home)) emit(row);
       // The local rows ran under a blocking spawnSync child: let a signal delivered meanwhile
       // take effect now that the child has returned (§3e E7).
       await new Promise((resolve) => setImmediate(resolve));
     }
-    if (sig.exit === null) emit(checkRegistry());
-    if (sig.exit === null) emit(checkPolicy(home));
-    if (sig.exit === null) emit(checkKimiCredential(io));
-    if (sig.exit === null) emit(checkBin(io, "claude", "A5"));
-    if (sig.exit === null) emit(checkBin(io, "codex", "A6"));
+    if (start("registry")) emit(checkRegistry());
+    if (start("policy")) emit(checkPolicy(home));
+    if (start("cred.kimi-code")) emit(checkKimiCredential(io));
+    if (start("bin.claude")) emit(checkBin(io, "claude", "A5"));
+    if (start("bin.codex")) emit(checkBin(io, "codex", "A6"));
   } finally {
-    process.removeListener("SIGINT", onSigint);
-    process.removeListener("SIGTERM", onSigterm);
+    if (ownListeners) {
+      process.removeListener("SIGINT", onSigint);
+      process.removeListener("SIGTERM", onSigterm);
+    }
   }
-
   const counts = { pass: 0, warn: 0, fail: 0, skip: 0 };
   for (const c of checks) if (c.status !== "init") counts[c.status]++;
   const exitCode =
     sig.exit ?? (homeInvalid ? EXIT.usage : counts.fail > 0 ? EXIT.failure : EXIT.ok);
-  const ms = Date.now() - t0;
+  return { checks, exitCode, ms: Date.now() - t0, counts };
+}
+
+/** Tier W for doctor's stdout rows (P-10): stdout TTY, TERM set and not dumb, width ≥ 80. */
+export function doctorTierW(io: CliIO): boolean {
+  if (io.env.NO_COLOR !== undefined) return false;
+  if (!io.stdoutIsTTY) return false;
+  const term = io.env.TERM;
+  if (term === undefined || term === "" || term === "dumb") return false;
+  return (io.columns ?? 0) >= 80;
+}
+
+/** The doctor Style from the stdout gate (io.ts) and the §3.3 colour rules. */
+export function doctorStyle(io: CliIO): Style {
+  const on = !colorEnabled(io) ? "none" : colorDepth(io.env);
+  return Style.forDepth(on, asciiForced(io.env));
+}
+
+/** §6.6 tier-A RESULT spans: FAIL 1;31, WARN 33, exit digits per IQ-10. Never bold FAIL here. */
+export function resultTierA(
+  fail: number,
+  warn: number,
+  skip: number,
+  ms: number,
+  exitCode: number,
+  color: boolean,
+): string {
+  const f = fail > 0 ? paint(color, "1;31", `${fail} FAIL`) : `${fail} FAIL`;
+  const w = warn > 0 ? paint(color, "33", `${warn} WARN`) : `${warn} WARN`;
+  const digits =
+    exitCode !== 0
+      ? paint(color, "1;31", String(exitCode))
+      : fail === 0 && warn === 0
+        ? paint(color, "32", String(exitCode))
+        : paint(color, "33", String(exitCode));
+  return `RESULT  ${f} · ${w} · ${skip} SKIP · ${ms} ms   exit ${digits}`;
+}
+
+export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number> {
+  const style = doctorStyle(io);
+  const g = glyphsFor(style.ascii);
+  const w = doctorTierW(io);
+  const color = !opts.json && colorEnabled(io);
+  const width = io.columns ?? 80;
+  if (!opts.json) {
+    io.stdout.write(
+      w
+        ? `${doctorHeaderW(MADC_VERSION, PROTOCOL_VERSION, style, g)}\n`
+        : `madc doctor · madc ${MADC_VERSION} · protocol ${PROTOCOL_VERSION}\n`,
+    );
+  }
+  let lastPending = false;
+  const hooks: DoctorHooks = opts.json
+    ? {}
+    : {
+        onStart: (id) => {
+          if (w) {
+            io.stdout.write(`${doctorPendingRowW(id, style, g)}\n`);
+            lastPending = true;
+          }
+        },
+        onRow: (c) => {
+          if (w) {
+            // The pending placeholder is replaced in place (§8): rows are short, ids ≤ 14.
+            if (lastPending) io.stdout.write("\u001b[1F\r\u001b[K");
+            lastPending = false;
+            for (const line of doctorRowW(c, style, g, width)) {
+              io.stdout.write(`${line}\n`);
+            }
+          } else {
+            // Tier A/P bytes: the pinned `WORD  id  summary` rows, coloured only on a TTY.
+            io.stdout.write(renderRow(c, color));
+          }
+        },
+      };
+  const run = await collectDoctor(io, opts, hooks);
   if (opts.json) {
     io.stdout.write(
       `${JSON.stringify({
-        ok: exitCode === EXIT.ok,
-        exitCode,
+        ok: run.exitCode === EXIT.ok,
+        exitCode: run.exitCode,
         madcVersion: MADC_VERSION,
         protocolVersion: PROTOCOL_VERSION,
-        durationMs: ms,
-        checks,
-        counts,
+        durationMs: run.ms,
+        checks: run.checks,
+        counts: run.counts,
       })}\n`,
+    );
+  } else if (w) {
+    io.stdout.write(
+      `${doctorResultW(
+        `RESULT  ${run.counts.fail} FAIL · ${run.counts.warn} WARN · ${run.counts.skip} SKIP · ${run.ms} ms   exit ${run.exitCode}`,
+        run.counts.fail,
+        run.counts.warn,
+        style,
+      )}\n`,
     );
   } else {
     io.stdout.write(
-      `RESULT  ${counts.fail} FAIL · ${counts.warn} WARN · ${counts.skip} SKIP · ${ms} ms   exit ${exitCode}\n`,
+      `${resultTierA(
+        run.counts.fail,
+        run.counts.warn,
+        run.counts.skip,
+        run.ms,
+        run.exitCode,
+        color,
+      )}\n`,
     );
   }
-  return exitCode;
+  return run.exitCode;
 }

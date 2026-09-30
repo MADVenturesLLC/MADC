@@ -11,10 +11,7 @@ import {
   EngineExitedError,
   EngineProtocolError,
   EngineRpcError,
-  ITEM_KINDS,
   type Item,
-  type ItemStatus,
-  listCatalog,
   PROTOCOL_VERSION,
   spawnEngine,
   type Thread,
@@ -22,6 +19,25 @@ import {
   verifySessionFile,
   type WireMessage,
 } from "@madc/engine/client";
+import {
+  type ReceiptData,
+  receiptPlain,
+  receiptTierA,
+  sanitizeReceiptData,
+} from "./app/receipt.ts";
+import { glyphsFor, Style } from "./app/style.ts";
+import { decideTier } from "./app/tiers.ts";
+import { renderVerdictCard, type Verdict } from "./app/verdict.ts";
+import {
+  classifyMessage,
+  isDomainId,
+  isErrorBody,
+  isItemShape,
+  isThreadShape,
+  isTurnShape,
+  stripControls,
+  violationMessage,
+} from "./app/wire.ts";
 import {
   type Classified,
   classifyCode,
@@ -31,6 +47,9 @@ import {
 } from "./exit-codes.ts";
 import { type CliIO, sleep, TimeoutError, withTimeout } from "./io.ts";
 import { claimMode } from "./mode.ts";
+
+/** `classifyMessage` moved to app/wire.ts (shared with the app); re-exported for importers. */
+export { classifyMessage };
 
 const DEFAULT_SEAT = "madc-default";
 export const PROMPT_CAP_BYTES = 1024 * 1024;
@@ -90,164 +109,8 @@ function finalText(items: readonly Item[]): string {
   return text;
 }
 
-/**
- * Erratum §3e E11: in human mode, engine-supplied text written to stdout or stderr has every C0
- * control character except TAB and LF, plus DEL and the C1 range, replaced with U+FFFD (no ANSI
- * injection from a model). `--json` carries text verbatim.
- */
-// biome-ignore lint/suspicious/noControlCharactersInRegex: §3e E11 replaces exactly these control ranges with U+FFFD.
-const CONTROL_CHARS = /[\u0000-\u0008\u000B-\u001F\u007F\u0080-\u009F]/g;
-function stripControls(s: string): string {
-  return s.replace(CONTROL_CHARS, "\uFFFD");
-}
-
-/**
- * Runtime shape check of one wire item (Copilot r4108764755): the fields the CLI reads must have
- * their pinned types, so nothing malformed reaches the renderers.
- */
-const ITEM_STATUSES: readonly ItemStatus[] = ["inProgress", "completed", "failed"];
-
-/** Protocol pin §1 "IDs": domain ids are opaque strings of this grammar before any path join. */
-const DOMAIN_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const isDomainId = (v: unknown): v is string => typeof v === "string" && DOMAIN_ID.test(v);
-
-/**
- * Erratum §3b N6 (D-188), widened by M1-A3 per seat pin S1 / protocol pin §5 P2: a servedModel
- * `backing` is any WIRED registry id (M0's closed three-literal list grew `ollama-cloud` when its
- * adapter landed; A4+ lanes join by registry flip, not by CLI edit). The catalog is frozen data,
- * so this set is computed once.
- */
-const SERVED_MODEL_BACKINGS: ReadonlySet<string> = new Set(
-  listCatalog()
-    .filter((entry) => entry.wired)
-    .map((entry) => entry.id),
-);
-
-function isItemShape(i: unknown): i is Item {
-  if (i === null || typeof i !== "object") return false;
-  const r = i as Record<string, unknown>;
-  if (typeof r.id !== "string" || typeof r.kind !== "string" || typeof r.status !== "string") {
-    return false;
-  }
-  // Item.id is a domain id (protocol pin §1 "IDs"): `../x` and friends are protocol violations.
-  if (!isDomainId(r.id)) return false;
-  // Copilot r4109396318: `kind` and `status` must be members of the pinned unions.
-  if (!(ITEM_KINDS as readonly string[]).includes(r.kind)) return false;
-  if (!(ITEM_STATUSES as readonly string[]).includes(r.status)) return false;
-  if (r.kind === "agentMessage") return typeof r.text === "string";
-  if (r.kind === "servedModel") {
-    return (
-      typeof r.requestedModel === "string" &&
-      typeof r.servedModel === "string" &&
-      typeof r.backing === "string" &&
-      SERVED_MODEL_BACKINGS.has(r.backing) &&
-      typeof r.providerId === "string"
-    );
-  }
-  return true;
-}
-
-function isErrorBody(e: unknown): boolean {
-  if (e === null || typeof e !== "object") return false;
-  const r = e as Record<string, unknown>;
-  return Number.isInteger(r.code) && typeof r.message === "string";
-}
-
-/** Minimal runtime shape check of a `Turn` from the wire (fields the CLI reads). */
-function isTurnShape(t: unknown): t is Turn {
-  if (t === null || typeof t !== "object") return false;
-  const r = t as Record<string, unknown>;
-  return (
-    typeof r.id === "string" &&
-    typeof r.threadId === "string" &&
-    typeof r.status === "string" &&
-    Array.isArray(r.items) &&
-    r.items.every(isItemShape) &&
-    typeof r.startedAt === "number" &&
-    (r.completedAt === null || typeof r.completedAt === "number") &&
-    // Copilot r4108941737: `error` is required, and is null or an RPC error body.
-    Object.hasOwn(r, "error") &&
-    (r.error === null || isErrorBody(r.error)) &&
-    // Protocol type: `error` is set iff the status is `failed` (Copilot r4109224803), so a
-    // `completed` turn carrying an error can never map to exit 0. Status strings stay verbatim.
-    (r.status === "failed") === (r.error !== null)
-  );
-}
-
-/** Protocol pin §5 ThreadStatus. */
-const THREAD_STATUSES: readonly string[] = ["idle", "active", "closed"];
-
-/**
- * Full `Thread` shape check (erratum §3b N5/N7, protocol pin §5): every field the pin lists, with
- * `seatId` equal to the seat the CLI asked for.
- */
-function isThreadShape(t: unknown, seatId: string): t is Thread {
-  if (t === null || typeof t !== "object") return false;
-  const r = t as Record<string, unknown>;
-  return (
-    isDomainId(r.id) &&
-    isDomainId(r.seatId) &&
-    r.seatId === seatId &&
-    (typeof r.cwd === "string" || r.cwd === null) &&
-    typeof r.createdAt === "number" &&
-    typeof r.updatedAt === "number" &&
-    typeof r.status === "string" &&
-    THREAD_STATUSES.includes(r.status) &&
-    typeof r.preview === "string"
-  );
-}
-
-/**
- * Erratum §3b "well-formed message": every object in `client.messages` is a notification, a
- * response, or malformed (N2–N4). The `jsonrpc` field is neither required nor checked.
- * Accepts `unknown` and never throws (Copilot PR #23): a non-object JSON value classifies as the
- * N4-style malformed case. (The client already routes non-object lines to `protocolViolations`
- * instead of `messages`; this is belt-and-braces.)
- */
-type MessageClass =
-  | { readonly kind: "ok" }
-  | { readonly kind: "n2" } // both an id and a method
-  | { readonly kind: "n3" } // neither a method nor an id
-  | { readonly kind: "n4"; readonly malformedError: boolean }; // any other malformed object
-
-export function classifyMessage(m: unknown): MessageClass {
-  if (m === null || typeof m !== "object" || Array.isArray(m)) {
-    return { kind: "n4", malformedError: false };
-  }
-  const w = m as WireMessage;
-  const hasId = Object.hasOwn(w, "id");
-  const hasMethod = Object.hasOwn(w, "method");
-  if (hasId && hasMethod) return { kind: "n2" };
-  if (!hasId && !hasMethod) return { kind: "n3" };
-  if (hasMethod) {
-    // A notification: `method` must be a string (there is no own id key here).
-    return typeof w.method === "string" ? { kind: "ok" } : { kind: "n4", malformedError: false };
-  }
-  // A response: own id that is a number or a string, or null together with `error`; exactly one
-  // of own `result` and own `error`; an error is an integer code plus a string message.
-  if (typeof w.id !== "number" && typeof w.id !== "string" && w.id !== null) {
-    return { kind: "n4", malformedError: false };
-  }
-  const hasResult = Object.hasOwn(w, "result");
-  const hasError = Object.hasOwn(w, "error");
-  if (hasResult === hasError) return { kind: "n4", malformedError: false };
-  if (w.id === null && !hasError) return { kind: "n4", malformedError: false };
-  if (hasError && !isErrorBody(w.error)) return { kind: "n4", malformedError: true };
-  return { kind: "ok" };
-}
-
-function violationMessage(c: Exclude<MessageClass, { kind: "ok" }>): string {
-  switch (c.kind) {
-    case "n2":
-      return "protocol violation: engine message with both id and method";
-    case "n3":
-      return "protocol violation: engine message with neither method nor id";
-    case "n4":
-      return c.malformedError
-        ? "protocol violation: malformed error response"
-        : "protocol violation: malformed engine message";
-  }
-}
+// The wire validators and E11 sanitiser moved to `app/wire.ts` (shared with the Witness app,
+// DESIGN-SPEC §5.10 E-d); the imports above keep the same names for every call site below.
 
 function servedModelOf(item: Item | null | undefined): ServedModel | null {
   if (item === null || typeof item !== "object" || item.kind !== "servedModel") return null;
@@ -639,7 +502,10 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
       done.catch(() => undefined);
       if (stream && io.stderrIsTTY) {
         statusTimer = setInterval(() => {
-          io.stderr.write(`\r… ${seatId} · ${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+          const text = `… ${seatId} · ${((Date.now() - startedAt) / 1000).toFixed(1)}s`;
+          // P-7: the same pinned text, drawn as a filled pill in tier W; the \r\x1b[K clear is
+          // unchanged in every tier (IQ-14).
+          io.stderr.write(`\r\u001b[K${statusPill(text, io)}`);
         }, 200);
       }
       if (sigintPending) throw new Forced();
@@ -964,24 +830,100 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
   } else if (cleanText !== "") {
     io.stdout.write(cleanText.endsWith("\n") ? cleanText : `${cleanText}\n`);
   }
+  // §3.3/§3.4: the receipt's tier (both-TTY gate for every human stderr line, RQ-1). Piped
+  // stdout, --json and TERM=dumb keep today's plain bytes exactly (hard rule 1).
+  const tier = decideTier({
+    stdoutIsTTY: io.stdoutIsTTY,
+    stderrIsTTY: io.stderrIsTTY,
+    stdinIsTTY: false,
+    columns: io.columns,
+    rows: io.rows,
+    env: io.env,
+    json: opts.json,
+    human: true,
+  });
+  const style = Style.forDepth(tier.depth, tier.ascii);
+  const g = glyphsFor(tier.ascii);
   if (threadId !== null) {
     const turnWord = turnStartDisplay === "not-started" ? "NOT STARTED" : "UNKNOWN";
-    io.stderr.write(
-      stripControls(receipt(finalTurn, turnWord, durationMs, served, session, error, exit)),
-    );
+    const data: ReceiptData = {
+      turn: finalTurn === null ? null : { status: finalTurn.status, id: finalTurn.id, durationMs },
+      turnWord,
+      served,
+      session,
+      error,
+      exit,
+    };
+    if (tier.tier === "W" && io.stderrIsTTY) {
+      // §6.1: the pinned receipt rows verbatim inside the verdict card (stderr, one write).
+      // Engine-supplied values are sanitised at the data boundary (§5.10 E-a); the card's own
+      // chrome must never run through the control-char replacer.
+      const card = renderVerdictCard(
+        oneShotVerdict(exit, session, finalTurn),
+        sanitizeReceiptData(data),
+        io.columns ?? 80,
+        style,
+        g,
+      );
+      io.stderr.write(`${card.join("\n")}\n`);
+    } else if (tier.tier === "A") {
+      // §6.2 spans are chrome: engine values were sanitised at the data boundary, so the
+      // assembled receipt must not run through the control-char replacer.
+      io.stderr.write(receiptTierA(sanitizeReceiptData(data)));
+    } else {
+      io.stderr.write(stripControls(receiptPlain(data)));
+    }
   } else if (error !== null) {
     const e = error as ErrorOut;
-    io.stderr.write(
-      stripControls(
-        `madc: ${e.class} error${e.code === null ? "" : ` ${e.code}`}: ${e.message}\nexit ${exit}\n`,
-      ),
-    );
+    const messageLine = `madc: ${stripControls(e.class)} error${e.code === null ? "" : ` ${e.code}`}: ${stripControls(e.message)}\n`;
+    const exitLine = `exit ${exit}\n`;
+    // §6.2: pre-thread message 31, exit digits 1;31 (IQ-5) under the same both-TTY gate. The
+    // engine-supplied parts were sanitised above; the spans are chrome and stay.
+    if (tier.depth !== "none" && io.stderrIsTTY) {
+      io.stderr.write(
+        `\u001b[31m${messageLine.replace("\n", "")}\u001b[0m\nexit \u001b[1;31m${exit}\u001b[0m\n`,
+      );
+    } else {
+      io.stderr.write(`${messageLine}${exitLine}`);
+    }
   }
   return exit;
 }
 
+/** §6.1 verdict rule: COMPLETED only on chain VERIFIED + exit 0; FAILED for turn/chain failure;
+ * EXIT n otherwise; UNVERIFIED exit 0 draws the warn title with no big art. */
+function oneShotVerdict(exit: number, session: SessionOut | null, turn: Turn | null): Verdict {
+  if (exit === EXIT.ok) {
+    if (session?.chain === "verified" && turn !== null && turn.status === "completed") {
+      return { kind: "completed" };
+    }
+    return { kind: "unverified" };
+  }
+  if (turn?.status === "failed" || session?.chain === "failed") return { kind: "failed" };
+  return { kind: "exit", code: exit };
+}
+
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** §6.1 P-7: the status text unchanged; tier W adds the accent fill, tier A stays plain.
+ * Round 8: the tier decision uses the REAL CliIO terminal facts (TTY flags, columns, rows,
+ * env) — the previous call supplied undefined dimensions and forced stdin non-TTY, which
+ * selected Level A on every terminal, so the pill never got its tier-W fill. */
+export function statusPill(text: string, io: CliIO): string {
+  const tier = decideTier({
+    stdoutIsTTY: io.stdoutIsTTY,
+    stderrIsTTY: io.stderrIsTTY,
+    stdinIsTTY: io.stdinIsTTY === true,
+    columns: io.columns,
+    rows: io.rows,
+    env: io.env,
+    json: false,
+    human: true,
+  });
+  if (tier.tier !== "W") return text;
+  return Style.forDepth(tier.depth, tier.ascii).filled("accent", text);
 }
 
 /** Read-only re-read + verify of `sessions/<threadId>.jsonl` (CLI pin §2 `session` line). */
@@ -1016,49 +958,5 @@ function verifyThread(
   return { path, seq, headHash: v.lastHash, chain: "verified" };
 }
 
-const RULE = `─ receipt ${"─".repeat(45)}`;
-
-function receipt(
-  turn: Turn | null,
-  turnWord: string,
-  durationMs: number,
-  served: ServedModel | null,
-  session: SessionOut | null,
-  error: ErrorOut | null,
-  exit: number,
-): string {
-  const lines = [RULE];
-  if (turn === null) {
-    lines.push(` turn     ${turnWord.padEnd(20)} -`);
-  } else {
-    lines.push(
-      ` turn     ${turn.status.toUpperCase().padEnd(20)} ${turn.id.padEnd(15)} ${(durationMs / 1000).toFixed(1)}s`,
-    );
-  }
-  lines.push(
-    served === null
-      ? " model    NO RECEIPT"
-      : ` model    ${served.requestedModel} → ${served.servedModel}   (${served.backing})`,
-  );
-  if (session !== null) {
-    lines.push(` session  ${session.path}`);
-    if (session.chain === "failed") {
-      lines.push(`          chain FAILED line ${session.line}: ${session.reason}`);
-    } else if (session.chain === "unverified") {
-      const where =
-        session.seq === null ? "" : `seq ${session.seq} · head ${session.headHash.slice(0, 12)} · `;
-      lines.push(`          ${where}UNVERIFIED: ${session.reason}`);
-    } else {
-      lines.push(
-        `          seq ${session.seq} · head ${session.headHash.slice(0, 12)} · chain VERIFIED`,
-      );
-    }
-  }
-  if (error !== null) {
-    lines.push(
-      ` error    ${error.class}${error.code === null ? "" : ` ${error.code}`}: ${error.message}`,
-    );
-  }
-  lines.push(` exit     ${exit}`);
-  return `${lines.join("\n")}\n`;
-}
+// The pinned receipt rows moved to `app/receipt.ts` (shared with the app's exit receipt and
+// the tier-W verdict card, DESIGN-SPEC §5.12/§6.1); `receiptPlain` reproduces these bytes.

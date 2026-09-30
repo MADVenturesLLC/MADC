@@ -26,6 +26,7 @@ sessions/
 transcripts/
 .madc/
 .claude/settings.local.json
+.mimosa/
 
 # Local agent tool state (never committed; biome skips them via vcs.useIgnoreFile)
 .qwen/
