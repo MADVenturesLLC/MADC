@@ -133,7 +133,9 @@ function defaultRunCommand(
     child.stdout.setEncoding("utf8").on("data", (chunk: string) => (stdout += chunk));
     child.stderr.setEncoding("utf8").on("data", (chunk: string) => (stderr += chunk));
     child.on("error", () => finish(null));
-    child.on("exit", (code) => finish(code));
+    // `close`, not `exit`: Node may emit `exit` before the child's last stdout chunk is delivered,
+    // which would read an existing record as "" (found by M1-A5 CI). `close` waits for stdio.
+    child.on("close", (code) => finish(code));
     // A dead child's stdin errors with EPIPE; the exit path above already settled the outcome.
     child.stdin.on("error", () => undefined);
     child.stdin.end(spec.input ?? "");
