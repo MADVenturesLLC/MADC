@@ -10,6 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { defaultAgentFactory } from "./main.ts";
+import { denyAllRepoPolicy } from "./policy/store.ts";
 import { ErrorCode } from "./protocol/errors.ts";
 import { CLIENT_REQUEST_METHODS, CLIENT_REQUEST_PARAM_FIELDS } from "./protocol/types.ts";
 import { createRedactor, REDACTED, verifySessionFile } from "./session-store.ts";
@@ -257,7 +258,7 @@ test("A2 a raw secret line on the session stdin stays a -32700 parse error and i
 
 // ------------------------------------------------------- redaction (seat pin §4.2 / S6, plan G)
 
-test("A2 redaction: xai-…, sk-sp-… and generic sk-… shapes never persist, and the chain still verifies", async () => {
+test("A2/A4 redaction: xai-…, sk-sp-…, AIza… and generic sk-… shapes never persist, and the chain still verifies", async () => {
   const sb = authSandbox();
   const client = startEngine(sb.home, ECHO_ENGINE, sb.env);
   try {
@@ -266,7 +267,9 @@ test("A2 redaction: xai-…, sk-sp-… and generic sk-… shapes never persist, 
     const xai = "xai-synthetic-redaction-key-0123456789";
     const plan = "sk-sp-synthetic-plan-key-0123456789";
     const generic = "sk-synthetic-generic-key-0123456789abcdef";
-    const text = `pasted ${xai} and ${plan} and ${generic}`;
+    // S6 (M1-A4): the Gemini lane's standard Google API-key shape.
+    const gemini = "AIzaSySyntheticGeminiKeyValue0123456789";
+    const text = `pasted ${xai} and ${plan} and ${generic} and ${gemini}`;
     const { turn } = await client.request("turn/start", {
       threadId: thread.id,
       input: [{ type: "text", text }],
@@ -275,7 +278,7 @@ test("A2 redaction: xai-…, sk-sp-… and generic sk-… shapes never persist, 
 
     const path = join(sb.home, "sessions", `${thread.id}.jsonl`);
     const onDisk = readFileSync(path, "utf8");
-    for (const secret of [xai, plan, generic]) {
+    for (const secret of [xai, plan, generic, gemini]) {
       assert.ok(!onDisk.includes(secret), `${secret.slice(0, 8)}… must never persist`);
     }
     assert.ok(onDisk.includes(REDACTED));
@@ -311,7 +314,10 @@ test("A2 the redactor learns every stored key: the store-resolved credential is 
       saved[name] = process.env[name];
       process.env[name] = value;
     }
-    const agent = await defaultAgentFactory({ home: join(root, "home") });
+    const agent = await defaultAgentFactory({
+      home: join(root, "home"),
+      repoPolicy: denyAllRepoPolicy(),
+    });
     assert.deepStrictEqual([...(agent.redactValues ?? [])], [learned]);
     const redacted = createRedactor(agent.redactValues ?? [])({
       text: `before ${learned} after`,

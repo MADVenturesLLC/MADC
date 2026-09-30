@@ -67,6 +67,20 @@ export type TurnEndPayload = {
   status: Exclude<TurnStatus, "inProgress">;
   error: { code: number; message: string } | null;
 };
+/**
+ * Seat pin §4.2 (S4, added by M1-A4): one repo-gated provider decision, recording the RESOLVED
+ * identity (normalized remote, realpath'd top-level) and the reason. `remote` / `topLevel` are null
+ * on the half that could not be resolved, so an ambiguous identity never reports a value it did not
+ * establish. Carries no credential and never the caller-supplied `cwd` string.
+ */
+export type RepoDecisionPayload = {
+  turnId: string;
+  providerId: string;
+  remote: string | null;
+  topLevel: string | null;
+  decision: "allow" | "deny";
+  reason: string;
+};
 export type SessionClosePayload = { reason: string };
 
 export type SessionPayloads = {
@@ -75,6 +89,7 @@ export type SessionPayloads = {
   item: ItemPayload;
   servedModel: ServedModelPayload;
   "fallback.rejected": FallbackRejectedPayload;
+  "repo.decision": RepoDecisionPayload;
   "turn.end": TurnEndPayload;
   "session.close": SessionClosePayload;
 };
@@ -85,6 +100,7 @@ export const SESSION_EVENT_TYPES: readonly SessionEventType[] = Object.freeze([
   "item",
   "servedModel",
   "fallback.rejected",
+  "repo.decision",
   "turn.end",
   "session.close",
 ]);
@@ -147,6 +163,11 @@ export const TOKEN_PATTERNS: readonly RegExp[] = Object.freeze([
   // which the generic `sk-…` shape above only catches from 16 chars after `sk-`).
   /\bxai-[A-Za-z0-9_-]{8,}/g,
   /\bsk-sp-[A-Za-z0-9_-]{8,}/g,
+  // S6 (M1-A4): the Gemini lane's standard Google API-key shape. `gemini-api-key` accepts AUTH keys
+  // only and the auth-key shape is not documented in any pinned source, so this catches the shape
+  // Google's page names as the one being retired — and the planning record's own secret grep lists
+  // `AIza` alongside `sk-` and `ghp_`.
+  /\bAIza[A-Za-z0-9_-]{20,}/g,
   /\bgh[pousr]_[A-Za-z0-9]{20,}/g,
   /\bxox[abp]-[A-Za-z0-9-]{10,}/g,
   /\bAKIA[0-9A-Z]{16}\b/g,
@@ -873,6 +894,10 @@ const PROVIDER_STATUSES: readonly unknown[] = [
   "forbidden",
 ];
 const TURN_MODES: readonly unknown[] = ["interactive", "headless"];
+/** M1 seat pin §4.2 `repo.decision` (added by M1-A4). */
+const REPO_DECISIONS: readonly unknown[] = ["allow", "deny"];
+const REPO_ALLOW_REASONS: readonly unknown[] = ["repo-allowed", "not-repo-gated"];
+const REPO_DENY_REASONS: readonly unknown[] = ["repo-not-allowed", "repo-identity-ambiguous"];
 
 /**
  * A receipt / `session.open` backing is any WIRED registry id (seat pin S1; M0's three-literal
@@ -966,6 +991,19 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
         p.reason === "fallback-lane-mismatch"
         ? null
         : "malformed fallback.rejected payload";
+    }
+    case "repo.decision": {
+      const reasonOk =
+        (p.decision === "allow" && REPO_ALLOW_REASONS.includes(p.reason)) ||
+        (p.decision === "deny" && REPO_DENY_REASONS.includes(p.reason));
+      return isValidId(p.turnId) &&
+        isStr(p.providerId) &&
+        (p.remote === null || isStr(p.remote)) &&
+        (p.topLevel === null || isStr(p.topLevel)) &&
+        REPO_DECISIONS.includes(p.decision) &&
+        reasonOk
+        ? null
+        : "malformed repo.decision payload";
     }
     case "turn.end": {
       const err = p.error;

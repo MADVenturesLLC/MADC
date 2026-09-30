@@ -2,11 +2,13 @@ import { lstatSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import type { Readable, Writable } from "node:stream";
-import { getById } from "@madc/registry";
+import { canServe, getById } from "@madc/registry";
 import type { Agent, AgentTurnContext, TurnSink } from "./agent.ts";
 import { type CredentialStore, createCredentialStore } from "./credentials/store.ts";
 import { confinedPath, sessionsOwnerReadUnsupported } from "./home.ts";
 import { acquireThreadLock, holdsThreadLock, type LockHandle, releaseThreadLock } from "./lock.ts";
+import { type RepoIdentityDeps, resolveRepoIdentity } from "./policy/identity.ts";
+import { denyAllRepoPolicy, isRepoGated, type RepoPolicy } from "./policy/store.ts";
 import {
   alreadyInitialized,
   ErrorCode,
@@ -15,6 +17,7 @@ import {
   invalidRequest,
   methodNotFound,
   notInitialized,
+  providerRefusalError,
   RpcError,
   type SessionWriteFailedData,
   threadNotFound,
@@ -25,6 +28,7 @@ import { isValidId, newId } from "./protocol/ids.ts";
 import {
   type AuthStatusResult,
   DEFAULT_SEAT_ID,
+  ENGINE_TURN_MODE,
   type InitializeResult,
   type Item,
   PROTOCOL_VERSION,
@@ -73,6 +77,15 @@ export type EngineOptions = {
    * store backed by a fake keychain.
    */
   credentials?: CredentialStore;
+  /**
+   * M1-A4: the loaded `$MADC_HOME/policy.json` repo allowlists (seat pin §5). Default: the
+   * deny-everywhere policy, which is also what a clean install resolves to (D-M1-8) — so an engine
+   * that never loads the file cannot widen access. Production wiring in `main.ts` always passes the
+   * loaded policy.
+   */
+  repoPolicy?: RepoPolicy;
+  /** M1-A4 test seam: `realpath` / `git` injection for repo-identity resolution. */
+  repoIdentityDeps?: RepoIdentityDeps;
 };
 
 type TurnRecord = {
@@ -181,9 +194,61 @@ export class EngineConnection {
   readonly #poisoned = new Map<string, { path: string; seq: number }>();
   /** M1-A2 credential store, created on the first `auth/*` call (never at construction). */
   #credentials: CredentialStore | null = null;
+  /** M1-A4 repo allowlists (seat pin §5); deny-everywhere unless a loaded policy was supplied. */
+  readonly #repoPolicy: RepoPolicy;
 
   constructor(opts: EngineOptions) {
     this.#opts = opts;
+    this.#repoPolicy = opts.repoPolicy ?? denyAllRepoPolicy();
+  }
+
+  /**
+   * M1-A4 repo-policy gate for the seat's assigned backing (protocol pin §4.2: repo-policy checks
+   * run in `turn/start` before any model or vendor call; protocol pin §2: repo identity resolution
+   * is ENGINE-owned, so the caller-supplied `cwd` string is never matched against an allowlist).
+   *
+   * Runs BEFORE the agent's preflight, because D-M1-8 must be observable on a clean install: an
+   * empty allowlist denies every repo with `-32007 repo-not-allowed`, including when no DeepSeek
+   * credential is configured. It is skipped for a lane that could not serve this turn's mode anyway,
+   * so it never pre-empts a `forbidden` / `interactive-only-headless` / `headless-not-permitted`
+   * denial that `assertAllowed` owns (M1-A5's acceptance depends on that ordering).
+   *
+   * The decision is durable BEFORE it is acted on: the pinned `repo.decision` event (seat pin §4.2)
+   * is appended first, and an append failure poisons the writer and surfaces as `-32009` — a
+   * decision that is not recorded is not claimed. `turnId` is therefore minted before preflight; it
+   * is a pure local id, so C3's "append `turn.start` only after preflight" ordering is unchanged.
+   * A denial leaves a `repo.decision` line with no `turn.start`, which `rebuildSession` ignores.
+   */
+  #repoGate(record: ThreadRecord, turnId: string): void {
+    const providerId = record.seat.seat.preferredBacking;
+    if (!isRepoGated(providerId)) return;
+    const entry = getById(providerId);
+    if (entry === undefined || !canServe(entry, ENGINE_TURN_MODE)) return;
+
+    const resolution = resolveRepoIdentity(record.thread.cwd, this.#opts.repoIdentityDeps ?? {});
+    const decision = this.#repoPolicy.decide(providerId, resolution);
+    try {
+      record.session.append("repo.decision", {
+        turnId,
+        providerId,
+        remote: decision.remote,
+        topLevel: decision.topLevel,
+        decision: decision.decision,
+        reason: decision.reason,
+      });
+    } catch (err) {
+      if (!(err instanceof RpcError)) throw err;
+      this.#notePoisoned(record.thread.id, record.session);
+      throw err;
+    }
+    this.#log(`repo gate ${providerId}: ${decision.decision} (${decision.reason})`);
+    if (decision.decision === "deny") {
+      throw providerRefusalError({
+        providerId,
+        reason: decision.reason,
+        status: entry.status,
+      });
+    }
   }
 
   /**
@@ -847,14 +912,19 @@ export class EngineConnection {
     if (record.session.broken) {
       throw sessionWriteFailed(threadId, record.session.path, record.session.nextSeq);
     }
+    const ctx = this.#turnContext(record, input);
+    // M1-A4: the repo-policy gate runs before preflight (D-M1-8 must be observable on a clean
+    // install), and its pinned receipt names the turn it gated — so the turn id is minted here.
+    // Minting an id is pure, so Amendment 3 C3's ordering (preflight at step 4, the `turn.start`
+    // append at step 5) is unchanged.
+    const turnId = newId("turn");
+    this.#repoGate(record, turnId);
     // C3 step 4: seat / registry / credential preflight, exactly once, against the record that
     // will append (the reloaded record after a re-take; D-162). A refusal after a re-take leaves
     // the re-taken lock held by this process, as any refused turn/start does.
-    const ctx = this.#turnContext(record, input);
     this.#opts.agent.preflight?.(ctx);
 
     const now = Date.now();
-    const turnId = newId("turn");
     // turn.start is durable before the turn exists: an append failure is a -32009 response error.
     try {
       // C3 step 5: only after preflight, append turn.start.
@@ -920,6 +990,9 @@ export class EngineConnection {
       seat: record.seat.seat,
       seatPath: record.seat.path,
       input,
+      // M1-A4: context only. A repo-gated provider's identity is resolved by the engine from this
+      // path (seat pin §5); the string itself is never matched against an allowlist.
+      cwd: record.thread.cwd,
     };
   }
 
@@ -1040,6 +1113,22 @@ export class EngineConnection {
         if (!live()) return false;
         try {
           record.session.append("fallback.rejected", payload);
+          return true;
+        } catch (err) {
+          if (!(err instanceof RpcError)) throw err;
+          this.#notePoisoned(record.thread.id, record.session);
+          this.#finishTurn(record, tr, "failed", err.toBody());
+          return false;
+        }
+      },
+      repoDecision: (payload) => {
+        // M1-A4: the durable `repo.decision` receipt for a repo-gated FALLBACK CANDIDATE (the
+        // assigned backing is gated inside `turn/start`). Same durability rule as
+        // `fallbackRejected`: a failed append poisons and fails the turn, and the `false` return
+        // stops the agent from building or calling that candidate.
+        if (!live()) return false;
+        try {
+          record.session.append("repo.decision", payload);
           return true;
         } catch (err) {
           if (!(err instanceof RpcError)) throw err;

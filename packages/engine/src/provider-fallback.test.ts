@@ -20,12 +20,14 @@ import {
 } from "@madc/adapters";
 import type { AgentTurnContext, TurnSink } from "./agent.ts";
 import { defaultAgentFactory } from "./main.ts";
+import { denyAllRepoPolicy } from "./policy/store.ts";
 import { ErrorCode, RpcError } from "./protocol/errors.ts";
 import type { Item, ServedModelItem } from "./protocol/types.ts";
 import { createProviderAgent, type DirectLane } from "./provider-agent.ts";
 import { type EngineSeat, MADC_DEFAULT_SEAT } from "./seat.ts";
 import {
   type FallbackRejectedPayload,
+  type RepoDecisionPayload,
   rebuildSession,
   unguardedSessionWriterForTests,
   verifySessionFile,
@@ -51,12 +53,21 @@ type Captured = {
   items: Item[];
   deltas: Array<{ id: string; delta: string }>;
   rejections: FallbackRejectedPayload[];
+  repoDecisions: RepoDecisionPayload[];
 };
 
-function captureSink(options: { rejectionRecorded?: boolean } = {}): TurnSink & {
+function captureSink(
+  options: { rejectionRecorded?: boolean; repoDecisionRecorded?: boolean } = {},
+): TurnSink & {
   captured: Captured;
 } {
-  const captured: Captured = { started: [], items: [], deltas: [], rejections: [] };
+  const captured: Captured = {
+    started: [],
+    items: [],
+    deltas: [],
+    rejections: [],
+    repoDecisions: [],
+  };
   const controller = new AbortController();
   let n = 0;
   return {
@@ -80,6 +91,11 @@ function captureSink(options: { rejectionRecorded?: boolean } = {}): TurnSink & 
       // false simulates the server sink whose fallback.rejected append failed: the session is
       // poisoned and the turn is already finalized (Copilot 4131965600).
       return options.rejectionRecorded ?? true;
+    },
+    repoDecision: (payload) => {
+      captured.repoDecisions.push(payload);
+      // false simulates the server sink whose repo.decision append failed (M1-A4).
+      return options.repoDecisionRecorded ?? true;
     },
   };
 }
@@ -142,6 +158,8 @@ function ctxFor(seat: EngineSeat): AgentTurnContext {
     seat,
     seatPath: join(tmpdir(), `${seat.id}.json`),
     input: [{ type: "text", text: "hi" }],
+    // No lane exercised here is repo-gated, so the identity is never resolved (M1-A4).
+    cwd: null,
     turnId: "turn_fb",
   };
 }
@@ -265,9 +283,10 @@ test("A3: a candidate without credentials is skipped; when nobody can serve, the
     directLanes: [
       kimiLane(port),
       {
-        // xai-api is same-lane (allowed-direct + payg) and headless-allowed, but UNWIRED until
-        // A4: assertAllowed(requireLive) denies it → skipped before any call.
-        providerId: "xai-api",
+        // openrouter is same-lane with kimi-code (allowed-direct + payg) and headless-allowed, but
+        // UNWIRED (no M1 act lands its adapter): assertAllowed(requireLive) denies it → skipped
+        // before any call. This fixture was xai-api until M1-A4 wired that lane.
+        providerId: "openrouter",
         credential: null,
         createPort: () => {
           throw new Error("never built");
@@ -277,7 +296,7 @@ test("A3: a candidate without credentials is skipped; when nobody can serve, the
     ],
   });
   const sink = captureSink();
-  const seat = seatWith({ fallbacks: ["xai-api"] });
+  const seat = seatWith({ fallbacks: ["openrouter"] });
   const err = await agent.run(ctxFor(seat), sink).then(
     () => null,
     (e: unknown) => e,
@@ -559,8 +578,13 @@ test("A3: defaultAgentFactory resolves every direct lane from the M1-A2 store an
       saved[name] = process.env[name];
       process.env[name] = value;
     }
-    const agent = await defaultAgentFactory({ home: join(root, "home") });
+    const agent = await defaultAgentFactory({
+      home: join(root, "home"),
+      repoPolicy: denyAllRepoPolicy(),
+    });
     const learned = [...(agent.redactValues ?? [])].sort();
+    // Only kimi-code and ollama-cloud exist in this fake keychain: the four M1-A4 lanes resolve to
+    // null, so they contribute no redaction value and the list is unchanged.
     assert.deepEqual(learned, [kimiKey, ollamaKey].sort());
   } finally {
     for (const [name, value] of Object.entries(saved)) {

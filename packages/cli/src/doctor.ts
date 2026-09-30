@@ -30,7 +30,10 @@ import {
   inspectMadcHome,
   isPidAlive,
   listCatalog,
+  loadRepoPolicy,
   PROTOCOL_VERSION,
+  REPO_GATED_PROVIDER_IDS,
+  type RepoPolicyLoad,
   readLock,
   resolveMadcHome,
   sessionsOwnerReadUnsupported,
@@ -853,6 +856,76 @@ function checkRegistry(): Check {
   }
 }
 
+/**
+ * M1-A4: the `$MADC_HOME/policy.json` repo allowlists (M1 seat pin §5). Read-only, like every other
+ * doctor row. Reports what the engine reports at start: entries rejected AT LOAD (a path-only entry,
+ * an entry whose remote does not normalize, a key that is not a registry id), a file refused
+ * outright, and a mode more permissive than the pinned `0600`.
+ *
+ * A rejected entry GRANTS NOTHING, so each one is a WARN the operator must see: the allowlist they
+ * meant to write is not the allowlist in force, and the lane silently denies. Never prints a
+ * credential value, and never prints an entry's own text — a remote can carry
+ * `https://user:token@host/…`, so rejections are identified by provider id and position only.
+ */
+function checkPolicy(home: HomeState): Check {
+  if (home.kind !== "present") return skip("policy", "MADC_HOME is not present: nothing to read");
+  const gated = [...REPO_GATED_PROVIDER_IDS];
+  let loaded: RepoPolicyLoad;
+  try {
+    loaded = loadRepoPolicy(home.path);
+  } catch (err) {
+    // loadRepoPolicy is total; this is the belt-and-braces path so doctor itself never throws.
+    return { id: "policy", status: "fail", summary: `policy.json: ${errText(err)}`, evidence: {} };
+  }
+  if (!loaded.present) {
+    return {
+      id: "policy",
+      status: "pass",
+      summary: `no policy.json: repo-gated providers (${gated.join(", ")}) deny every repository (D-M1-8 clean-install default)`,
+      evidence: { present: false, repoGated: gated, allowEntries: 0 },
+    };
+  }
+
+  let allowEntries = 0;
+  for (const list of loaded.policy.allow.values()) allowEntries += list.length;
+  const evidence: Record<string, unknown> = {
+    present: true,
+    repoGated: gated,
+    providers: [...loaded.policy.allow.keys()],
+    allowEntries,
+    rejected: loaded.rejected.length,
+  };
+
+  const warnings: string[] = [];
+  // A refused file is fail-closed (deny everywhere) but is never what the operator intended.
+  for (const { issue } of loaded.fileIssues) {
+    warnings.push(`${issue}; repo-gated providers deny every repository`);
+  }
+  for (const entry of loaded.rejected) {
+    const where = entry.index === null ? entry.providerId : `${entry.providerId}[${entry.index}]`;
+    warnings.push(`${where} rejected: ${entry.issue} (grants nothing)`);
+  }
+  if (loaded.permissiveMode !== null) {
+    evidence.mode = loaded.permissiveMode;
+    warnings.push(`mode ${loaded.permissiveMode} is more permissive than the pinned 0600`);
+  }
+
+  if (warnings.length > 0) {
+    return {
+      id: "policy",
+      status: "warn",
+      summary: `${warnings.length} policy.json problem(s): ${warnings.join("; ")}`,
+      evidence,
+    };
+  }
+  return {
+    id: "policy",
+    status: "pass",
+    summary: `${allowEntries} allowlist entries across ${loaded.policy.allow.size} repo-gated providers`,
+    evidence,
+  };
+}
+
 function checkKimiCredential(io: CliIO): Check {
   // M1-A2 (D-M1-5): credentials live in the OS keychain, resolved by the engine; the environment
   // satisfies presence ONLY under the pinned MADC_DEV_ENV_KEYS=1 development exception, which this
@@ -1042,6 +1115,7 @@ export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number>
       await new Promise((resolve) => setImmediate(resolve));
     }
     if (sig.exit === null) emit(checkRegistry());
+    if (sig.exit === null) emit(checkPolicy(home));
     if (sig.exit === null) emit(checkKimiCredential(io));
     if (sig.exit === null) emit(checkBin(io, "claude", "A5"));
     if (sig.exit === null) emit(checkBin(io, "codex", "A6"));

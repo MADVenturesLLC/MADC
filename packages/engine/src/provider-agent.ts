@@ -50,11 +50,14 @@ import {
 import {
   assertAllowed,
   type ConnectPreference,
+  canServe,
   getById,
   type ProviderEntry,
   RegistryDeniedError,
 } from "@madc/registry";
 import type { Agent, AgentTurnContext, TurnPreflightContext, TurnSink } from "./agent.ts";
+import { type RepoIdentityDeps, resolveRepoIdentity } from "./policy/identity.ts";
+import { denyAllRepoPolicy, isRepoGated, type RepoPolicy } from "./policy/store.ts";
 import {
   ErrorCode,
   internalError,
@@ -63,7 +66,7 @@ import {
   RpcError,
   type SeatInvalidData,
 } from "./protocol/errors.ts";
-import type { Item, ServedModelItem } from "./protocol/types.ts";
+import { ENGINE_TURN_MODE, type Item, type ServedModelItem } from "./protocol/types.ts";
 import { laneMismatch } from "./seats/lane.ts";
 
 /**
@@ -111,6 +114,15 @@ export type ProviderAgentOptions = {
   readonly detectCodexBinary?: () => string | null;
   /** stderr logger (never receives secrets or upstream text). */
   readonly log?: (line: string) => void;
+  /**
+   * M1-A4: the loaded `$MADC_HOME/policy.json` repo allowlists (seat pin §5). Used here ONLY for
+   * fallback candidates — the seat's assigned backing is gated by the engine inside `turn/start`
+   * (protocol pin §4.2), and gating it twice would write two receipts for one decision. Default:
+   * deny-everywhere, so "fallbacks never move into a repo-denied provider" holds even unwired.
+   */
+  readonly repoPolicy?: RepoPolicy;
+  /** M1-A4 test seam: `realpath` / `git` injection for repo-identity resolution. */
+  readonly repoIdentityDeps?: RepoIdentityDeps;
 };
 
 type TurnPlan =
@@ -149,9 +161,10 @@ const HALT: Walk = Object.freeze({ kind: "halt" });
 
 /**
  * Engine turns are non-interactive provider calls until M1-A5 lands mode attestation: `headless`
- * is the fail-closed mode for every `assertAllowed` check and every receipt.
+ * is the fail-closed mode for every `assertAllowed` check and every receipt. Shared with the
+ * server's M1-A4 repo gate so the two cannot disagree (protocol types, `ENGINE_TURN_MODE`).
  */
-const TURN_MODE = "headless" as const;
+const TURN_MODE = ENGINE_TURN_MODE;
 
 /** Intent `connect` per seat pin §2: from the registry entry; unknown ids fail closed as direct. */
 function connectFor(entry: ProviderEntry | undefined): ConnectPreference {
@@ -295,6 +308,9 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
     sink.completeItem(item);
   };
 
+  // M1-A4: deny-everywhere when nothing was loaded, so an unwired policy can never widen a lane.
+  const repoPolicy = options.repoPolicy ?? denyAllRepoPolicy();
+
   return Object.freeze({
     name: "provider",
     // Every resolved direct-lane key is redacted from session JSONL by exact value (seat pin
@@ -312,6 +328,42 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
       const primary = planFor(seat.preferredBacking, ctx);
       const fallbacks = seat.fallbacks;
       let nextIndex = 0;
+
+      /**
+       * M1-A4: a fallback never moves into a repo-denied provider (plan §6; seat pin §2). Resolved
+       * lazily, only for a repo-gated candidate the walk actually reaches, and recorded durably
+       * through the sink as the pinned `repo.decision` event. A denial skips the candidate with a
+       * log line, like every other ineligible candidate; `halt` means the receipt could not be
+       * persisted, so the session is poisoned and the turn already finalized — nothing further may
+       * be built or called.
+       *
+       * A lane that cannot serve this turn's mode at all is left to `planFor`'s own refusal, which
+       * keeps this gate from pre-empting a mode denial (M1-A5's `interactive-only-headless`).
+       */
+      const repoGateFor = (candidate: string): "proceed" | "skip" | "halt" => {
+        if (!isRepoGated(candidate)) return "proceed";
+        const entry = getById(candidate);
+        if (entry === undefined || !canServe(entry, TURN_MODE)) return "proceed";
+        const decision = repoPolicy.decide(
+          candidate,
+          resolveRepoIdentity(ctx.cwd, options.repoIdentityDeps ?? {}),
+        );
+        const recorded =
+          sink.repoDecision?.({
+            turnId: ctx.turnId,
+            providerId: candidate,
+            remote: decision.remote,
+            topLevel: decision.topLevel,
+            decision: decision.decision,
+            reason: decision.reason,
+          }) ?? true;
+        if (!recorded) return "halt";
+        if (decision.decision === "deny") {
+          options.log?.(`fallback ${candidate}: repo-denied (${decision.reason}); skipped`);
+          return "skip";
+        }
+        return "proceed";
+      };
 
       /**
        * The next fallback candidate worth a call. Same-lane mismatches are rejected BEFORE any
@@ -359,6 +411,11 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
             options.log?.(`fallback ${candidate}: rejected fallback-lane-mismatch`);
             continue;
           }
+          // M1-A4: never fall back into a repo-denied provider. Checked after the same-lane rule
+          // (a lane mismatch is the cheaper, purely static refusal) and before any call is planned.
+          const gate = repoGateFor(candidate);
+          if (gate === "halt") return HALT;
+          if (gate === "skip") continue;
           try {
             return { kind: "attempt", plan: planFor(candidate, ctx) };
           } catch (err) {

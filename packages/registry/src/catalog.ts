@@ -18,11 +18,13 @@ function deepFreeze<T extends object>(value: T): T {
  * docs/plan/subscription-lanes-2026-09-24.md; the two PAYG ids quote PLAN-madc-M1-build-plan.md
  * §7 M1-A1 (PAYG terms not re-verified on 2026-09-24 → wired: false, verifiedAt: "").
  *
- * `wired: true` only where the lane is actually wired in this build (kimi-code, claude-code,
- * codex from M0). Ollama Cloud, Mistral, DeepSeek, Gemini auth key, xAI API, the MiniMax and
- * Alibaba plans and Grok Build flip to wired: true in the act that lands their adapter
- * (M1-A3/A4/A5/A6), each PR citing its roadmap §3 row. `ollama-cloud` ships headless: "denied"
- * (D-M1-3): headless flips only with a reviewed catalog change adding headlessPermission.
+ * `wired: true` only where the lane is actually wired in this build: kimi-code, claude-code and
+ * codex from M0, ollama-cloud from M1-A3, and mistral-pro / deepseek-payg / gemini-api-key /
+ * xai-api from M1-A4. The MiniMax and Alibaba plans and Grok Build flip to wired: true in the act
+ * that lands their adapter (M1-A5/A6), each PR citing its roadmap §3 row. `ollama-cloud` ships
+ * headless: "denied" (D-M1-3): headless flips only with a reviewed catalog change adding
+ * headlessPermission. `deepseek-payg` being wired does NOT open the lane: it is repo-gated with an
+ * empty allowlist on a clean install (D-M1-8, seat pin §5), so every repo denies.
  */
 export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
   // --- Live from M0 (wired: true) ---
@@ -97,7 +99,9 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     connect: "direct",
     wire: "openai-compat",
     clientIdentity: "default",
-    wired: false,
+    // Wired by M1-A4 (roadmap §3 row 3: Mistral Pro — allowed-direct; pi-ai built-in `mistral`,
+    // mistral-conversations wire against https://api.mistral.ai/v1/chat/completions, Bearer key).
+    wired: true,
     credentialClass: "payg",
     headless: "allowed",
     verifiedAt: "2026-09-24",
@@ -112,7 +116,12 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     connect: "direct",
     wire: "openai-compat",
     clientIdentity: "default",
-    wired: false,
+    // Wired by M1-A4 (roadmap §3 row 4: DeepSeek PAYG — allowed-direct; pi-ai built-in `deepseek`,
+    // openai-completions wire against https://api.deepseek.com/chat/completions, Bearer key).
+    // WIRED BUT GATED (D-M1-8): this id is repo-gated by $MADC_HOME/policy.json (seat pin §5) and
+    // a clean install ships an EMPTY allowlist, so every repo denies with -32007 repo-not-allowed.
+    // Wiring the adapter does not open the lane; only the Founder naming a repo does.
+    wired: true,
     credentialClass: "payg",
     headless: "allowed",
     verifiedAt: "2026-09-24",
@@ -127,7 +136,13 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     connect: "direct",
     wire: "native",
     clientIdentity: "default",
-    wired: false,
+    // Wired by M1-A4 (roadmap §3 row 5: Gemini API auth key — allowed-direct; pi-ai built-in
+    // `google`, google-generative-ai wire against
+    // https://generativelanguage.googleapis.com/v1beta, x-goog-api-key header). AUTH KEYS ONLY:
+    // Google rejects standard keys from September 2026 (sourceQuote below), so `madc doctor` flags
+    // a standard-shaped key as a likely failure. No Google OAuth of any kind — Antigravity/Gemini
+    // sign-in stays `forbidden` (gemini-antigravity-signin).
+    wired: true,
     credentialClass: "payg",
     headless: "allowed",
     verifiedAt: "2026-09-24",
@@ -142,7 +157,12 @@ export const PROVIDER_CATALOG: readonly ProviderEntry[] = [
     connect: "direct",
     wire: "openai-compat",
     clientIdentity: "default",
-    wired: false,
+    // Wired by M1-A4 (roadmap §3 row 11: xAI API — allowed-direct; pi-ai built-in `xai`,
+    // openai-responses wire against https://api.x.ai/v1/responses, Bearer key). API KEY ONLY: the
+    // XAI_API_KEY-style credential comes from the M1-A2 keychain. pi-ai's own xAI OAuth
+    // (SuperGrok / X Premium sign-in) is NOT enabled — the adapter strips it, and consumer sign-in
+    // stays `forbidden` (xai-consumer-signin, AUP "bypassing our systems or protective measures").
+    wired: true,
     credentialClass: "payg",
     headless: "allowed",
     verifiedAt: "2026-09-24",

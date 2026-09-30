@@ -27,8 +27,18 @@ import {
   type ProviderTurnResult,
 } from "../provider-port.ts";
 
-/** Wire apis a direct-key lane can speak through pi-ai (registry `wire` field drives the choice). */
-export type DirectWireApi = "anthropic-messages" | "openai-completions";
+/**
+ * Wire apis a direct-key lane can speak through pi-ai (registry `wire` field drives the choice).
+ * M1-A3: `anthropic-messages` (kimi) and `openai-completions` (ollama). M1-A4 adds the three wire
+ * styles its four built-in lanes use: `mistral-conversations` (mistral), `google-generative-ai`
+ * (google) and `openai-responses` (xai); deepseek reuses `openai-completions`.
+ */
+export type DirectWireApi =
+  | "anthropic-messages"
+  | "openai-completions"
+  | "mistral-conversations"
+  | "google-generative-ai"
+  | "openai-responses";
 
 /** HTTP statuses mapped to the recorded `quota-or-unreachable` signal (plan M1-A3, pin P5). */
 export const QUOTA_OR_UNREACHABLE_STATUSES: readonly number[] = Object.freeze([429, 502]);
@@ -70,6 +80,29 @@ export type DirectKeyPortConfig = {
 export function leadingHttpStatus(errorMessage: string | undefined): number | null {
   const match = /^([1-5]\d\d)\b/.exec(errorMessage ?? "");
   return match?.[1] === undefined ? null : Number(match[1]);
+}
+
+/**
+ * The HTTP status pi-ai 0.87.1 reports for a failed provider call, across every wire a direct-key
+ * lane can speak. Its `utils/error-body.js` `formatProviderError` emits one of:
+ *
+ * - `"<status>: <body>"` — no prefix; caught by {@link leadingHttpStatus} (M1-A3's lanes).
+ * - `"<prefix> (<status>): <body>"` — with a prefix, e.g. `"xai API error (502): 502 \"…\""`. The
+ *   status is NOT leading here, so M1-A3's extractor alone would lose it and a 429/502 on the xAI
+ *   lane would never map to the recorded `quota-or-unreachable` signal (protocol pin §5 P5).
+ * - the upstream message unchanged, when pi-ai decides the message already carries the body — in
+ *   which case NO status is recoverable. Verified on the `google-generative-ai` wire, where the
+ *   `@google/genai` error message is the raw error body: a 429 there yields `null`. That is a
+ *   limitation of the pinned pi-ai, not of this port, and it is asserted as such in the Gemini
+ *   conformance test rather than papered over by guessing a status out of an upstream body.
+ *
+ * Only the status is kept; the body (which may echo request content) is never propagated.
+ */
+export function providerErrorStatus(errorMessage: string | undefined): number | null {
+  const leading = leadingHttpStatus(errorMessage);
+  if (leading !== null) return leading;
+  const prefixed = /\(([1-5]\d\d)\)/.exec(errorMessage ?? "");
+  return prefixed?.[1] === undefined ? null : Number(prefixed[1]);
 }
 
 function failure(
@@ -180,7 +213,7 @@ export function createDirectKeyPort(config: DirectKeyPortConfig): ProviderPort {
         throw failure(
           config,
           request.signal,
-          status ?? leadingHttpStatus(final.errorMessage),
+          status ?? providerErrorStatus(final.errorMessage),
           final.stopReason === "aborted",
         );
       }
@@ -192,6 +225,15 @@ export function createDirectKeyPort(config: DirectKeyPortConfig): ProviderPort {
       // OpenAI-compat lanes: pi-ai fills responseModel from the first chunk's `model` — the vendor
       // reported an identity even when it equals the requested id. Anthropic lanes omit the key so
       // the M0 three-key result shape is untouched (the engine derives vendorReported there).
+      //
+      // M1-A4 note (verified against pi-ai 0.87.1, so no test asserts what the wire cannot
+      // deliver): in the whole pinned package only `api/openai-completions.js` and
+      // `api/anthropic-messages.js` ever assign `responseModel`. So of the four A4 lanes only
+      // DeepSeek (openai-completions) can surface a vendor-reported identity; `mistral-
+      // conversations`, `google-generative-ai` and `openai-responses` leave it undefined even
+      // though their real responses do carry a model field. Those three receipts therefore record
+      // the requested model with `vendorReported: false`, which is what protocol pin §5's honesty
+      // rule requires — the condition below is already correct for all four and needs no widening.
       const vendorReported =
         config.api === "openai-completions" && final.responseModel !== undefined
           ? { vendorReported: true as const }
