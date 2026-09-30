@@ -10,6 +10,11 @@ export type CliIO = {
   readonly env: Readonly<Record<string, string | undefined>>;
   readonly stdoutIsTTY: boolean;
   readonly stderrIsTTY: boolean;
+  /**
+   * M1-A5: stdin is a TTY (one of the facts behind the turn mode claim, `mode.ts`). Optional so
+   * existing IO fixtures keep working; absent reads as `false`, which can only claim `headless`.
+   */
+  readonly stdinIsTTY?: boolean;
   readonly cwd: string;
   /**
    * Engine entry script. Undefined = the real engine (`@madc/engine/client` default). Only the
@@ -26,6 +31,7 @@ export function processIO(engineEntry?: string): CliIO {
     env: process.env,
     stdoutIsTTY: process.stdout.isTTY === true,
     stderrIsTTY: process.stderr.isTTY === true,
+    stdinIsTTY: process.stdin.isTTY === true,
     // §3e E16 F-130: read lazily — only the one-shot needs cwd, and a deleted current directory
     // must not break `--version`, `--help`, usage errors or doctor.
     get cwd() {

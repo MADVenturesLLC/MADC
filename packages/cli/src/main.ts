@@ -213,6 +213,7 @@ async function oneShot(
       env: io.env,
       stdoutIsTTY: io.stdoutIsTTY,
       stderrIsTTY: io.stderrIsTTY,
+      ...(io.stdinIsTTY !== undefined ? { stdinIsTTY: io.stdinIsTTY } : {}),
       cwd,
       ...(io.engineEntry !== undefined ? { engineEntry: io.engineEntry } : {}),
     };
