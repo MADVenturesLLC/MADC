@@ -72,9 +72,11 @@ export const PROMETHEUS_SEAT: EngineSeat = Object.freeze({
   // The M0-A3 lock, unchanged (seat pin §3): pi-ai provider `kimi-coding`, model `kimi-for-coding`.
   pinnedModel: "kimi-coding/kimi-for-coding",
   preferredBacking: "kimi-code",
-  // Same lane (allowed-direct + payg). On a headless turn the hop is skipped — not rejected —
-  // because `ollama-cloud` ships `headless: "denied"` (D-M1-3).
-  fallbacks: Object.freeze(["ollama-cloud"]),
+  // Empty (I3 Option B, Founder default). A seat carries one lane-namespaced `pinnedModel`;
+  // `kimi-coding/kimi-for-coding` cannot resolve in another direct lane's namespace (e.g.
+  // `ollama-cloud`), so a same-lane hop here was never honest. Citation: Founder 2026-09-30
+  // pin-the-subscription-surface. Do not invent a second model id to fill the cell.
+  fallbacks: Object.freeze([]),
   memory: Object.freeze({ mode: "file", path: "memory/prometheus.md" }),
   tools: Object.freeze({ deny: Object.freeze(["writes outside docs/** and scratch"]) }),
   policy: Object.freeze({ headlessOk: true }),
@@ -94,8 +96,10 @@ export const SURFACE_ARCHITECT_SEAT: EngineSeat = Object.freeze({
   // name returned by this list". The `/api/tags` name is model truth at call time (M1-A3).
   pinnedModel: "ollama-cloud/gpt-oss:120b",
   preferredBacking: "ollama-cloud",
-  // Same lane (allowed-direct + payg).
-  fallbacks: Object.freeze(["kimi-code"]),
+  // Empty (I3 Option B, Founder default). `ollama-cloud/gpt-oss:120b` cannot resolve in
+  // `kimi-code`'s namespace — a seat's single `pinnedModel` is lane-namespaced (Founder
+  // 2026-09-30 pin-the-subscription-surface). Same-lane on the D-M1-7 axis is not enough.
+  fallbacks: Object.freeze([]),
   memory: Object.freeze({ mode: "file", path: "memory/surface-architect.md" }),
   tools: Object.freeze({
     deny: Object.freeze(["writes outside docs/plan/PIN-* and docs/**"]),
