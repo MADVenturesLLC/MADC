@@ -25,6 +25,7 @@ import {
   SEAT_ID_INVALID,
 } from "./args.ts";
 import {
+  collectDoctor,
   confinedSeatSha,
   localRows,
   procStartMs,
@@ -422,6 +423,48 @@ test("A7 §2 on a TTY a foreign-turn delta is never rendered, only classified (B
   } finally {
     if (saved === undefined) delete process.env.MADC_TEST_FAKE_SCENARIO;
     else process.env.MADC_TEST_FAKE_SCENARIO = saved;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("M1-A8 doctor with caller-owned signal state: the caller's kill reaches the lanes probe (Copilot r4151089642)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "madc-a8-extsig-"));
+  try {
+    // An engine that answers initialize, exits on EOF, and never answers provider/list.
+    const engine = join(dir, "lanes-hang-engine.mjs");
+    writeFileSync(
+      engine,
+      [
+        'import { createInterface } from "node:readline";',
+        'createInterface({ input: process.stdin }).on("line", (line) => {',
+        "  const m = JSON.parse(line);",
+        '  if (m.method === "initialize") {',
+        '    const result = { serverInfo: { name: "madc-engine", version: "0.0.0" }, protocolVersion: "madc-m1/1" };',
+        '    process.stdout.write(JSON.stringify({ id: m.id, result }) + "\\n");',
+        "  }",
+        '}).on("close", () => process.exit(0));',
+        "",
+      ].join("\n"),
+    );
+    const sig: { exit: number | null; kill: (() => void) | null } = { exit: null, kill: null };
+    const io = fakeIO({ env: { MADC_HOME: join(dir, "home") }, engineEntry: engine });
+    const t0 = Date.now();
+    const run = await collectDoctor(
+      io,
+      { json: false, init: false },
+      {
+        // The app's quit (Ctrl-D: no exit code) lands while the lanes probe is waiting.
+        onStart: (id) => {
+          if (id === "lanes") setTimeout(() => sig.kill?.(), 300);
+        },
+      },
+      sig,
+    );
+    const elapsed = Date.now() - t0;
+    const lanes = run.checks.find((c) => c.id === "lanes");
+    assert.equal(lanes?.status, "fail");
+    assert.ok(elapsed < 10_000, `the kill ended the probe, not its 20 s budget (${elapsed} ms)`);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

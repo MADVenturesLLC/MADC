@@ -1319,8 +1319,12 @@ export async function collectDoctor(
       home = resolveHome(io);
     }
     // M1-A8: the `lanes` probe reads nothing from MADC_HOME (its engine runs on a throwaway home),
-    // so it starts now and overlaps every row before it; its row is still emitted last.
-    if (sig.exit === null) lanes = checkLanes(io, home, lanesSig);
+    // so when doctor owns the signal listeners it starts now and overlaps every row before it (its
+    // row is still emitted last; the listeners above kill it). When the caller owns the signal
+    // state (`externalSig`, the app's /doctor overlay) the probe runs in sequence on that state
+    // instead, so the caller's own kill reaches it exactly like the engine probe's (Copilot
+    // r4151089642).
+    if (externalSig === undefined && sig.exit === null) lanes = checkLanes(io, home, lanesSig);
     if (start("runtime")) emit(checkRuntime());
     if (start("engine")) {
       emit(
@@ -1349,7 +1353,7 @@ export async function collectDoctor(
     if (start("bin.codex")) emit(checkBin(io, "codex", "A6"));
     if (seatsRow !== null && start("seats")) emit(seatsRow);
     if (start("lanes")) {
-      emit(await (lanes ?? checkLanes(io, home, lanesSig)));
+      emit(await (lanes ?? checkLanes(io, home, sig)));
       lanesEmitted = true;
     }
   } finally {
