@@ -475,6 +475,50 @@ test("an already-aborted signal never reaches a prompt", async () => {
   });
 });
 
+test("already aborted: the killed agent's EPIPE landing before 'close' still ends aborted", async () => {
+  // M1-A9 regression for the test above, made deterministic. The client kills the agent at once,
+  // while the handshake still writes `initialize` into the dying pipe; the EPIPE can reach the
+  // stdin 'error' handler BEFORE the child's 'close' (it did on CI for `main` @ e83e517). This stub
+  // pins that order, and the turn must read as the abort it is, not as a vendor failure.
+  const killedBeforeClose: AcpSpawn = () => {
+    const child = new EventEmitter() as ChildProcess;
+    const stream = () =>
+      Object.assign(new EventEmitter(), { setEncoding: () => undefined }) as unknown as NonNullable<
+        ChildProcess["stdout"]
+      >;
+    child.stdout = stream();
+    child.stderr = stream();
+    const stdin = new EventEmitter();
+    child.stdin = Object.assign(stdin, {
+      write: () => {
+        const err = new Error("write EPIPE") as NodeJS.ErrnoException;
+        err.code = "EPIPE";
+        queueMicrotask(() => stdin.emit("error", err));
+        return false;
+      },
+    }) as unknown as NonNullable<ChildProcess["stdin"]>;
+    let killed = false;
+    child.kill = () => {
+      if (!killed) {
+        killed = true;
+        setTimeout(() => child.emit("close", null, "SIGTERM"), 20);
+      }
+      return true;
+    };
+    return child;
+  };
+  const port = createAcpPort({
+    spec: TEST_SPEC,
+    binaryPath: FAKE_GROK_BINARY,
+    spawn: killedBeforeClose,
+  });
+  const turn = turnRequest();
+  turn.controller.abort();
+  const err = await expectCallError(port.streamTurn(turn.request));
+  assert.equal(err.kind, "aborted");
+  assert.equal(err.message, "acp-test turn aborted");
+});
+
 test("auth: the spec's choice is sent with its _meta; no usable method or a refusal → no-credentials", async () => {
   await withFake("ok", async ({ spawn, wire }) => {
     const port = createAcpPort({ spec: AUTH_SPEC, binaryPath: FAKE_GROK_BINARY, spawn });

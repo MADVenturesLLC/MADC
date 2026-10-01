@@ -406,9 +406,15 @@ function streamCodexTurn(
     // A closed vendor pipe reports EPIPE as an async stream 'error', never a thrown write — the
     // try/catch in `write` alone cannot see it, and an unhandled stream error would crash the
     // engine. Route it into the normal failure path (the child's 'close' settles the same way).
+    // After an abort the pipe closed because MAD killed the child, and that EPIPE can land before
+    // 'close': it is still the abort, never a vendor failure (M1-A9: the already-aborted race).
     child.stdin?.on("error", () => {
       if (settled) return;
-      fail(new ProviderCallError("failed", null, "codex app-server stdin closed"));
+      fail(
+        request.signal.aborted
+          ? new ProviderCallError("aborted", null, "codex turn aborted")
+          : new ProviderCallError("failed", null, "codex app-server stdin closed"),
+      );
     });
     // stderr is drained but never read, logged, or surfaced (it can carry vendor text or account
     // details). resume() keeps the stream flowing without a per-chunk callback.

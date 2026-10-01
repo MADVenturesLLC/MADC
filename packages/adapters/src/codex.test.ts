@@ -303,6 +303,46 @@ test("abort (turn/interrupt) sends the documented interrupt, kills the child, en
   });
 });
 
+test("already aborted: the killed child's EPIPE landing before 'close' still ends aborted", async () => {
+  // M1-A9 regression. An already-aborted signal makes the adapter kill the child at once, while
+  // the handshake still writes `initialize` into the dying pipe. The EPIPE that write produces can
+  // reach the stdin 'error' handler BEFORE the child's 'close' — this stub pins that order — and
+  // it must read as the abort it is, not as a vendor failure.
+  const killedBeforeClose = (): ChildProcess => {
+    const child = new EventEmitter() as ChildProcess;
+    const fakeStream = () =>
+      Object.assign(new EventEmitter(), { setEncoding: () => undefined }) as unknown as NonNullable<
+        ChildProcess["stdout"]
+      >;
+    child.stdout = fakeStream();
+    child.stderr = fakeStream();
+    const stdin = new EventEmitter();
+    child.stdin = Object.assign(stdin, {
+      write: () => {
+        const err = new Error("write EPIPE") as NodeJS.ErrnoException;
+        err.code = "EPIPE";
+        queueMicrotask(() => stdin.emit("error", err));
+        return false;
+      },
+    }) as unknown as NonNullable<ChildProcess["stdin"]>;
+    let killed = false;
+    child.kill = () => {
+      if (!killed) {
+        killed = true;
+        setTimeout(() => child.emit("close", null, "SIGTERM"), 20);
+      }
+      return true;
+    };
+    return child;
+  };
+  const controller = new AbortController();
+  controller.abort();
+  const port = createCodexCodePort({ binaryPath: FAKE_CODEX_BINARY, spawn: killedBeforeClose });
+  const err = await failureOf(port.streamTurn(turnRequest({ signal: controller.signal })));
+  assert.equal(err.kind, "aborted");
+  assert.equal(err.message, "codex turn aborted");
+});
+
 test("binary that vanishes at spawn → failed with reason binary-missing (protocol pin §4.2)", async () => {
   // A stub spawn that behaves like node's ENOENT: 'error' emitted, no stdio data, no 'close'
   // before the promise settles.
