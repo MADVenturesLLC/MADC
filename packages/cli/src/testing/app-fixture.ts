@@ -62,7 +62,8 @@ const helpersOnly = process.env.MADC_TEST_FIXTURE_HELPERS_ONLY === "1";
  * pid, seven-digit ones included (no modulo, no truncation). */
 export const fixtureThreadId = (pid: number): string => `thr_app${String(pid).padStart(6, "0")}`;
 const threadId = fixtureThreadId(process.pid);
-const seatId = "madc-default";
+/** The seat `thread/start` asked for (M1-A8 `madc -s`), else the engine default madc-default. */
+let seatId = "madc-default";
 const sessionFile = join(home, "sessions", `${threadId}.jsonl`);
 const send = (m: unknown): void => {
   process.stdout.write(`${JSON.stringify(m)}\n`);
@@ -210,6 +211,10 @@ rl?.on("line", (line) => {
       if (threadStartMode === "die") {
         process.exit(3);
       }
+      // M1-A8: answer on the requested seat, like the real engine (the session file's envelope
+      // `seatId` then records what the app asked for).
+      const requested = msg.params?.seatId;
+      if (seq === 0 && typeof requested === "string") seatId = requested;
       mkdirSync(join(home, "sessions"), { recursive: true });
       if (seq === 0) {
         append("session.open", {
@@ -676,6 +681,11 @@ rl?.on("line", (line) => {
       send({ id: msg.id, result: {} });
       return;
     }
+    case "provider/list":
+      // M1-A8: an M1 engine answers the lanes report; the fixture has no lanes to report, so the
+      // launch doctor's `lanes` row passes empty instead of FAILing (which would hold input).
+      send({ id: msg.id, result: { data: [] } });
+      return;
     default:
       send({ id: msg.id, error: { code: -32601, message: "Method not found" } });
   }

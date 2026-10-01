@@ -972,7 +972,10 @@ export class WitnessApp {
     if (client === null) return;
     try {
       if (this.threadId === null) {
+        // M1-A8: the app asks for the seat its banner shows (`madc -s <seatId>`, else
+        // madc-default) and accepts only a thread on that seat (isThreadShape below).
         const started = (await client.request("thread/start", {
+          seatId: this.#banner.seatId,
           cwd: this.#io.cwd,
         })) as { thread?: unknown } | undefined;
         if (!isThreadShape(started?.thread, this.#banner.seatId)) {

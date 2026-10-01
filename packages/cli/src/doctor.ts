@@ -3,6 +3,12 @@
  * creates, seeds, locks or appends; `--init` seeds only by spawning the engine against the real
  * home (the engine's own seed writer). Every PASS carries evidence; WARN and SKIP never fail.
  * Never prints a credential value or a lock token; never execs a vendor binary.
+ *
+ * M1-A8 appends two rows after the M0 set (ids and order of the existing rows are unchanged):
+ * `seats` — every seat in `seats/` through the engine's `seat/list` projection, FAIL on a seat that
+ * does not load, WARN on a fallback that can never be eligible (D-M1-7); and `lanes` — the
+ * engine's `provider/list` (on a throwaway home), WARN when a stale allow entry is denied by the
+ * registry's freshness rule (D-M1-6), with the full lanes table printed under the row.
  */
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -30,22 +36,32 @@ import {
   inspectMadcHome,
   isPidAlive,
   listCatalog,
+  listSeatSummaries,
   loadRepoPolicy,
   PROTOCOL_VERSION,
   REPO_GATED_PROVIDER_IDS,
   type RepoPolicyLoad,
   readLock,
   resolveMadcHome,
+  type SeatSummary,
   sessionsOwnerReadUnsupported,
   spawnEngine,
   verifySessionFile,
 } from "@madc/engine/client";
 import { doctorHeaderW, doctorPendingRowW, doctorResultW, doctorRowW } from "./app/doctor-view.ts";
+import { stripControls } from "./app/sanitize.ts";
 import { glyphsFor, Style } from "./app/style.ts";
 import { asciiForced, colorDepth } from "./app/tiers.ts";
 import { takeEarlySignal } from "./early-signal.ts";
 import { EXIT } from "./exit-codes.ts";
 import { type CliIO, colorEnabled, paint, TimeoutError, withTimeout } from "./io.ts";
+import {
+  fetchLanes,
+  type LaneRow,
+  renderLaneTable,
+  staleDeniedIds,
+  staleDeniedLine,
+} from "./lanes.ts";
 
 export type CheckStatus = "pass" | "warn" | "fail" | "skip" | "init";
 
@@ -57,6 +73,11 @@ export type Check = {
 };
 
 const ENGINE_PROBE_MS = 5_000;
+/**
+ * M1-A8 `lanes` row: engine start plus `provider/list`, whose credential probes are keychain
+ * children capped at 10 s each and run in parallel — the row's own hard timeout (CLI pin §3).
+ */
+const LANES_PROBE_MS = 20_000;
 const INIT_TIMEOUT_MS = 30_000;
 const FLOOR = { node: "22.19.0", bun: "1.2.0" } as const;
 const DEFAULT_SEAT = "madc-default";
@@ -452,8 +473,10 @@ function inspectDirect(home: string): Inspection {
 }
 
 /**
- * The rows that read MADC_HOME: `seat` (inspection + no-follow hash), `session` (chain verify)
- * and `locks` (survey). Synchronous; the parent only ever runs this inside the bounded child.
+ * The rows that read MADC_HOME: `seat` (inspection + no-follow hash), `session` (chain verify),
+ * `locks` (survey) and — M1-A8 — `seats` (every seat through the `seat/list` projection; emitted
+ * later, after `bin.codex`, so the M0 row order is unchanged). Synchronous; the parent only ever
+ * runs this inside the bounded child.
  */
 export function localRows(home: HomeState): Check[] {
   const insp = home.kind === "present" ? inspectDirect(home.path) : null;
@@ -461,8 +484,12 @@ export function localRows(home: HomeState): Check[] {
     checkSeat(home, insp),
     checkSession(home, insp),
     home.kind === "invalid" ? skip("locks", "MADC_HOME is invalid") : checkLocks(home),
+    checkSeats(home, home.kind === "present" ? listSeatSummaries(home.path) : null),
   ];
 }
+
+/** The ids of the rows `localRows` returns, in order. */
+const LOCAL_ROW_IDS = ["seat", "session", "locks", "seats"] as const;
 
 /** Seat sha256 for `--init`'s before/after comparison (runs inside the bounded child). */
 export function initSeatSha(home: string): string | null {
@@ -500,9 +527,16 @@ function runLocalChild(mode: "rows" | "init-sha", arg: string): ChildResult {
 function localRowsBounded(home: HomeState): Check[] {
   if (home.kind !== "present") return localRows(home); // no MADC_HOME reads
   const r = runLocalChild("rows", JSON.stringify(home));
-  if (r.ok && Array.isArray(r.value) && r.value.length === 3) return r.value as Check[];
+  if (
+    r.ok &&
+    Array.isArray(r.value) &&
+    r.value.length === LOCAL_ROW_IDS.length &&
+    r.value.every((c, i) => (c as Partial<Check> | null)?.id === LOCAL_ROW_IDS[i])
+  ) {
+    return r.value as Check[];
+  }
   const reason = r.ok ? "inspection returned malformed output" : r.reason;
-  return ["seat", "session", "locks"].map((id) => ({
+  return LOCAL_ROW_IDS.map((id) => ({
     id,
     status: "fail" as const,
     summary: reason,
@@ -929,12 +963,112 @@ function checkPolicy(home: HomeState): Check {
   };
 }
 
+/**
+ * M1-A8 `seats`: every seat in `$MADC_HOME/seats/`, read through `listSeatSummaries` — the exact
+ * projection the engine's `seat/list` method returns (M1-A7). Doctor cannot ask the method itself:
+ * every engine start seeds the roster and tightens modes in the home, and plain doctor is read-only
+ * there (CLI pin §3). Runs inside the bounded child with the other MADC_HOME reads.
+ *
+ * - FAIL: a seat file that does not load (the seat cannot serve a turn; existing FAIL rule).
+ * - WARN: a listed fallback that can never be eligible under the same-lane rule (D-M1-7), as the
+ *   engine words it at seat load (seat pin §2: "`madc doctor` warn[s] on any listed fallback that
+ *   can never be eligible").
+ * Seat-file-sourced text is stripped of control bytes before it reaches a row.
+ */
+export function checkSeats(home: HomeState, seats: readonly SeatSummary[] | null): Check {
+  if (home.kind === "invalid") return skip("seats", "MADC_HOME is invalid");
+  if (home.kind === "missing" || seats === null) {
+    return skip("seats", `not initialized (${join(home.path, "seats")})`);
+  }
+  const dir = join(home.path, "seats");
+  const evidence = {
+    dir,
+    seats: seats.map((s) =>
+      s.ok
+        ? { id: s.id, ok: true, warnings: s.warnings.map(stripControls) }
+        : { id: s.id, ok: false, path: s.path, code: s.code, issues: s.issues.map(stripControls) },
+    ),
+  };
+  if (seats.length === 0) {
+    return {
+      id: "seats",
+      status: "warn",
+      summary: `no seat listed under ${dir} (missing, unreadable, or not confined to MADC_HOME)`,
+      evidence,
+    };
+  }
+  const broken: string[] = [];
+  const warnings: string[] = [];
+  for (const s of seats) {
+    if (s.ok) {
+      // The engine's warning already names the seat ("seat <id>: fallback …", seat load).
+      for (const w of s.warnings) warnings.push(stripControls(w));
+    } else {
+      const issues = s.issues.length === 0 ? "" : ` ${s.issues.map(stripControls).join("; ")}`;
+      broken.push(`${s.id}: ${s.code}${issues}`);
+    }
+  }
+  if (broken.length > 0) {
+    return {
+      id: "seats",
+      status: "fail",
+      summary: [...broken, ...warnings].join("; "),
+      evidence,
+    };
+  }
+  if (warnings.length > 0) {
+    return { id: "seats", status: "warn", summary: warnings.join("; "), evidence };
+  }
+  return {
+    id: "seats",
+    status: "pass",
+    summary: `${seats.length} seats: ${seats.map((s) => s.id).join(", ")}`,
+    evidence,
+  };
+}
+
+/**
+ * M1-A8 `lanes`: the engine's `provider/list` (one source for presence and freshness; the CLI
+ * probes nothing itself), read from an engine on a throwaway home with the operator's environment
+ * otherwise unchanged. WARN when the registry's freshness rule denies a stale allow entry
+ * (D-M1-6); FAIL when the engine cannot answer (the row's own hard timeout included). The full
+ * table rides in `evidence.lanes` and prints under the row in human output (`runDoctor`).
+ */
+async function checkLanes(io: CliIO, home: HomeState, sig?: DoctorSignal): Promise<Check> {
+  if (home.kind === "invalid") return skip("lanes", "MADC_HOME is invalid: nothing spawned");
+  const r = await fetchLanes(io, {
+    clientName: "madc-doctor",
+    budgetMs: LANES_PROBE_MS,
+    ...(sig !== undefined ? { sig } : {}),
+  });
+  if (!r.ok) {
+    return {
+      id: "lanes",
+      status: "fail",
+      summary: `provider/list: ${stripControls(r.reason)}`,
+      evidence: { reason: stripControls(r.reason), ...(r.code !== null ? { code: r.code } : {}) },
+    };
+  }
+  const rows = r.rows;
+  const denied = staleDeniedIds(rows);
+  const wired = rows.filter((x) => x.wired).length;
+  const direct = rows.filter((x) => x.credentialsPresent !== null);
+  const vendor = rows.filter((x) => x.binaryPresent !== null);
+  const counts = `${rows.length} lanes · wired ${wired} · credentials ${direct.filter((x) => x.credentialsPresent).length}/${direct.length} · binaries ${vendor.filter((x) => x.binaryPresent).length}/${vendor.length}`;
+  const evidence = { lanes: rows, staleDenied: denied };
+  const stale = staleDeniedLine(rows);
+  if (stale !== null) {
+    return { id: "lanes", status: "warn", summary: `${stale} · ${counts}`, evidence };
+  }
+  return { id: "lanes", status: "pass", summary: `${counts} · terms fresh`, evidence };
+}
+
 function checkKimiCredential(io: CliIO): Check {
   // M1-A2 (D-M1-5): credentials live in the OS keychain, resolved by the engine; the environment
   // satisfies presence ONLY under the pinned MADC_DEV_ENV_KEYS=1 development exception, which this
   // row must disclose loudly. Presence only: never a value, its length, a prefix or a hash.
-  // Keychain presence per provider is queried by `madc auth status <providerId>`; the full lanes
-  // report (every lane's credentials/binary presence) lands in M1-A8.
+  // Keychain presence per provider is queried by `madc auth status <providerId>`; every lane's
+  // credentials/binary presence is the M1-A8 `lanes` row below.
   const devEnvKeys = io.env.MADC_DEV_ENV_KEYS === "1";
   const envSet = (io.env.KIMI_API_KEY ?? "").trim() !== "";
   if (devEnvKeys) {
@@ -1147,8 +1281,14 @@ export async function collectDoctor(
       );
     }
     if (start("home")) emit(checkHome(home));
+    // M1-A8: the `seats` row is computed in the same bounded child as `seat` / `session` /
+    // `locks`, and emitted after `bin.codex` so the M0 row order is unchanged.
+    let seatsRow: Check | null = null;
     if (start("seat")) {
-      for (const row of localRowsBounded(home)) emit(row);
+      for (const row of localRowsBounded(home)) {
+        if (row.id === "seats") seatsRow = row;
+        else emit(row);
+      }
       // The local rows ran under a blocking spawnSync child: let a signal delivered meanwhile
       // take effect now that the child has returned (§3e E7).
       await new Promise((resolve) => setImmediate(resolve));
@@ -1158,6 +1298,8 @@ export async function collectDoctor(
     if (start("cred.kimi-code")) emit(checkKimiCredential(io));
     if (start("bin.claude")) emit(checkBin(io, "claude", "A5"));
     if (start("bin.codex")) emit(checkBin(io, "codex", "A6"));
+    if (seatsRow !== null && start("seats")) emit(seatsRow);
+    if (start("lanes")) emit(await checkLanes(io, home, sig));
   } finally {
     if (ownListeners) {
       process.removeListener("SIGINT", onSigint);
@@ -1206,6 +1348,16 @@ export function resultTierA(
   return `RESULT  ${f} · ${w} · ${skip} SKIP · ${ms} ms   exit ${digits}`;
 }
 
+/**
+ * The lanes table under the `lanes` row (human output only): every line indented by six spaces,
+ * so a reader of the pinned `WORD  id  summary` rows can skip it. Plain text — every cell is a
+ * validated id, enum, date or fixed word (`lanes.ts`).
+ */
+export function laneTableLines(c: Check): string[] {
+  if (c.id !== "lanes" || !Array.isArray(c.evidence.lanes)) return [];
+  return renderLaneTable(c.evidence.lanes as LaneRow[]).map((line) => `      ${line}`);
+}
+
 export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number> {
   const style = doctorStyle(io);
   const g = glyphsFor(style.ascii);
@@ -1241,6 +1393,8 @@ export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number>
             // Tier A/P bytes: the pinned `WORD  id  summary` rows, coloured only on a TTY.
             io.stdout.write(renderRow(c, color));
           }
+          // M1-A8: the lanes table prints under its row, indented so it never reads as a row.
+          for (const line of laneTableLines(c)) io.stdout.write(`${line}\n`);
         },
       };
   const run = await collectDoctor(io, opts, hooks);

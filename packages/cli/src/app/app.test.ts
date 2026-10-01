@@ -870,8 +870,9 @@ describe("§5.9 /doctor overlay leaves no screen remnants at 143×44", () => {
       type(r.tty, "/doctor");
       r.tty.key("enter");
       await until(() => r.app.doctorOverlayOpen, "overlay open");
+      // `lanes` (M1-A8) is the last doctor row.
       await until(
-        () => r.tty.lastFrame().join("\n").includes("bin.codex"),
+        () => r.tty.lastFrame().join("\n").includes("lanes"),
         "overlay rows finished streaming",
       );
       assertOpenScreen(screenOf(r.tty));
@@ -881,8 +882,7 @@ describe("§5.9 /doctor overlay leaves no screen remnants at 143×44", () => {
       const before = r.tty.chunks.length;
       r.tty.key({ char: "r" } as KeyValue);
       await until(
-        () =>
-          r.tty.chunks.length > before + 2 && r.tty.lastFrame().join("\n").includes("bin.codex"),
+        () => r.tty.chunks.length > before + 2 && r.tty.lastFrame().join("\n").includes("lanes"),
         "overlay re-run finished streaming",
       );
       assertOpenScreen(screenOf(r.tty));
