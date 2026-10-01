@@ -4,6 +4,8 @@
 
 *Base: `main` @ `c4f97fc668c4b55d701b0be4875aa0c4180cdd15` (the M1 I1–I3 squash, PR #45); its parent is M1-A9 `148a2793620d045e2a0470b8f6add630af26cbc8` (PR #44). Every file and line cited below was read at that commit. This pin was not written by Surface Architect and claims none of Surface's authority; it is a builder's proposal for Argus review and the Founder's merge. Nothing in it is implemented: no code in `packages/` writes, reads, links or refuses any event named here, and this act adds none.*
 
+*Revision 2026-10-01 (same-PR correction on PR #46, one commit on head `f4ac048e27be7b67c813cc7474a9d9b22329e193`): the Founder ruled **D-M2-A0-1 … D-M2-A0-6** as this pin's recommended defaults on 2026-10-01; §9 records the rulings. Argus reviewed that head **PASS-WITH-ADVISORIES** ([PR #46, comment 5941986958](https://github.com/MADVenturesLLC/MADC/pull/46#issuecomment-5941986958)). The status line is unchanged: proposed until this PR merges. No code was added.*
+
 **What this pin does.** It names the session chain events the room (M2) and the memory and tools milestone (M4) need, with their fields, their hash inputs and the refusal that applies when a required field is missing. The desktop (M3) can then bind to one schema once (roadmap §2, reason 2), and the M2 build plan can commission acts against pinned shapes instead of inventing them act by act.
 
 **What it does not do.** It changes no envelope field, no hash formula, no protocol method, no seat field and no existing event. It does not enable handoffs: `handoffs.enabled` stays `false`, and a seat file with `enabled: true` still fails `-32006`, as the M1 seat pin §2 says and `packages/engine/src/seat.ts:254` enforces. It creates no worktree, no inbox, no memory store and no MCP client. §6 lists the non-goals.
@@ -223,7 +225,7 @@ type EvidenceRef =
 - A `git` ref resolves when the object exists in the thread's recorded `topLevel` (§2.2) or, if `remote` is given, in a checkout of that remote the verifier can read.
 - A ref that cannot be resolved is reported **unresolved**, never silently accepted. Doctor WARNs `evidence-ref-unresolved`; a ref whose line exists but whose hash differs is FAIL `evidence-ref-mismatch`. The M3 rule follows from this: "the renderer refuses a success state without a verified ref" (roadmap §4 M3).
 
-Which engine resolves what at write time is D-M2-A0-4. The shape check is never optional.
+Same-file refs are resolved at write time and every other ref by the verifier (D-M2-A0-4, ruled 2026-10-01). The shape check is never optional.
 
 ---
 
@@ -277,7 +279,7 @@ type ToolCallReceiptPayload = {
 
 ## 5. The refusal: `-32010 EvidenceInvalid` (proposed)
 
-The M1 protocol pin §4.1 table ends at `-32009`. This pin proposes one code for every schema-v2 refusal, so an operator, a seat and doctor can tell "the record was invalid" from an I/O failure (`-32009`), from bad request params (`-32602`) and from an unexpected engine fault (`-32603`). It is **not** in `ErrorCode` at the base, no M1 pin is edited to add it, and it binds only when the Founder merges this pin (or rules otherwise, D-M2-A0-1). The M2 protocol pin, when written, carries it into the error table.
+The M1 protocol pin §4.1 table ends at `-32009`. This pin proposes one code for every schema-v2 refusal, so an operator, a seat and doctor can tell "the record was invalid" from an I/O failure (`-32009`), from bad request params (`-32602`) and from an unexpected engine fault (`-32603`). It is **not** in `ErrorCode` at the base, no M1 pin is edited to add it, and it binds only when the Founder merges this pin (D-M2-A0-1, ruled 2026-10-01: the new code stands). The M2 protocol pin, when written, carries it into the error table.
 
 | Code | Name | When | `data` |
 | --- | --- | --- | --- |
@@ -362,18 +364,18 @@ Placeholders in angle brackets stand for values the engine fills; no model strin
 
 ---
 
-## 9. FOUNDER_DECISION_REQUIRED
+## 9. Founder rulings — D-M2-A0-1 … D-M2-A0-6 (ruled 2026-10-01)
 
-Each row has one recommended default. None blocks Argus review. Rulings are recorded in this file by a Founder-merged PR that says so (README draft edit rule).
+**Ruled by the Founder on 2026-10-01: every row's recommended default is the ruling.** Nothing in this table is awaiting a decision. The rulings were recorded by the same-PR correction to PR #46 at the Founder's instruction (README draft edit rule: a draft may be edited in place by a Founder-merged PR that says so in its body). They bind when this PR merges; until then the pin stays proposed.
 
-| # | Decision | Recommended default | What it blocks |
-| --- | --- | --- | --- |
-| D-M2-A0-1 | The schema-v2 refusal code: a new `-32010 EvidenceInvalid` (§5), or reuse of `-32603` / `-32602`? | **New `-32010`.** An invalid record must be distinguishable from an engine fault and from bad params; the reasons in §5 give doctor and M3 one enum to bind. | The M2 protocol pin's error table |
-| D-M2-A0-2 | Reserved M4 names (`memory.write`, `tool.call`) met in a file today: validate their shape (integrity failure if malformed), or tolerate as unknown? | **Validate.** Nothing legitimate writes them yet, so a shape fault is a fault. | The v2 verifier |
-| D-M2-A0-3 | Record a failed target open as `handoff.aborted`, or leave the `handoff.out` dangling? | **Record it.** A dangling `handoff.out` is indistinguishable from a crash; a recorded abort is evidence. | §2.1 |
-| D-M2-A0-4 | Resolve same-file `session` / `servedModel` evidence refs at write time (the writer holds the verified file), with cross-file and `git` refs left to the verifier? | **Yes, same-file at write time.** It is cheap and it stops a seat citing a hash that is not in its own file. | §2.3, §3, §4.2 |
-| D-M2-A0-5 | A v2 engine writes `session.close` on every clean shutdown (M1: optional), so the close-time HEAD is recorded? | **Yes.** Without it, "HEAD at close" is never recorded. | §2.2 |
-| D-M2-A0-6 | Envelope stays `v: 1` with v2 as an additive vocabulary (the base's verifier comment), or bump to `v: 2` so v1 engines fail closed on v2 files? | **Stay `v: 1`.** The base already tolerates unknown types for exactly this reason; a bump breaks "additive" and buys nothing a v1 engine could enforce anyway. | §1 |
+| # | Decision | Recommended default | Founder ruling (2026-10-01) | Where it lands |
+| --- | --- | --- | --- | --- |
+| D-M2-A0-1 | The schema-v2 refusal code: a new `-32010 EvidenceInvalid` (§5), or reuse of `-32603` / `-32602`? | **New `-32010`.** An invalid record must be distinguishable from an engine fault and from bad params; the reasons in §5 give doctor and M3 one enum to bind. | **Default accepted.** New `-32010 EvidenceInvalid`. | The M2 protocol pin's error table |
+| D-M2-A0-2 | Reserved M4 names (`memory.write`, `tool.call`) met in a file today: validate their shape (integrity failure if malformed), or tolerate as unknown? | **Validate.** Nothing legitimate writes them yet, so a shape fault is a fault. | **Default accepted.** Validate reserved shapes when present. | The v2 verifier |
+| D-M2-A0-3 | Record a failed target open as `handoff.aborted`, or leave the `handoff.out` dangling? | **Record it.** A dangling `handoff.out` is indistinguishable from a crash; a recorded abort is evidence. | **Default accepted.** `handoff.aborted` is written. | §2.1 |
+| D-M2-A0-4 | Resolve same-file `session` / `servedModel` evidence refs at write time (the writer holds the verified file), with cross-file and `git` refs left to the verifier? | **Yes, same-file at write time.** It is cheap and it stops a seat citing a hash that is not in its own file. | **Default accepted.** Same-file refs at write time; the rest by the verifier. | §2.3, §3, §4.2 |
+| D-M2-A0-5 | A v2 engine writes `session.close` on every clean shutdown (M1: optional), so the close-time HEAD is recorded? | **Yes.** Without it, "HEAD at close" is never recorded. | **Default accepted.** `session.close` on every clean shutdown. | §2.2 |
+| D-M2-A0-6 | Envelope stays `v: 1` with v2 as an additive vocabulary (the base's verifier comment), or bump to `v: 2` so v1 engines fail closed on v2 files? | **Stay `v: 1`.** The base already tolerates unknown types for exactly this reason; a bump breaks "additive" and buys nothing a v1 engine could enforce anyway. | **Default accepted.** Envelope stays `v: 1`. | §1 |
 
 ---
 
