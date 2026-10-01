@@ -22,6 +22,11 @@
  *                        lands on the closed stdin pipe → EPIPE must settle the turn, never crash)
  * - `vanish`           — exits 127 immediately (spawn-raced binary-missing is covered by a stub
  *                        spawn that emits `error`; this mode covers the close-without-turn path)
+ * - `tool-round-trip`  — M1-A9 L1: the vendor runs one tool ITSELF before it answers — a
+ *                        synthetic `commandExecution` item (started → completed, with output)
+ *                        between the user item and the agentMessage, and listed in the
+ *                        turn/completed items. The adapter reads only an item's `type`, so the
+ *                        fixture carries just enough fields to look like one.
  *
  * Records every client message it receives to `MADC_TEST_CODEX_WIRE_LOG` (one JSON line each)
  * when set, so tests can assert exactly what the adapter would have sent to the vendor binary.
@@ -76,6 +81,33 @@ function completeTurn(): void {
     method: "item/completed",
     params: { item: userItem, threadId: THREAD_ID, turnId: TURN_ID, completedAtMs: 2 },
   });
+  const toolItems: Record<string, unknown>[] = [];
+  if (mode === "tool-round-trip") {
+    const command = (status: string, output: string | null, exitCode: number | null) => ({
+      type: "commandExecution",
+      id: "item_fakecommand",
+      command: "cat README.md",
+      cwd: "/fake/workspace",
+      status,
+      aggregatedOutput: output,
+      exitCode,
+    });
+    send({
+      method: "item/started",
+      params: {
+        item: command("inProgress", null, null),
+        threadId: THREAD_ID,
+        turnId: TURN_ID,
+        startedAtMs: 2,
+      },
+    });
+    const done = command("completed", "# MADC\n", 0);
+    send({
+      method: "item/completed",
+      params: { item: done, threadId: THREAD_ID, turnId: TURN_ID, completedAtMs: 3 },
+    });
+    toolItems.push(done);
+  }
   const full = `fake codex answer to: ${prompt}`;
   send({
     method: "item/started",
@@ -107,7 +139,7 @@ function completeTurn(): void {
   });
   send({
     method: "turn/completed",
-    params: { threadId: THREAD_ID, turn: turn("completed", [agentItem(full)]) },
+    params: { threadId: THREAD_ID, turn: turn("completed", [...toolItems, agentItem(full)]) },
   });
 }
 

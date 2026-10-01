@@ -102,6 +102,14 @@ export function resolveMinimaxPinnedModel(pinnedModel: string): PinnedModelResol
   });
 }
 
+/**
+ * The pinned pi-ai built-in provider, unchanged — the lane's own pi-ai configuration. The port
+ * streams through it, and the M1-A9 L1 tool round-trip drives the same builder.
+ */
+export function buildMinimaxProvider() {
+  return minimaxProvider();
+}
+
 export type MinimaxTokenPlanPortOptions = {
   readonly apiKey: string;
   /** Test seam: override the catalog base URL. Production never sets it. */
@@ -119,7 +127,7 @@ export function createMinimaxTokenPlanPort(options: MinimaxTokenPlanPortOptions)
     piProvider: MINIMAX_PI_PROVIDER,
     api: MINIMAX_WIRE_API,
     apiKey: options.apiKey,
-    buildProvider: () => minimaxProvider(),
+    buildProvider: buildMinimaxProvider,
     ...(options.baseUrl === undefined ? {} : { baseUrl: options.baseUrl }),
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });

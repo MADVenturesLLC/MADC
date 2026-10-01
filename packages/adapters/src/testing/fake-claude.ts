@@ -12,6 +12,10 @@
  * - `hang`             — writes nothing, runs until killed (abort tests)
  * - `vanish`           — exits 127 immediately (spawn- raced binary-missing is covered by a stub
  *                        spawn that emits `error`; this mode covers the close-without-result path)
+ * - `tool-round-trip`  — M1-A9 L1: the result of a turn in which the vendor ran one tool ITSELF
+ *                        (`num_turns: 2` — the tool-use turn and the answer turn) and answered
+ *                        after it. Print mode's single JSON result carries no tool events, so the
+ *                        post-tool answer and `num_turns` are the only trace of the round-trip.
  *
  * Records its argv (prompt, model, system prompt) to `MADC_TEST_CLAUDE_ARGV_LOG` (one JSON line)
  * when set, so tests can assert exactly what the adapter would have passed to the vendor binary.
@@ -54,6 +58,9 @@ switch (mode) {
     break;
   case "no-model":
     result({ modelUsage: {} });
+    break;
+  case "tool-round-trip":
+    result({ num_turns: 2, result: `fake claude answer after one tool call: ${prompt}` });
     break;
   case "nonzero":
     process.stderr.write("fake claude: exploded with account details that must never surface\n");
