@@ -1,6 +1,7 @@
 /**
- * Test fixture: a scripted MULTI-TURN engine for Witness-app tests (stdio JSONL, node:* only,
- * no engine imports — the same constraint as fake-engine.ts). The turn script comes from
+ * Test fixture: a scripted MULTI-TURN engine for Witness-app tests (stdio JSONL, no engine
+ * internals — the same constraint as fake-engine.ts; its one non-node import is the pure registry
+ * catalog on `@madc/engine/client`, so its `provider/list` answer covers every lane, M1-A8). The turn script comes from
  * `MADC_TEST_APP_TURNS` (a JSON array); each `turn/start` pops the next entry:
  *
  *   {"kind":"ok","text":"…"}            turn completes; servedModel receipt; chain intact
@@ -24,6 +25,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { createInterface } from "node:readline";
+import { listCatalog } from "@madc/engine/client";
 
 type TurnScript =
   | { readonly kind: "ok"; readonly text?: string }
@@ -682,9 +684,22 @@ rl?.on("line", (line) => {
       return;
     }
     case "provider/list":
-      // M1-A8: an M1 engine answers the lanes report; the fixture has no lanes to report, so the
-      // launch doctor's `lanes` row passes empty instead of FAILing (which would hold input).
-      send({ id: msg.id, result: { data: [] } });
+      // M1-A8: an M1 engine answers the lanes report with one entry per catalog entry (the CLI
+      // refuses anything partial). The fixture reports nothing present and nothing stale, so the
+      // launch doctor's `lanes` row passes instead of FAILing (which would hold input).
+      send({
+        id: msg.id,
+        result: {
+          data: listCatalog().map((e) => ({
+            id: e.id,
+            status: e.status,
+            wired: e.wired,
+            verifiedAt: e.verifiedAt,
+            stale: false,
+            ...(e.connect === "direct" ? { credentialsPresent: false } : {}),
+          })),
+        },
+      });
       return;
     default:
       send({ id: msg.id, error: { code: -32601, message: "Method not found" } });

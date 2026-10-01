@@ -69,24 +69,39 @@ const isRecord = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === "object" && !Array.isArray(v);
 
 /**
- * Strict read of a `provider/list` result: `{ data: ProviderSummary[] }` with every field of the
- * pinned type (protocol pin §5). Anything else is `null` (a protocol violation for the caller).
- * Only the pinned fields are copied, so nothing the engine might add could ever be printed.
+ * Strict read of a `provider/list` result against the catalog it must cover (protocol pin §3.5,
+ * §5): `{ data: ProviderSummary[] }` with exactly one entry per catalog entry, same ids in catalog
+ * order, each entry's `status` / `wired` / `verifiedAt` equal to the catalog's, and presence only
+ * where the lane's `connect` kind allows it — `credentialsPresent` on (every) `direct` lane,
+ * `binaryPresent` only on `vendor-agent` lanes, never both. Anything else is `null` (a protocol
+ * violation for the caller), so a partial, reordered or stale answer is never shown as a complete
+ * report and no lane ever shows a presence fact it cannot have. Only the pinned fields are copied,
+ * so nothing the engine might add could ever be printed. `catalog` defaults to the registry's own.
  */
-export function parseProviderList(result: unknown): ProviderSummary[] | null {
+export function parseProviderList(
+  result: unknown,
+  catalog: readonly ProviderEntry[] = listCatalog(),
+): ProviderSummary[] | null {
   if (!isRecord(result) || !Array.isArray(result.data)) return null;
+  const data = result.data as unknown[];
+  if (data.length !== catalog.length) return null;
   const out: ProviderSummary[] = [];
-  for (const raw of result.data as unknown[]) {
-    if (!isRecord(raw)) return null;
+  for (const [i, raw] of data.entries()) {
+    const entry = catalog[i];
+    if (entry === undefined || !isRecord(raw)) return null;
     const { id, status, wired, verifiedAt, stale, credentialsPresent, binaryPresent } = raw;
-    if (!isValidId(id)) return null;
-    if (typeof status !== "string" || !STATUSES.has(status)) return null;
-    if (typeof wired !== "boolean" || typeof stale !== "boolean") return null;
+    if (!isValidId(id) || id !== entry.id) return null;
+    if (typeof status !== "string" || !STATUSES.has(status) || status !== entry.status) return null;
+    if (typeof wired !== "boolean" || wired !== entry.wired) return null;
+    if (typeof stale !== "boolean") return null;
     if (typeof verifiedAt !== "string" || !VERIFIED_AT.test(verifiedAt)) return null;
+    if (verifiedAt !== entry.verifiedAt) return null;
+    // Every direct lane reports credential presence (the engine always probes it).
+    if ((credentialsPresent === undefined) !== (entry.connect !== "direct")) return null;
     if (credentialsPresent !== undefined && typeof credentialsPresent !== "boolean") return null;
-    if (binaryPresent !== undefined && typeof binaryPresent !== "boolean") return null;
-    // Pin §5: credentialsPresent (direct) OR binaryPresent (vendor-agent), never both.
-    if (credentialsPresent !== undefined && binaryPresent !== undefined) return null;
+    if (binaryPresent !== undefined) {
+      if (typeof binaryPresent !== "boolean" || entry.connect !== "vendor-agent") return null;
+    }
     out.push({
       id,
       status: status as ProviderStatus,

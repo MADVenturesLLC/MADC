@@ -23,6 +23,7 @@ import { fileURLToPath } from "node:url";
 import { canServe, listCatalog, type ProviderEntry } from "@madc/engine/client";
 import { laneRows, parseProviderList, renderLaneTable, staleDeniedIds } from "./lanes.ts";
 import { parseSeatList, renderSeatsTable } from "./lists.ts";
+import { callEngineOnce } from "./rpc-call.ts";
 
 const ENGINE_SRC = fileURLToPath(new URL("../../engine/src/", import.meta.url));
 const ECHO = join(ENGINE_SRC, "testing", "echo-engine.ts");
@@ -380,29 +381,114 @@ test("A8 seats ls (human): table, warnings and broken seats printed; invalid MAD
 
 // ------------------------------------------------------------------------ units
 
-test("A8 parseProviderList is strict and copies only the pinned fields", () => {
-  const ok = {
-    id: "kimi-code",
+test("A8 parseProviderList: one entry per catalog entry, in order, presence only where allowed", () => {
+  // A three-entry catalog: a direct lane, a vendor-agent lane, a forbidden stub.
+  const catalog = [
+    {
+      id: "lane-d",
+      status: "allowed-direct",
+      connect: "direct",
+      wired: true,
+      verifiedAt: "2026-09-24",
+    },
+    {
+      id: "lane-v",
+      status: "allowed-via-vendor-agent",
+      connect: "vendor-agent",
+      wired: true,
+      verifiedAt: "2026-09-24",
+    },
+    { id: "lane-f", status: "forbidden", connect: "none", wired: false, verifiedAt: "" },
+  ] as unknown as ProviderEntry[];
+  const d = {
+    id: "lane-d",
     status: "allowed-direct",
     wired: true,
     verifiedAt: "2026-09-24",
     stale: false,
     credentialsPresent: true,
   };
-  assert.deepStrictEqual(parseProviderList({ data: [ok] }), [ok]);
+  const v = {
+    id: "lane-v",
+    status: "allowed-via-vendor-agent",
+    wired: true,
+    verifiedAt: "2026-09-24",
+    stale: false,
+    binaryPresent: false,
+  };
+  const f = { id: "lane-f", status: "forbidden", wired: false, verifiedAt: "", stale: true };
+  assert.deepStrictEqual(parseProviderList({ data: [d, v, f] }, catalog), [d, v, f]);
+  // A vendor-agent lane with no adapter in the engine's build carries no presence field: allowed.
+  const { binaryPresent: _omit, ...vNoAdapter } = v;
+  assert.deepStrictEqual(parseProviderList({ data: [d, vNoAdapter, f] }, catalog), [
+    d,
+    vNoAdapter,
+    f,
+  ]);
   // An extra field the engine might add is never copied out (so it can never be printed).
-  assert.deepStrictEqual(parseProviderList({ data: [{ ...ok, apiKey: SYNTHETIC }] }), [ok]);
-  for (const bad of [
-    null,
-    { data: {} },
-    { data: [{ ...ok, status: "maybe" }] },
-    { data: [{ ...ok, wired: "yes" }] },
-    { data: [{ ...ok, verifiedAt: "yesterday" }] },
-    { data: [{ ...ok, credentialsPresent: "true" }] },
-    { data: [{ ...ok, binaryPresent: false }] }, // both presence fields: pin §5 says one
-    { data: [{ ...ok, id: "../x" }] },
-  ]) {
-    assert.equal(parseProviderList(bad), null, JSON.stringify(bad));
+  assert.deepStrictEqual(
+    parseProviderList({ data: [{ ...d, apiKey: SYNTHETIC }, v, f] }, catalog),
+    [d, v, f],
+  );
+  const { credentialsPresent: _drop, ...dNoPresence } = d;
+  for (const [why, bad] of [
+    ["not an object", null],
+    ["data not an array", { data: {} }],
+    ["partial (a lane missing)", { data: [d, v] }],
+    ["empty", { data: [] }],
+    ["reordered", { data: [v, d, f] }],
+    ["duplicated", { data: [d, d, f] }],
+    ["unknown id", { data: [{ ...d, id: "lane-x" }, v, f] }],
+    ["bad id grammar", { data: [{ ...d, id: "../x" }, v, f] }],
+    ["status differs from the catalog", { data: [{ ...d, status: "forbidden" }, v, f] }],
+    ["unknown status", { data: [{ ...d, status: "maybe" }, v, f] }],
+    ["wired differs", { data: [{ ...d, wired: false }, v, f] }],
+    ["wired not boolean", { data: [{ ...d, wired: "yes" }, v, f] }],
+    ["verifiedAt differs", { data: [{ ...d, verifiedAt: "2026-09-01" }, v, f] }],
+    ["verifiedAt not a date", { data: [{ ...d, verifiedAt: "yesterday" }, v, f] }],
+    ["credentialsPresent not boolean", { data: [{ ...d, credentialsPresent: "true" }, v, f] }],
+    ["direct lane without credential presence", { data: [dNoPresence, v, f] }],
+    ["binaryPresent on a direct lane", { data: [{ ...d, binaryPresent: false }, v, f] }],
+    [
+      "credentialsPresent on a vendor-agent lane",
+      { data: [d, { ...v, credentialsPresent: true }, f] },
+    ],
+    ["presence on a forbidden stub", { data: [d, v, { ...f, binaryPresent: true }] }],
+  ] as const) {
+    assert.equal(parseProviderList(bad, catalog), null, why);
+  }
+});
+
+test("A8 rpc-call: cleanup never extends the deadline (an engine that never answers is killed)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "madc-a8-rpc-"));
+  try {
+    // An "engine" that reads stdin forever and never writes a line.
+    const silent = join(dir, "silent-engine.mjs");
+    writeFileSync(silent, "process.stdin.resume();\nsetInterval(() => {}, 1000);\n");
+    const io = {
+      stdout: { write: () => undefined },
+      stderr: { write: () => undefined },
+      stdin: process.stdin,
+      env: {},
+      stdoutIsTTY: false,
+      stderrIsTTY: false,
+      cwd: dir,
+      engineEntry: silent,
+    };
+    const t0 = Date.now();
+    const r = await callEngineOnce(io, {
+      env: {},
+      clientName: "madc-test",
+      method: "provider/list",
+      budgetMs: 400,
+    });
+    const elapsed = Date.now() - t0;
+    assert.equal(r.ok, false);
+    assert.equal(r.ok ? "" : r.reason, "timeout 400ms");
+    // The old cleanup waited up to 1 s more after the deadline; now the child is killed at once.
+    assert.ok(elapsed < 1_200, `returned within the budget plus kill latency (${elapsed} ms)`);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

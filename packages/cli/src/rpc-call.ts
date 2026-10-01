@@ -37,7 +37,7 @@ export type EngineCallOptions = {
   readonly env: Record<string, string | undefined>;
   readonly clientName: string;
   readonly method: "provider/list" | "seat/list";
-  /** Hard deadline for the whole exchange (initialize + request). */
+  /** Hard deadline for the whole exchange (initialize + request + cleanup). */
   readonly budgetMs: number;
   readonly sig?: EngineCallSignal;
 };
@@ -117,8 +117,11 @@ export async function callEngineOnce(
     }
   } finally {
     if (opts.sig !== undefined) opts.sig.kill = null;
+    // Cleanup never extends the deadline: EOF, then a kill once the budget (at most 1 s more of
+    // it) is spent — a timed-out or hung engine is killed at once.
+    const grace = Math.min(1_000, Math.max(0, opts.budgetMs - (Date.now() - t0)));
     try {
-      await c.close(1_000);
+      await c.close(grace);
     } catch {
       // the result above already carries the failure
     }
