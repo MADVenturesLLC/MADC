@@ -56,6 +56,8 @@ const home = process.env.MADC_HOME ?? "";
  * thread-id encoding without spawning anything): the readline wiring — the module's only
  * runtime side effect — is skipped. Spawned child engines never set this variable. */
 const helpersOnly = process.env.MADC_TEST_FIXTURE_HELPERS_ONLY === "1";
+/** I2: file receiving one JSON line per `turn/start` request's params (mode-claim assertions). */
+const requestLog = process.env.MADC_TEST_APP_REQUESTS ?? "";
 /** Thread id minted from an engine process id: a restarted engine (fresh process, same
  * home) must not append a fresh seq-0 chain into the dead engine's session file. The
  * encoding is LOSSLESS — `thr_app` + the decimal pid, zero-padded to at least six digits —
@@ -243,6 +245,16 @@ rl?.on("line", (line) => {
       return;
     }
     case "turn/start": {
+      // I2: the exact params the client sent, for the mode-claim assertions (secrets never ride
+      // a turn/start request, so recording the raw params is safe). Best effort: a vanished or
+      // unwritable log file must never break the fixture's turn.
+      if (requestLog !== "") {
+        try {
+          appendFileSync(requestLog, `${JSON.stringify(msg.params ?? {})}\n`);
+        } catch {
+          // The log is diagnostics, not protocol: ignore.
+        }
+      }
       const turnId = `turn_app${String(turnCounter).padStart(4, "0")}`;
       turnCounter++;
       const step = script.shift() ?? { kind: "ok", text: "fixture reply" };

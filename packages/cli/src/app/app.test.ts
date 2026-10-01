@@ -6,7 +6,7 @@
  * leak between tests.
  */
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Readable } from "node:stream";
@@ -47,6 +47,7 @@ type Rig = {
   readonly stderr: RecordingOut;
   readonly stdout: RecordingOut;
   readonly home: string;
+  readonly requestLogPath: string;
   cleanup: () => void;
 };
 
@@ -62,21 +63,27 @@ function rig(
     rows?: number;
     uiNote?: string;
     firstPrompt?: string;
+    /** I2: override the io TTY facts the mode claim reads (default true, as production). */
+    stdinIsTTY?: boolean;
+    stdoutIsTTY?: boolean;
   } = {},
 ): Rig {
   const home = mkdtempSync(join(tmpdir(), "madc-app-"));
   process.env.MADC_TEST_APP_TURNS = JSON.stringify(script);
+  // I2: the fixture child inherits process.env, so the request log rides it (like APP_TURNS).
+  process.env.MADC_TEST_APP_REQUESTS = join(home, "requests.jsonl");
   const tty = new VirtualTty(opts.cols ?? 110, opts.rows ?? 32);
   const stderr = new RecordingOut();
   const stdout = new RecordingOut();
+  const requestLogPath = process.env.MADC_TEST_APP_REQUESTS ?? "";
   const io: CliIO = {
     stdout,
     stderr,
     stdin: process.stdin,
     env: { TERM: "xterm-256color", LANG: "en_US.UTF-8" },
-    stdoutIsTTY: true,
+    stdoutIsTTY: opts.stdoutIsTTY ?? true,
     stderrIsTTY: true,
-    stdinIsTTY: true,
+    stdinIsTTY: opts.stdinIsTTY ?? true,
     columns: opts.cols ?? 110,
     rows: opts.rows ?? 32,
     cwd: "/home/mike/code/madc",
@@ -135,7 +142,9 @@ function rig(
     stderr,
     stdout,
     home,
+    requestLogPath,
     cleanup: async () => {
+      delete process.env.MADC_TEST_APP_REQUESTS;
       await app.dispose();
       rmSync(home, { recursive: true, force: true });
     },
@@ -575,6 +584,104 @@ describe("Witness app (tier W)", () => {
     }
   });
 });
+
+describe("I2: turn/start mode claim (Witness + request log)", () => {
+  const readRequests = (path: string): Record<string, unknown>[] => {
+    const raw = readFileSync(path, "utf8");
+    return raw
+      .split("\n")
+      .filter((line) => line !== "")
+      .map((line) => JSON.parse(line) as Record<string, unknown>);
+  };
+
+  /** Credential-shaped prefixes pinned in args.ts — must never appear in turn/start params. */
+  const SECRET_SHAPED = /(?:sk-(?:sp-)?|xai-|Bearer\s+[A-Za-z0-9._-]+|api[_-]?key)/i;
+
+  const assertNoSecrets = (params: Record<string, unknown>): void => {
+    const blob = JSON.stringify(params);
+    assert.doesNotMatch(blob, SECRET_SHAPED, `secret-shaped token in params: ${blob}`);
+    for (const key of Object.keys(params)) {
+      assert.doesNotMatch(
+        key,
+        /^(?:.*(?:api[_-]?key|access[_-]?token|secret|password|credential|authorization).*)$/i,
+        `secret-shaped key ${key}`,
+      );
+    }
+  };
+
+  it("Witness claims interactive when stdin and stdout are TTYs", async () => {
+    const r = rig([{ kind: "ok", text: "interactive claim" }], {
+      stdinIsTTY: true,
+      stdoutIsTTY: true,
+    });
+    try {
+      await r.app.start();
+      r.app.onDoctorFinished(10);
+      sendTurn(r.tty, "hi");
+      await until(
+        () => r.app.phase === "idle" && r.app.turns.length === 1 && r.app.turns[0]?.verify != null,
+        "I2 interactive turn",
+      );
+      const reqs = readRequests(r.requestLogPath);
+      assert.equal(reqs.length, 1, "one turn/start recorded");
+      assert.equal(reqs[0]?.mode, "interactive");
+      assertNoSecrets(reqs[0] ?? {});
+      await r.cleanup();
+    } catch (e) {
+      await r.cleanup();
+      throw e;
+    }
+  });
+
+  it("Witness claims headless when a TTY fact is missing (non-TTY)", async () => {
+    const r = rig([{ kind: "ok", text: "headless claim" }], {
+      stdinIsTTY: false,
+      stdoutIsTTY: true,
+    });
+    try {
+      await r.app.start();
+      r.app.onDoctorFinished(10);
+      sendTurn(r.tty, "hi");
+      await until(
+        () => r.app.phase === "idle" && r.app.turns.length === 1 && r.app.turns[0]?.verify != null,
+        "I2 headless turn",
+      );
+      const reqs = readRequests(r.requestLogPath);
+      assert.equal(reqs.length, 1, "one turn/start recorded");
+      assert.equal(reqs[0]?.mode, "headless");
+      assertNoSecrets(reqs[0] ?? {});
+      await r.cleanup();
+    } catch (e) {
+      await r.cleanup();
+      throw e;
+    }
+  });
+
+  it("recorded turn/start params carry no secret-shaped token", async () => {
+    const r = rig([{ kind: "ok", text: "no secrets" }]);
+    try {
+      await r.app.start();
+      r.app.onDoctorFinished(10);
+      sendTurn(r.tty, "hi");
+      await until(
+        () => r.app.phase === "idle" && r.app.turns.length === 1 && r.app.turns[0]?.verify != null,
+        "I2 secret-scan turn",
+      );
+      const reqs = readRequests(r.requestLogPath);
+      assert.ok(reqs.length >= 1);
+      for (const params of reqs) assertNoSecrets(params);
+      assert.ok(paramsModeIsClaim(reqs[0]?.mode));
+      await r.cleanup();
+    } catch (e) {
+      await r.cleanup();
+      throw e;
+    }
+  });
+});
+
+function paramsModeIsClaim(mode: unknown): boolean {
+  return mode === "interactive" || mode === "headless";
+}
 
 /** The app never writes to stdout while it owns the screen (§5.0). */
 describe("Witness app stdout discipline", () => {
