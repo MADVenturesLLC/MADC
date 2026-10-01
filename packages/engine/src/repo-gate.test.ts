@@ -55,6 +55,7 @@ import {
   type SessionEvent,
   verifySessionFile,
 } from "./session-store.ts";
+import { fixtureGitEnv } from "./testing/git-env.ts";
 import { makeHome, seatFileBody, writeSeatFile } from "./testing/harness.ts";
 
 const POSIX = process.platform !== "win32";
@@ -73,13 +74,16 @@ function makeRoot(): string {
  * producing `.git`; the retry absorbs that transient, and a persistent failure still fails loudly
  * with diagnostics. That matters beyond test hygiene: the `git config` that follows would otherwise
  * resolve into whatever repository git could find instead, which is how a fixture value ended up
- * written into this repository's own shared config during this act.
+ * written into this repository's own shared config during this act. M1-A9 found the cause of "exit 0
+ * without `.git`": an inherited `GIT_DIR` (a git hook exports one), so every fixture `git` child now
+ * runs with the runner's `GIT_*` variables stripped (`fixtureGitEnv`).
  */
 function initRepo(dir: string): void {
   mkdirSync(dir, { recursive: true });
   for (let attempt = 1; ; attempt += 1) {
     execFileSync("git", ["init", "--quiet", "--", dir], {
       encoding: "utf8",
+      env: fixtureGitEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
     if (existsSync(join(dir, ".git"))) return;
@@ -89,6 +93,7 @@ function initRepo(dir: string): void {
         gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], {
           cwd: dir,
           encoding: "utf8",
+          env: fixtureGitEnv(),
           stdio: ["ignore", "pipe", "pipe"],
         }).trim();
       } catch {
@@ -113,6 +118,7 @@ function makeRepo(parent: string, name: string, originUrl: string): string {
   initRepo(dir);
   execFileSync("git", ["config", "--local", "--replace-all", "remote.origin.url", originUrl], {
     cwd: dir,
+    env: fixtureGitEnv(),
     stdio: ["ignore", "ignore", "pipe"],
   });
   return realpathSync(dir);
@@ -825,4 +831,36 @@ test("A9 L1 DeepSeek: on a clean install the real lane is refused before any req
   } finally {
     await e.close();
   }
+});
+
+test("A9 fixture safety: an inherited GIT_DIR never redirects a fixture git child (pre-push from a worktree)", async (t) => {
+  // The repo's pre-push hook runs this suite; from a linked worktree git exports an absolute
+  // `GIT_DIR`. Before `fixtureGitEnv`, the fixtures' `git init` then re-initialized THAT repository
+  // (`core.bare = true` in the shared config). A scratch canary stands in for it here.
+  const root = makeRoot();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const canary = join(root, "canary.git");
+  execFileSync("git", ["init", "--quiet", "--bare", "--", canary], { env: fixtureGitEnv() });
+  const canaryConfig = readFileSync(join(canary, "config"), "utf8");
+
+  const previous = process.env.GIT_DIR;
+  process.env.GIT_DIR = canary;
+  try {
+    const repo = makeRepo(root, "under-hook", `https://${ALLOWED_REMOTE}.git`);
+    assert.ok(existsSync(join(repo, ".git")), "the fixture got its own repository");
+    const origin = execFileSync("git", ["config", "--local", "--get", "remote.origin.url"], {
+      cwd: repo,
+      encoding: "utf8",
+      env: fixtureGitEnv(),
+    }).trim();
+    assert.equal(origin, `https://${ALLOWED_REMOTE}.git`);
+  } finally {
+    if (previous === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = previous;
+  }
+  assert.equal(
+    readFileSync(join(canary, "config"), "utf8"),
+    canaryConfig,
+    "the repository GIT_DIR named is untouched",
+  );
 });
