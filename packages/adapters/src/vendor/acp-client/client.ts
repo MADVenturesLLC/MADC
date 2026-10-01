@@ -336,10 +336,16 @@ function streamAcpTurn(
       }
     });
     // A closed agent pipe reports EPIPE as an async stream 'error' (never a thrown write); an
-    // unhandled stream error would crash the engine, so route it into the failure path.
+    // unhandled stream error would crash the engine, so route it into the failure path. After an
+    // abort the pipe closed because MAD killed the child, and that EPIPE can land before 'close':
+    // it is still the abort, never a vendor failure (M1-A9: the already-aborted race).
     child.stdin?.on("error", () => {
       if (settled) return;
-      fail(new ProviderCallError("failed", null, `${label} agent stdin closed`));
+      fail(
+        request.signal.aborted
+          ? new ProviderCallError("aborted", null, `${label} turn aborted`)
+          : new ProviderCallError("failed", null, `${label} agent stdin closed`),
+      );
     });
     // stderr is drained but never read, logged, or surfaced (it can carry vendor or account text).
     child.stderr?.resume?.();

@@ -128,16 +128,21 @@ function listedModel(id: string, baseUrl: string): Model<"openai-completions"> {
   };
 }
 
-function ollamaCloudProvider(
+/**
+ * The lane's own pi-ai configuration: the OpenAI-compat custom provider over `baseUrl`, carrying
+ * exactly the `listed` model ids (the live `/api/tags` answer; empty before the first refresh).
+ * The port streams through it, and the M1-A9 L1 tool round-trip drives the same builder.
+ */
+export function buildOllamaCloudProvider(
   baseUrl: string,
-  models: readonly Model<"openai-completions">[],
+  listedIds: readonly string[],
 ): Provider<"openai-completions"> {
   return createProvider({
     id: OLLAMA_PI_PROVIDER,
     name: "Ollama Cloud",
     baseUrl,
     auth: { apiKey: envApiKeyAuth("Ollama Cloud API key", [OLLAMA_API_KEY_ENV]) },
-    models,
+    models: listedIds.map((id) => listedModel(id, baseUrl)),
     api: openAICompletionsApi(),
   });
 }
@@ -161,7 +166,7 @@ export function createOllamaCloudPort(options: OllamaCloudPortOptions): Provider
     apiKey: options.apiKey,
     // The static catalog is EMPTY on purpose: availability truth is the live list, fetched by
     // refreshProvider the first time a model is requested (and re-fetched on an unknown model).
-    buildProvider: () => ollamaCloudProvider(baseUrl, []),
+    buildProvider: () => buildOllamaCloudProvider(baseUrl, []),
     refreshProvider: async () => {
       const listed = await listOllamaCloudModels({
         apiKey: options.apiKey,
@@ -169,9 +174,9 @@ export function createOllamaCloudPort(options: OllamaCloudPortOptions): Provider
         ...(options.tagsUrl === undefined ? {} : { tagsUrl: options.tagsUrl }),
         ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
       });
-      return ollamaCloudProvider(
+      return buildOllamaCloudProvider(
         baseUrl,
-        listed.map((model) => listedModel(model.id, baseUrl)),
+        listed.map((model) => model.id),
       );
     },
     ...(options.baseUrl === undefined ? {} : { baseUrl: options.baseUrl }),

@@ -46,6 +46,7 @@ export {
   type StaticCatalogLane,
 } from "./direct/pinned-model.ts";
 export {
+  buildKimiProvider,
   createKimiCodePort,
   honestUserAgent,
   KIMI_API_KEY_ENV,
@@ -78,8 +79,10 @@ export {
   ALIBABA_PLAN_KEY_PREFIX,
   type AlibabaClass,
   type AlibabaCodingPlanPortOptions,
+  alibabaCodingPlanModel,
   alibabaEndpointClass,
   alibabaKeyClass,
+  buildAlibabaCodingPlanProvider,
   checkAlibabaCredential,
   createAlibabaCodingPlanPort,
   resolveAlibabaCodingPlanPinnedModel,
@@ -112,6 +115,7 @@ export {
   resolveGeminiPinnedModel,
 } from "./providers/gemini.ts";
 export {
+  buildMinimaxProvider,
   checkMinimaxCredential,
   createMinimaxTokenPlanPort,
   MINIMAX_BASE_URL,
@@ -138,6 +142,7 @@ export {
   resolveMistralPinnedModel,
 } from "./providers/mistral.ts";
 export {
+  buildOllamaCloudProvider,
   createOllamaCloudPort,
   type ListedOllamaModel,
   listOllamaCloudModels,

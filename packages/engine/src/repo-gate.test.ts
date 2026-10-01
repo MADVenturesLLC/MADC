@@ -5,7 +5,9 @@
  *
  * Network-free and credential-free: the fixture agent never calls a provider, the repositories are
  * real temporary git checkouts, and every assertion is about the RESPONSE ERROR and the durable
- * `repo.decision` receipt.
+ * `repo.decision` receipt. The M1-A9 cases at the end are the one exception: they run the real
+ * DeepSeek adapter on its in-process fake transport (a `.invalid` host, a synthetic key) behind the
+ * same gate, so an allowed turn is actually served and a denied one provably never reaches the wire.
  *
  * What this file proves that `policy/policy.test.ts` (the pure matrix) cannot:
  * - the gate runs INSIDE `turn/start`, before the agent's preflight and before any provider call, so
@@ -33,11 +35,13 @@ import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
 import {
+  createDeepseekPort,
   ProviderCallError,
   type ProviderPort,
   resolveDeepseekPinnedModel,
   resolveKimiPinnedModel,
 } from "@madc/adapters";
+import { createFakeDeepSeekTransport } from "@madc/adapters/testing";
 import type { Agent, AgentTurnContext, TurnSink } from "./agent.ts";
 import { loadRepoPolicy, POLICY_FILE_NAME } from "./policy/store.ts";
 import { ErrorCode, RpcError } from "./protocol/errors.ts";
@@ -51,6 +55,7 @@ import {
   type SessionEvent,
   verifySessionFile,
 } from "./session-store.ts";
+import { fixtureGitEnv } from "./testing/git-env.ts";
 import { makeHome, seatFileBody, writeSeatFile } from "./testing/harness.ts";
 
 const POSIX = process.platform !== "win32";
@@ -69,13 +74,16 @@ function makeRoot(): string {
  * producing `.git`; the retry absorbs that transient, and a persistent failure still fails loudly
  * with diagnostics. That matters beyond test hygiene: the `git config` that follows would otherwise
  * resolve into whatever repository git could find instead, which is how a fixture value ended up
- * written into this repository's own shared config during this act.
+ * written into this repository's own shared config during this act. M1-A9 found the cause of "exit 0
+ * without `.git`": an inherited `GIT_DIR` (a git hook exports one), so every fixture `git` child now
+ * runs with the runner's `GIT_*` variables stripped (`fixtureGitEnv`).
  */
 function initRepo(dir: string): void {
   mkdirSync(dir, { recursive: true });
   for (let attempt = 1; ; attempt += 1) {
     execFileSync("git", ["init", "--quiet", "--", dir], {
       encoding: "utf8",
+      env: fixtureGitEnv(),
       stdio: ["ignore", "pipe", "pipe"],
     });
     if (existsSync(join(dir, ".git"))) return;
@@ -85,6 +93,7 @@ function initRepo(dir: string): void {
         gitDir = execFileSync("git", ["rev-parse", "--absolute-git-dir"], {
           cwd: dir,
           encoding: "utf8",
+          env: fixtureGitEnv(),
           stdio: ["ignore", "pipe", "pipe"],
         }).trim();
       } catch {
@@ -109,6 +118,7 @@ function makeRepo(parent: string, name: string, originUrl: string): string {
   initRepo(dir);
   execFileSync("git", ["config", "--local", "--replace-all", "remote.origin.url", originUrl], {
     cwd: dir,
+    env: fixtureGitEnv(),
     stdio: ["ignore", "ignore", "pipe"],
   });
   return realpathSync(dir);
@@ -693,4 +703,164 @@ test("A4 gate: a repo decision that cannot be recorded stops the walk before any
   );
   assert.equal(sink.captured.repoDecisions.length, 1, "the decision was offered to the sink");
   assert.equal(deepseek.calls(), 0, "an unrecorded decision never authorizes a call");
+});
+
+// ------------------------------------------- M1-A9: the real DeepSeek lane behind the gate
+//
+// Plan §2 B: "DeepSeek passing mock conformance against a test allowlist, and denying every repo
+// on a clean install". The cases above prove the gate with a fixture agent that serves nothing;
+// these two put the PRODUCTION provider agent with the REAL DeepSeek adapter (on its in-process
+// fake transport, a `.invalid` host) behind the same in-process connection, so the allowed turn is
+// actually served and receipted, and the denied one provably never reaches the wire.
+
+/** The production agent with only the DeepSeek lane, on the fake transport. */
+function deepseekAgent(fetch: typeof globalThis.fetch): Agent {
+  return createProviderAgent({
+    directLanes: [
+      {
+        providerId: DEEPSEEK,
+        credential: "test-sentinel-key-a9-deepseek",
+        createPort: (apiKey) =>
+          createDeepseekPort({ apiKey, baseUrl: "https://deepseek-fake.invalid", fetch }),
+        resolvePinnedModel: resolveDeepseekPinnedModel,
+      },
+    ],
+  });
+}
+
+function sessionEvents(home: string, threadId: string): SessionEvent[] {
+  return readFileSync(join(home, "sessions", `${threadId}.jsonl`), "utf8")
+    .split("\n")
+    .filter((line) => line !== "")
+    .map((line) => JSON.parse(line) as SessionEvent);
+}
+
+async function waitForTurnEnd(home: string, threadId: string): Promise<SessionEvent> {
+  const until = Date.now() + 5_000;
+  for (;;) {
+    const end = sessionEvents(home, threadId).find((event) => event.type === "turn.end");
+    if (end !== undefined) return end;
+    if (Date.now() > until) throw new Error("timed out waiting for turn.end");
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+test("A9 L1 DeepSeek: an allowlisted repo is served end to end by the real lane, receipted and chained", async (t) => {
+  const root = makeRoot();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const { home, cleanup } = makeHome();
+  t.after(cleanup);
+  const repo = makeRepo(root, "a9-allowed", `git@github.com:owner/repo.git`);
+  // A TEST allowlist naming the temporary repo only; the shipped default stays empty (D-M1-8).
+  writePolicy(home, { [DEEPSEEK]: [ALLOWED_REMOTE] });
+  writeSeatFile(home, deepseekSeat("ds-a9"));
+  const fake = createFakeDeepSeekTransport({
+    reply: { type: "stream", chunks: ["served ", "by deepseek"], model: "deepseek-flash-0408" },
+  });
+
+  const e = startEngine(home, deepseekAgent(fake.fetch));
+  try {
+    await handshake(e);
+    const threadId = await startThread(e, "ds-a9", repo);
+    const reply = await e.request("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "hello deepseek" }],
+    });
+    assert.equal(reply.error, undefined, JSON.stringify(reply.error));
+    const end = await waitForTurnEnd(home, threadId);
+    assert.deepEqual(end.payload, {
+      turnId: (end.payload as { turnId: string }).turnId,
+      status: "completed",
+      error: null,
+    });
+    assert.equal(fake.requests.length, 1, "exactly one request reached the (fake) DeepSeek wire");
+
+    const events = sessionEvents(home, threadId);
+    const decision = events.find((event) => event.type === "repo.decision");
+    assert.ok(decision, "the gate's decision is recorded");
+    assert.equal((decision.payload as RepoDecisionPayload).decision, "allow");
+    assert.ok(
+      events.indexOf(decision) < events.findIndex((event) => event.type === "turn.start"),
+      "the gate decided before the turn started",
+    );
+    const served = events.find((event) => event.type === "servedModel");
+    assert.deepEqual(served?.payload, {
+      turnId: (end.payload as { turnId: string }).turnId,
+      requestedModel: "deepseek/deepseek-flash",
+      servedModel: "deepseek-flash-0408",
+      backing: DEEPSEEK,
+      providerId: DEEPSEEK,
+      lane: "allowed-direct",
+      mode: "headless",
+      fallbackFrom: null,
+      vendorReported: true,
+    });
+    const path = join(home, "sessions", `${threadId}.jsonl`);
+    assert.ok(verifySessionFile(path, threadId, {}, home).ok, "the hash chain verifies");
+  } finally {
+    await e.close();
+  }
+});
+
+test("A9 L1 DeepSeek: on a clean install the real lane is refused before any request exists", async (t) => {
+  const root = makeRoot();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const { home, cleanup } = makeHome();
+  t.after(cleanup);
+  const repo = makeRepo(root, "a9-clean", `https://${ALLOWED_REMOTE}.git`);
+  // No policy.json: the clean-install default (D-M1-8). A credential IS present for the lane.
+  writeSeatFile(home, deepseekSeat("ds-a9-clean"));
+  const fake = createFakeDeepSeekTransport();
+
+  const e = startEngine(home, deepseekAgent(fake.fetch));
+  try {
+    await handshake(e);
+    const threadId = await startThread(e, "ds-a9-clean", repo);
+    const reply = await e.request("turn/start", {
+      threadId,
+      input: [{ type: "text", text: "hello deepseek" }],
+    });
+    const error = reply.error as { code: number; data: Record<string, unknown> } | undefined;
+    assert.equal(error?.code, ErrorCode.ProviderDenied);
+    assert.equal(error?.data?.reason, "repo-not-allowed");
+    assert.deepEqual(fake.requests, [], "nothing reached the wire");
+    assert.ok(
+      !sessionEvents(home, threadId).some((event) => event.type === "servedModel"),
+      "no receipt for a refused turn",
+    );
+  } finally {
+    await e.close();
+  }
+});
+
+test("A9 fixture safety: an inherited GIT_DIR never redirects a fixture git child (pre-push from a worktree)", async (t) => {
+  // The repo's pre-push hook runs this suite; from a linked worktree git exports an absolute
+  // `GIT_DIR`. Before `fixtureGitEnv`, the fixtures' `git init` then re-initialized THAT repository
+  // (`core.bare = true` in the shared config). A scratch canary stands in for it here.
+  const root = makeRoot();
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const canary = join(root, "canary.git");
+  execFileSync("git", ["init", "--quiet", "--bare", "--", canary], { env: fixtureGitEnv() });
+  const canaryConfig = readFileSync(join(canary, "config"), "utf8");
+
+  const previous = process.env.GIT_DIR;
+  process.env.GIT_DIR = canary;
+  try {
+    const repo = makeRepo(root, "under-hook", `https://${ALLOWED_REMOTE}.git`);
+    assert.ok(existsSync(join(repo, ".git")), "the fixture got its own repository");
+    const origin = execFileSync("git", ["config", "--local", "--get", "remote.origin.url"], {
+      cwd: repo,
+      encoding: "utf8",
+      env: fixtureGitEnv(),
+    }).trim();
+    assert.equal(origin, `https://${ALLOWED_REMOTE}.git`);
+  } finally {
+    if (previous === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = previous;
+  }
+  assert.equal(
+    readFileSync(join(canary, "config"), "utf8"),
+    canaryConfig,
+    "the repository GIT_DIR named is untouched",
+  );
 });

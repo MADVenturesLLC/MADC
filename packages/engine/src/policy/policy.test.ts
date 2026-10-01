@@ -29,6 +29,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
+import { fixtureGitEnv } from "../testing/git-env.ts";
 import { type RepoIdentityResolution, resolveRepoIdentity } from "./identity.ts";
 import {
   loadRepoPolicy,
@@ -56,13 +57,16 @@ function makeRoot(): string {
  * one bounded retry: under the full parallel suite `git init` has been observed to exit 0 without
  * producing `.git`. That matters beyond test hygiene — the `git config` calls that follow would
  * otherwise resolve into whatever repository git could find instead, which is how a fixture value
- * reached this repository's own shared config during this act.
+ * reached this repository's own shared config during this act. M1-A9 found the cause of "exit 0
+ * without `.git`": an inherited `GIT_DIR` (a git hook exports one), so every fixture `git` child now
+ * runs with the runner's `GIT_*` variables stripped (`fixtureGitEnv`).
  */
 function git(dir: string, ...args: string[]): void {
   mkdirSync(dir, { recursive: true });
   for (let attempt = 1; ; attempt += 1) {
     execFileSync("git", [...args, "--", dir], {
       cwd: dir,
+      env: fixtureGitEnv(),
       stdio: ["ignore", "ignore", "pipe"],
     });
     if (existsSync(join(dir, ".git"))) return;
@@ -84,6 +88,7 @@ function git(dir: string, ...args: string[]): void {
 function setConfig(dir: string, key: string, value: string): void {
   execFileSync("git", ["config", "--local", key, value], {
     cwd: dir,
+    env: fixtureGitEnv(),
     stdio: ["ignore", "ignore", "pipe"],
   });
 }
@@ -91,6 +96,7 @@ function setConfig(dir: string, key: string, value: string): void {
 function addConfig(dir: string, key: string, value: string): void {
   execFileSync("git", ["config", "--local", "--add", key, value], {
     cwd: dir,
+    env: fixtureGitEnv(),
     stdio: ["ignore", "ignore", "pipe"],
   });
 }

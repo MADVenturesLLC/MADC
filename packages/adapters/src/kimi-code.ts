@@ -98,6 +98,14 @@ export function honestUserAgent(madcVersion: string): string {
   return `madc/${madcVersion} (pi-ai/${PI_AI_VERSION}; ${process.platform} ${process.arch})`;
 }
 
+/**
+ * The pinned pi-ai built-in provider, unchanged — the lane's own pi-ai configuration. The port
+ * streams through it, and the M1-A9 L1 tool round-trip drives the same builder.
+ */
+export function buildKimiProvider() {
+  return kimiCodingProvider();
+}
+
 export type KimiCodePortOptions = {
   readonly apiKey: string;
   readonly userAgent: string;
@@ -119,7 +127,7 @@ export function createKimiCodePort(options: KimiCodePortOptions): ProviderPort {
     piProvider: KIMI_PI_PROVIDER,
     api: "anthropic-messages",
     apiKey: options.apiKey,
-    buildProvider: () => kimiCodingProvider(),
+    buildProvider: buildKimiProvider,
     userAgent: options.userAgent,
     ...(options.baseUrl === undefined ? {} : { baseUrl: options.baseUrl }),
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),

@@ -148,8 +148,12 @@ export function resolveAlibabaCodingPlanPinnedModel(pinnedModel: string): Pinned
   return { ok: true, modelId: pinnedModel.slice(slash + 1) };
 }
 
-/** The pass-through model record (see module docs: zeros mean "unknown", never a claim). */
-function codingPlanModel(id: string, baseUrl: string): Model<"openai-completions"> {
+/**
+ * The pass-through model record (see module docs: zeros mean "unknown", never a claim). Exported
+ * with {@link buildAlibabaCodingPlanProvider} so the M1-A9 L1 tool round-trip drives exactly what
+ * the port streams through.
+ */
+export function alibabaCodingPlanModel(id: string, baseUrl: string): Model<"openai-completions"> {
   return {
     id,
     name: id,
@@ -163,6 +167,23 @@ function codingPlanModel(id: string, baseUrl: string): Model<"openai-completions
     maxTokens: 0,
     compat: { supportsStore: false, supportsDeveloperRole: false },
   };
+}
+
+/**
+ * The lane's own pi-ai configuration: the OpenAI-compat custom provider over `baseUrl` with an
+ * EMPTY static catalog — every id comes through {@link alibabaCodingPlanModel} (see module docs).
+ */
+export function buildAlibabaCodingPlanProvider(baseUrl: string) {
+  return createProvider({
+    id: ALIBABA_CODING_PLAN_PI_PROVIDER,
+    name: "Alibaba Cloud Coding Plan",
+    baseUrl,
+    auth: {
+      apiKey: envApiKeyAuth("Alibaba Coding Plan API key", [ALIBABA_CODING_PLAN_API_KEY_ENV]),
+    },
+    models: [],
+    api: openAICompletionsApi(),
+  });
 }
 
 export type AlibabaCodingPlanPortOptions = {
@@ -184,18 +205,8 @@ export function createAlibabaCodingPlanPort(options: AlibabaCodingPlanPortOption
     api: ALIBABA_CODING_PLAN_WIRE_API,
     apiKey: options.apiKey,
     // An empty static catalog: every id comes through `unlistedModel` (see module docs).
-    buildProvider: () =>
-      createProvider({
-        id: ALIBABA_CODING_PLAN_PI_PROVIDER,
-        name: "Alibaba Cloud Coding Plan",
-        baseUrl,
-        auth: {
-          apiKey: envApiKeyAuth("Alibaba Coding Plan API key", [ALIBABA_CODING_PLAN_API_KEY_ENV]),
-        },
-        models: [],
-        api: openAICompletionsApi(),
-      }),
-    unlistedModel: (modelId) => codingPlanModel(modelId, baseUrl),
+    buildProvider: () => buildAlibabaCodingPlanProvider(baseUrl),
+    unlistedModel: (modelId) => alibabaCodingPlanModel(modelId, baseUrl),
     ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
   });
 }

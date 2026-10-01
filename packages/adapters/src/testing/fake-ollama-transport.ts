@@ -25,6 +25,19 @@ export type FakeOllamaReply =
   | { readonly type: "stream"; readonly chunks: readonly string[]; readonly model: string }
   /** Streams chunks whose `model` field is omitted: the vendor reports no identity. */
   | { readonly type: "stream-no-model"; readonly chunks: readonly string[] }
+  /**
+   * M1-A9 (L1 tool round-trip): the assistant answers with one tool call (`finish_reason:
+   * "tool_calls"` → pi-ai `stopReason: "toolUse"`), in the same OpenAI chat-completions frames the
+   * DeepSeek fake uses. pi-ai yields a `{ type: "toolCall", id, name, arguments }` content part
+   * with `id` verbatim.
+   */
+  | {
+      readonly type: "tool-call";
+      readonly id: string;
+      readonly name: string;
+      readonly args: Readonly<Record<string, unknown>>;
+      readonly model: string;
+    }
   /** Plain HTTP error with a JSON body (tests use it for 429/502 quota signals). */
   | { readonly type: "status"; readonly status: number; readonly body: string }
   /** Sends the role frame + one delta, then stalls until the request is aborted. */
@@ -73,11 +86,36 @@ function deltaFrame(model: string | null, content: string): string {
   });
 }
 
-function endFrames(model: string | null): string {
+function toolCallFrame(
+  model: string,
+  call: { readonly id: string; readonly name: string; readonly args: unknown },
+): string {
+  return chunkFrame({
+    model,
+    choices: [
+      {
+        index: 0,
+        delta: {
+          tool_calls: [
+            {
+              index: 0,
+              id: call.id,
+              type: "function",
+              function: { name: call.name, arguments: JSON.stringify(call.args) },
+            },
+          ],
+        },
+        finish_reason: null,
+      },
+    ],
+  });
+}
+
+function endFrames(model: string | null, finishReason = "stop"): string {
   return (
     chunkFrame({
       ...(model === null ? {} : { model }),
-      choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+      choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
     }) +
     chunkFrame({
       ...(model === null ? {} : { model }),
@@ -165,6 +203,12 @@ export function createFakeOllamaTransport(
         if (current.type === "hang") {
           controller.enqueue(encoder.encode(deltaFrame(model, "partial")));
           signal?.addEventListener("abort", () => controller.error(abortError()), { once: true });
+          return;
+        }
+        if (current.type === "tool-call") {
+          controller.enqueue(encoder.encode(toolCallFrame(current.model, current)));
+          controller.enqueue(encoder.encode(endFrames(current.model, "tool_calls")));
+          controller.close();
           return;
         }
         for (const chunk of current.chunks) {
