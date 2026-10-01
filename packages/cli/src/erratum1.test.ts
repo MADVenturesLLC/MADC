@@ -258,7 +258,11 @@ test("§3b rules 1/3: unknown notifications and unmatched responses never reset 
       const r = await runOneShotChild(sb, { scenario, turnIdleMs: 60_000, responseTimeoutMs: 500 });
       assert.equal(r.code, 3, `${scenario}: ${r.stdout}${r.stderr}`);
       assert.equal(parseJson(r.stdout).error?.message, "timeout 500ms", scenario);
-      assert.ok(r.ms < 2_000, `${scenario}: the original deadline held (${r.ms} ms)`);
+      // The storm never stops, so a deadline that reset on inbound messages would never fire at
+      // all (the pinned mutation hangs until the harness cap). The bound only separates "fired
+      // near its 500 ms deadline" from "never"; it covers two runtime start-ups (CLI + engine) on
+      // a loaded CI runner, where 2 s proved too tight once the M1-A8 suite grew (2144 / 2242 ms).
+      assert.ok(r.ms < 3_000, `${scenario}: the original deadline held (${r.ms} ms)`);
     } finally {
       sb.cleanup();
     }
