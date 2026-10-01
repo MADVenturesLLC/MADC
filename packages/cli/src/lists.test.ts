@@ -459,6 +459,54 @@ test("A8 parseProviderList: one entry per catalog entry, in order, presence only
   }
 });
 
+test("A8 rpc-call: a non-protocol stdout line written during shutdown still fails the call", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "madc-a8-rpc-late-"));
+  try {
+    // Answers initialize and seat/list correctly, then writes a non-JSON line on EOF (i.e. while
+    // the caller is already cleaning up) before exiting.
+    const engine = join(dir, "late-garbage-engine.mjs");
+    writeFileSync(
+      engine,
+      [
+        'import { createInterface } from "node:readline";',
+        'const send = (m) => process.stdout.write(JSON.stringify(m) + "\\n");',
+        "createInterface({ input: process.stdin })",
+        '  .on("line", (line) => {',
+        "    const m = JSON.parse(line);",
+        '    if (m.method === "initialize") {',
+        '      send({ id: m.id, result: { serverInfo: { name: "madc-engine", version: "0.0.0" }, protocolVersion: "madc-m1/1" } });',
+        '    } else if (m.method === "seat/list") {',
+        "      send({ id: m.id, result: { data: [] } });",
+        "    }",
+        "  })",
+        '  .on("close", () => process.stdout.write("not json\\n", () => process.exit(0)));',
+        "",
+      ].join("\n"),
+    );
+    const io = {
+      stdout: { write: () => undefined },
+      stderr: { write: () => undefined },
+      stdin: process.stdin,
+      env: {},
+      stdoutIsTTY: false,
+      stderrIsTTY: false,
+      cwd: dir,
+      engineEntry: engine,
+    };
+    const r = await callEngineOnce(io, {
+      env: {},
+      clientName: "madc-test",
+      method: "seat/list",
+      budgetMs: 10_000,
+    });
+    assert.equal(r.ok, false, "a late malformed line is a protocol violation, not success");
+    assert.equal(r.ok ? "" : r.reason, "protocol violation: non-JSON line on engine stdout");
+    assert.equal(r.ok ? 0 : r.exit, 3);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("A8 rpc-call: cleanup never extends the deadline (an engine that never answers is killed)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "madc-a8-rpc-"));
   try {
