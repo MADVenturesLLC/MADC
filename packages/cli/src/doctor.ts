@@ -35,6 +35,7 @@ import {
   EngineRpcError,
   inspectMadcHome,
   isPidAlive,
+  isValidId,
   listCatalog,
   listSeatSummaries,
   loadRepoPolicy,
@@ -484,7 +485,9 @@ export function localRows(home: HomeState): Check[] {
     checkSeat(home, insp),
     checkSession(home, insp),
     home.kind === "invalid" ? skip("locks", "MADC_HOME is invalid") : checkLocks(home),
-    checkSeats(home, home.kind === "present" ? listSeatSummaries(home.path) : null),
+    home.kind === "present"
+      ? checkSeats(home, listSeatSummaries(home.path), straySeatFiles(home.path) ?? [])
+      : checkSeats(home, null),
   ];
 }
 
@@ -964,6 +967,28 @@ function checkPolicy(home: HomeState): Check {
 }
 
 /**
+ * `seats/*.json` names that `seat/list` never lists because their stem cannot be a seat id (e.g.
+ * `bad.id.json`): `thread/start` refuses such an id with -32602 before any path join, so the file
+ * can never load as a seat. M1-A7 left reporting them to doctor (`seats/list.ts`). Dot-names are
+ * skipped like the engine does (the seed writer's temp files). Read-only and confined: `seats/`
+ * must be a real directory under the real home, unchanged across the listing; else `null`.
+ */
+export function straySeatFiles(home: string): string[] | null {
+  const before = confinedDirId(home, "seats");
+  if (before === null) return null;
+  let names: string[];
+  try {
+    names = readdirSync(join(home, "seats"));
+  } catch {
+    return null;
+  }
+  if (!sameDirId(before, confinedDirId(home, "seats"))) return null;
+  return names
+    .filter((n) => n.endsWith(".json") && !n.startsWith(".") && !isValidId(n.slice(0, -5)))
+    .sort();
+}
+
+/**
  * M1-A8 `seats`: every seat in `$MADC_HOME/seats/`, read through `listSeatSummaries` — the exact
  * projection the engine's `seat/list` method returns (M1-A7). Doctor cannot ask the method itself:
  * every engine start seeds the roster and tightens modes in the home, and plain doctor is read-only
@@ -972,15 +997,21 @@ function checkPolicy(home: HomeState): Check {
  * - FAIL: a seat file that does not load (the seat cannot serve a turn; existing FAIL rule).
  * - WARN: a listed fallback that can never be eligible under the same-lane rule (D-M1-7), as the
  *   engine words it at seat load (seat pin §2: "`madc doctor` warn[s] on any listed fallback that
- *   can never be eligible").
- * Seat-file-sourced text is stripped of control bytes before it reaches a row.
+ *   can never be eligible"); and a `seats/*.json` file whose name can never be a seat id
+ *   (`straySeatFiles`), which `seat/list` deliberately does not list.
+ * Seat-file-sourced text, file names included, is stripped of control bytes before it reaches a row.
  */
-export function checkSeats(home: HomeState, seats: readonly SeatSummary[] | null): Check {
+export function checkSeats(
+  home: HomeState,
+  seats: readonly SeatSummary[] | null,
+  stray: readonly string[] = [],
+): Check {
   if (home.kind === "invalid") return skip("seats", "MADC_HOME is invalid");
   if (home.kind === "missing" || seats === null) {
     return skip("seats", `not initialized (${join(home.path, "seats")})`);
   }
   const dir = join(home.path, "seats");
+  const strayNames = stray.map(stripControls);
   const evidence = {
     dir,
     seats: seats.map((s) =>
@@ -988,12 +1019,19 @@ export function checkSeats(home: HomeState, seats: readonly SeatSummary[] | null
         ? { id: s.id, ok: true, warnings: s.warnings.map(stripControls) }
         : { id: s.id, ok: false, path: s.path, code: s.code, issues: s.issues.map(stripControls) },
     ),
+    stray: strayNames,
   };
+  const strayWarnings = strayNames.map(
+    (n) => `seats/${n}: not a seat id (^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$), never loaded as a seat`,
+  );
   if (seats.length === 0) {
     return {
       id: "seats",
       status: "warn",
-      summary: `no seat listed under ${dir} (missing, unreadable, or not confined to MADC_HOME)`,
+      summary: [
+        `no seat listed under ${dir} (missing, unreadable, or not confined to MADC_HOME)`,
+        ...strayWarnings,
+      ].join("; "),
       evidence,
     };
   }
@@ -1008,6 +1046,7 @@ export function checkSeats(home: HomeState, seats: readonly SeatSummary[] | null
       broken.push(`${s.id}: ${s.code}${issues}`);
     }
   }
+  warnings.push(...strayWarnings);
   if (broken.length > 0) {
     return {
       id: "seats",

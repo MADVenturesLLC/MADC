@@ -429,6 +429,31 @@ test("M1-A8 doctor lanes: exit 0 with a WARN naming every stale (denied) allow e
   }
 });
 
+test("M1-A8 doctor seats: a seats/*.json name that can never be a seat id is WARNed (seat/list skips it)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    await seedWithSession(sb);
+    // `seat/list` never lists these (their stems fail the id grammar); A7 left them to doctor.
+    writeFileSync(join(sb.home, "seats", "bad.id.json"), "{}", { mode: 0o600 });
+    const esc = String.fromCharCode(27);
+    writeFileSync(join(sb.home, "seats", `x${esc}[31m.json`), "{}", { mode: 0o600 });
+    const r = await runCli(sb, ["doctor", "--json"]);
+    assert.equal(r.code, 0, r.stdout);
+    const row = check(JSON.parse(r.stdout) as DoctorJson, "seats");
+    assert.equal(row.status, "warn");
+    assert.match(row.summary, /seats\/bad\.id\.json: not a seat id .*never loaded as a seat/);
+    assert.match(row.summary, /seats\/x\uFFFD\[31m\.json: not a seat id/);
+    assert.ok(!row.summary.includes(esc), "file names are stripped of control bytes");
+    assert.deepEqual(row.evidence.stray, ["bad.id.json", "x\uFFFD[31m.json"]);
+    const text = await runCli(sb, ["doctor"]);
+    assert.ok(!text.stdout.includes(esc), "no raw ESC from a file name reaches the terminal");
+  } finally {
+    sb.cleanup();
+  }
+});
+
 test("M1-A8 doctor seats: a seat file that does not load FAILs (exit 1); never-eligible fallbacks WARN", {
   timeout: 60_000,
 }, async () => {
