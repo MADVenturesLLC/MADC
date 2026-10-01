@@ -46,6 +46,7 @@ import {
   type InitializeResult,
   type Item,
   PROTOCOL_VERSION,
+  type ProviderListResult,
   type RequestId,
   type RpcErrorBody,
   SERVER_NAME,
@@ -59,6 +60,11 @@ import {
   type UserInput,
 } from "./protocol/types.ts";
 import { encodeMessage, isPlainObject, parseLine } from "./protocol/wire.ts";
+import {
+  defaultBinaryPresence,
+  listProviderSummaries,
+  type ProviderPresence,
+} from "./providers/list.ts";
 import { type LoadedSeat, loadSeat } from "./seat-store.ts";
 import { listSeatSummaries } from "./seats/list.ts";
 import { ensureSeatMemoryFile } from "./seats/memory.ts";
@@ -108,6 +114,14 @@ export type EngineOptions = {
    * engine that never serves a presence-gated turn never touches the terminal. Tests inject fakes.
    */
   terminal?: PresenceTerminal;
+  /**
+   * M1-A8: how `provider/list` learns credential and binary presence. Default: the engine's own
+   * credential store (`status`, presence only) and the turn preflight's read-only PATH lookups.
+   * Tests inject fakes.
+   */
+  providerPresence?: ProviderPresence;
+  /** M1-A8 test seam: the clock `provider/list` judges terms freshness by (default `Date.now`). */
+  now?: () => number;
 };
 
 type TurnRecord = {
@@ -478,6 +492,8 @@ export class EngineConnection {
         return this.#turnInterrupt(params);
       case "seat/list":
         return { value: this.#seatList(params) };
+      case "provider/list":
+        return this.#providerList(params);
       case "auth/status":
         return this.#authStatus(params);
       case "auth/remove":
@@ -501,6 +517,27 @@ export class EngineConnection {
       throw invalidParams([`seat/list takes no params (got ${unexpected.join(", ")})`]);
     }
     return { data: listSeatSummaries(this.#opts.home) };
+  }
+
+  // ---------------------------------------------------------------- providers
+
+  /**
+   * M1-A8 (protocol pin §3.5 P4, §5): `{ data: ProviderSummary[] }`, one summary per registry
+   * catalog entry. Read-only, presence only. Params are pinned as `{}`, so any field at all is
+   * -32602 — like `seat/list`, the method takes nothing and can therefore never be handed a secret.
+   */
+  async #providerList(params: unknown): Promise<{ value: ProviderListResult }> {
+    const p = paramsObject(params);
+    const unexpected = Object.keys(p);
+    if (unexpected.length > 0) {
+      throw invalidParams([`provider/list takes no params (got ${unexpected.join(", ")})`]);
+    }
+    const presence: ProviderPresence = this.#opts.providerPresence ?? {
+      credentials: (providerId) => this.#credentialStore().status(providerId),
+      binary: defaultBinaryPresence(),
+    };
+    const now = this.#opts.now?.() ?? Date.now();
+    return { value: { data: await listProviderSummaries(presence, now) } };
   }
 
   /**

@@ -246,7 +246,43 @@ export type SeatSummary =
 
 export type SeatListResult = { data: SeatSummary[] };
 
-/** Client → server requests (complete M0 list plus the M1 `auth/*` and `seat/list` methods). */
+/**
+ * `provider/list` (P4, protocol pin §3.5): params are pinned as `{}`, so the method declares no
+ * fields — the engine accepts an absent or empty params object and refuses anything else (-32602).
+ */
+export type ProviderListParams = Record<string, never>;
+
+/**
+ * One registry catalog entry as `provider/list` reports it (protocol pin §5, exact field set). Every
+ * catalog entry is listed — wired, unwired and `forbidden` alike — in catalog order. Presence is a
+ * boolean and nothing else: never a credential value, its length, a prefix or a hash.
+ *
+ * - `credentialsPresent` is set only on a lane whose registry `connect` is `direct` (the credential
+ *   store's presence probe, the same answer `auth/status` gives).
+ * - `binaryPresent` is set only on a `vendor-agent` lane whose binary this build can look for (a
+ *   read-only PATH lookup, never an execution). A vendor-agent entry with no adapter in this build
+ *   carries neither field rather than a guess.
+ * - A `forbidden` entry (`connect: "none"`) carries neither: there is no lane to be present for.
+ * - `stale` is `isStale(entry, now)` against the registry's 30-day window (M1-A1), reported for
+ *   every entry; whether a stale entry is denied (an allow entry without a Founder override, D-M1-6)
+ *   is the registry's rule, not a field here.
+ */
+export type ProviderSummary = {
+  readonly id: string;
+  readonly status: ProviderStatus;
+  readonly wired: boolean;
+  readonly verifiedAt: string;
+  readonly stale: boolean;
+  readonly credentialsPresent?: boolean;
+  readonly binaryPresent?: boolean;
+};
+
+export type ProviderListResult = { data: ProviderSummary[] };
+
+/**
+ * Client → server requests (complete M0 list plus the M1 §3.5 methods: `seat/list`,
+ * `provider/list`, `auth/status`, `auth/remove`).
+ */
 export type ClientRequests = {
   initialize: { params: InitializeParams; result: InitializeResult };
   "thread/start": { params: ThreadStartParams; result: ThreadStartResult };
@@ -255,6 +291,7 @@ export type ClientRequests = {
   "turn/start": { params: TurnStartParams; result: TurnStartResult };
   "turn/interrupt": { params: TurnInterruptParams; result: TurnInterruptResult };
   "seat/list": { params: SeatListParams; result: SeatListResult };
+  "provider/list": { params: ProviderListParams; result: ProviderListResult };
   "auth/status": { params: AuthStatusParams; result: AuthStatusResult };
   "auth/remove": { params: AuthRemoveParams; result: AuthRemoveResult };
 };
@@ -295,6 +332,7 @@ export const CLIENT_REQUEST_METHODS: readonly ClientRequestMethod[] = Object.fre
   "turn/start",
   "turn/interrupt",
   "seat/list",
+  "provider/list",
   "auth/status",
   "auth/remove",
 ]);
@@ -302,9 +340,9 @@ export const CLIENT_REQUEST_METHODS: readonly ClientRequestMethod[] = Object.fre
 /**
  * Declared top-level params fields per request method (M1-A2 schema test, protocol pin §3.5: "No
  * `auth/set` over JSONL … No JSONL method accepts a secret value"). Keys are exactly
- * `CLIENT_REQUEST_METHODS`; no field may carry a secret. `seat/list` is the one method the pin
- * gives empty params (`{}`), so it declares no field — an empty list there is the pinned shape,
- * not a missing declaration.
+ * `CLIENT_REQUEST_METHODS`; no field may carry a secret. `seat/list` and `provider/list` are the two
+ * methods the pin gives empty params (`{}`), so they declare no field — an empty list there is the
+ * pinned shape, not a missing declaration.
  */
 export const CLIENT_REQUEST_PARAM_FIELDS: Readonly<Record<ClientRequestMethod, readonly string[]>> =
   Object.freeze({
@@ -315,6 +353,7 @@ export const CLIENT_REQUEST_PARAM_FIELDS: Readonly<Record<ClientRequestMethod, r
     "turn/start": ["threadId", "input", "mode"],
     "turn/interrupt": ["threadId", "turnId"],
     "seat/list": [],
+    "provider/list": [],
     "auth/status": ["providerId"],
     "auth/remove": ["providerId"],
   });

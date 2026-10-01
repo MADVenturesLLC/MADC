@@ -40,15 +40,23 @@ test("@madc/engine/client (CLI surface) carries no engine loop or agents", () =>
     "startStdioEngine",
     "SessionWriter",
     "seedDefaultSeat",
-    // M1-A7: the CLI reaches seats through the `seat/list` method, never through the writer or the
-    // host-side projection.
+    // M1-A7: the CLI never reaches the seed writer. (M1-A8 moved `listSeatSummaries` onto the
+    // surface, read-only, for doctor — see the next test.)
     "seedSeatFile",
     "seedRosterSeats",
-    "listSeatSummaries",
     "runAuthSet",
     "createCredentialStore",
     "defaultAgentFactory",
   ]) {
     assert.equal(Object.hasOwn(sdk, hostOnly), false, `${hostOnly} must not be on the CLI surface`);
   }
+});
+
+test("M1-A8: the CLI surface adds only read-only seat listing and pure registry policy", () => {
+  // `madc seats ls` calls the `seat/list` METHOD. Doctor cannot: an engine start seeds the roster
+  // and tightens modes in the real $MADC_HOME, and plain doctor is read-only there (CLI pin §3). It
+  // therefore reads the same projection through the same function, read-only, in its bounded child.
+  assert.equal(sdk.listSeatSummaries, engine.listSeatSummaries);
+  assert.equal(typeof sdk.canServe, "function");
+  assert.equal(sdk.DEFAULT_STALE_DAYS, 30);
 });

@@ -14,9 +14,25 @@
  * <providerId>` child (protocol pin §2: a separate process, NOT a JSONL session; stdio inherited
  * so the child owns the no-echo TTY prompt). The credential store itself stays host-side: the CLI
  * never reads, writes or sees a credential value.
+ *
+ * Act M1-A8: adds the pure registry mode check (`canServe`) and freshness window
+ * (`DEFAULT_STALE_DAYS`), so `madc providers ls` and doctor's lanes table say which modes a lane can
+ * serve from the registry's own policy rather than a second copy of it; and the read-only seat
+ * projection `listSeatSummaries` for doctor's `seats` row. `madc seats ls` uses the `seat/list`
+ * method; doctor cannot, because every engine start seeds the roster and tightens directory modes
+ * in `$MADC_HOME`, and plain doctor is read-only against the real home (CLI pin §3). So doctor
+ * reads the identical projection through the function that method calls, inside its bounded
+ * child — the same pattern as `inspectMadcHome` (M0-A7) and `loadRepoPolicy` (M1-A4). It loads
+ * seats through the engine's confined, no-follow loader and never writes.
  */
 
-export { listCatalog, type ProviderEntry, type ProviderStatus } from "@madc/registry";
+export {
+  canServe,
+  DEFAULT_STALE_DAYS,
+  listCatalog,
+  type ProviderEntry,
+  type ProviderStatus,
+} from "@madc/registry";
 export {
   ENGINE_ENTRY,
   EngineClient,
@@ -58,6 +74,7 @@ export {
 export * from "./protocol/errors.ts";
 export { ID_PATTERN, isValidId } from "./protocol/ids.ts";
 export * from "./protocol/types.ts";
+export { listSeatSummaries } from "./seats/list.ts";
 export {
   type SessionFailureKind,
   type SessionVerifyResult,
