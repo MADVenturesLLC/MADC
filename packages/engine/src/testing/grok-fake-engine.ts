@@ -17,6 +17,10 @@ import { createCodexCodePort, createGrokBuildPort } from "@madc/adapters";
 import { createFakeAcpSpawn, createFakeCodexSpawn } from "@madc/adapters/testing";
 import { startStdioEngine } from "../main.ts";
 import { createProviderAgent } from "../provider-agent.ts";
+import { applyRegistryTestClock } from "./registry-test-clock.ts";
+
+applyRegistryTestClock();
+
 import { ENGINE_VERSION } from "../server.ts";
 
 /** Behaves like node's ENOENT: an `error` event, silent stdio, no result. */

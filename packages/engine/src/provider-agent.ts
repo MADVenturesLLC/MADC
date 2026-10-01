@@ -115,6 +115,14 @@ export type ProviderAgentOptions = {
   /** M1-A3: registry-driven direct-key lanes (kimi-code, ollama-cloud; A4/A5 add more). */
   readonly directLanes?: readonly DirectLane[];
   /**
+   * I1 (D-M1-6): the registry freshness clock for the turn-time preflight, as unix ms. The engine
+   * supplies it on every real turn so a stale allow entry denies (reason `terms-stale`) BEFORE any
+   * network call — the same rule doctor's lanes report already shows. Absent reads as the real
+   * system clock; tests inject a fixed instant, and the test harness pins the seam so suites stay
+   * deterministic past the catalog's freshness window.
+   */
+  readonly assertAllowedNow?: number;
+  /**
    * A5: builds the Claude Code port for a detected binary path. Its presence means the claude-code
    * adapter is in this build (production always passes it; kimi-only fixtures omit it).
    */
@@ -229,7 +237,27 @@ function providerUnavailable(
   } satisfies ProviderUnavailableData);
 }
 
+/**
+ * I1: the test-only freshness clock pin (unix ms), or undefined. Valid iff a non-negative safe
+ * integer — anything else is IGNORED, never trusted: a malformed pin must not widen a lane, and
+ * the real clock denies a stale entry exactly as a valid pin would have.
+ */
+function parseRegistryTestNow(value: string | undefined): number | undefined {
+  if (value === undefined || value === "") return undefined;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
 export function createProviderAgent(options: ProviderAgentOptions): Agent {
+  // I1: freshness clock for the turn-time preflight. Explicit option wins; a test process (or a
+  // spawned test engine) pins the clock through MADC_TEST_REGISTRY_NOW (unix ms — never set
+  // outside tests, the same escape-hatch pattern as MADC_DEV_ENV_KEYS); production reads the real
+  // clock. Pinned by the engine test harness so suites stay deterministic past the catalog's
+  // freshness window (verifiedAt + 30 days) instead of failing en masse on the real clock.
+  const assertAllowedNow =
+    options.assertAllowedNow ??
+    parseRegistryTestNow(process.env.MADC_TEST_REGISTRY_NOW) ??
+    Date.now();
   const detectClaudeBinary = options.detectClaudeBinary ?? (() => findClaudeBinary(process.env));
   const detectCodexBinary = options.detectCodexBinary ?? (() => findCodexBinary(process.env));
   const detectGrokBinary = options.detectGrokBinary ?? (() => findGrokBinary(process.env));
@@ -269,6 +297,10 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
         mode: laneMode(entry, ctx),
         connect: connectFor(entry),
         requireLive: true,
+        // I1 (D-M1-6): the engine's freshness clock — a stale allow entry denies here (reason
+        // `terms-stale`) before any lane, port or network is touched, so turn time and the
+        // doctor / providers-ls lanes report can no longer disagree.
+        now: assertAllowedNow,
       });
     } catch (err) {
       if (err instanceof RegistryDeniedError) {

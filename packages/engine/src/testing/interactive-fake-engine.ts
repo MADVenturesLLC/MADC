@@ -24,6 +24,9 @@ import {
 import { createFakeDeepSeekTransport, createFakeKimiTransport } from "@madc/adapters/testing";
 import { startStdioEngine } from "../main.ts";
 import { createProviderAgent } from "../provider-agent.ts";
+import { applyRegistryTestClock } from "./registry-test-clock.ts";
+
+applyRegistryTestClock();
 
 export const FAKE_MINIMAX_BASE_URL = "https://minimax-fake.invalid/anthropic";
 export const FAKE_ALIBABA_BASE_URL = "https://alibaba-fake.invalid/v1";

@@ -32,6 +32,21 @@ export const INTERACTIVE_FAKE_ENGINE = fileURLToPath(
 /** M1-A5: the real system terminal in its own process (`script` pty / detached spawn tests). */
 export const PRESENCE_PROBE = fileURLToPath(new URL("./presence-probe.ts", import.meta.url));
 
+// I1 (D-M1-6): the pinned registry freshness clock (see ./registry-test-clock.ts). Importing this
+// module sets MADC_TEST_REGISTRY_NOW in the test process, so in-process engines and every engine
+// this harness spawns are deterministic inside the catalog's freshness window; `hermeticEnv`
+// carries the same pin to spawned children. A test that needs a different instant overrides the
+// env (or the engine option) after importing.
+import {
+  applyRegistryTestClock,
+  REGISTRY_TEST_NOW_ENV,
+  REGISTRY_TEST_NOW_MS,
+} from "./registry-test-clock.ts";
+
+applyRegistryTestClock();
+
+export { REGISTRY_TEST_NOW_ENV, REGISTRY_TEST_NOW_MS };
+
 export function makeHome(): { home: string; cleanup: () => void } {
   const root = mkdtempSync(join(tmpdir(), "madc-a2-"));
   const home = join(root, "home");
@@ -74,7 +89,10 @@ export function hermeticEnv(
   for (const name of Object.keys(process.env)) {
     if (SECRET_ENV_NAME.test(name)) env[name] = undefined;
   }
-  return { ...env, ...extra };
+  // I1: pin the freshness clock for every spawned test engine (the in-process pin rides the
+  // import of this module; a test that NEEDS the real or a different clock overrides the env
+  // in its own `extra` — see the stale-entry tests).
+  return { ...env, [REGISTRY_TEST_NOW_ENV]: String(REGISTRY_TEST_NOW_MS), ...extra };
 }
 
 /** Spawns a test engine (default: the echo fixture) with a hermetic env. */
