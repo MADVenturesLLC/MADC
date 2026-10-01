@@ -771,10 +771,10 @@ test("A9 L1 DeepSeek: an allowlisted repo is served end to end by the real lane,
 
     const events = sessionEvents(home, threadId);
     const decision = events.find((event) => event.type === "repo.decision");
-    assert.equal((decision?.payload as RepoDecisionPayload).decision, "allow");
+    assert.ok(decision, "the gate's decision is recorded");
+    assert.equal((decision.payload as RepoDecisionPayload).decision, "allow");
     assert.ok(
-      events.indexOf(decision as SessionEvent) <
-        events.findIndex((event) => event.type === "turn.start"),
+      events.indexOf(decision) < events.findIndex((event) => event.type === "turn.start"),
       "the gate decided before the turn started",
     );
     const served = events.find((event) => event.type === "servedModel");
