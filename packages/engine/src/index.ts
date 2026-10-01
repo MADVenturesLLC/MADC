@@ -112,6 +112,11 @@ export {
   type ProviderAgentOptions,
 } from "./provider-agent.ts";
 export {
+  defaultBinaryPresence,
+  listProviderSummaries,
+  type ProviderPresence,
+} from "./providers/list.ts";
+export {
   type EngineSeat,
   MADC_DEFAULT_SEAT,
   memoryPathIssue,

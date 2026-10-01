@@ -17,8 +17,15 @@ import { PassThrough } from "node:stream";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { ErrorCode } from "@madc/engine/client";
-import { CHAT_RESERVED, hasJsonFlag, parseArgs } from "./args.ts";
 import {
+  CHAT_RESERVED,
+  hasJsonFlag,
+  parseArgs,
+  SEAT_CHAT_NEEDS_TTY,
+  SEAT_ID_INVALID,
+} from "./args.ts";
+import {
+  collectDoctor,
   confinedSeatSha,
   localRows,
   procStartMs,
@@ -85,6 +92,103 @@ test("A7 §1 usage errors: bare text is reserved for M1 chat; unknown flag, -s w
   assert.equal(parseArgs(["doctor", "extra"]).kind, "usage");
   assert.equal(parseArgs(["-p", "x", "--init"]).kind, "usage");
   assert.equal(parseArgs(["doctor", "-s", "x"]).kind, "usage");
+});
+
+test("M1-A8 grammar: providers ls / seats ls [--json]; nothing else is accepted around them", () => {
+  assert.deepEqual(parseArgs(["providers", "ls"]), { kind: "providers-ls", json: false });
+  assert.deepEqual(parseArgs(["--json", "providers", "ls"]), { kind: "providers-ls", json: true });
+  assert.deepEqual(parseArgs(["seats", "ls", "--json"]), { kind: "seats-ls", json: true });
+  assert.deepEqual(parseArgs(["providers"]), {
+    kind: "usage",
+    message: "providers needs a subcommand: ls",
+  });
+  // An unknown subcommand is never echoed (it could be anything pasted on the command line).
+  assert.deepEqual(parseArgs(["seats", "sk-not-a-subcommand"]), {
+    kind: "usage",
+    message: "unknown seats subcommand (expected ls)",
+  });
+  assert.deepEqual(parseArgs(["providers", "ls", "extra"]), {
+    kind: "usage",
+    message: "unexpected argument extra",
+  });
+  assert.equal(parseArgs(["providers", "ls", "-s", "x"]).kind, "usage");
+  assert.equal(parseArgs(["seats", "ls", "--init"]).kind, "usage");
+  // `-p` keeps the one-shot's own rule for stray positionals (M0 bytes unchanged).
+  assert.deepEqual(parseArgs(["-p", "hi", "providers", "ls"]), {
+    kind: "usage",
+    message: "unexpected argument providers",
+  });
+});
+
+test("M1-A8 grammar: -s on the interactive entry carries the seat; a bad id is refused at parse", () => {
+  // The M0/rev-6.2 shapes are unchanged without -s.
+  assert.deepEqual(parseArgs([]), { kind: "usage", message: "no command given" });
+  assert.deepEqual(parseArgs(["hi"]), { kind: "usage", message: CHAT_RESERVED });
+  // With -s: the same entry, now carrying the seat (main routes it to the app on a full TTY).
+  assert.deepEqual(parseArgs(["-s", "daedalus"]), {
+    kind: "usage",
+    message: SEAT_CHAT_NEEDS_TTY,
+    seatId: "daedalus",
+  });
+  assert.deepEqual(parseArgs(["-s", "daedalus", "plan the act"]), {
+    kind: "usage",
+    message: CHAT_RESERVED,
+    seatId: "daedalus",
+  });
+  assert.deepEqual(parseArgs(["plan the act", "-s", "daedalus"]), {
+    kind: "usage",
+    message: CHAT_RESERVED,
+    seatId: "daedalus",
+  });
+  // An id the engine could never accept: usage before anything spawns, the id never echoed.
+  for (const bad of ["../x", "", "a.b", "-x", " daedalus", "x".repeat(129)]) {
+    assert.deepEqual(parseArgs(["-s", bad]), { kind: "usage", message: SEAT_ID_INVALID }, bad);
+    assert.deepEqual(parseArgs(["-s", bad, "hi"]), { kind: "usage", message: SEAT_ID_INVALID });
+  }
+  assert.deepEqual(parseArgs(["-s"]), { kind: "usage", message: "-s needs a value" });
+  // The one-shot is unchanged: its seat id is the engine's to judge (-32602 / -32005 / -32006).
+  assert.deepEqual(parseArgs(["-p", "hi", "-s", "../x"]), {
+    kind: "oneshot",
+    prompt: "hi",
+    seatId: "../x",
+    json: false,
+  });
+  assert.equal(parseArgs(["doctor", "-s", "x"]).kind, "usage");
+  assert.equal(parseArgs(["--init", "-s", "x"]).kind, "usage");
+});
+
+test("M1-A8 -s off a TTY: one usage line, exit 2, nothing spawned; --json gets the JSON shape", async () => {
+  const io = fakeIO({ engineEntry: "/nonexistent/engine.ts" });
+  assert.equal(await main(["-s", "daedalus"], io), 2);
+  assert.equal(io.err(), `madc: ${SEAT_CHAT_NEEDS_TTY} (see madc --help)\n`);
+  assert.equal(io.out(), "");
+  // With text, the non-TTY bytes are today's CHAT_RESERVED line exactly (rev 6.2 hard rule 1).
+  const text = fakeIO({ engineEntry: "/nonexistent/engine.ts" });
+  assert.equal(await main(["-s", "daedalus", "hi"], text), 2);
+  assert.equal(text.err(), `${CHAT_RESERVED}\n`);
+  const bad = fakeIO({ engineEntry: "/nonexistent/engine.ts" });
+  assert.equal(await main(["-s", "../x", "hi"], bad), 2);
+  assert.equal(bad.err(), `madc: ${SEAT_ID_INVALID} (see madc --help)\n`);
+  // Even on a full TTY a bad id never reaches the app: exit 2 before anything starts.
+  const tty = fakeIO({
+    engineEntry: "/nonexistent/engine.ts",
+    stdinIsTTY: true,
+    stdoutIsTTY: true,
+    stderrIsTTY: true,
+    columns: 120,
+    rows: 40,
+  });
+  assert.equal(await main(["-s", "../x"], tty), 2);
+  assert.equal(tty.err(), `madc: ${SEAT_ID_INVALID} (see madc --help)\n`);
+  const json = fakeIO();
+  assert.equal(await main(["--json", "-s", "daedalus"], json), 2);
+  const out = JSON.parse(json.out()) as {
+    exitCode: number;
+    error: { class: string; message: string };
+  };
+  assert.equal(out.exitCode, 2);
+  assert.equal(out.error.class, "usage");
+  assert.equal(out.error.message, SEAT_CHAT_NEEDS_TTY);
 });
 
 test("A7 §4 exit table: every protocol error code has an explicit class", () => {
@@ -319,6 +423,48 @@ test("A7 §2 on a TTY a foreign-turn delta is never rendered, only classified (B
   } finally {
     if (saved === undefined) delete process.env.MADC_TEST_FAKE_SCENARIO;
     else process.env.MADC_TEST_FAKE_SCENARIO = saved;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("M1-A8 doctor with caller-owned signal state: the caller's kill reaches the lanes probe (Copilot r4151089642)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "madc-a8-extsig-"));
+  try {
+    // An engine that answers initialize, exits on EOF, and never answers provider/list.
+    const engine = join(dir, "lanes-hang-engine.mjs");
+    writeFileSync(
+      engine,
+      [
+        'import { createInterface } from "node:readline";',
+        'createInterface({ input: process.stdin }).on("line", (line) => {',
+        "  const m = JSON.parse(line);",
+        '  if (m.method === "initialize") {',
+        '    const result = { serverInfo: { name: "madc-engine", version: "0.0.0" }, protocolVersion: "madc-m1/1" };',
+        '    process.stdout.write(JSON.stringify({ id: m.id, result }) + "\\n");',
+        "  }",
+        '}).on("close", () => process.exit(0));',
+        "",
+      ].join("\n"),
+    );
+    const sig: { exit: number | null; kill: (() => void) | null } = { exit: null, kill: null };
+    const io = fakeIO({ env: { MADC_HOME: join(dir, "home") }, engineEntry: engine });
+    const t0 = Date.now();
+    const run = await collectDoctor(
+      io,
+      { json: false, init: false },
+      {
+        // The app's quit (Ctrl-D: no exit code) lands while the lanes probe is waiting.
+        onStart: (id) => {
+          if (id === "lanes") setTimeout(() => sig.kill?.(), 300);
+        },
+      },
+      sig,
+    );
+    const elapsed = Date.now() - t0;
+    const lanes = run.checks.find((c) => c.id === "lanes");
+    assert.equal(lanes?.status, "fail");
+    assert.ok(elapsed < 10_000, `the kill ended the probe, not its 20 s budget (${elapsed} ms)`);
+  } finally {
     rmSync(dir, { recursive: true, force: true });
   }
 });

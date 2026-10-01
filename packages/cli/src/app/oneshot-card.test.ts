@@ -292,7 +292,9 @@ describe("§8 doctor tier-W presentation", () => {
     };
     const run = await collectDoctor(quietIo, { json: false, init: false }, {});
     assert.equal(stdout.text(), ""); // collectDoctor never writes
-    assert.equal(run.checks.length, 11); // runtime, engine, home, seat, session, locks, registry, policy, cred, bin.claude, bin.codex
+    // runtime, engine, home, seat, session, locks, registry, policy, cred, bin.claude, bin.codex,
+    // and the M1-A8 seats + lanes rows.
+    assert.equal(run.checks.length, 13);
     assert.equal(typeof run.exitCode, "number");
     rmSync(someHome, { recursive: true, force: true });
   });

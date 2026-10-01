@@ -1,6 +1,7 @@
 /**
- * Test fixture: a scripted MULTI-TURN engine for Witness-app tests (stdio JSONL, node:* only,
- * no engine imports — the same constraint as fake-engine.ts). The turn script comes from
+ * Test fixture: a scripted MULTI-TURN engine for Witness-app tests (stdio JSONL, no engine
+ * internals — the same constraint as fake-engine.ts; `provider/list` (M1-A8) loads the pure
+ * registry catalog from `@madc/engine/client` lazily, so only that request pays for the import). The turn script comes from
  * `MADC_TEST_APP_TURNS` (a JSON array); each `turn/start` pops the next entry:
  *
  *   {"kind":"ok","text":"…"}            turn completes; servedModel receipt; chain intact
@@ -62,7 +63,8 @@ const helpersOnly = process.env.MADC_TEST_FIXTURE_HELPERS_ONLY === "1";
  * pid, seven-digit ones included (no modulo, no truncation). */
 export const fixtureThreadId = (pid: number): string => `thr_app${String(pid).padStart(6, "0")}`;
 const threadId = fixtureThreadId(process.pid);
-const seatId = "madc-default";
+/** The seat `thread/start` asked for (M1-A8 `madc -s`), else the engine default madc-default. */
+let seatId = "madc-default";
 const sessionFile = join(home, "sessions", `${threadId}.jsonl`);
 const send = (m: unknown): void => {
   process.stdout.write(`${JSON.stringify(m)}\n`);
@@ -210,6 +212,10 @@ rl?.on("line", (line) => {
       if (threadStartMode === "die") {
         process.exit(3);
       }
+      // M1-A8: answer on the requested seat, like the real engine (the session file's envelope
+      // `seatId` then records what the app asked for).
+      const requested = msg.params?.seatId;
+      if (seq === 0 && typeof requested === "string") seatId = requested;
       mkdirSync(join(home, "sessions"), { recursive: true });
       if (seq === 0) {
         append("session.open", {
@@ -676,6 +682,27 @@ rl?.on("line", (line) => {
       send({ id: msg.id, result: {} });
       return;
     }
+    case "provider/list":
+      // M1-A8: an M1 engine answers the lanes report with one entry per catalog entry (the CLI
+      // refuses anything partial). The fixture reports nothing present and nothing stale, so the
+      // launch doctor's `lanes` row passes instead of FAILing (which would hold input). The
+      // catalog is imported here, lazily: the SDK graph is too heavy to load on every spawn.
+      void import("@madc/engine/client").then(({ listCatalog }) => {
+        send({
+          id: msg.id,
+          result: {
+            data: listCatalog().map((e) => ({
+              id: e.id,
+              status: e.status,
+              wired: e.wired,
+              verifiedAt: e.verifiedAt,
+              stale: false,
+              ...(e.connect === "direct" ? { credentialsPresent: false } : {}),
+            })),
+          },
+        });
+      });
+      return;
     default:
       send({ id: msg.id, error: { code: -32601, message: "Method not found" } });
   }

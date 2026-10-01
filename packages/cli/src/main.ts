@@ -2,18 +2,20 @@
  * `madc` entry logic (CLI pin §1). Talks to the engine only through `@madc/engine/client`
  * (spawned child, stdio JSONL) — except `auth set`, which spawns the one-shot
  * `madc-engine auth-set` child (M1-A2, protocol pin §2: never a JSONL session). M0 surface:
- * --version, --help, doctor, headless -p. M1-A2 adds `auth set|rm|status`. No chat.
+ * --version, --help, doctor, headless -p. M1-A2 adds `auth set|rm|status`; M1-A8 adds
+ * `providers ls`, `seats ls` and `-s <seatId>` on the interactive (Witness) entry.
  */
 import { MADC_VERSION } from "@madc/core";
 import { PROTOCOL_VERSION, resolveMadcHome } from "@madc/engine/client";
 import { runWitnessApp } from "./app/launch.ts";
 import { ProcessTty } from "./app/tty.ts";
-import { CHAT_RESERVED, hasJsonFlag, parseArgs, USAGE } from "./args.ts";
+import { CHAT_RESERVED, hasJsonFlag, parseArgs, SEAT_CHAT_NEEDS_TTY, USAGE } from "./args.ts";
 import { runAuth } from "./auth.ts";
 import { classifyHomePath, runDoctor } from "./doctor.ts";
 import { takeEarlySignal } from "./early-signal.ts";
 import { EXIT } from "./exit-codes.ts";
 import type { CliIO } from "./io.ts";
+import { runProvidersLs, runSeatsLs } from "./lists.ts";
 import { PROMPT_CAP_BYTES, readPromptFromStdin, runOneShot } from "./oneshot.ts";
 
 const DEFAULT_SEAT = "madc-default";
@@ -30,13 +32,15 @@ export async function main(argv: readonly string[], io: CliIO): Promise<number> 
     case "usage":
       // Rev 6.2 (P-2/P-3/P-4): on a full TTY, bare `madc` opens the app and `madc "<text>"`
       // opens it and sends <text> as the first turn. Otherwise today's bytes exactly (hard
-      // rule 1: nothing changes in non-TTY mode).
+      // rule 1: nothing changes in non-TTY mode). M1-A8: `-s <seatId>` opens it on that seat.
       if (
         !hasJsonFlag(argv) &&
-        (parsed.message === "no command given" || parsed.message === CHAT_RESERVED) &&
+        (parsed.message === "no command given" ||
+          parsed.message === CHAT_RESERVED ||
+          parsed.message === SEAT_CHAT_NEEDS_TTY) &&
         appGateOpen(io)
       ) {
-        return witnessEntry(io, firstPositional(argv));
+        return witnessEntry(io, firstPositional(argv), parsed.seatId);
       }
       // §3e E8: with `--json` anywhere as a flag token, every parse-level usage failure prints
       // one JSON object and nothing on stderr.
@@ -49,6 +53,10 @@ export async function main(argv: readonly string[], io: CliIO): Promise<number> 
       return runDoctor(io, { json: parsed.json, init: parsed.init });
     case "auth":
       return runAuth(io, parsed.sub, parsed.providerId);
+    case "providers-ls":
+      return runProvidersLs(io, parsed.json);
+    case "seats-ls":
+      return runSeatsLs(io, parsed.json);
     case "oneshot":
       return oneShot(io, parsed.prompt, parsed.seatId, parsed.json);
   }
@@ -76,9 +84,14 @@ function firstPositional(argv: readonly string[]): string | null {
 
 /**
  * The Witness app entry (DESIGN-SPEC §5.0): the config checks print as today before the app
- * starts; then the tier decides between the full app, the line mode and inline mode.
+ * starts; then the tier decides between the full app, the line mode and inline mode. `seatId`
+ * (M1-A8, `-s`) is the seat the app opens its thread on; undefined keeps the engine default.
  */
-async function witnessEntry(io: CliIO, firstPrompt: string | null): Promise<number> {
+async function witnessEntry(
+  io: CliIO,
+  firstPrompt: string | null,
+  seatId: string | undefined,
+): Promise<number> {
   const earlySignal = takeEarlySignal();
   if (earlySignal !== null) {
     io.stderr.write("madc: interrupted by signal\n");
@@ -138,6 +151,7 @@ async function witnessEntry(io: CliIO, firstPrompt: string | null): Promise<numb
       home,
       turnIdleMs: idle.ms,
       firstPrompt,
+      ...(seatId !== undefined ? { seatId } : {}),
       tty,
       onApp: (a) => {
         app = a;

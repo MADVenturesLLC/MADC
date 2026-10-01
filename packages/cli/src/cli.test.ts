@@ -45,6 +45,9 @@ const DOCTOR_IDS = [
   "cred.kimi-code",
   "bin.claude",
   "bin.codex",
+  // M1-A8: appended after the M0 rows (whose ids and order are unchanged).
+  "seats",
+  "lanes",
 ];
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[`);
 const SECRET_ENV_NAME = /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i;
@@ -84,6 +87,9 @@ function runCli(sb: Sandbox, args: string[], opts: RunOptions = {}): Promise<Run
     HOME: join(sb.root, "user"),
     USERPROFILE: join(sb.root, "user"),
     PATH: sb.bin,
+    // No OS keychain backend: engine starts (doctor's probes, the M1-A8 `lanes` row) never reach
+    // a developer's real keychain from a test.
+    MADC_TEST_KEYCHAIN_PLATFORM: "none",
   });
   if (opts.engine !== undefined) env.MADC_TEST_ENGINE_ENTRY = opts.engine;
   for (const [k, v] of Object.entries(opts.env ?? {})) {
@@ -204,17 +210,27 @@ test("A7 §7.1 doctor exits 0 on an engine-seeded home with no KIMI_API_KEY and 
     );
     assert.equal(check(report, "bin.claude").summary, "not on PATH · adapter not built (A5)");
     assert.equal(check(report, "bin.codex").summary, "not on PATH · adapter not built (A6)");
-    assert.deepEqual(report.counts, { pass: 8, warn: 0, fail: 0, skip: 3 });
+    // M1-A8: two WARNs on a healthy seeded home, both pinned behaviour rather than faults — the
+    // seeded daedalus seat lists kimi-code, which can never be eligible under D-M1-7 (seat pin
+    // §3 says so in that cell), and the catalog carries never-verified allow entries the
+    // registry denies as stale (D-M1-6). WARN never fails doctor.
+    assert.equal(check(report, "seats").status, "warn");
+    assert.equal(check(report, "lanes").status, "warn");
+    assert.deepEqual(report.counts, { pass: 8, warn: 2, fail: 0, skip: 3 });
     const text = await runCli(sb, ["doctor"]);
     assert.equal(text.code, 0);
     const rows = text.stdout.trim().split("\n");
     assert.equal(rows[0], "madc doctor · madc 0.0.0 · protocol madc-m1/1");
     assert.deepEqual(
-      rows.slice(1, -1).map((l) => l.slice(6).split(" ")[0]),
+      rows
+        .slice(1, -1)
+        // M1-A8: the lanes table prints under its row, indented six spaces (never a row).
+        .filter((l) => !l.startsWith("      "))
+        .map((l) => l.slice(6).split(" ")[0]),
       DOCTOR_IDS,
       "text rows in pinned order",
     );
-    assert.match(rows.at(-1) ?? "", /^RESULT {2}0 FAIL · 0 WARN · 3 SKIP · \d+ ms {3}exit 0$/);
+    assert.match(rows.at(-1) ?? "", /^RESULT {2}0 FAIL · 2 WARN · 3 SKIP · \d+ ms {3}exit 0$/);
     assert.doesNotMatch(text.stdout + text.stderr, ANSI, "non-TTY output has no ANSI");
   } finally {
     sb.cleanup();
@@ -356,6 +372,130 @@ test("A7 §7.3 tampered session line → doctor session FAIL integrity (exit 1);
       );
       assert.equal(sha256(path), sha, "torn tail left untouched");
     }
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("M1-A8 doctor lanes: exit 0 with a WARN naming every stale (denied) allow entry; table under the row", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    await seedWithSession(sb);
+    const r = await runCli(sb, ["doctor", "--json"]);
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    assert.equal(r.stdout.trim().split("\n").length, 1, "--json is exactly one JSON value");
+    const report = JSON.parse(r.stdout) as DoctorJson;
+    const row = check(report, "lanes");
+    const lanes = row.evidence.lanes as Array<{
+      id: string;
+      status: string;
+      stale: boolean;
+      founderOverride: boolean;
+      staleDenied: boolean;
+    }>;
+    assert.ok(Array.isArray(lanes) && lanes.length > 0, "the lanes table is in the evidence");
+    // Denied for staleness = an allow entry, stale, no Founder override (D-M1-6); forbidden never.
+    const denied = lanes
+      .filter((l) => l.stale && l.status !== "forbidden" && !l.founderOverride)
+      .map((l) => l.id);
+    assert.ok(denied.length > 0, "the shipped catalog carries never-verified allow entries");
+    assert.deepEqual(row.evidence.staleDenied, denied);
+    assert.deepEqual(
+      lanes.filter((l) => l.staleDenied).map((l) => l.id),
+      denied,
+    );
+    assert.equal(row.status, "warn");
+    assert.match(row.summary, /^terms stale \(> 30 days, D-M1-6\): the registry denies /);
+    for (const id of denied) assert.ok(row.summary.includes(id), `${id} named in the WARN`);
+    assert.equal(report.ok, true, "WARN alone never fails doctor");
+
+    const text = await runCli(sb, ["doctor"]);
+    assert.equal(text.code, 0);
+    const lines = text.stdout.split("\n");
+    const at = lines.findIndex((l) => l.startsWith("WARN  lanes "));
+    assert.ok(at > 0, "the lanes row prints");
+    assert.match(
+      lines[at + 1] ?? "",
+      /^ {6}LANE +STATUS +WIRED +PRESENT +VERIFIED +TERMS +SERVES$/,
+    );
+    for (const [i, lane] of lanes.entries()) {
+      assert.ok(lines[at + 2 + i]?.startsWith(`      ${lane.id} `), `${lane.id} table line`);
+    }
+    assert.match(lines[at + 2 + lanes.length] ?? "", /^RESULT /);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("M1-A8 doctor seats: a seats/*.json name that can never be a seat id is WARNed (seat/list skips it)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    await seedWithSession(sb);
+    // `seat/list` never lists these (their stems fail the id grammar); A7 left them to doctor.
+    writeFileSync(join(sb.home, "seats", "bad.id.json"), "{}", { mode: 0o600 });
+    const esc = String.fromCharCode(27);
+    writeFileSync(join(sb.home, "seats", `x${esc}[31m.json`), "{}", { mode: 0o600 });
+    const r = await runCli(sb, ["doctor", "--json"]);
+    assert.equal(r.code, 0, r.stdout);
+    const row = check(JSON.parse(r.stdout) as DoctorJson, "seats");
+    assert.equal(row.status, "warn");
+    assert.match(row.summary, /seats\/bad\.id\.json: not a seat id .*never loaded as a seat/);
+    assert.match(row.summary, /seats\/x\uFFFD\[31m\.json: not a seat id/);
+    assert.ok(!row.summary.includes(esc), "file names are stripped of control bytes");
+    assert.deepEqual(row.evidence.stray, ["bad.id.json", "x\uFFFD[31m.json"]);
+    const text = await runCli(sb, ["doctor"]);
+    assert.ok(!text.stdout.includes(esc), "no raw ESC from a file name reaches the terminal");
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("M1-A8 doctor seats: a seat file that does not load FAILs (exit 1); never-eligible fallbacks WARN", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    await seedWithSession(sb);
+    // Healthy seeded home: the seeded daedalus seat lists kimi-code, never eligible (D-M1-7).
+    let r = await runCli(sb, ["doctor", "--json"]);
+    assert.equal(r.code, 0, r.stdout);
+    let row = check(JSON.parse(r.stdout) as DoctorJson, "seats");
+    assert.equal(row.status, "warn");
+    assert.match(
+      row.summary,
+      /^seat daedalus: fallback kimi-code can never be eligible \(fallback-lane-mismatch; assigned allowed-via-vendor-agent\/vendor-session, candidate allowed-direct\/payg\)$/,
+    );
+    // An unreadable seat (not JSON): FAIL, exit 1 — the existing seat FAIL rule, for every seat.
+    const broken = join(sb.home, "seats", "broken.json");
+    writeFileSync(broken, "{ not json", { mode: 0o600 });
+    const sha = sha256(broken);
+    r = await runCli(sb, ["doctor", "--json"]);
+    assert.equal(r.code, 1, r.stdout);
+    const report = JSON.parse(r.stdout) as DoctorJson;
+    row = check(report, "seats");
+    assert.equal(row.status, "fail");
+    assert.match(row.summary, /^broken: -32006 /);
+    assert.match(row.summary, /seat daedalus: fallback kimi-code can never be eligible/);
+    const listed = row.evidence.seats as Array<{ id: string; ok: boolean; path?: string }>;
+    assert.deepEqual(
+      listed.map((x) => [x.id, x.ok]),
+      [
+        ["broken", false],
+        ["daedalus", true],
+        ["hephaestus", true],
+        ["madc-default", true],
+        ["prometheus", true],
+        ["surface-architect", true],
+      ],
+    );
+    assert.equal(listed[0]?.path, broken);
+    // The default seat itself is fine, so the M0 `seat` row still passes.
+    assert.equal(check(report, "seat").status, "pass");
+    assert.equal(sha256(broken), sha, "doctor never modifies a seat file");
   } finally {
     sb.cleanup();
   }
@@ -603,6 +743,34 @@ test("A7 §7.5 exit 2: bare text, unknown flag, bad seat id (-32602) and missing
     const missing = await runCli(sb, ["-p", "hi", "-s", "nosuchseat", "--json"], { engine: ECHO });
     assert.equal(missing.code, 2);
     assert.equal((JSON.parse(missing.stdout) as { error: { code: number } }).error.code, -32005);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("M1-A8 madc -p … -s <seat> runs the turn on that seat (JSON seatId, thread, session envelope)", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    const r = await runCli(sb, ["-p", "hi", "-s", "daedalus", "--json"], { engine: ECHO });
+    assert.equal(r.code, 0, r.stdout + r.stderr);
+    const out = JSON.parse(r.stdout) as {
+      seatId: string;
+      threadId: string;
+      session: { path: string; chain: string };
+    };
+    assert.equal(out.seatId, "daedalus");
+    assert.equal(out.session.chain, "verified");
+    const events = readFileSync(out.session.path, "utf8")
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => JSON.parse(l) as { seatId: string; type: string; payload: { backing?: string } });
+    assert.ok(
+      events.every((e) => e.seatId === "daedalus"),
+      "every session line is on daedalus",
+    );
+    assert.equal(events[0]?.payload.backing, "claude-code", "daedalus's own backing (seat pin §3)");
   } finally {
     sb.cleanup();
   }

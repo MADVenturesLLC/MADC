@@ -10,7 +10,7 @@
 import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { listCatalog, PROTOCOL_VERSION } from "@madc/engine/client";
+import { DEFAULT_SEAT_ID, listCatalog, PROTOCOL_VERSION } from "@madc/engine/client";
 import type { Check } from "../doctor.ts";
 import { collectDoctor, confinedDirId, confinedSeatSha, sameDirId } from "../doctor.ts";
 import type { CliIO } from "../io.ts";
@@ -32,6 +32,11 @@ export type LaunchOptions = {
   readonly home: string;
   readonly turnIdleMs: number;
   readonly firstPrompt: string | null;
+  /**
+   * M1-A8 (`madc -s <seatId>`): the seat the app opens its thread on and shows in the banner and
+   * header. Undefined is the engine default, `madc-default` (protocol pin §3.2).
+   */
+  readonly seatId?: string;
   readonly tty?: AppTty;
   /** Called with the live app so the production entry can wire process signals to it. */
   readonly onApp?: (app: WitnessApp) => void;
@@ -48,8 +53,6 @@ export type LaunchOptions = {
     | undefined;
   readonly verify?: (req: VerifyRequest) => Promise<VerifyOutcome>;
 };
-
-const SEAT = "madc-default";
 
 /**
  * §5.0 IQW-12: only `MADC_UI=lines` is recognized. Unset, empty and every other value count
@@ -163,11 +166,12 @@ const doctorSummary = (
 function bannerData(
   io: CliIO,
   home: string,
+  seatId: string,
   rows: readonly Check[],
   ms: number | null,
   uiNote: string | null,
 ): BannerData {
-  const seat = seatFields(home, SEAT);
+  const seat = seatFields(home, seatId);
   const lane =
     seat.backing !== null
       ? (buildRegistrySummary()?.wired.includes(seat.backing) ?? false)
@@ -177,9 +181,11 @@ function bannerData(
   return {
     version: "0.0.0",
     protocol: PROTOCOL_VERSION,
-    seatId: SEAT,
-    seatSha: confinedSeatSha(home, `${SEAT}.json`)?.slice(0, 12) ?? null,
-    backing: seat.backing ?? "kimi-code",
+    seatId,
+    seatSha: confinedSeatSha(home, `${seatId}.json`)?.slice(0, 12) ?? null,
+    // An unreadable madc-default shows its M0 seed backing, as before M1-A8; any other selected
+    // seat (`-s`) whose file cannot be read says so rather than guessing a backing.
+    backing: seat.backing ?? (seatId === DEFAULT_SEAT_ID ? "kimi-code" : "unknown"),
     backingLane: lane,
     requested: seat.requested,
     served: null,
@@ -196,6 +202,7 @@ function bannerData(
 
 export async function runWitnessApp(opts: LaunchOptions): Promise<number> {
   const io = opts.io;
+  const seatId = opts.seatId ?? DEFAULT_SEAT_ID;
   // §3.4 production tier selection: the app's own gate decides W vs A from the REAL terminal
   // dimensions and env, not just MADC_UI — a limited terminal (below 80×24, TERM unset, TERM
   // exactly dumb, MADC_UI=lines, win32 without VT) receives Level A even when a tty is wired.
@@ -221,6 +228,7 @@ export async function runWitnessApp(opts: LaunchOptions): Promise<number> {
       home: opts.home,
       turnIdleMs: opts.turnIdleMs,
       firstPrompt: opts.firstPrompt,
+      seatId,
       why,
       launchWarnRows: warnRowsOf(rows),
       exposeSignals: opts.exposeSignals ?? undefined,
@@ -233,7 +241,7 @@ export async function runWitnessApp(opts: LaunchOptions): Promise<number> {
   const tty = opts.tty;
   const rows: Check[] = [];
   let doctorMs: number | null = null;
-  const banner = bannerData(io, opts.home, rows, doctorMs, uiNoteFor(io.env));
+  const banner = bannerData(io, opts.home, seatId, rows, doctorMs, uiNoteFor(io.env));
   return await new Promise<number>((resolve) => {
     const app = new WitnessApp(tty, {
       io,

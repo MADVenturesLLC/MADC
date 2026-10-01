@@ -7,6 +7,7 @@
 import * as readline from "node:readline";
 import { MADC_VERSION } from "@madc/core";
 import {
+  DEFAULT_SEAT_ID,
   type EngineClient,
   EngineExitedError,
   EngineProtocolError,
@@ -44,6 +45,8 @@ export type LineModeOptions = {
   readonly home: string;
   readonly turnIdleMs: number;
   readonly firstPrompt: string | null;
+  /** M1-A8 (`madc -s <seatId>`): the seat the thread opens on. Default madc-default. */
+  readonly seatId?: string;
   readonly why: string;
   readonly launchWarnRows: readonly Check[];
   /**
@@ -68,8 +71,9 @@ export async function runLineModeApp(opts: LineModeOptions): Promise<number> {
     asciiForced(io.env),
   );
   const g = glyphsFor(style.ascii);
+  const seatId = opts.seatId ?? DEFAULT_SEAT_ID;
   io.stdout.write(
-    `madc ${MADC_VERSION} · ${PROTOCOL_VERSION} · madc-default · line mode (${opts.why})\n`,
+    `madc ${MADC_VERSION} · ${PROTOCOL_VERSION} · ${seatId} · line mode (${opts.why})\n`,
   );
   for (const row of opts.launchWarnRows) {
     io.stderr.write(`${stripControls(row.summary)}\n`);
@@ -202,10 +206,10 @@ export async function runLineModeApp(opts: LineModeOptions): Promise<number> {
     const c = client;
     try {
       if (threadId === null) {
-        const started = (await c.request("thread/start", { cwd: io.cwd })) as
+        const started = (await c.request("thread/start", { seatId, cwd: io.cwd })) as
           | { thread?: unknown }
           | undefined;
-        if (!isThreadShape(started?.thread, "madc-default")) {
+        if (!isThreadShape(started?.thread, seatId)) {
           throw new EngineProtocolError(
             "protocol violation: thread/start returned an invalid thread",
           );
