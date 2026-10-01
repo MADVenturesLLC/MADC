@@ -1237,15 +1237,20 @@ export async function collectDoctor(
     hooks.onRow?.(c);
   };
   const sig: DoctorSignal = externalSig ?? { exit: null, kill: null };
+  // M1-A8: the `lanes` probe runs concurrently with the other rows (below), so it has its own kill
+  // hook; a signal kills it exactly like the engine probe.
+  const lanesSig: DoctorSignal = { exit: null, kill: null };
   let ownListeners = false;
   let homeInvalid = false;
   const onSigint = () => {
     sig.exit = sig.exit ?? EXIT.sigint;
     sig.kill?.();
+    lanesSig.kill?.();
   };
   const onSigterm = () => {
     sig.exit = EXIT.sigterm;
     sig.kill?.();
+    lanesSig.kill?.();
   };
   if (externalSig === undefined) {
     // §3e E7: doctor installs SIGINT/SIGTERM listeners for its whole run. On a signal it kills
@@ -1259,6 +1264,8 @@ export async function collectDoctor(
     const earlySignal = takeEarlySignal();
     if (earlySignal !== null) sig.exit = earlySignal;
   }
+  let lanes: Promise<Check> | null = null;
+  let lanesEmitted = false;
   try {
     // MADC_HOME set but not absolute: exit-2 class, and nothing spawns (CLI pin §1).
     let home = resolveHome(io);
@@ -1272,6 +1279,9 @@ export async function collectDoctor(
       emit(await runInit(io, home.path, sig));
       home = resolveHome(io);
     }
+    // M1-A8: the `lanes` probe reads nothing from MADC_HOME (its engine runs on a throwaway home),
+    // so it starts now and overlaps every row before it; its row is still emitted last.
+    if (sig.exit === null) lanes = checkLanes(io, home, lanesSig);
     if (start("runtime")) emit(checkRuntime());
     if (start("engine")) {
       emit(
@@ -1299,8 +1309,17 @@ export async function collectDoctor(
     if (start("bin.claude")) emit(checkBin(io, "claude", "A5"));
     if (start("bin.codex")) emit(checkBin(io, "codex", "A6"));
     if (seatsRow !== null && start("seats")) emit(seatsRow);
-    if (start("lanes")) emit(await checkLanes(io, home, sig));
+    if (start("lanes")) {
+      emit(await (lanes ?? checkLanes(io, home, lanesSig)));
+      lanesEmitted = true;
+    }
   } finally {
+    // A run that ended before the `lanes` row (a signal, or a throw) kills its probe and still
+    // waits for it, so the probe's temp home is removed before doctor returns (§3e E7).
+    if (lanes !== null && !lanesEmitted) {
+      lanesSig.kill?.();
+      await lanes.catch(() => undefined);
+    }
     if (ownListeners) {
       process.removeListener("SIGINT", onSigint);
       process.removeListener("SIGTERM", onSigterm);
