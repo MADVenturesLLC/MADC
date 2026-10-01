@@ -555,6 +555,9 @@ const PI_AI_IMPORT = /(?:\bfrom\s*|\bimport\s*\(?\s*|\brequire\s*\(\s*)["']@eare
  * pi-ai configuration instead of by widening the shared `ProviderPort` seam. Driving pi-ai's catalog
  * is unavoidable for that, and the file is inside `packages/adapters`, so plan §5's package rule
  * still holds. See that file's module docs.
+ *
+ * M1-A9 allowlists the second (and last) one under the same ruling: L1 for the four wired direct
+ * lanes M1-A4 did not cover (kimi-code, ollama-cloud, minimax-token-plan, alibaba-coding-plan).
  */
 const PI_AI_IMPORTERS: readonly string[] = [
   "adapters/src/kimi-code.ts",
@@ -567,6 +570,7 @@ const PI_AI_IMPORTERS: readonly string[] = [
   "adapters/src/providers/minimax.ts",
   "adapters/src/providers/alibaba-coding.ts",
   "adapters/src/providers/direct-key-conformance.test.ts",
+  "adapters/src/providers/direct-lane-l1.test.ts",
 ];
 
 test("plan §6: only packages/adapters imports @earendil-works/pi-ai, and only its direct-key lane modules", () => {

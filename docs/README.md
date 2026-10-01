@@ -5,3 +5,4 @@
 | [adr/](adr/) | Architecture Decision Records |
 | [plan/](plan/) | Planning documents (verbatim; supersede, do not rewrite) |
 | [policy/CODE-ADVISORIES.md](policy/CODE-ADVISORIES.md) | Code advisories DoD (Copilot; code scanning if enabled) |
+| [runbook/](runbook/) | Operator guides: [M0.md](runbook/M0.md), [M1.md](runbook/M1.md) |

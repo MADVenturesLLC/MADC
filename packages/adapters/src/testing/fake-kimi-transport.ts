@@ -21,7 +21,20 @@ export type FakeKimiReply =
   /** Plain HTTP error with a JSON body (tests use it to echo hostile content back). */
   | { readonly type: "status"; readonly status: number; readonly body: string }
   /** Sends `message_start` + one delta, then stalls until the request is aborted. */
-  | { readonly type: "hang"; readonly model: string };
+  | { readonly type: "hang"; readonly model: string }
+  /**
+   * M1-A9 (L1 tool round-trip): one `tool_use` content block whose input arrives as a single
+   * `input_json_delta`, then `stop_reason: "tool_use"` (→ pi-ai `stopReason: "toolUse"`). pi-ai
+   * yields a `{ type: "toolCall", id, name, arguments }` content part with `id` verbatim. Any
+   * Anthropic-Messages lane can use it (MiniMax shares this fake).
+   */
+  | {
+      readonly type: "tool-call";
+      readonly id: string;
+      readonly name: string;
+      readonly args: Readonly<Record<string, unknown>>;
+      readonly model: string;
+    };
 
 export type FakeKimiTransport = {
   readonly fetch: typeof globalThis.fetch;
@@ -44,21 +57,49 @@ function frame(event: string, data: unknown): string {
   return `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
 }
 
+function messageStartFrame(model: string): string {
+  return frame("message_start", {
+    type: "message_start",
+    message: {
+      id: "msg_fake_01",
+      type: "message",
+      role: "assistant",
+      model,
+      content: [],
+      stop_reason: null,
+      stop_sequence: null,
+      usage: { input_tokens: 7, output_tokens: 1 },
+    },
+  });
+}
+
+/** `message_start`, one `tool_use` block with its whole input in one delta, `stop_reason: tool_use`. */
+function toolUseFrames(reply: Extract<FakeKimiReply, { type: "tool-call" }>): string {
+  return (
+    messageStartFrame(reply.model) +
+    frame("content_block_start", {
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "tool_use", id: reply.id, name: reply.name, input: {} },
+    }) +
+    frame("content_block_delta", {
+      type: "content_block_delta",
+      index: 0,
+      delta: { type: "input_json_delta", partial_json: JSON.stringify(reply.args) },
+    }) +
+    frame("content_block_stop", { type: "content_block_stop", index: 0 }) +
+    frame("message_delta", {
+      type: "message_delta",
+      delta: { stop_reason: "tool_use", stop_sequence: null },
+      usage: { output_tokens: 1 },
+    }) +
+    frame("message_stop", { type: "message_stop" })
+  );
+}
+
 function startFrames(model: string): string {
   return (
-    frame("message_start", {
-      type: "message_start",
-      message: {
-        id: "msg_fake_01",
-        type: "message",
-        role: "assistant",
-        model,
-        content: [],
-        stop_reason: null,
-        stop_sequence: null,
-        usage: { input_tokens: 7, output_tokens: 1 },
-      },
-    }) +
+    messageStartFrame(model) +
     frame("content_block_start", {
       type: "content_block_start",
       index: 0,
@@ -140,6 +181,11 @@ export function createFakeKimiTransport(
     }
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
+        if (current.type === "tool-call") {
+          controller.enqueue(encoder.encode(toolUseFrames(current)));
+          controller.close();
+          return;
+        }
         controller.enqueue(encoder.encode(startFrames(current.model)));
         if (current.type === "hang") {
           controller.enqueue(encoder.encode(deltaFrame("partial")));
