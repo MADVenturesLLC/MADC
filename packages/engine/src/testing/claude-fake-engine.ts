@@ -28,6 +28,10 @@ import {
 } from "@madc/adapters/testing";
 import { startStdioEngine } from "../main.ts";
 import { createProviderAgent } from "../provider-agent.ts";
+import { applyRegistryTestClock } from "./registry-test-clock.ts";
+
+applyRegistryTestClock();
+
 import { ENGINE_VERSION } from "../server.ts";
 
 /** Same never-resolving host as `kimi-fake-engine.ts` (defined there; it is a side-effecting entry). */

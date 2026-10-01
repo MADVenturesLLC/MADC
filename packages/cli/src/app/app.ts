@@ -22,6 +22,7 @@ import {
 import type { Check } from "../doctor.ts";
 import { EXIT } from "../exit-codes.ts";
 import type { CliIO } from "../io.ts";
+import { claimMode } from "../mode.ts";
 import { buildReceiptData } from "./app-receipt.ts";
 import { overlayWidth, renderOverlay } from "./doctor-view.ts";
 import {
@@ -1303,6 +1304,15 @@ export class WitnessApp {
           client.request("turn/start", {
             threadId,
             input: [{ type: "text", text: prompt }],
+            // I2: the Witness runs only behind the full-TTY app gate, so this surface sends the
+            // mode CLAIM (`interactive` when stdin+stdout are TTYs; headless otherwise). The
+            // engine never trusts the claim alone — its own presence check unlocks presence
+            // lanes (M1-A5 / protocol pin §3.3 P3).
+            mode: claimMode({
+              stdinIsTTY: this.#io.stdinIsTTY === true,
+              stdoutIsTTY: this.#io.stdoutIsTTY,
+              print: false,
+            }),
           }),
           violation,
           soft,

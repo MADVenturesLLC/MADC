@@ -6,8 +6,9 @@
  * `mode: "interactive"`, so the engine never trusts it alone. A lane that serves only a person at
  * the terminal is unlocked solely by the ENGINE's own presence check on its controlling terminal.
  *
- * The CLI's only turn path today is `madc -p`, so every CLI turn claims `headless`. The same rule
- * decides the claim for the non-`-p` surface when a later act adds one (`madc -s <seat>`, M1-A8).
+ * Surfaces (I2): the witnessed entries (`madc` bare / with text / `-s <seatId>`, tier W or A)
+ * claim through this rule with `print: false`. The `-p` one-shot still sends an explicit
+ * `mode: claimMode({…, print: true})` headless claim (M1-A5) — never interactive.
  */
 import type { TurnMode } from "@madc/engine/client";
 

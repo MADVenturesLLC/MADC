@@ -101,7 +101,7 @@ const ROSTER = [
     role: "idea and research",
     preferredBacking: "kimi-code",
     pinnedModel: "kimi-coding/kimi-for-coding",
-    fallbacks: ["ollama-cloud"],
+    fallbacks: [],
     headlessOk: true,
   },
   {
@@ -111,7 +111,7 @@ const ROSTER = [
     role: "contracts and pins",
     preferredBacking: "ollama-cloud",
     pinnedModel: `ollama-cloud/${OLLAMA_MODEL}`,
-    fallbacks: ["kimi-code"],
+    fallbacks: [],
     headlessOk: false,
   },
   {
@@ -218,7 +218,8 @@ test("A7: a fresh $MADC_HOME seeds exactly the five roster seats with the plan �
     // does not, and the four v2 seats load with their persisted order.
     assert.deepEqual(loadSeat(home, "madc-default").seat.fallbacks, []);
     assert.deepEqual(loadSeat(home, "daedalus").seat.fallbacks, ["kimi-code"]);
-    assert.deepEqual(loadSeat(home, "prometheus").seat.fallbacks, ["ollama-cloud"]);
+    assert.deepEqual(loadSeat(home, "prometheus").seat.fallbacks, []);
+    assert.deepEqual(loadSeat(home, "surface-architect").seat.fallbacks, []);
 
     // The two cells the act pins by name.
     const daedalus = readSeat(home, "daedalus");
@@ -230,7 +231,13 @@ test("A7: a fresh $MADC_HOME seeds exactly the five roster seats with the plan �
     );
     const surface = readSeat(home, "surface-architect");
     assert.equal(surface.preferredBacking, "ollama-cloud");
+    assert.deepEqual(surface.fallbacks, [], "I3 Option B: impossible seed fallback emptied");
     assert.deepEqual(surface.policy, { headlessOk: false }, "D-M1-3 unchanged");
+    assert.deepEqual(
+      readSeat(home, "prometheus").fallbacks,
+      [],
+      "I3 Option B: pinnedModel cannot resolve across direct namespaces",
+    );
 
     // The M0 default seat is still the v1 seed, byte for byte.
     assert.equal(
@@ -388,7 +395,12 @@ test("A7: seat/list reports all five seats with the locked projection, and takes
     assert.ok(surface?.ok);
     assert.equal(surface.pinnedModel, `ollama-cloud/${OLLAMA_MODEL}`);
     assert.deepEqual(surface.policy, { headlessOk: false });
-    assert.deepEqual(surface.warnings, [], "ollama-cloud → kimi-code is same-lane, so no warning");
+    assert.deepEqual(surface.fallbacks, [], "I3 Option B: empty seed fallbacks");
+    assert.deepEqual(surface.warnings, [], "empty fallbacks → no lane-mismatch warning");
+    const prometheus = byId.get("prometheus");
+    assert.ok(prometheus?.ok);
+    assert.deepEqual(prometheus.fallbacks, []);
+    assert.deepEqual(prometheus.warnings, [], "empty fallbacks → no warning");
 
     const hephaestus = byId.get("hephaestus");
     assert.ok(hephaestus?.ok);
@@ -1124,12 +1136,10 @@ test("A7: the same-lane predicate — status OR billing difference rejects; an e
     "daedalus warns",
   );
   assert.deepEqual(neverEligibleFallbacks("codex", ["claude-code"]), [], "hephaestus does not");
-  assert.deepEqual(
-    neverEligibleFallbacks("kimi-code", ["ollama-cloud"]),
-    [],
-    "prometheus does not",
-  );
-  assert.deepEqual(neverEligibleFallbacks("ollama-cloud", ["kimi-code"]), [], "surface does not");
+  // I3 Option B emptied prometheus/surface seed fallbacks; same-lane kimi↔ollama is still
+  // asserted via laneMismatch above. Seeded cells warn about nothing because the lists are empty.
+  assert.deepEqual(neverEligibleFallbacks("kimi-code", []), [], "prometheus has none");
+  assert.deepEqual(neverEligibleFallbacks("ollama-cloud", []), [], "surface has none");
   assert.deepEqual(neverEligibleFallbacks("kimi-code", []), [], "madc-default has none");
   // Order is preserved and an unknown id is a load failure, not a warning.
   assert.deepEqual(
@@ -1144,7 +1154,9 @@ test("A7: the seeded roster's pinnedModel values are the ones this act locked", 
   assert.equal(DAEDALUS_SEAT.pinnedModel, "claude-sonnet-4-5");
   assert.equal(HEPHAESTUS_SEAT.pinnedModel, "gpt-5.1-codex");
   assert.equal(PROMETHEUS_SEAT.pinnedModel, "kimi-coding/kimi-for-coding");
+  assert.deepEqual(PROMETHEUS_SEAT.fallbacks, [], "I3 Option B");
   assert.equal(SURFACE_ARCHITECT_SEAT.pinnedModel, `ollama-cloud/${OLLAMA_MODEL}`);
+  assert.deepEqual(SURFACE_ARCHITECT_SEAT.fallbacks, [], "I3 Option B");
   assert.equal(MADC_DEFAULT_SEAT.pinnedModel, "kimi-coding/kimi-for-coding");
   // The Ollama id is the /api/tags spelling (planning record OLL-17/OLL-19), not an invented one.
   assert.match(SURFACE_ARCHITECT_SEAT.pinnedModel, /^ollama-cloud\/gpt-oss:120b$/);

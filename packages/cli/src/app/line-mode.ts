@@ -17,6 +17,7 @@ import {
 import type { Check } from "../doctor.ts";
 import { EXIT } from "../exit-codes.ts";
 import type { CliIO } from "../io.ts";
+import { claimMode } from "../mode.ts";
 import { buildReceiptData } from "./app-receipt.ts";
 import { receiptPlain, receiptTierA, sanitizeReceiptData } from "./receipt.ts";
 import { sanitizeErrorLike, sanitizeItem, sanitizeText, stripControls } from "./sanitize.ts";
@@ -310,6 +311,14 @@ export async function runLineModeApp(opts: LineModeOptions): Promise<number> {
       const ts = await c.request("turn/start", {
         threadId: tid,
         input: [{ type: "text", text: prompt }],
+        // I2: Level A is also a witnessed, TTY-gated surface (main.ts's app gate); it sends the
+        // same mode CLAIM the tier-W app sends. `print: false` — the `-p` one-shot never runs
+        // through here.
+        mode: claimMode({
+          stdinIsTTY: io.stdinIsTTY === true,
+          stdoutIsTTY: io.stdoutIsTTY,
+          print: false,
+        }),
       });
       const t = (ts as { turn?: unknown } | undefined)?.turn;
       if (!isTurnShape(t) || !isDomainId(t.id) || t.threadId !== tid) {

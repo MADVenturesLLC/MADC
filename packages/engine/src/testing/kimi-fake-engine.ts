@@ -15,6 +15,10 @@ import { createFakeKimiTransport, type FakeKimiReply } from "@madc/adapters/test
 import type { Agent } from "../agent.ts";
 import { startStdioEngine } from "../main.ts";
 import { createProviderAgent } from "../provider-agent.ts";
+import { applyRegistryTestClock } from "./registry-test-clock.ts";
+
+applyRegistryTestClock();
+
 import { ENGINE_VERSION } from "../server.ts";
 
 export const FAKE_KIMI_BASE_URL = "https://kimi-fake.invalid/coding";
