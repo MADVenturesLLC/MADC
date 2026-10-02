@@ -819,17 +819,22 @@ test("Argus 5391475289 miss 1 (Copilot 4165236039): a target is not accepted aga
     );
     assert.equal(sha256(target), before);
     await e.close();
-    // doctor: the source is the newest file; its chain row is a FAIL integrity, not a PASS with
-    // findings, and nothing threw.
-    const report = inspectMadcHome(home);
-    assert.equal(report.lastSession?.threadId, "thr_src");
-    assert.deepEqual(report.lastSession?.chain, {
-      ok: false,
-      line: lines.length + 1,
-      reason: "malformed founderDecision payload",
-      kind: "integrity",
-    });
-    assert.deepEqual(report.lastSession?.findings, []);
+    // doctor's read path on the SOURCE, selected by thread id — never as "the newest file": under
+    // a coarse filesystem clock the two fixture writes can share an mtime, and the name tiebreak
+    // then picks thr_tgt (the push CI run of 6c93967). The chain row doctor would carry for
+    // thr_src is a FAIL integrity at the appended line, not a PASS with findings; nothing threw.
+    const chain = verifySessionFile(sessionPath(home, "thr_src"), "thr_src", {}, home);
+    assert.deepEqual(
+      chain.ok
+        ? { ok: true }
+        : { ok: false, line: chain.line, reason: chain.reason, kind: chain.kind },
+      {
+        ok: false,
+        line: lines.length + 1,
+        reason: "malformed founderDecision payload",
+        kind: "integrity",
+      },
+    );
   } finally {
     cleanup();
   }
