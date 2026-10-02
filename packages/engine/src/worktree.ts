@@ -41,23 +41,29 @@ function topLevelOf(cwd: string, runGit: GitRunner, realpath: Realpath): string 
 }
 
 /**
- * `HEAD` at `topLevel`: 40 lowercase hex, or null for an unborn branch. A failed `git` (gone
- * directory, timeout, not a repository any more) is `ok: false`, never a false "unborn".
+ * `HEAD` at `topLevel`: the commit it resolves to (40 lowercase hex), or null ONLY for an unborn
+ * branch (pin §2.2). The commit probe is `HEAD^{commit}`, so a detached HEAD naming a missing
+ * object does not pass as a head (plain `--verify HEAD` accepts any well-formed object name). An
+ * unborn branch is exactly "HEAD is a symbolic ref to a branch that has no commit yet": a corrupt
+ * or unreadable HEAD, a failed `git`, or a branch that exists but does not resolve are `ok: false`,
+ * never recorded as `head: null` (Argus 5391475289 miss 3, Copilot 4165236178).
  */
 function headOf(
   topLevel: string,
   runGit: GitRunner,
 ): { ok: true; head: string | null } | { ok: false } {
-  const head = runGit(["rev-parse", "--verify", "--quiet", "HEAD"], topLevel);
+  const head = runGit(["rev-parse", "--verify", "--quiet", "HEAD^{commit}"], topLevel);
   if (head.code === 0) {
     const sha = head.stdout.trim();
     return SHA40.test(sha) ? { ok: true, head: sha } : { ok: false };
   }
-  // No commit to resolve: only an unborn branch inside a readable work tree reads as null.
-  const inside = runGit(["rev-parse", "--is-inside-work-tree"], topLevel);
-  return inside.code === 0 && inside.stdout.trim() === "true"
-    ? { ok: true, head: null }
-    : { ok: false };
+  const symbolic = runGit(["symbolic-ref", "--quiet", "HEAD"], topLevel);
+  if (symbolic.code !== 0) return { ok: false };
+  const ref = symbolic.stdout.trim();
+  if (!ref.startsWith("refs/heads/")) return { ok: false };
+  // The branch HEAD names must not exist yet; one that exists but did not resolve is corrupt.
+  const exists = runGit(["show-ref", "--verify", "--quiet", ref], topLevel);
+  return exists.code === 0 ? { ok: false } : { ok: true, head: null };
 }
 
 function identityAt(topLevel: string, runGit: GitRunner): WorktreeIdentity | null {

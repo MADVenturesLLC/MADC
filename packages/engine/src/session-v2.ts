@@ -317,7 +317,18 @@ function checkFounderDecision(p: Record<string, unknown>): ShapeIssue[] {
   return out;
 }
 
-function checkMemoryWrite(p: Record<string, unknown>): ShapeIssue[] {
+/**
+ * What a shape check may know beyond the payload (M2-A1 correction, Argus 5391475289 misses 2
+ * and 4): the envelope seat, so a reserved `memory.write` names that seat's OWN confined memory
+ * file (§4.1: "a seat writes only its own memory"), and whether the file's `session.open` is a v2
+ * line, so a v2 `session.close` must carry `worktree` (§2.2) while a v1 close may stay keyless.
+ */
+export type ShapeContext = {
+  readonly seatId?: string;
+  readonly openV2?: boolean;
+};
+
+function checkMemoryWrite(p: Record<string, unknown>, ctx: ShapeContext): ShapeIssue[] {
   const out: ShapeIssue[] = [];
   field(p, "turnId", isValidId, "must match the id grammar", out);
   field(
@@ -327,6 +338,13 @@ function checkMemoryWrite(p: Record<string, unknown>): ShapeIssue[] {
     "must be a seat memory path",
     out,
   );
+  // §4.1 (Copilot 4165236118): the seat is the envelope seatId, and its confined memory file is
+  // `memory/<seatId>.md` (seats/memory.ts): another seat's file, or a nested path, is invalid.
+  if (ctx.seatId !== undefined && isStr(p.path) && p.path !== `memory/${ctx.seatId}.md`) {
+    out.push(
+      invalid("path", `must be the envelope seat's own memory file memory/${ctx.seatId}.md`),
+    );
+  }
   field(p, "op", (v) => v === "append", 'must be "append"', out);
   field(p, "bytes", (v) => isSeq(v) && v > 0, "must be a positive integer", out);
   field(p, "contentSha256", isHex64, "must be 64 lowercase hex", out);
@@ -364,7 +382,11 @@ function checkToolCall(p: Record<string, unknown>): ShapeIssue[] {
  * `session.open` with `handoff` or `worktree` but not both is a fault (§2.2 verifier rule); one
  * with neither is a v1 line. Every other M1 type has no v2 fields and reports nothing.
  */
-export function checkV2Payload(type: string, p: Record<string, unknown>): ShapeIssue[] {
+export function checkV2Payload(
+  type: string,
+  p: Record<string, unknown>,
+  ctx: ShapeContext = {},
+): ShapeIssue[] {
   switch (type) {
     case "session.open": {
       const hasHandoff = present(p, "handoff");
@@ -376,7 +398,10 @@ export function checkV2Payload(type: string, p: Record<string, unknown>): ShapeI
       return [...checkHandoffLink(p.handoff), ...checkWorktreeIdentity(p.worktree, "worktree")];
     }
     case "session.close":
-      return present(p, "worktree") ? checkWorktreeIdentity(p.worktree, "worktree") : [];
+      // §2.2 (Copilot 4165236142): after a v2 open the close carries `worktree` (object or null);
+      // only a v1 file's close may be keyless.
+      if (!present(p, "worktree")) return ctx.openV2 === true ? [missing("worktree")] : [];
+      return checkWorktreeIdentity(p.worktree, "worktree");
     case "handoff.out":
       return checkHandoffOut(p);
     case "handoff.link":
@@ -386,7 +411,7 @@ export function checkV2Payload(type: string, p: Record<string, unknown>): ShapeI
     case "founderDecision":
       return checkFounderDecision(p);
     case "memory.write":
-      return checkMemoryWrite(p);
+      return checkMemoryWrite(p, ctx);
     case "tool.call":
       return checkToolCall(p);
     default:
@@ -554,7 +579,7 @@ function sameFileRefIssues(
 export function validateForWrite(
   type: string,
   payload: unknown,
-  ctx: { readonly threadId: string; readonly index: SessionChainIndex },
+  ctx: { readonly threadId: string; readonly seatId: string; readonly index: SessionChainIndex },
 ): WriteRefusal | null {
   if ((RESERVED_EVENT_TYPES as readonly string[]).includes(type)) {
     return {
@@ -565,10 +590,14 @@ export function validateForWrite(
   if (!isPlainRecord(payload)) {
     return { reason: "field-invalid", issues: ["payload must be an object"] };
   }
-  const issues = checkV2Payload(type, payload);
+  const { index } = ctx;
+  // The index knows whether this file's open is a v2 line (its `worktree` key was noted).
+  const issues = checkV2Payload(type, payload, {
+    seatId: ctx.seatId,
+    openV2: index.openWorktree !== undefined,
+  });
   if (issues.length > 0) return toRefusal(issues);
   const p = payload;
-  const { index } = ctx;
   switch (type) {
     case "handoff.out": {
       const id = p.handoffId as string;

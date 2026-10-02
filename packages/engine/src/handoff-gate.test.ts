@@ -761,3 +761,197 @@ test("M2 §10.6 seat gate unchanged: handoffs.enabled: true or a non-empty targe
     cleanup();
   }
 });
+
+// ------------------------------------------------ M2-A1 correction (Argus 5391475289)
+
+test("Argus 5391475289 miss 1 (Copilot 4165236039): a target is not accepted against a source that contains a hash-valid malformed line (v2 or M0); doctor's chain row FAILs integrity for the v2 case", async () => {
+  // (a) a malformed v2 line (founderDecision with evidenceRefs [null]) appended to a linked source.
+  const { home, cleanup } = makeHome();
+  try {
+    writePair(home, "link");
+    const src = sessionPath(home, "thr_src");
+    const lines = readLines(src);
+    const last = lines.at(-1) as Line;
+    const body = {
+      v: 1 as const,
+      seq: last.seq + 1,
+      ts: last.ts + 1,
+      type: "founderDecision",
+      threadId: "thr_src",
+      seatId: "daedalus",
+      payload: {
+        decisionId: "dec_1",
+        turnId: "turn_1",
+        question: "q",
+        recommendedDefault: "d",
+        evidenceRefs: [null],
+      },
+    };
+    const hash = sessionEventHash(last.hash, body as never);
+    const { payload, ...head } = body;
+    writeFileSync(
+      src,
+      `${readFileSync(src, "utf8")}${JSON.stringify({ ...head, prevHash: last.hash, hash, payload })}\n`,
+    );
+    const v = verifySessionFile(src, "thr_src", {}, home);
+    assert.equal(v.ok, false, "the source does not verify any more (rule 1.5)");
+    assert.equal(
+      v.ok ? "" : `${v.kind} ${v.reason}`,
+      "integrity malformed founderDecision payload",
+    );
+    const genesis = readLines(sessionPath(home, "thr_tgt"))[0] as Line;
+    const check = checkHandoffTarget(home, {
+      threadId: "thr_tgt",
+      seatId: "hephaestus",
+      genesisHash: genesis.hash,
+      link: genesis.payload.handoff as never,
+    });
+    assert.equal(check.ok, false);
+    assert.equal(check.ok ? "" : check.kind, "unverifiable");
+    const target = sessionPath(home, "thr_tgt");
+    const before = sha256(target);
+    const e = inProcess(home);
+    await e.init();
+    expectEvidenceInvalid(
+      await e.request("thread/resume", { threadId: "thr_tgt" }),
+      "thr_tgt",
+      "handoff-one-way",
+    );
+    assert.equal(sha256(target), before);
+    await e.close();
+    // doctor: the source is the newest file; its chain row is a FAIL integrity, not a PASS with
+    // findings, and nothing threw.
+    const report = inspectMadcHome(home);
+    assert.equal(report.lastSession?.threadId, "thr_src");
+    assert.deepEqual(report.lastSession?.chain, {
+      ok: false,
+      line: lines.length + 1,
+      reason: "malformed founderDecision payload",
+      kind: "integrity",
+    });
+    assert.deepEqual(report.lastSession?.findings, []);
+  } finally {
+    cleanup();
+  }
+  // (b) a malformed M0 line (item with an id outside the grammar): the chain verifies under the
+  // M1 contract, but the gate validates the full payload shape and refuses the target.
+  const { home: home2, cleanup: cleanup2 } = makeHome();
+  try {
+    writePair(home2, "link");
+    rewriteLine(sessionPath(home2, "thr_src"), 1, (p) => {
+      p.turnId = "bad id";
+    });
+    assert.equal(verifySessionFile(sessionPath(home2, "thr_src"), "thr_src", {}, home2).ok, true);
+    const genesis = readLines(sessionPath(home2, "thr_tgt"))[0] as Line;
+    const check = checkHandoffTarget(home2, {
+      threadId: "thr_tgt",
+      seatId: "hephaestus",
+      genesisHash: genesis.hash,
+      link: genesis.payload.handoff as never,
+    });
+    assert.equal(check.ok, false);
+    assert.match(check.ok ? "" : check.issues.join(" "), /malformed turn.start payload/);
+    const e = inProcess(home2);
+    await e.init();
+    expectEvidenceInvalid(
+      await e.request("thread/resume", { threadId: "thr_tgt" }),
+      "thr_tgt",
+      "handoff-one-way",
+    );
+    await e.close();
+  } finally {
+    cleanup2();
+  }
+});
+
+test("Argus 5391475289 miss 3 (Copilot 4165236178): head is null only for an unborn branch — a HEAD that does not resolve to a commit records no worktree at open and null at close (doctor WARNs worktree-head-unreadable)", async () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), "madc-m2a1-miss3-"));
+  const { home, cleanup } = makeHome();
+  try {
+    // Real git: a detached HEAD naming an object that does not exist is not an unborn branch.
+    const repo = join(root, "repo");
+    initRepo(repo);
+    const head1 = commit(repo, "one");
+    const e = inProcess(home);
+    await e.init();
+    const healthy = await start2(e, repo);
+    writeFileSync(join(repo, ".git", "HEAD"), `${"0".repeat(39)}1\n`);
+    const broken = await start2(e, repo);
+    const openOf = (id: string) => (readLines(sessionPath(home, id))[0] as Line).payload;
+    assert.deepEqual((openOf(healthy).worktree as { head: string }).head, head1);
+    assert.equal(
+      openOf(broken).worktree,
+      null,
+      "a HEAD that resolves to no commit is not an identity",
+    );
+    // The healthy thread closes while HEAD is broken: null at close, and doctor WARNs.
+    await e.close();
+    const closeOf = (id: string) => (readLines(sessionPath(home, id)).at(-1) as Line).payload;
+    assert.deepEqual(closeOf(healthy), { reason: "shutdown", worktree: null });
+    assert.deepEqual(closeOf(broken), { reason: "shutdown", worktree: null });
+    const v = verifySessionFile(sessionPath(home, healthy), healthy, {}, home);
+    assert.deepEqual(
+      inspectSessionV2(home, v.ok ? v.events : []).map((f) => `${f.level} ${f.code}`),
+      ["warn worktree-head-unreadable"],
+    );
+    // A genuine unborn branch (HEAD → a branch with no commit) still records head: null.
+    const unborn = join(root, "unborn");
+    initRepo(unborn);
+    const orphan = join(root, "orphan");
+    initRepo(orphan);
+    commit(orphan, "x");
+    git(orphan, ["checkout", "--quiet", "--orphan", "fresh"]);
+    const e2 = inProcess(home);
+    await e2.init();
+    const tUnborn = await start2(e2, unborn);
+    const tOrphan = await start2(e2, orphan);
+    assert.deepEqual(openOf(tUnborn).worktree, {
+      topLevel: realpathSync(unborn),
+      remote: null,
+      head: null,
+    });
+    assert.deepEqual(openOf(tOrphan).worktree, {
+      topLevel: realpathSync(orphan),
+      remote: null,
+      head: null,
+    });
+    await e2.close();
+    for (const id of [tUnborn, tOrphan]) {
+      const w = closeOf(id).worktree as { head: string | null };
+      assert.equal(w.head, null, id);
+      const vv = verifySessionFile(sessionPath(home, id), id, {}, home);
+      assert.deepEqual(inspectSessionV2(home, vv.ok ? vv.events : []), [], id);
+    }
+  } finally {
+    cleanup();
+    rmSync(root, { recursive: true, force: true });
+  }
+  // The exact probe of the review: `rev-parse --verify HEAD` exits 128 while the path is inside
+  // a work tree, and HEAD is not a symbolic ref. That is not unborn: no identity is recorded.
+  const { home: home3, cleanup: cleanup3 } = makeHome();
+  try {
+    const e = inProcess(home3, echoAgent, {
+      worktreeDeps: {
+        realpath: (p) => p,
+        runGit: (args) => {
+          if (args[0] === "rev-parse" && args[1] === "--show-toplevel")
+            return { code: 0, stdout: "/repo\n" };
+          if (args[0] === "rev-parse" && args[1] === "--is-inside-work-tree")
+            return { code: 0, stdout: "true\n" };
+          if (args[0] === "rev-parse" && args[1] === "--verify") return { code: 128, stdout: "" };
+          return { code: 128, stdout: "" };
+        },
+      },
+    });
+    await e.init();
+    const t = await start2(e, "/repo");
+    assert.equal((readLines(sessionPath(home3, t))[0] as Line).payload.worktree, null);
+    await e.close();
+    assert.deepEqual((readLines(sessionPath(home3, t)).at(-1) as Line).payload, {
+      reason: "shutdown",
+      worktree: null,
+    });
+  } finally {
+    cleanup3();
+  }
+});

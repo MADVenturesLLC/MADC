@@ -13,7 +13,12 @@ import { join } from "node:path";
 import { isPidAlive, readLock } from "./lock.ts";
 import { defaultGitRunner, type GitRunner } from "./policy/identity.ts";
 import { isValidId } from "./protocol/ids.ts";
-import { type SessionEvent, verifySessionFile } from "./session-store.ts";
+import {
+  rebuildSession,
+  type SessionEvent,
+  v2LineIssue,
+  verifySessionFile,
+} from "./session-store.ts";
 import {
   type EvidenceRef,
   type SessionOpenHandoffLink,
@@ -22,8 +27,13 @@ import {
 } from "./session-v2.ts";
 
 export type SessionFindingLevel = "warn" | "fail";
-/** Pin §7 names (plus `handoff-terminal-conflict`, Copilot 4160774801, and `not-cleanly-closed`). */
+/**
+ * Pin §7 names, plus `handoff-terminal-conflict` (Copilot 4160774801), `not-cleanly-closed`, and
+ * `integrity` (pin §7 "malformed v2 payload … FAIL (integrity)", rule 1.5) for a hash-valid line
+ * whose schema-v2 payload is malformed — reported, never thrown (Copilot 4165236079).
+ */
 export type SessionFindingCode =
+  | "integrity"
   | "handoff-mismatch"
   | "handoff-terminal-conflict"
   | "evidence-ref-mismatch"
@@ -64,12 +74,22 @@ function isPlainRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-/** Read-only, confined read of another thread's chain. Never creates, locks or appends. */
+/**
+ * Read-only, confined read of another thread's chain. Never creates, locks or appends. A chain
+ * counts as readable only when it verifies (envelope, seq, hashes and the v2 shapes) AND every
+ * known payload rebuilds (Copilot 4165236039: the full event payload shape, M0/M1 included, is
+ * validated before a chain is used by the handoff gate).
+ */
 function readChain(home: string, threadId: string): Chain {
   if (!isValidId(threadId)) return { ok: false, reason: "thread id is outside the id grammar" };
   const path = join(home, "sessions", `${threadId}.jsonl`);
   const v = verifySessionFile(path, threadId, {}, home);
   if (!v.ok) return { ok: false, reason: `line ${v.line}: ${v.reason} (${v.kind})` };
+  try {
+    rebuildSession(v.events);
+  } catch (err) {
+    return { ok: false, reason: `${err instanceof Error ? err.message : String(err)} (integrity)` };
+  }
   return { ok: true, events: v.events };
 }
 
@@ -211,22 +231,44 @@ export type InspectSessionDeps = {
  */
 export function inspectSessionV2(
   home: string,
-  events: readonly SessionEvent[],
+  lines: readonly SessionEvent[],
   deps: InspectSessionDeps = {},
 ): SessionFinding[] {
   const findings: SessionFinding[] = [];
-  const open = events[0];
-  if (open === undefined || open.type !== "session.open") return findings;
-  const { threadId, seatId } = open;
-  const openPayload = payloadOf(open);
-  const v2Open = Object.hasOwn(openPayload, "worktree");
-  const openWorktree = (openPayload.worktree ?? null) as WorktreeIdentity | null;
   const fail = (code: SessionFindingCode, detail: string): void => {
     findings.push({ level: "fail", code, detail });
   };
   const warn = (code: SessionFindingCode, detail: string): void => {
     findings.push({ level: "warn", code, detail });
   };
+  const open = lines[0];
+  if (open === undefined || open.type !== "session.open") return findings;
+  // Rule 1.5 / pin §7 (Copilot 4165236079): a hash-valid line whose v2 payload is malformed is a
+  // FAIL `integrity` finding, and that line takes no further part — the inspection never throws
+  // on a shape it was handed. (The verifier already refuses such a file; this guards a caller
+  // that hands over lines it parsed itself.)
+  const { threadId, seatId } = open;
+  if (!isPlainRecord(open.payload)) {
+    fail("integrity", "line 1: payload is not an object");
+    return findings;
+  }
+  const openPayload = payloadOf(open);
+  const events: SessionEvent[] = [];
+  for (const e of lines) {
+    if (!isPlainRecord(e.payload)) {
+      fail("integrity", `line ${e.seq + 1}: payload is not an object`);
+      continue;
+    }
+    const issue = v2LineIssue(e.type, payloadOf(e), { seatId: e.seatId, open: openPayload });
+    if (issue !== null) {
+      fail("integrity", `line ${e.seq + 1}: ${issue}`);
+      if (e === open) return findings; // nothing below can be judged without a sound open
+      continue;
+    }
+    events.push(e);
+  }
+  const v2Open = Object.hasOwn(openPayload, "worktree");
+  const openWorktree = (openPayload.worktree ?? null) as WorktreeIdentity | null;
 
   // --- this thread as a handoff TARGET (§2.1 (b)/(c) against the source file)
   const link = openPayload.handoff;

@@ -535,7 +535,7 @@ export class SessionWriter {
     // M2 pin rule 1.5 / §2.2 ("no file is created"): the `session.open` record is validated BEFORE
     // the file exists, so a malformed `handoff` or `worktree` refuses -32010 with nothing on disk.
     const index = new SessionChainIndex();
-    const refusal = validateForWrite("session.open", open, { threadId, index });
+    const refusal = validateForWrite("session.open", open, { threadId, seatId, index });
     if (refusal !== null) {
       throw evidenceInvalid({
         threadId,
@@ -764,7 +764,11 @@ export class SessionWriter {
       ) {
         throw new TypeError(`unknown session event type ${JSON.stringify(type)}`);
       }
-      const refusal = validateForWrite(type, payload, { threadId: this.threadId, index: shadow });
+      const refusal = validateForWrite(type, payload, {
+        threadId: this.threadId,
+        seatId: this.seatId,
+        index: shadow,
+      });
       if (refusal !== null) throw refuse(type, payload, refusal);
       shadow.note({ type, hash: "", payload });
     }
@@ -1040,9 +1044,65 @@ export function verifySessionText(text: string, expectedThreadId?: string): Sess
     if (e.prevHash !== prevHash) return fail("prevHash does not match the previous hash");
     if (!isPlainRecord(e.payload)) return fail("payload is not an object");
     if (sessionEventHash(prevHash, e) !== e.hash) return fail("hash mismatch");
+    // M2 pin rule 1.5 (Argus 5391475289 miss 1, Copilot 4165236039 / 4165236079): a hash-valid
+    // line whose SCHEMA-V2 payload is malformed is an integrity failure here, on the read path
+    // doctor and the handoff gate use — the verifier does not stop at the hash. M0/M1 payload
+    // shapes stay `rebuildSession`'s (the M1 contract: "payloads are not shape-checked here").
+    const v2Issue = v2LineIssue(e.type, e.payload, {
+      seatId: e.seatId,
+      open: (events[0]?.payload as Record<string, unknown> | undefined) ?? e.payload,
+    });
+    if (v2Issue !== null) return fail(v2Issue);
     prevHash = e.hash;
     events.push(e);
     offset = nl + 1;
+  }
+}
+
+/**
+ * Rule 1.5, read side: the schema-v2 shape fault of one hash-valid line, or null. `open` is the
+ * file's `session.open` payload (the line itself at seq 0): it says whether the file is v2 (a
+ * `worktree` key on the open), which a `session.close` must then carry and match by `topLevel`
+ * (§2.2); `seatId` is the envelope seat a reserved `memory.write` must name (§4.1). Shared by
+ * `verifySessionText`, `rebuildSession` and `inspectSessionV2`, so one rule decides all three.
+ */
+export function v2LineIssue(
+  type: string,
+  payload: Record<string, unknown>,
+  ctx: { readonly seatId: string; readonly open: Record<string, unknown> },
+): string | null {
+  const openV2 = Object.hasOwn(ctx.open, "worktree") && ctx.open.worktree !== undefined;
+  switch (type) {
+    case "session.open":
+      return checkV2Payload("session.open", payload).length === 0
+        ? null
+        : "malformed session.open payload";
+    case "session.close": {
+      if (checkV2Payload("session.close", payload, { openV2 }).length > 0) {
+        return "malformed session.close payload";
+      }
+      // §2.2: a close identity names the open's top-level; a v2 engine never writes one for a
+      // thread whose open recorded none.
+      const close = payload.worktree;
+      if (close !== undefined && close !== null) {
+        const o = ctx.open.worktree as WorktreeIdentity | null | undefined;
+        if (o === undefined || o === null || (close as WorktreeIdentity).topLevel !== o.topLevel) {
+          return "session.close worktree does not match session.open";
+        }
+      }
+      return null;
+    }
+    case "handoff.out":
+    case "handoff.link":
+    case "handoff.aborted":
+    case "founderDecision":
+    case "memory.write":
+    case "tool.call":
+      return checkV2Payload(type, payload, { seatId: ctx.seatId }).length === 0
+        ? null
+        : `malformed ${type} payload`;
+    default:
+      return null;
   }
 }
 
@@ -1123,18 +1183,18 @@ function isM0Item(item: unknown): boolean {
 function checkPayload(
   type: SessionEventType | ReservedEventType,
   p: Record<string, unknown>,
+  ctx: { readonly seatId: string; readonly open: Record<string, unknown> },
 ): string | null {
   switch (type) {
     case "session.open":
       // M2 pin §2.2 verifier rule: `handoff` and `worktree` both present (each an object or null)
       // or both absent (a v1 line); one without the other, or a malformed one, is an integrity
-      // failure exactly like a malformed M1 field.
+      // failure exactly like a malformed M1 field (the v2 half is `v2LineIssue`, as in verify).
       return (p.cwd === null || isStr(p.cwd)) &&
         isWiredBacking(p.backing) &&
         isStr(p.providerId) &&
-        isStr(p.pinnedModel) &&
-        checkV2Payload("session.open", p).length === 0
-        ? null
+        isStr(p.pinnedModel)
+        ? v2LineIssue("session.open", p, ctx)
         : "malformed session.open payload";
     case "turn.start": {
       // M1-A5: a pre-A5 line carries none of `mode` / `presence` / `tty`; an A5 line carries
@@ -1204,9 +1264,10 @@ function checkPayload(
         : "malformed turn.end payload";
     }
     case "session.close":
-      // M2 pin §2.2: a `worktree` key, when present, is an identity or null.
-      return isStr(p.reason) && checkV2Payload("session.close", p).length === 0
-        ? null
+      // M2 pin §2.2: a v2 file's close carries `worktree` (identity or null) naming the open's
+      // top-level; a v1 close may stay keyless (`v2LineIssue`, as in verify).
+      return isStr(p.reason)
+        ? v2LineIssue("session.close", p, ctx)
         : "malformed session.close payload";
     // M2 pin §2.1 / §2.3 (schema v2) and the reserved M4 names (§4, D-M2-A0-2: validated when
     // met, so a malformed reserved line is an integrity failure, never a tolerated unknown).
@@ -1216,7 +1277,7 @@ function checkPayload(
     case "founderDecision":
     case "memory.write":
     case "tool.call":
-      return checkV2Payload(type, p).length === 0 ? null : `malformed ${type} payload`;
+      return v2LineIssue(type, p, ctx);
   }
 }
 
@@ -1291,29 +1352,19 @@ export function rebuildSession(events: readonly SessionEvent[], now = Date.now()
   }
   const turns = new Map<string, Turn>();
   let preview: string | null = null;
-  const openWorktree = (open.payload as Record<string, unknown>).worktree;
+  const openPayload = open.payload as Record<string, unknown>;
   for (const e of events) {
     // Payload shapes are checked here, for the known event types only (M0/M1, the M2 v2 types and
-    // the reserved M4 names): the verifier covers the envelope, seq and hash chain; unknown event
-    // types and extra payload fields are ignored (M2 pin rule 1.3, additive both ways).
+    // the reserved M4 names): the verifier covers the envelope, seq, hash chain and — since the
+    // M2-A1 correction — the v2 shapes; unknown event types and extra payload fields are ignored
+    // (M2 pin rule 1.3, additive both ways).
     if (SHAPE_CHECKED_TYPES.includes(e.type)) {
       const issue = checkPayload(
         e.type as SessionEventType | ReservedEventType,
         e.payload as Record<string, unknown>,
+        { seatId: e.seatId, open: openPayload },
       );
       if (issue !== null) throw new Error(`line ${e.seq + 1}: ${issue}`);
-    }
-    if (e.type === "session.close") {
-      // M2 pin §2.2: a close identity names the open's top-level; a v2 engine never writes one
-      // for a thread whose open recorded none.
-      const close = (e.payload as Record<string, unknown>).worktree;
-      if (close !== undefined && close !== null) {
-        const c = close as WorktreeIdentity;
-        const o = openWorktree as WorktreeIdentity | null | undefined;
-        if (o === undefined || o === null || c.topLevel !== o.topLevel) {
-          throw new Error(`line ${e.seq + 1}: session.close worktree does not match session.open`);
-        }
-      }
     }
     if (e.type === "turn.start") {
       const p = e.payload as TurnStartPayload;

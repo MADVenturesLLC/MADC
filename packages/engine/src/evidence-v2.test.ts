@@ -21,6 +21,7 @@ import {
   realpathSync,
   rmSync,
   statSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -310,12 +311,17 @@ test("M2 D-M2-A0-2: a reserved line met in a file is shape-validated — well-fo
     ["tool.call", { ...toolCall, call: { seq: -1, hash: HEX64 } }],
     ["tool.call", { ...toolCall, decision: "maybe" }],
   ] as const) {
-    const bad = verifySessionText(rawChain([open, { type, payload }]));
-    assert.equal(bad.ok, true, "the hash chain itself is fine");
-    assert.throws(
-      () => rebuildSession(bad.ok ? bad.events : []),
-      new RegExp(`line 2: malformed ${type} payload`),
-    );
+    // M2-A1 correction (Argus 5391475289 miss 1): the verifier itself refuses the line — it does
+    // not stop at the hash — and rebuild refuses the same lines when handed them directly.
+    const text = rawChain([open, { type, payload }]);
+    const bad = verifySessionText(text);
+    assert.equal(bad.ok, false, type);
+    assert.equal(bad.ok ? "" : `${bad.kind} ${bad.reason}`, `integrity malformed ${type} payload`);
+    const parsed = text
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => JSON.parse(l) as SessionEvent);
+    assert.throws(() => rebuildSession(parsed), new RegExp(`line 2: malformed ${type} payload`));
   }
 });
 
@@ -614,12 +620,17 @@ test("M2 §2.2 at thread/start: a malformed session.open handoff or worktree ref
     for (const [name, open] of cases) {
       const text = rawChain([{ type: "session.open", payload: open }]);
       const v = verifySessionText(text);
-      assert.equal(v.ok, true, name);
-      assert.throws(
-        () => rebuildSession(v.ok ? v.events : []),
-        /line 1: malformed session.open payload/,
+      assert.equal(v.ok, false, name);
+      assert.equal(
+        v.ok ? "" : `${v.line} ${v.kind} ${v.reason}`,
+        "1 integrity malformed session.open payload",
         name,
       );
+      const parsed = text
+        .split("\n")
+        .filter((l) => l !== "")
+        .map((l) => JSON.parse(l) as SessionEvent);
+      assert.throws(() => rebuildSession(parsed), /line 1: malformed session.open payload/, name);
     }
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -966,10 +977,10 @@ test("M2 §10.5 additive both ways: a v1 fixture verifies and rebuilds unchanged
     },
   ]);
   const bc = verifySessionText(badClose);
-  assert.equal(bc.ok, true);
-  assert.throws(
-    () => rebuildSession(bc.ok ? bc.events : []),
-    /line 2: session.close worktree does not match/,
+  assert.equal(bc.ok, false);
+  assert.equal(
+    bc.ok ? "" : `${bc.line} ${bc.kind} ${bc.reason}`,
+    "2 integrity session.close worktree does not match session.open",
   );
 });
 
@@ -1040,6 +1051,255 @@ test("M2 D-M2-A0-4: the writer's index — genesisHash, lineAt, and a resume tha
     );
     assert.match(String(d.issues), /not below the next seq 0/);
     independentVerify(f.path);
+  } finally {
+    f.cleanup();
+  }
+});
+
+// ------------------------------------------------ M2-A1 correction (Argus 5391475289)
+
+test("Argus 5391475289 miss 1 (Copilot 4165236039/4165236079): a hash-valid malformed v2 payload is an integrity failure in verifySessionText; inspectSessionV2 reports FAIL integrity and never throws", () => {
+  const dir = mkdtempSync(join(realpathSync(tmpdir()), "madc-m2a1-miss1-"));
+  try {
+    const open = { type: "session.open", payload: { ...V2_OPEN } };
+    const sessionRef = { kind: "session", path: "sessions/thr_raw.jsonl", seq: 0, hash: HEX64 };
+    const bad: Array<[string, { type: string; payload: Record<string, unknown> }]> = [
+      [
+        "founderDecision evidenceRefs [null]",
+        { type: "founderDecision", payload: decision([null]) },
+      ],
+      ["founderDecision evidenceRefs []", { type: "founderDecision", payload: decision([]) }],
+      [
+        "founderDecision ref with bad path",
+        { type: "founderDecision", payload: decision([{ ...sessionRef, path: "/etc/passwd" }]) },
+      ],
+      [
+        "handoff.out empty brief",
+        {
+          type: "handoff.out",
+          payload: { handoffId: "ho_1", turnId: null, targetSeatId: "hephaestus", brief: " " },
+        },
+      ],
+      [
+        "handoff.link short hash",
+        {
+          type: "handoff.link",
+          payload: {
+            handoffId: "ho_1",
+            targetThreadId: "thr_t",
+            targetSeatId: "hephaestus",
+            targetGenesisHash: "ab",
+          },
+        },
+      ],
+      [
+        "handoff.aborted bad reason",
+        { type: "handoff.aborted", payload: { handoffId: "ho_1", reason: "nope", error: null } },
+      ],
+      [
+        "memory.write bytes 0",
+        {
+          type: "memory.write",
+          payload: {
+            turnId: "turn_1",
+            path: "memory/madc-default.md",
+            op: "append",
+            bytes: 0,
+            contentSha256: HEX64,
+            requestedModel: "m",
+            servedModel: "m",
+            providerId: BACKING,
+            lane: "allowed-direct",
+            vendorReported: true,
+          },
+        },
+      ],
+      [
+        "tool.call bad decision",
+        {
+          type: "tool.call",
+          payload: {
+            turnId: "turn_1",
+            callId: "item_1",
+            name: "x",
+            server: null,
+            call: { seq: 0, hash: HEX64 },
+            result: null,
+            decision: "maybe",
+            reason: null,
+          },
+        },
+      ],
+    ];
+    for (const [name, line] of bad) {
+      const text = rawChain([open, line]);
+      // The verifier does not stop at the hash (rule 1.5): integrity, line 2, the pinned reason.
+      const v = verifySessionText(text, "thr_raw");
+      assert.equal(v.ok, false, name);
+      if (v.ok) continue;
+      assert.equal(v.kind, "integrity", name);
+      assert.equal(v.line, 2, name);
+      assert.equal(v.reason, `malformed ${line.type} payload`, name);
+      // And the file-level reader (what doctor and the handoff gate use) refuses it the same way.
+      const path = join(dir, `${name.replace(/\W+/g, "_")}.jsonl`);
+      writeFileSync(path, text);
+      const vf = verifySessionFile(path, "thr_raw");
+      assert.equal(vf.ok, false, name);
+      assert.equal(vf.ok ? "" : vf.reason, `malformed ${line.type} payload`, name);
+      // inspectSessionV2 handed the parsed lines reports a FAIL and does not throw.
+      const parsed = text
+        .split("\n")
+        .filter((l) => l !== "")
+        .map((l) => JSON.parse(l) as SessionEvent);
+      let findings: ReturnType<typeof inspectSessionV2> = [];
+      assert.doesNotThrow(() => {
+        findings = inspectSessionV2(dir, parsed);
+      }, name);
+      // (The fixture is a v2 open with no close and no lock, so `not-cleanly-closed` rides along.)
+      assert.deepEqual(
+        findings.filter((f) => f.code === "integrity").map((f) => `${f.level} ${f.code}`),
+        ["fail integrity"],
+        name,
+      );
+      assert.match(findings[0]?.detail ?? "", /^line 2: malformed /, name);
+    }
+    // A well-formed v2 file still verifies and reports nothing: the rule is additive.
+    const good = rawChain([
+      open,
+      {
+        type: "handoff.out",
+        payload: { handoffId: "ho_1", turnId: null, targetSeatId: "hephaestus", brief: "b" },
+      },
+      {
+        type: "handoff.aborted",
+        payload: { handoffId: "ho_1", reason: "interrupted", error: null },
+      },
+      { type: "session.close", payload: { reason: "shutdown", worktree: null } },
+    ]);
+    const gv = verifySessionText(good, "thr_raw");
+    assert.equal(gv.ok, true, gv.ok ? "" : gv.reason);
+    assert.deepEqual(
+      inspectSessionV2(dir, gv.ok ? gv.events : []).filter((f) => f.code === "integrity"),
+      [],
+    );
+    // The M1 contract is unchanged: a malformed M0 payload still verifies (rebuild refuses it).
+    const m0 = verifySessionText(
+      rawChain([open, { type: "turn.start", payload: { turnId: "bad id", inputText: "x" } }]),
+      "thr_raw",
+    );
+    assert.equal(m0.ok, true);
+    assert.throws(
+      () => rebuildSession(m0.ok ? m0.events : []),
+      /line 2: malformed turn.start payload/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("Argus 5391475289 miss 2 (Copilot 4165236142): after a v2 open, a session.close without the worktree key does not verify, does not rebuild, and is refused by the writer; a v1 close may stay keyless", () => {
+  const v2open = { type: "session.open", payload: { ...V2_OPEN } };
+  const v1open = { type: "session.open", payload: { ...V1_OPEN } };
+  const keyless = { type: "session.close", payload: { reason: "shutdown" } };
+  // Read side.
+  const v2 = verifySessionText(rawChain([v2open, keyless]), "thr_raw");
+  assert.equal(v2.ok, false);
+  assert.equal(
+    v2.ok ? "" : `${v2.line} ${v2.kind} ${v2.reason}`,
+    "2 integrity malformed session.close payload",
+  );
+  const v1 = verifySessionText(rawChain([v1open, keyless]), "thr_raw");
+  assert.equal(v1.ok, true);
+  assert.doesNotThrow(() => rebuildSession(v1.ok ? v1.events : []));
+  // A v1 file closed by a v2 engine carries `worktree: null`: that still verifies.
+  const v1v2 = verifySessionText(
+    rawChain([v1open, { type: "session.close", payload: { reason: "shutdown", worktree: null } }]),
+    "thr_raw",
+  );
+  assert.equal(v1v2.ok, true);
+  // Write side: the writer on a v2 open refuses the keyless close; on a v1 open it accepts it.
+  const f2 = fixture("thr_src", "madc-default", V2_OPEN);
+  try {
+    const d = expectRefusal(f2, "session.close", { reason: "shutdown" }, "field-missing");
+    assert.match(String(d.issues), /worktree is required/);
+    f2.writer.append("session.close", { reason: "shutdown", worktree: null });
+    assert.equal(verifySessionFile(f2.path, "thr_src").ok, true);
+  } finally {
+    f2.cleanup();
+  }
+  const f1 = fixture("thr_v1", "madc-default", V1_OPEN);
+  try {
+    f1.writer.append("session.close", { reason: "shutdown" });
+    const v = verifySessionFile(f1.path, "thr_v1");
+    assert.equal(v.ok, true);
+    assert.doesNotThrow(() => rebuildSession(v.ok ? v.events : []));
+  } finally {
+    f1.cleanup();
+  }
+});
+
+test("Argus 5391475289 miss 4 (Copilot 4165236118): a memory.write naming another seat's memory file, or a nested path, fails the shape check (verify, rebuild, inspect); the type stays reserved for the writer", () => {
+  const open = { type: "session.open", payload: { ...V2_OPEN } };
+  const receipt = (path: string) => ({
+    turnId: "turn_1",
+    path,
+    op: "append",
+    bytes: 3,
+    contentSha256: HEX64,
+    requestedModel: "m",
+    servedModel: "m",
+    providerId: BACKING,
+    lane: "allowed-direct",
+    vendorReported: true,
+  });
+  // The envelope seat of rawChain is madc-default.
+  const own = verifySessionText(
+    rawChain([open, { type: "memory.write", payload: receipt("memory/madc-default.md") }]),
+    "thr_raw",
+  );
+  assert.equal(own.ok, true, own.ok ? "" : own.reason);
+  assert.doesNotThrow(() => rebuildSession(own.ok ? own.events : []));
+  for (const path of [
+    "memory/other-seat.md",
+    "memory/team/madc-default.md",
+    "memory/madc-default/notes.md",
+  ]) {
+    const text = rawChain([open, { type: "memory.write", payload: receipt(path) }]);
+    const v = verifySessionText(text, "thr_raw");
+    assert.equal(v.ok, false, path);
+    assert.equal(
+      v.ok ? "" : `${v.kind} ${v.reason}`,
+      "integrity malformed memory.write payload",
+      path,
+    );
+    const parsed = text
+      .split("\n")
+      .filter((l) => l !== "")
+      .map((l) => JSON.parse(l) as SessionEvent);
+    assert.throws(() => rebuildSession(parsed), /line 2: malformed memory.write payload/, path);
+    assert.deepEqual(
+      inspectSessionV2("/nonexistent-home", parsed)
+        .filter((f) => f.code === "integrity")
+        .map((f) => `${f.level} ${f.code}`),
+      ["fail integrity"],
+      path,
+    );
+  }
+  // Another seat's envelope makes the same path its own: the rule is the envelope seat, not a name.
+  const theirs = verifySessionText(
+    rawChain(
+      [open, { type: "memory.write", payload: receipt("memory/hephaestus.md") }],
+      "thr_raw",
+      "hephaestus",
+    ),
+    "thr_raw",
+  );
+  assert.equal(theirs.ok, true, theirs.ok ? "" : theirs.reason);
+  // The writer still refuses the type before any shape check: reserved, nothing appended.
+  const f = fixture();
+  try {
+    expectRefusal(f, "memory.write", receipt("memory/madc-default.md"), "reserved", "turn_1");
+    expectRefusal(f, "memory.write", receipt("memory/other-seat.md"), "reserved", "turn_1");
   } finally {
     f.cleanup();
   }
