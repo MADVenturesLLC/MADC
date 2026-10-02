@@ -118,6 +118,15 @@ const text = (t: string) => [{ type: "text", text: t }];
 const sha256 = (path: string) => createHash("sha256").update(readFileSync(path)).digest("hex");
 const sessionPath = (home: string, id: string) => join(home, "sessions", `${id}.jsonl`);
 const lockPath = (home: string, id: string) => join(home, "sessions", `${id}.lock`);
+/** M2-A1: `"<seq> <type>"` per line, for the D-M2-A0-5 close-line assertions. */
+const seqTypes = (path: string): string[] =>
+  readFileSync(path, "utf8")
+    .split("\n")
+    .filter((l) => l !== "")
+    .map((l) => {
+      const e = JSON.parse(l) as { seq: number; type: string };
+      return `${e.seq} ${e.type}`;
+    });
 
 function completedTurn(m: Wire): Turn {
   return (m.params as { turn: Turn }).turn;
@@ -381,10 +390,14 @@ test("A3 1b (b): rollback failed → poisoned for the process life; every later 
     await b.init();
     assert.ok((await b.request("thread/resume", { threadId: t })).result);
     await b.close();
+    // M2 (D-M2-A0-5): the HEALTHY engine b appended exactly its `session.close` on its clean
+    // shutdown; the poisoned engine e still writes nothing, before and after that line.
+    assert.deepEqual(seqTypes(path).slice(-1), [`${firstRefusedSeq} session.close`]);
+    const shaAfterB = sha256(path);
     expectRefusal(await e.request("thread/resume", { threadId: t }));
     expectRefusal(await e.request("turn/start", { threadId: t, input: text("fourth") }));
     assert.equal(existsSync(lockPath(home, t)), false, "the poisoned engine never re-takes");
-    assert.equal(sha256(path), shaBefore, "still nothing written");
+    assert.equal(sha256(path), shaAfterB, "still nothing written by the poisoned engine");
     // A new engine process resumes and appends, and the chain verifies (the truncate reached disk).
     const c = inProcess(home);
     await c.init();
@@ -581,10 +594,14 @@ test("A3 1b-p: preflight still refuses before any append, on an ordinary turn/st
     await b.init();
     assert.ok((await b.request("thread/resume", { threadId: t })).result);
     await b.close();
+    // M2 (D-M2-A0-5): b's clean shutdown appended its `session.close` (seq 1); the refused
+    // turn/start on e, after the re-take, still appends nothing on top of it.
+    assert.deepEqual(seqTypes(path), ["0 session.open", "1 session.close"]);
+    const afterB = sha256(path);
     const refused2 = await e.request("turn/start", { threadId: t, input: text("y") });
     assert.equal((refused2.error as { code: number }).code, -32008);
     assert.equal(preflights, 2, "preflight ran again, once, after the re-take");
-    assert.equal(sha256(path), before, "still nothing appended");
+    assert.equal(sha256(path), afterB, "still nothing appended by the refused turn/start");
     const lock = readFileSync(lockPath(home, t), "utf8");
     assert.equal(
       (JSON.parse(lock) as { pid: number }).pid,

@@ -25,6 +25,15 @@ test("engine public surface exports protocol constants, host, and client SDK", (
   assert.equal(typeof engine.credentialEnvVar, "function");
   assert.equal(engine.MADC_DEV_ENV_KEYS, "MADC_DEV_ENV_KEYS");
   assert.equal(engine.KEYCHAIN_SERVICE, "madc");
+  // M2-A1 (evidence schema v2): the refusal code, the reserved set, the link check, the doctor
+  // findings and the engine-owned worktree identity are host surface.
+  assert.equal(engine.ErrorCode.EvidenceInvalid, -32010);
+  assert.deepEqual([...engine.RESERVED_EVENT_TYPES], ["memory.write", "tool.call"]);
+  assert.equal(typeof engine.inspectSessionV2, "function");
+  assert.equal(typeof engine.checkHandoffTarget, "function");
+  assert.equal(typeof engine.resolveWorktreeIdentity, "function");
+  assert.equal(typeof engine.validateForWrite, "function");
+  assert.equal(typeof engine.SessionChainIndex, "function");
 });
 
 test("@madc/engine/client (CLI surface) carries no engine loop or agents", () => {
@@ -33,12 +42,19 @@ test("@madc/engine/client (CLI surface) carries no engine loop or agents", () =>
   // itself (and the runner) stay host-side, so the CLI never touches a credential value.
   assert.equal(typeof sdk.spawnAuthSet, "function");
   assert.equal(sdk.ErrorCode.TurnAlreadyActive, -32004);
+  // M2-A1: the CLI classifies -32010 (exit table) and reads doctor findings through
+  // `inspectMadcHome`; it never gets the writer, the index or the link check.
+  assert.equal(sdk.ErrorCode.EvidenceInvalid, -32010);
   for (const hostOnly of [
     "runEngine",
     "EngineConnection",
     "echoAgent",
     "startStdioEngine",
     "SessionWriter",
+    "SessionChainIndex",
+    "checkHandoffTarget",
+    "inspectSessionV2",
+    "resolveWorktreeIdentity",
     "seedDefaultSeat",
     // M1-A7: the CLI never reaches the seed writer. (M1-A8 moved `listSeatSummaries` onto the
     // surface, read-only, for doctor — see the next test.)

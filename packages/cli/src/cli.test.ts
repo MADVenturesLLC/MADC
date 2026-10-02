@@ -1344,3 +1344,120 @@ test("A7 §7.6 colour only on a TTY: doctor rows are coloured on a TTY, never wi
     sb.cleanup();
   }
 });
+
+test("M2-A1 doctor session row: a one-way handoff (no handoff.link yet) WARNs handoff-incomplete; a two-way link passes", {
+  timeout: 60_000,
+}, async () => {
+  // Fixture chains hashed with the seat pin §4.3 formula, written straight into the sandbox home:
+  // doctor is read-only and the row must come from the file, not from an engine.
+  const sorted = (value: unknown): string =>
+    JSON.stringify(value, (_k, v: unknown) =>
+      v !== null && typeof v === "object" && !Array.isArray(v)
+        ? Object.fromEntries(
+            Object.keys(v as object)
+              .sort()
+              .map((k) => [k, (v as Record<string, unknown>)[k]]),
+          )
+        : v,
+    );
+  const chain = (
+    threadId: string,
+    seatId: string,
+    lines: Array<[string, Record<string, unknown>]>,
+  ) => {
+    let prevHash = "0".repeat(64);
+    const out: string[] = [];
+    const hashes: string[] = [];
+    lines.forEach(([type, payload], seq) => {
+      const body = { v: 1, seq, ts: 1 + seq, type, threadId, seatId, payload };
+      const hash = createHash("sha256")
+        .update(`${prevHash}\n${sorted(body)}`, "utf8")
+        .digest("hex");
+      const { payload: p, ...head } = body;
+      out.push(JSON.stringify({ ...head, prevHash, hash, payload: p }));
+      hashes.push(hash);
+      prevHash = hash;
+    });
+    return { text: `${out.join("\n")}\n`, hashes };
+  };
+  const open = {
+    cwd: null,
+    backing: "kimi-code",
+    providerId: "kimi-code",
+    pinnedModel: "m",
+    worktree: null,
+    handoff: null,
+  };
+  const outLine: [string, Record<string, unknown>] = [
+    "handoff.out",
+    { handoffId: "ho_1", turnId: null, targetSeatId: "hephaestus", brief: "do it" },
+  ];
+  for (const linked of [false, true]) {
+    const sb = sandbox();
+    try {
+      mkdirSync(join(sb.home, "sessions"), { recursive: true, mode: 0o700 });
+      const src = chain("thr_src", "daedalus", [["session.open", open], outLine]);
+      const tgt = chain("thr_tgt", "hephaestus", [
+        [
+          "session.open",
+          {
+            ...open,
+            handoff: {
+              sourceThreadId: "thr_src",
+              sourceSeatId: "daedalus",
+              handoffId: "ho_1",
+              sourceSeq: 1,
+              sourceHash: src.hashes[1],
+            },
+          },
+        ],
+        ["session.close", { reason: "shutdown", worktree: null }],
+      ]);
+      const srcLines: Array<[string, Record<string, unknown>]> = [["session.open", open], outLine];
+      if (linked) {
+        srcLines.push([
+          "handoff.link",
+          {
+            handoffId: "ho_1",
+            targetThreadId: "thr_tgt",
+            targetSeatId: "hephaestus",
+            targetGenesisHash: tgt.hashes[0] as string,
+          },
+        ]);
+      }
+      srcLines.push(["session.close", { reason: "shutdown", worktree: null }]);
+      writeFileSync(join(sb.home, "sessions", "thr_tgt.jsonl"), tgt.text, { mode: 0o600 });
+      await new Promise((r) => setTimeout(r, 20));
+      // The source is the newest file, so it is the session doctor inspects.
+      writeFileSync(
+        join(sb.home, "sessions", "thr_src.jsonl"),
+        chain("thr_src", "daedalus", srcLines).text,
+        { mode: 0o600 },
+      );
+      const r = await runCli(sb, ["doctor", "--json"]);
+      assert.equal(r.code, 0, r.stderr);
+      const report = JSON.parse(r.stdout) as DoctorJson;
+      const row = check(report, "session");
+      if (linked) {
+        assert.equal(row.status, "pass", row.summary);
+        assert.match(row.summary, /^thr_src · 4 events · head [0-9a-f]{12}$/);
+        assert.deepEqual(row.evidence.findings, []);
+      } else {
+        assert.equal(row.status, "warn", row.summary);
+        assert.match(
+          row.summary,
+          /^thr_src · 3 events · head [0-9a-f]{12} · handoff-incomplete: handoff ho_1 /,
+        );
+        assert.equal(row.summary.includes("do it"), false, "a finding never carries the brief");
+        assert.deepEqual(
+          (row.evidence.findings as Array<{ level: string; code: string }>).map(
+            (f) => `${f.level} ${f.code}`,
+          ),
+          ["warn handoff-incomplete"],
+        );
+      }
+    } finally {
+      sb.cleanup();
+    }
+  }
+});

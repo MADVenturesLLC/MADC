@@ -22,9 +22,30 @@ import { getById, type ProviderStatus } from "@madc/registry";
 import { isStrictlyUnder } from "./home.ts";
 import { type OpenNoFollowOptions, openNoFollow } from "./lock.ts";
 import type { Presence } from "./presence/policy.ts";
-import { ErrorCode, RpcError, type SessionWriteFailedData } from "./protocol/errors.ts";
+import {
+  ErrorCode,
+  evidenceInvalid,
+  RpcError,
+  type SessionWriteFailedData,
+} from "./protocol/errors.ts";
 import { isValidId } from "./protocol/ids.ts";
 import type { Item, RpcErrorBody, Thread, Turn, TurnMode, TurnStatus } from "./protocol/types.ts";
+import {
+  checkV2Payload,
+  type FounderDecisionPayload,
+  type HandoffAbortedPayload,
+  type HandoffLinkPayload,
+  type HandoffOutPayload,
+  RESERVED_EVENT_TYPES,
+  type ReservedEventType,
+  redactionRefusal,
+  SessionChainIndex,
+  type SessionOpenHandoffLink,
+  turnIdOf,
+  validateForWrite,
+  type WorktreeIdentity,
+  type WriteRefusal,
+} from "./session-v2.ts";
 
 export const GENESIS_HASH = "0".repeat(64);
 export const REDACTED = "[REDACTED]";
@@ -35,6 +56,13 @@ export type SessionOpenPayload = {
   backing: string;
   providerId: string;
   pinnedModel: string;
+  /**
+   * M2 pin §2.1 / §2.2 (schema v2, additive): a v2 engine writes BOTH `handoff` (the source link of
+   * a handoff target, else null) and `worktree` (engine-owned identity, else null); a v1 line has
+   * neither. One without the other is refused at write time and is an integrity failure on read.
+   */
+  handoff?: SessionOpenHandoffLink | null;
+  worktree?: WorktreeIdentity | null;
 };
 /**
  * M1-A5 TTY facts of the presence check that verified a turn (M1 plan §7 M1-A5: "TTY facts … go
@@ -105,7 +133,27 @@ export type RepoDecisionPayload = {
   decision: "allow" | "deny";
   reason: string;
 };
-export type SessionClosePayload = { reason: string };
+/**
+ * `session.close` (seat pin §4.2). M2 pin §2.2 (D-M2-A0-5): a v2 engine writes it on every clean
+ * shutdown, with `worktree.head` re-read at the RECORDED top-level (null when it can no longer be
+ * read). Optional in the type because M1 never wrote the key.
+ */
+export type SessionClosePayload = { reason: string; worktree?: WorktreeIdentity | null };
+
+export type {
+  EvidenceRef,
+  FounderDecisionPayload,
+  HandoffAbortedPayload,
+  HandoffAbortReason,
+  HandoffLinkPayload,
+  HandoffOutPayload,
+  MemoryWritePayload,
+  ReservedEventType,
+  SessionOpenHandoffLink,
+  ToolCallReceiptPayload,
+  WorktreeIdentity,
+} from "./session-v2.ts";
+export { RESERVED_EVENT_TYPES, SessionChainIndex } from "./session-v2.ts";
 
 export type SessionPayloads = {
   "session.open": SessionOpenPayload;
@@ -116,8 +164,15 @@ export type SessionPayloads = {
   "repo.decision": RepoDecisionPayload;
   "turn.end": TurnEndPayload;
   "session.close": SessionClosePayload;
+  // M2 pin §2 (schema v2 on the unchanged v:1 envelope, D-M2-A0-6). `memory.write` and
+  // `tool.call` are deliberately NOT here: they are reserved for M4 (pin §4, §10 item 8).
+  "handoff.out": HandoffOutPayload;
+  "handoff.link": HandoffLinkPayload;
+  "handoff.aborted": HandoffAbortedPayload;
+  founderDecision: FounderDecisionPayload;
 };
 export type SessionEventType = keyof SessionPayloads;
+/** The WRITABLE set. A reserved M4 name entering it before the M4 pin fails the §10 item 8 guard. */
 export const SESSION_EVENT_TYPES: readonly SessionEventType[] = Object.freeze([
   "session.open",
   "turn.start",
@@ -127,6 +182,10 @@ export const SESSION_EVENT_TYPES: readonly SessionEventType[] = Object.freeze([
   "repo.decision",
   "turn.end",
   "session.close",
+  "handoff.out",
+  "handoff.link",
+  "handoff.aborted",
+  "founderDecision",
 ]);
 
 export type SessionEvent<T extends SessionEventType = SessionEventType> = {
@@ -413,6 +472,13 @@ export class SessionWriter {
    * Every append must still resolve here.
    */
   readonly #realPath: string;
+  /**
+   * M2 pin D-M2-A0-4: the verified file this writer holds, as an index — every line's hash and
+   * type, the handoff states and the decision ids — so a same-file evidence ref, a duplicate id and
+   * a second terminal record are refused at write time without re-reading the file. Built from the
+   * verified events at resume, from the `session.open` at create, and told every durable append.
+   */
+  readonly #index: SessionChainIndex;
 
   private constructor(
     path: string,
@@ -425,6 +491,7 @@ export class SessionWriter {
     expectedEnd: number,
     holdsLock: () => boolean,
     hooks: SessionWriterHooks,
+    index: SessionChainIndex,
   ) {
     this.path = path;
     this.#expectedEnd = expectedEnd;
@@ -436,6 +503,7 @@ export class SessionWriter {
     this.#seq = seq;
     this.#prevHash = prevHash;
     this.#secrets = secrets;
+    this.#index = index;
   }
 
   /**
@@ -464,6 +532,19 @@ export class SessionWriter {
       throw new TypeError("SessionWriter.create requires a holdsLock guard (Amendment 3 item 3)");
     }
     const holdsLock = guards.holdsLock;
+    // M2 pin rule 1.5 / §2.2 ("no file is created"): the `session.open` record is validated BEFORE
+    // the file exists, so a malformed `handoff` or `worktree` refuses -32010 with nothing on disk.
+    const index = new SessionChainIndex();
+    const refusal = validateForWrite("session.open", open, { threadId, index });
+    if (refusal !== null) {
+      throw evidenceInvalid({
+        threadId,
+        turnId: null,
+        type: "session.open",
+        reason: refusal.reason,
+        issues: refusal.issues,
+      });
+    }
     let created: { dev: bigint; ino: bigint };
     try {
       const fd = openSync(path, APPEND_FLAGS | constants.O_CREAT | constants.O_EXCL, 0o600);
@@ -517,6 +598,7 @@ export class SessionWriter {
       0, // created exclusively just now: empty
       holdsLock,
       hooks,
+      index,
     );
     try {
       writer.append("session.open", open, ts);
@@ -534,6 +616,12 @@ export class SessionWriter {
    * swap between verification and resume never continues another session's chain (else -32009).
    * `guards.expectedSize` is the verified byte size (Amendment 2 §2); every append requires the
    * file to still be exactly that long (plus this writer's own writes).
+   *
+   * M2 (D-M2-A0-4): `index` is the chain index of the verified events (`SessionChainIndex
+   * .fromEvents(verified.events)`), so same-file evidence refs resolve at write time. A caller that
+   * passes none gets an EMPTY index: every same-file ref, every `handoff.link` / `handoff.aborted`
+   * and every non-null `session.close.worktree` is then refused (fail-closed), never resolved
+   * against a file the writer did not read.
    */
   static resume(
     path: string,
@@ -546,6 +634,7 @@ export class SessionWriter {
     verifiedFile: SessionFileId | undefined,
     guards: SessionResumeGuards,
     hooks: SessionWriterHooks = {},
+    index: SessionChainIndex = new SessionChainIndex(),
   ): SessionWriter {
     // Amendment 3 item 3 (Option A): `guards` is a required parameter — resume binds the lock and
     // the verified size, and omitting either is a tsc error AND a run-time throw (3c).
@@ -588,11 +677,22 @@ export class SessionWriter {
       expectedEnd,
       holdsLock,
       hooks,
+      index,
     );
   }
 
   get nextSeq(): number {
     return this.#seq;
+  }
+
+  /** The file's seq-0 hash (G for a handoff target, M2 pin §2.1), or null before `session.open`. */
+  get genesisHash(): string | null {
+    return this.#index.lineAt(0)?.hash ?? null;
+  }
+
+  /** Hash and type of the chained line at `seq`, as this writer knows it (M2 pin D-M2-A0-4). */
+  lineAt(seq: number): { readonly hash: string; readonly type: string } | undefined {
+    return this.#index.lineAt(seq);
   }
 
   get broken(): boolean {
@@ -642,11 +742,41 @@ export class SessionWriter {
   ): SessionEvent[] {
     const firstSeq = this.#seq;
     if (this.#broken) throw sessionWriteFailed(this.threadId, this.path, firstSeq);
+    // M2 pin rule 1.5: validity is checked BEFORE redaction, hashing and any I/O. On a fault
+    // nothing is written, no fd is opened, and the writer is NOT broken (the file, its offset and
+    // the chain are untouched because no bytes were attempted). A reserved M4 name refuses
+    // `reserved` (§4); a type outside the vocabulary altogether is an engine fault, not a record.
+    const refuse = (type: string, payload: unknown, refusal: WriteRefusal): RpcError =>
+      evidenceInvalid({
+        threadId: this.threadId,
+        turnId: turnIdOf(payload),
+        type,
+        reason: refusal.reason,
+        issues: refusal.issues,
+      });
+    // Entries of one batch are validated against the index as it will be once the earlier entries
+    // of the same batch are durable, so a duplicate id inside a batch is refused too.
+    const shadow = this.#index.clone();
+    for (const { type, payload } of entries) {
+      if (
+        !(SESSION_EVENT_TYPES as readonly string[]).includes(type) &&
+        !(RESERVED_EVENT_TYPES as readonly string[]).includes(type)
+      ) {
+        throw new TypeError(`unknown session event type ${JSON.stringify(type)}`);
+      }
+      const refusal = validateForWrite(type, payload, { threadId: this.threadId, index: shadow });
+      if (refusal !== null) throw refuse(type, payload, refusal);
+      shadow.note({ type, hash: "", payload });
+    }
     const redact = createRedactor(this.#secrets());
     const events: SessionEvent[] = [];
     let prevHash = this.#prevHash;
     for (const [i, { type, payload }] of entries.entries()) {
       const redacted = redact(payload) as SessionPayloads[SessionEventType];
+      // Copilot 4160774703 (#46): a structural field (id, hash, path, SHA, remote) that redaction
+      // would rewrite is refused here, before the append, instead of persisting as `[REDACTED]`.
+      const structural = redactionRefusal(type, payload, redacted);
+      if (structural !== null) throw refuse(type, payload, structural);
       const body = {
         v: 1 as const,
         seq: firstSeq + i,
@@ -721,6 +851,8 @@ export class SessionWriter {
     this.#seq = firstSeq + events.length;
     this.#prevHash = prevHash;
     this.#expectedEnd += bytes.length;
+    // The batch is durable: the index now holds every line this writer knows to be on disk.
+    for (const e of events) this.#index.note(e);
     return events;
   }
 }
@@ -773,6 +905,10 @@ export const unguardedSessionWriterForTests = {
     } catch {
       throw sessionWriteFailed(threadId, path, nextSeq);
     }
+    // M2: a test resume reads the file it continues, so same-file refs resolve exactly as the
+    // engine's resume (which builds the index from the events it verified) resolves them.
+    const verified = verifySessionFile(path, threadId, {}, home);
+    const index = verified.ok ? SessionChainIndex.fromEvents(verified.events) : undefined;
     return SessionWriter.resume(
       path,
       threadId,
@@ -784,6 +920,7 @@ export const unguardedSessionWriterForTests = {
       verifiedFile,
       { holdsLock: () => true, expectedSize },
       hooks,
+      index,
     );
   },
 } as const;
@@ -983,13 +1120,20 @@ function isM0Item(item: unknown): boolean {
  * hash-valid line with a malformed payload makes `rebuildSession` throw, so a crafted file is
  * skipped by list and refused by resume (-32603), never crashing either.
  */
-function checkPayload(type: SessionEventType, p: Record<string, unknown>): string | null {
+function checkPayload(
+  type: SessionEventType | ReservedEventType,
+  p: Record<string, unknown>,
+): string | null {
   switch (type) {
     case "session.open":
+      // M2 pin §2.2 verifier rule: `handoff` and `worktree` both present (each an object or null)
+      // or both absent (a v1 line); one without the other, or a malformed one, is an integrity
+      // failure exactly like a malformed M1 field.
       return (p.cwd === null || isStr(p.cwd)) &&
         isWiredBacking(p.backing) &&
         isStr(p.providerId) &&
-        isStr(p.pinnedModel)
+        isStr(p.pinnedModel) &&
+        checkV2Payload("session.open", p).length === 0
         ? null
         : "malformed session.open payload";
     case "turn.start": {
@@ -1060,9 +1204,24 @@ function checkPayload(type: SessionEventType, p: Record<string, unknown>): strin
         : "malformed turn.end payload";
     }
     case "session.close":
-      return isStr(p.reason) ? null : "malformed session.close payload";
+      // M2 pin §2.2: a `worktree` key, when present, is an identity or null.
+      return isStr(p.reason) && checkV2Payload("session.close", p).length === 0
+        ? null
+        : "malformed session.close payload";
+    // M2 pin §2.1 / §2.3 (schema v2) and the reserved M4 names (§4, D-M2-A0-2: validated when
+    // met, so a malformed reserved line is an integrity failure, never a tolerated unknown).
+    case "handoff.out":
+    case "handoff.link":
+    case "handoff.aborted":
+    case "founderDecision":
+    case "memory.write":
+    case "tool.call":
+      return checkV2Payload(type, p).length === 0 ? null : `malformed ${type} payload`;
   }
 }
+
+/** The types `rebuildSession` shape-checks: the writable set plus the reserved M4 names. */
+const SHAPE_CHECKED_TYPES: readonly string[] = [...SESSION_EVENT_TYPES, ...RESERVED_EVENT_TYPES];
 
 /**
  * Read and verify `sessions/<threadId>.jsonl`. The final path component must be a regular file,
@@ -1132,12 +1291,29 @@ export function rebuildSession(events: readonly SessionEvent[], now = Date.now()
   }
   const turns = new Map<string, Turn>();
   let preview: string | null = null;
+  const openWorktree = (open.payload as Record<string, unknown>).worktree;
   for (const e of events) {
-    // Payload shapes are checked here, for the M0 event types only: the verifier covers the
-    // envelope, seq and hash chain; unknown event types and extra payload fields are ignored.
-    if (SESSION_EVENT_TYPES.includes(e.type)) {
-      const issue = checkPayload(e.type, e.payload as Record<string, unknown>);
+    // Payload shapes are checked here, for the known event types only (M0/M1, the M2 v2 types and
+    // the reserved M4 names): the verifier covers the envelope, seq and hash chain; unknown event
+    // types and extra payload fields are ignored (M2 pin rule 1.3, additive both ways).
+    if (SHAPE_CHECKED_TYPES.includes(e.type)) {
+      const issue = checkPayload(
+        e.type as SessionEventType | ReservedEventType,
+        e.payload as Record<string, unknown>,
+      );
       if (issue !== null) throw new Error(`line ${e.seq + 1}: ${issue}`);
+    }
+    if (e.type === "session.close") {
+      // M2 pin §2.2: a close identity names the open's top-level; a v2 engine never writes one
+      // for a thread whose open recorded none.
+      const close = (e.payload as Record<string, unknown>).worktree;
+      if (close !== undefined && close !== null) {
+        const c = close as WorktreeIdentity;
+        const o = openWorktree as WorktreeIdentity | null | undefined;
+        if (o === undefined || o === null || c.topLevel !== o.topLevel) {
+          throw new Error(`line ${e.seq + 1}: session.close worktree does not match session.open`);
+        }
+      }
     }
     if (e.type === "turn.start") {
       const p = e.payload as TurnStartPayload;

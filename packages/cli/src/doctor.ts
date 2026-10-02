@@ -45,6 +45,7 @@ import {
   readLock,
   resolveMadcHome,
   type SeatSummary,
+  type SessionFinding,
   sessionsOwnerReadUnsupported,
   spawnEngine,
   verifySessionFile,
@@ -441,7 +442,13 @@ type Inspection =
       readonly seat: SeatInfo;
       readonly lastSession: { readonly threadId: string; readonly path: string } | null;
       readonly verify:
-        | { readonly ok: true; readonly events: number; readonly lastHash: string }
+        | {
+            readonly ok: true;
+            readonly events: number;
+            readonly lastHash: string;
+            /** M2 pin §7: schema-v2 findings over the verified chain (engine `inspectMadcHome`). */
+            readonly findings: readonly SessionFinding[];
+          }
         | {
             readonly ok: false;
             readonly line: number;
@@ -462,7 +469,7 @@ function inspectDirect(home: string): Inspection {
   if (last !== null) {
     const v = verifySessionFile(last.path, last.threadId, {}, home);
     verify = v.ok
-      ? { ok: true, events: v.events.length, lastHash: v.lastHash }
+      ? { ok: true, events: v.events.length, lastHash: v.lastHash, findings: last.findings }
       : { ok: false, line: v.line, reason: v.reason, kind: v.kind };
   }
   return {
@@ -613,17 +620,36 @@ function checkSession(home: HomeState, insp: Inspection | null): Check {
   const v = insp.verify;
   if (last === null || v === null) return skip("session", "no sessions yet");
   if (v.ok) {
-    return {
-      id: "session",
-      status: "pass",
-      summary: `${last.threadId} · ${v.events} events · head ${v.lastHash.slice(0, 12)}`,
-      evidence: {
-        threadId: last.threadId,
-        path: last.path,
-        events: v.events,
-        headHash: v.lastHash,
-      },
+    const head = `${last.threadId} · ${v.events} events · head ${v.lastHash.slice(0, 12)}`;
+    const evidence = {
+      threadId: last.threadId,
+      path: last.path,
+      events: v.events,
+      headHash: v.lastHash,
+      findings: v.findings,
     };
+    // M2 pin §7: a FAIL finding (a link or a cited hash is wrong) fails the row; a WARN finding (a
+    // fact could not be established) warns. Finding text names seqs, ids and files only.
+    const failed = v.findings.filter((f) => f.level === "fail");
+    const warned = v.findings.filter((f) => f.level === "warn");
+    const describe = (f: SessionFinding) => `${f.code}: ${stripControls(f.detail)}`;
+    if (failed.length > 0) {
+      return {
+        id: "session",
+        status: "fail",
+        summary: `${head} · ${[...failed, ...warned].map(describe).join("; ")}`,
+        evidence,
+      };
+    }
+    if (warned.length > 0) {
+      return {
+        id: "session",
+        status: "warn",
+        summary: `${head} · ${warned.map(describe).join("; ")}`,
+        evidence,
+      };
+    }
+    return { id: "session", status: "pass", summary: head, evidence };
   }
   const evidence = {
     threadId: last.threadId,

@@ -51,6 +51,9 @@ export {
   type HomeReport,
   inspectMadcHome,
   type SeatReport,
+  type SessionFinding,
+  type SessionFindingCode,
+  type SessionFindingLevel,
   type SessionReport,
 } from "./inspect.ts";
 export { isPidAlive, type LockState, readLock } from "./lock.ts";

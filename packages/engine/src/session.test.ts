@@ -210,7 +210,11 @@ test("§6.3 / §6.4: a seat run writes session.open → turn.start → items →
       assert.equal(line.seatId, "madc-default");
     }
     assert.equal(lines[0]?.prevHash, GENESIS_HASH);
+    // M2 pin §2.2: a v2 engine always writes `worktree` (null: `/tmp/proj` is no work tree) and
+    // `handoff` (null: not a handoff target) on session.open, additively.
     assert.deepEqual(lines[0]?.payload, {
+      worktree: null,
+      handoff: null,
       cwd: "/tmp/proj",
       backing: "kimi-code",
       providerId: "kimi-code",
@@ -551,7 +555,9 @@ test("A4: a failed turn is recorded with turn.end.error = {code, message} only; 
     assert.equal(failed.status, "failed");
     await a.client.close();
     const lines = readLines(sessionPath(home, thread.id));
-    assert.deepEqual(lines.at(-1)?.payload, {
+    // M2 (D-M2-A0-5): the clean shutdown above appended `session.close` after the turn.end.
+    assert.equal(lines.at(-1)?.type, "session.close");
+    assert.deepEqual(lines.at(-2)?.payload, {
       turnId: failed.id,
       status: "failed",
       error: { code: -32603, message: "kimi-code request failed (HTTP 500)" },
@@ -808,6 +814,8 @@ test("§6.8 A4 helper: inspectMadcHome reports seat id, last session path, and c
         seatId: "madc-default",
         events: 5,
         chain: { ok: true },
+        // M2 pin §7: no v2 finding on a live, link-free thread (its lock is held by the engine).
+        findings: [],
       },
     });
     assert.notEqual(older.id, thread.id);

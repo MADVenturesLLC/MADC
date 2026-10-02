@@ -17,6 +17,14 @@ export const ErrorCode = Object.freeze({
   ProviderDenied: -32007,
   ProviderUnavailable: -32008,
   SessionWriteFailed: -32009,
+  /**
+   * M2 evidence schema v2 pin §5 (D-M2-A0-1, ruled 2026-10-01): a schema-v2 line would be written
+   * with a required field missing or invalid, a `founderDecision` has no evidence ref or a malformed
+   * or mismatched one, a handoff target is asked to serve while its link is one-way, or a reserved
+   * (M4) type is requested. Nothing is appended. Not in the frozen M1 protocol pin; the M2 pin §5
+   * is the table.
+   */
+  EvidenceInvalid: -32010,
 } as const);
 
 export type ErrorCodeName = keyof typeof ErrorCode;
@@ -46,6 +54,33 @@ export type ProviderUnavailableData = {
   reason: "unwired" | "binary-missing" | "no-credentials" | "quota-or-unreachable";
 };
 export type SessionWriteFailedData = { threadId: string; path: string; seq: number };
+/** M2 pin §5: the one enum doctor and M3 bind to. `issues` are human-readable, not a contract. */
+export type EvidenceRefusal =
+  | "field-missing"
+  | "field-invalid"
+  | "evidence-ref-missing"
+  | "evidence-ref-invalid"
+  | "handoff-one-way"
+  | "reserved";
+export const EVIDENCE_REFUSALS: readonly EvidenceRefusal[] = Object.freeze([
+  "field-missing",
+  "field-invalid",
+  "evidence-ref-missing",
+  "evidence-ref-invalid",
+  "handoff-one-way",
+  "reserved",
+]);
+/**
+ * M2 pin §5 `data` for -32010. `type` is the event whose record was refused or questioned.
+ * Never carries secrets, env, the `brief` or the `question` text: `issues` name fields, not values.
+ */
+export type EvidenceInvalidData = {
+  threadId: string;
+  turnId: string | null;
+  type: string;
+  reason: EvidenceRefusal;
+  issues: string[];
+};
 
 /** Throwable protocol error. Never put secrets, env, or stacks in `data`. */
 export class RpcError extends Error {
@@ -127,6 +162,17 @@ export function turnAlreadyActive(
     activeTurnId === null ? "Thread is locked by another engine process" : "Turn already active",
     data,
   );
+}
+
+/** M2 pin §5: -32010 `EvidenceInvalid`. The writer appended nothing. */
+export function evidenceInvalid(data: EvidenceInvalidData): RpcError {
+  return new RpcError(ErrorCode.EvidenceInvalid, `Evidence invalid (${data.reason})`, {
+    threadId: data.threadId,
+    turnId: data.turnId,
+    type: data.type,
+    reason: data.reason,
+    issues: [...data.issues],
+  } satisfies EvidenceInvalidData);
 }
 
 /**
