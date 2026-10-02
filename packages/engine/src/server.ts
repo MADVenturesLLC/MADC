@@ -12,6 +12,7 @@ import {
 } from "@madc/registry";
 import type { Agent, AgentTurnContext, TurnSink } from "./agent.ts";
 import { type CredentialStore, createCredentialStore } from "./credentials/store.ts";
+import { checkHandoffTarget } from "./handoff.ts";
 import { confinedPath, sessionsOwnerReadUnsupported } from "./home.ts";
 import { acquireThreadLock, holdsThreadLock, type LockHandle, releaseThreadLock } from "./lock.ts";
 import { type RepoIdentityDeps, resolveRepoIdentity } from "./policy/identity.ts";
@@ -26,6 +27,7 @@ import { createSystemTerminal, type PresenceTerminal } from "./presence/terminal
 import {
   alreadyInitialized,
   ErrorCode,
+  evidenceInvalid,
   internalError,
   invalidParams,
   invalidRequest,
@@ -72,14 +74,18 @@ import { seedRosterSeats } from "./seats/roster.ts";
 import {
   type RebuiltSession,
   rebuildSession,
+  SessionChainIndex,
   type SessionEvent,
   type SessionEventType,
+  type SessionOpenHandoffLink,
   type SessionPayloads,
   SessionWriter,
   sessionWriteFailed,
   type TurnStartTty,
   verifySessionFile,
+  type WorktreeIdentity,
 } from "./session-store.ts";
+import { rereadWorktreeIdentity, resolveWorktreeIdentity } from "./worktree.ts";
 
 export const ENGINE_VERSION = "0.0.0";
 
@@ -108,6 +114,12 @@ export type EngineOptions = {
   repoPolicy?: RepoPolicy;
   /** M1-A4 test seam: `realpath` / `git` injection for repo-identity resolution. */
   repoIdentityDeps?: RepoIdentityDeps;
+  /**
+   * M2-A1 test seam: `realpath` / `git` injection for the worktree identity recorded on
+   * `session.open` and `session.close` (M2 pin §2.2). Separate from `repoIdentityDeps` so a test
+   * can fake a repo-gate identity without faking `HEAD`, and vice versa. Default: real `git`.
+   */
+  worktreeDeps?: RepoIdentityDeps;
   /**
    * M1-A5: the engine's access to its own controlling terminal for the presence check (protocol pin
    * §3.3 P3). Default: the real `/dev/tty` (`presence/terminal.ts`), created on first need, so an
@@ -147,6 +159,24 @@ type ThreadRecord = {
   confirmedTerminal: TerminalFacts | null;
   /** M1-A5: a `turn/start` on this thread is waiting for the presence keypress. */
   confirming: boolean;
+  /** M2: what this thread's `session.open` recorded (schema v2). */
+  open: SessionOpenFacts;
+  /**
+   * M2 pin §2.1: the two-way link of a handoff TARGET was verified against the source file since
+   * this record was loaded. Checked on every `thread/resume` and before the first `turn/start`
+   * after a load (then cached for the later turns of the same load); never for a non-target.
+   */
+  handoffVerified: boolean;
+};
+
+/** M2 pin §2.1 / §2.2: the `session.open` facts a loaded thread keeps. */
+type SessionOpenFacts = {
+  /** The file's seq-0 hash (G for a handoff target). */
+  readonly genesisHash: string;
+  /** The source link when this thread is a handoff target; null otherwise (and for a v1 open). */
+  readonly handoff: SessionOpenHandoffLink | null;
+  /** The identity recorded at open; null for a non-git cwd and for a v1 open. */
+  readonly worktree: WorktreeIdentity | null;
 };
 
 /**
@@ -401,9 +431,82 @@ export class EngineConnection {
         record.activeTurnId === null ? undefined : record.turns.get(record.activeTurnId);
       if (active !== undefined) this.#finishTurn(record, active, "interrupted");
     }
+    // M2 pin §2.2 (D-M2-A0-5): every clean shutdown writes `session.close`, under the lock this
+    // process still holds, before that lock is released.
+    this.#closeSessions();
     this.releaseLocks();
     this.#closed = true;
     this.#rl?.close();
+  }
+
+  /**
+   * M2 pin §2.2 "At close" (D-M2-A0-5): one `session.close` per loaded thread whose writer is
+   * usable and whose lock this process still holds, with `worktree.head` re-read at the RECORDED
+   * top-level (null when it can no longer be read; doctor WARNs `worktree-head-unreadable`). A
+   * refused record (-32010) or a failed append (-32009) is one stderr line and never a protocol
+   * error: the operation that needed the line has already answered (pin §5 "Where it surfaces").
+   */
+  #closeSessions(): void {
+    for (const record of this.#threads.values()) {
+      const threadId = record.thread.id;
+      if (record.session.broken || this.#poisoned.has(threadId)) {
+        this.#log(`session ${threadId}: not closed (writer unusable)`);
+        continue;
+      }
+      if (!holdsThreadLock(record.lock)) {
+        this.#log(`session ${threadId}: not closed (thread lock no longer held)`);
+        continue;
+      }
+      const worktree =
+        record.open.worktree === null
+          ? null
+          : rereadWorktreeIdentity(record.open.worktree, this.#opts.worktreeDeps ?? {});
+      try {
+        record.session.append("session.close", { reason: "shutdown", worktree });
+      } catch (err) {
+        if (!(err instanceof RpcError)) throw err;
+        if (err.code === ErrorCode.EvidenceInvalid) {
+          const issues = Array.isArray(err.data?.issues) ? err.data.issues.join("; ") : "";
+          this.#log(`session ${threadId}: close record refused (${issues})`);
+          continue;
+        }
+        this.#notePoisoned(threadId, record.session);
+        this.#log(`session append failed (session.close): ${err.message}`);
+      }
+    }
+  }
+
+  /**
+   * M2 pin §2.1: a handoff TARGET serves only while §2.1 (b) and (c) hold against the source file,
+   * checked on every `thread/resume` (`force`) and before the first `turn/start` after a load.
+   * Anything less — no `handoff.link` yet, a recorded `handoff.aborted`, a line that differs, or a
+   * source file that cannot be read (Copilot 4160774858: unverifiable is NOT a pass for the target)
+   * — is `-32010 handoff-one-way`, and nothing is appended. A thread that is not a target returns
+   * at once.
+   */
+  #handoffGate(record: ThreadRecord, force = false): void {
+    const link = record.open.handoff;
+    if (link === null) return;
+    if (record.handoffVerified && !force) return;
+    const threadId = record.thread.id;
+    const check = checkHandoffTarget(this.#opts.home, {
+      threadId,
+      seatId: record.thread.seatId,
+      genesisHash: record.open.genesisHash,
+      link,
+    });
+    if (!check.ok) {
+      record.handoffVerified = false;
+      this.#log(`handoff gate ${threadId}: refused (${check.kind}): ${check.issues.join("; ")}`);
+      throw evidenceInvalid({
+        threadId,
+        turnId: null,
+        type: "session.open",
+        reason: "handoff-one-way",
+        issues: check.issues,
+      });
+    }
+    record.handoffVerified = true;
   }
 
   /** stdout is gone: nothing can be answered any more, so stop and clean up (same path as EOF). */
@@ -659,6 +762,11 @@ export class EngineConnection {
 
     const now = Date.now();
     const cwd = typeof p.cwd === "string" ? p.cwd : null;
+    // M2 pin §2.2: engine-owned worktree identity (realpath'd top-level, normalized origin, HEAD),
+    // resolved from `cwd` the way the repo gate resolves repo identity; null outside a work tree.
+    // `handoff` is null: no protocol surface of this act opens a handoff target (the typed
+    // mechanism is the M2 build plan's to commission); the writer still validates the field.
+    const worktree = resolveWorktreeIdentity(cwd, this.#opts.worktreeDeps ?? {});
     let session: SessionWriter;
     try {
       session = SessionWriter.create(
@@ -670,6 +778,8 @@ export class EngineConnection {
           backing: seat.seat.preferredBacking,
           providerId: seat.seat.preferredBacking,
           pinnedModel: seat.seat.pinnedModel,
+          worktree,
+          handoff: null,
         },
         () => this.#secrets(this.#threads.get(id)?.lock ?? handle),
         now, // session.open ts == thread.createdAt
@@ -713,6 +823,8 @@ export class EngineConnection {
       session,
       confirmedTerminal: null,
       confirming: false,
+      open: { genesisHash: session.genesisHash ?? "", handoff: null, worktree },
+      handoffVerified: false,
     });
     return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
   }
@@ -776,6 +888,9 @@ export class EngineConnection {
       // re-take reloads the thread from disk (Amendment 2 §3 — row (c): a lost lock is re-taken
       // even when the old writer was also broken).
       const current = this.#ensureLock(known);
+      // M2 pin §2.1: a handoff target re-checks its link on EVERY thread/resume (a reload already
+      // checked it inside #loadColdThread; a warm resume checks it here, against the files now).
+      this.#handoffGate(current, true);
       const thread = current.thread;
       return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
     }
@@ -836,6 +951,34 @@ export class EngineConnection {
     // verifySessionFile always reports the verified byte size; it is the §2 position bound.
     const verifiedSize = verified.size;
     if (verifiedSize === undefined) throw internalError("Session record failed verification");
+    // M2: the `session.open` facts (rebuildSession checked their shape; a v1 open has neither key).
+    const genesis = verified.events[0] as SessionEvent;
+    const openPayload = genesis.payload as Record<string, unknown>;
+    const open: SessionOpenFacts = {
+      genesisHash: genesis.hash,
+      handoff: (openPayload.handoff ?? null) as SessionOpenHandoffLink | null,
+      worktree: (openPayload.worktree ?? null) as WorktreeIdentity | null,
+    };
+    // M2 pin §2.1: a handoff target's link is checked BEFORE any append of this load (the dangling
+    // turn closes below included): a one-way target answers -32010 with nothing appended.
+    if (open.handoff !== null) {
+      const check = checkHandoffTarget(this.#opts.home, {
+        threadId,
+        seatId: rebuilt.thread.seatId,
+        genesisHash: open.genesisHash,
+        link: open.handoff,
+      });
+      if (!check.ok) {
+        this.#log(`handoff gate ${threadId}: refused (${check.kind}): ${check.issues.join("; ")}`);
+        throw evidenceInvalid({
+          threadId,
+          turnId: null,
+          type: "session.open",
+          reason: "handoff-one-way",
+          issues: check.issues,
+        });
+      }
+    }
     const session = SessionWriter.resume(
       path,
       threadId,
@@ -852,6 +995,8 @@ export class EngineConnection {
         onCloseFailed: (code) =>
           this.#log(`session ${threadId}: close failed after a durable append (${code})`),
       },
+      // M2 (D-M2-A0-4): the writer holds the verified file as an index.
+      SessionChainIndex.fromEvents(verified.events),
     );
     if (rebuilt.danglingTurnIds.length > 0) {
       // All dangling turns close in ONE append batch (Copilot r4107434889): either every
@@ -900,6 +1045,9 @@ export class EngineConnection {
       // M1-A5: a presence confirmation never survives a reload; the next gated turn asks again.
       confirmedTerminal: null,
       confirming: false,
+      open,
+      // The link was checked above for this load; the first turn/start checks it again (§2.1).
+      handoffVerified: false,
     };
   }
 
@@ -1042,6 +1190,10 @@ export class EngineConnection {
     if (record.session.broken) {
       throw sessionWriteFailed(threadId, record.session.path, record.session.nextSeq);
     }
+    // M2 pin §2.1 (between C3 steps 3 and 4): a handoff target serves only on a verified two-way
+    // link, checked here before the first turn of this load — before the presence phase, the repo
+    // gate (whose `repo.decision` would be an append) and preflight. Nothing is appended on refusal.
+    this.#handoffGate(record);
     const ctx = this.#turnContext(record, input);
     // M1-A4: the repo-policy gate runs before preflight (D-M1-8 must be observable on a clean
     // install), and its pinned receipt names the turn it gated — so the turn id is minted here.

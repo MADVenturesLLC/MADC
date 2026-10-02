@@ -57,6 +57,9 @@ test("§4.1 error-code constants match the pin table exactly", () => {
       ProviderDenied: -32007,
       ProviderUnavailable: -32008,
       SessionWriteFailed: -32009,
+      // M2 evidence schema v2 pin §5 (D-M2-A0-1, ruled 2026-10-01; merged as M2-A0, #46). The
+      // frozen M1 protocol pin table ends at -32009 and is not edited; the M2 pin is the table.
+      EvidenceInvalid: -32010,
     },
   );
   assert.ok(Object.isFrozen(ErrorCode));

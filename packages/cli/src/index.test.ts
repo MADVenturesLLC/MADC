@@ -209,6 +209,8 @@ test("A7 §4 exit table: every protocol error code has an explicit class", () =>
     ProviderDenied: [4, 4, 4],
     ProviderUnavailable: [4, 4, 4],
     SessionWriteFailed: [5, 5, 5],
+    // M2 pin §5 (M2-A1): an invalid evidence record is a session-record refusal like -32009.
+    EvidenceInvalid: [5, 5, 5],
   };
   assert.deepEqual(
     Object.keys(expected).sort(),

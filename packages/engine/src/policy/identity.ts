@@ -98,6 +98,15 @@ function gitEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
+/**
+ * The engine's own `git` runner: no shell, fixed literal arguments, repository-override variables
+ * stripped, 5 s timeout. Exported (M2-A1) so the worktree identity (`worktree.ts`) and doctor's
+ * evidence-ref resolution run `git` under exactly the rules the repo gate does.
+ */
+export function defaultGitRunner(args: readonly string[], cwd: string): GitCommandResult {
+  return defaultRunGit(args, cwd);
+}
+
 function defaultRunGit(args: readonly string[], cwd: string): GitCommandResult {
   let result: SpawnSyncReturns<string>;
   try {
@@ -178,12 +187,28 @@ export function resolveRepoIdentity(
   }
   if (topLevel === "") return fail("realpath resolution of the git top-level failed");
 
-  // (b) Every configured `origin` endpoint, fetch and push alike — repository-LOCAL only
-  // (`--local`), so a checkout with no local origin cannot inherit an operator/global
-  // `remote.origin.*` and look allowlisted (Copilot r4143721284 on PR #38). Exits 1 when nothing
-  // matches, which is the "no origin remote" case.
+  // (b) The normalized `origin` remote, with the seat pin §5 agreement rule.
+  const origin = resolveOriginRemote(runGit, cwd);
+  if (!origin.ok) return fail(origin.issue);
+
+  return { ok: true, identity: { remote: origin.remote, topLevel } };
+}
+
+export type OriginRemoteResolution =
+  | { readonly ok: true; readonly remote: string }
+  | { readonly ok: false; readonly issue: string };
+
+/**
+ * Every configured `origin` endpoint, fetch and push alike — repository-LOCAL only (`--local`),
+ * so a checkout with no local origin cannot inherit an operator/global `remote.origin.*` and look
+ * allowlisted (Copilot r4143721284 on PR #38). Exits 1 when nothing matches, which is the "no
+ * origin remote" case. Origin agreement (seat pin §5): every endpoint must normalize to the SAME
+ * remote; a fetch URL on the allowlist with a different push URL — or two fetch URLs — is
+ * ambiguous, not allowed. Shared by the repo gate and the M2 worktree identity (`worktree.ts`).
+ */
+export function resolveOriginRemote(runGit: GitRunner, cwd: string): OriginRemoteResolution {
   const configResult = runGit(["config", "--local", "--get-regexp", "^remote\\.origin\\."], cwd);
-  if (configResult.code !== 0) return fail("no origin remote is configured");
+  if (configResult.code !== 0) return { ok: false, issue: "no origin remote is configured" };
 
   const endpoints: string[] = [];
   for (const { key, value } of parseConfigLines(configResult.stdout)) {
@@ -192,21 +217,22 @@ export function resolveRepoIdentity(
       endpoints.push(value);
     }
   }
-  if (endpoints.length === 0) return fail("no origin remote is configured");
+  if (endpoints.length === 0) return { ok: false, issue: "no origin remote is configured" };
 
-  // Origin agreement (seat pin §5): every endpoint must normalize to the SAME remote. A fetch URL
-  // on the allowlist with a different push URL — or two fetch URLs — is ambiguous, not allowed.
   let remote: string | null = null;
   for (const endpoint of endpoints) {
     const normalized = normalizeRemote(endpoint);
-    if (!normalized.ok) return fail("origin remote is not a parseable git remote");
+    if (!normalized.ok) {
+      return { ok: false, issue: "origin remote is not a parseable git remote" };
+    }
     if (remote === null) {
       remote = normalized.remote;
       continue;
     }
-    if (remote !== normalized.remote) return fail("origin fetch and push endpoints disagree");
+    if (remote !== normalized.remote) {
+      return { ok: false, issue: "origin fetch and push endpoints disagree" };
+    }
   }
-  if (remote === null) return fail("no origin remote is configured");
-
-  return { ok: true, identity: { remote, topLevel } };
+  if (remote === null) return { ok: false, issue: "no origin remote is configured" };
+  return { ok: true, remote };
 }

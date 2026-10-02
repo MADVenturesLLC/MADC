@@ -4,12 +4,15 @@
  */
 import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
+import { inspectSessionV2, type SessionFinding } from "./handoff.ts";
 import { isStrictlyUnder } from "./home.ts";
 import { RpcError } from "./protocol/errors.ts";
 import { isValidId } from "./protocol/ids.ts";
 import { DEFAULT_SEAT_ID } from "./protocol/types.ts";
 import { loadSeat, seatFilePath } from "./seat-store.ts";
 import { type SessionFailureKind, verifySessionFile } from "./session-store.ts";
+
+export type { SessionFinding, SessionFindingCode, SessionFindingLevel } from "./handoff.ts";
 
 export type SeatReport =
   | { readonly id: string; readonly path: string; readonly ok: true }
@@ -35,6 +38,12 @@ export type SessionReport = {
         /** Amendment 2 §5: `torn-tail` (crash residue) or `integrity` (may be tampering). */
         readonly kind: SessionFailureKind;
       };
+  /**
+   * M2 pin §7: the schema-v2 findings over a chain that verifies (handoff links from either side,
+   * duplicate ids, evidence refs, the close-time worktree, a v2 thread never closed). Empty when
+   * the chain does not verify (the chain row already FAILs) and for a v1 file with no v2 lines.
+   */
+  readonly findings: readonly SessionFinding[];
 };
 
 export type HomeReport = {
@@ -108,12 +117,14 @@ export function inspectMadcHome(home: string, seatId: string = DEFAULT_SEAT_ID):
           seatId: result.events[0]?.seatId ?? null,
           events: result.events.length,
           chain: { ok: true },
+          findings: inspectSessionV2(home, result.events),
         }
       : {
           ...last,
           seatId: null,
           events: 0,
           chain: { ok: false, line: result.line, reason: result.reason, kind: result.kind },
+          findings: [],
         };
   }
   return { home, seat: seatReport(home, seatId), lastSession };

@@ -56,6 +56,12 @@ export function classifyCode(code: number, site: ErrorSite): Classified {
       return PROVIDER;
     case ErrorCode.SessionWriteFailed:
       return SESSION;
+    // M2 evidence schema v2 pin §5: `-32010 EvidenceInvalid` is a refused session RECORD (a
+    // schema-v2 line that would be invalid, or a handoff target whose link is one-way), the
+    // sibling of -32009 — so it takes the session class. The CLI pin is not amended by M2-A1;
+    // this is the nearest existing class, and the one-shot never opens a handoff target itself.
+    case ErrorCode.EvidenceInvalid:
+      return SESSION;
     default:
       return ENGINE;
   }
