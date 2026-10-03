@@ -14,7 +14,15 @@ import type { Agent, AgentTurnContext, TurnSink } from "./agent.ts";
 import { type CredentialStore, createCredentialStore } from "./credentials/store.ts";
 import { checkHandoffTarget } from "./handoff.ts";
 import { confinedPath, sessionsOwnerReadUnsupported } from "./home.ts";
-import { acquireThreadLock, holdsThreadLock, type LockHandle, releaseThreadLock } from "./lock.ts";
+import {
+  acquireThreadLock,
+  holdsThreadLock,
+  isPidAlive,
+  type LockHandle,
+  readLock,
+  releaseThreadLock,
+  threadLockPath,
+} from "./lock.ts";
 import { type RepoIdentityDeps, resolveRepoIdentity } from "./policy/identity.ts";
 import { denyAllRepoPolicy, isRepoGated, type RepoPolicy } from "./policy/store.ts";
 import {
@@ -55,6 +63,7 @@ import {
   type SeatListResult,
   type ServerNotifications,
   type Thread,
+  type ThreadHandoffResult,
   type ThreadListResult,
   type Turn,
   type TurnMode,
@@ -72,6 +81,8 @@ import { listSeatSummaries } from "./seats/list.ts";
 import { ensureSeatMemoryFile } from "./seats/memory.ts";
 import { seedRosterSeats } from "./seats/roster.ts";
 import {
+  type HandoffAbortReason,
+  type HandoffOutPayload,
   type RebuiltSession,
   rebuildSession,
   SessionChainIndex,
@@ -81,10 +92,12 @@ import {
   type SessionPayloads,
   SessionWriter,
   sessionWriteFailed,
+  sortedKeyJson,
   type TurnStartTty,
   verifySessionFile,
   type WorktreeIdentity,
 } from "./session-store.ts";
+import { checkV2Payload, turnIdOf } from "./session-v2.ts";
 import { rereadWorktreeIdentity, resolveWorktreeIdentity } from "./worktree.ts";
 
 export const ENGINE_VERSION = "0.0.0";
@@ -167,6 +180,14 @@ type ThreadRecord = {
    * after a load (then cached for the later turns of the same load); never for a non-target.
    */
   handoffVerified: boolean;
+};
+
+/** A thread `#openThread` created: its `session.open` is durable and the caller holds `lock`. */
+type OpenedThread = {
+  readonly thread: Thread;
+  readonly lock: LockHandle;
+  readonly session: SessionWriter;
+  readonly worktree: WorktreeIdentity | null;
 };
 
 /** M2 pin §2.1 / §2.2: the `session.open` facts a loaded thread keeps. */
@@ -589,6 +610,8 @@ export class EngineConnection {
         return this.#threadResume(params);
       case "thread/list":
         return { value: this.#threadList(params) };
+      case "thread/handoff":
+        return this.#threadHandoff(params);
       case "turn/start":
         return this.#turnStart(params);
       case "turn/interrupt":
@@ -735,6 +758,40 @@ export class EngineConnection {
     const seat = loadSeat(this.#opts.home, seatId);
     this.#noteSeatWarnings(seat);
 
+    const cwd = typeof p.cwd === "string" ? p.cwd : null;
+    // `handoff` is null: `thread/start` never opens a handoff target (only `thread/handoff` does).
+    const { thread, lock, session, worktree } = this.#openThread(seat, seatId, cwd, null);
+    const id = thread.id;
+    this.#threads.set(id, {
+      thread,
+      lock,
+      turns: new Map(),
+      activeTurnId: null,
+      seat,
+      session,
+      confirmedTerminal: null,
+      confirming: false,
+      open: { genesisHash: session.genesisHash ?? "", handoff: null, worktree },
+      handoffVerified: false,
+    });
+    return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+  }
+
+  /**
+   * The session-open path of `thread/start`, shared with the target of `thread/handoff` (M2
+   * handoff procedure pin §4 step 3): mint the thread id, refuse an owner-unreadable `sessions/`,
+   * take the new thread's lock, resolve the engine-owned worktree identity from `cwd`, and write
+   * `session.open` (seq 0) through `SessionWriter.create`, which validates `handoff` and `worktree`
+   * before the file exists. Then the seat's own memory path is materialized. On success the caller
+   * holds the returned lock; on failure nothing is held (the lock is released or kept for shutdown,
+   * and the writer removes a file it created) and the error propagates unchanged.
+   */
+  #openThread(
+    seat: LoadedSeat,
+    seatId: string,
+    cwd: string | null,
+    handoff: SessionOpenHandoffLink | null,
+  ): OpenedThread {
     const id = this.#opts.newThreadId?.() ?? newId("thr");
     if (!isValidId(id)) throw internalError("Generated thread id is invalid");
     // Amendment 3 item 5 rule 3: an owner-unreadable sessions/ fails -32009 BEFORE any lock or
@@ -761,11 +818,8 @@ export class EngineConnection {
     const handle = lock.handle;
 
     const now = Date.now();
-    const cwd = typeof p.cwd === "string" ? p.cwd : null;
     // M2 pin §2.2: engine-owned worktree identity (realpath'd top-level, normalized origin, HEAD),
     // resolved from `cwd` the way the repo gate resolves repo identity; null outside a work tree.
-    // `handoff` is null: no protocol surface of this act opens a handoff target (the typed
-    // mechanism is the M2 build plan's to commission); the writer still validates the field.
     const worktree = resolveWorktreeIdentity(cwd, this.#opts.worktreeDeps ?? {});
     let session: SessionWriter;
     try {
@@ -779,7 +833,7 @@ export class EngineConnection {
           providerId: seat.seat.preferredBacking,
           pinnedModel: seat.seat.pinnedModel,
           worktree,
-          handoff: null,
+          handoff,
         },
         () => this.#secrets(this.#threads.get(id)?.lock ?? handle),
         now, // session.open ts == thread.createdAt
@@ -814,19 +868,248 @@ export class EngineConnection {
     // memory notes are optional in M1 and no act commissions their content format, so a refusal
     // here must not fail a thread that could otherwise serve.
     this.#materializeSeatMemory(seat);
-    this.#threads.set(id, {
-      thread,
-      lock: handle,
-      turns: new Map(),
-      activeTurnId: null,
-      seat,
-      session,
-      confirmedTerminal: null,
-      confirming: false,
-      open: { genesisHash: session.genesisHash ?? "", handoff: null, worktree },
-      handoffVerified: false,
+    return { thread, lock: handle, session, worktree };
+  }
+
+  /**
+   * `thread/handoff` (M2 handoff procedure pin §4): the M2 evidence pin §2.1 order, performed
+   * in-process on the SOURCE thread this connection holds. Step 1 refuses before any append (the
+   * params, the source lock, the target seat); step 2 appends `handoff.out` (H) through the
+   * source writer, which redacts `brief`; step 3 opens the target through `#openThread` with
+   * `session.open.handoff` citing H (no JSON-RPC `thread/start`, no notification, no turn); step 4
+   * reads the target's genesis hash G back from disk, releases the target lock, appends
+   * `handoff.link` (G) and answers only when §2.1 (a), (b) and (c) hold against the files. A failure
+   * of step 3 or 4 after `handoff.out` exists appends `handoff.aborted` instead (step 5) and answers
+   * that failure. Synchronous throughout: no other request interleaves with the procedure.
+   */
+  #threadHandoff(params: unknown): { value: ThreadHandoffResult } {
+    const p = paramsObject(params);
+    const issues: string[] = [];
+    // The source thread id routes the request (protocol pin §4.1 -32602, as on every method); it is
+    // the envelope of the record, not one of its fields.
+    const threadId = requireId(p, "threadId", issues);
+    throwIfIssues(issues);
+
+    // Step 1a — the `handoff.out` fields, by the writer's own schema-v2 rule (evidence pin §2.1
+    // refusal row) and before any lock, seat or path use: absent → `field-missing`; a wrong type, an
+    // id outside the grammar or a `brief` empty after trim → `field-invalid`. Only keys the caller
+    // sent count as present (rule 1.6). `handoffId` is engine-assigned; a caller value is ignored.
+    const handoffId = newId("ho");
+    const candidate: Record<string, unknown> = { handoffId };
+    for (const key of ["turnId", "targetSeatId", "brief"] as const) {
+      if (Object.hasOwn(p, key)) candidate[key] = p[key];
+    }
+    const faults = checkV2Payload("handoff.out", candidate);
+    const firstFault = faults[0];
+    if (firstFault !== undefined) {
+      throw evidenceInvalid({
+        threadId,
+        turnId: turnIdOf(candidate),
+        type: "handoff.out",
+        reason: firstFault.reason,
+        issues: faults.map((f) => f.issue),
+      });
+    }
+    const out = candidate as HandoffOutPayload;
+
+    // Step 1b — the source: loaded here, its writer usable, its lock held by this acquisition. A
+    // lost lock is refused (-32004), never re-taken: the procedure appends to the source.
+    const poisoned = this.#poisoned.get(threadId);
+    if (poisoned !== undefined) throw sessionWriteFailed(threadId, poisoned.path, poisoned.seq);
+    const record = this.#threads.get(threadId);
+    if (record === undefined) {
+      const holder = this.#liveLockHolder(threadId);
+      if (holder !== null) throw turnAlreadyActive(threadId, null, holder);
+      throw threadNotFound(threadId);
+    }
+    if (!holdsThreadLock(record.lock)) {
+      throw turnAlreadyActive(threadId, null, this.#liveLockHolder(threadId) ?? undefined);
+    }
+    if (record.session.broken) {
+      throw sessionWriteFailed(threadId, record.session.path, record.session.nextSeq);
+    }
+    // A source that is itself a handoff target hands work on only while its own link verifies
+    // (evidence pin §2.1: an orphaned target serves nothing). Nothing is appended on refusal.
+    this.#handoffGate(record);
+
+    // Step 1c — the target seat loads exactly as `thread/start` loads one: -32005 / -32006, the
+    // seat gate (`handoffs.enabled` / `handoffs.targets`) included. `targets` is not consulted.
+    const targetSeat = loadSeat(this.#opts.home, out.targetSeatId);
+    this.#noteSeatWarnings(targetSeat);
+
+    // Step 2 — `handoff.out` (H) through the existing v2 writer: validated, redacted (`brief` by the
+    // shared redactor), hashed, fsynced. A refusal (-32010) or a failed append (-32009) has
+    // appended nothing; the handoff does not start.
+    let outLine: SessionEvent;
+    try {
+      outLine = record.session.append("handoff.out", out);
+    } catch (err) {
+      this.#notePoisoned(threadId, record.session);
+      throw err;
+    }
+    record.thread.updatedAt = Math.max(record.thread.updatedAt, outLine.ts);
+    const link: SessionOpenHandoffLink = {
+      sourceThreadId: threadId,
+      sourceSeatId: record.session.seatId,
+      handoffId,
+      sourceSeq: outLine.seq,
+      sourceHash: outLine.hash,
+    };
+
+    // Step 3 — the target opens through the `thread/start` session-open path, same cwd, worktree
+    // engine-resolved. It is not registered on this connection and gets no turn.
+    let target: OpenedThread;
+    try {
+      target = this.#openThread(targetSeat, out.targetSeatId, record.thread.cwd, link);
+    } catch (err) {
+      throw this.#abortHandoff(record, out, "target-open-failed", err);
+    }
+
+    // Step 4 — G read back from disk, then the target lock is released (every path).
+    let genesis: { ok: true; hash: string } | { ok: false; issue: string };
+    try {
+      genesis = this.#readTargetGenesis(target.session, out.targetSeatId, link);
+    } finally {
+      this.#releaseOrKeep(target.lock);
+    }
+    const targetThreadId = target.thread.id;
+    if (!genesis.ok) {
+      throw this.#abortHandoff(
+        record,
+        out,
+        "target-genesis-unavailable",
+        evidenceInvalid({
+          threadId,
+          turnId: out.turnId,
+          type: "handoff.link",
+          reason: "field-missing",
+          issues: [`targetGenesisHash is unavailable: ${genesis.issue}`],
+        }),
+      );
+    }
+    let linkLine: SessionEvent;
+    try {
+      linkLine = record.session.append("handoff.link", {
+        handoffId,
+        targetThreadId,
+        targetSeatId: out.targetSeatId,
+        targetGenesisHash: genesis.hash,
+      });
+    } catch (err) {
+      // A refused record is written as `handoff.aborted` instead (evidence pin §2.1 `handoff.link`
+      // row: a partial link is never written). A failed append broke the writer: nothing more can
+      // be appended, so the attempt stays `handoff-incomplete` and the -32009 is the answer.
+      if (err instanceof RpcError && err.code === ErrorCode.EvidenceInvalid) {
+        throw this.#abortHandoff(record, out, "target-genesis-unavailable", err);
+      }
+      this.#notePoisoned(threadId, record.session);
+      throw err;
+    }
+    record.thread.updatedAt = Math.max(record.thread.updatedAt, linkLine.ts);
+
+    // §2.1 (a)–(c) against the files as they now are, from the target's side: exactly the check the
+    // gate runs before the target's first turn. Success is never answered on less.
+    const check = checkHandoffTarget(this.#opts.home, {
+      threadId: targetThreadId,
+      seatId: out.targetSeatId,
+      genesisHash: genesis.hash,
+      link,
     });
-    return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+    if (!check.ok) {
+      this.#log(`handoff ${handoffId}: link does not verify (${check.kind})`);
+      throw evidenceInvalid({
+        threadId,
+        turnId: out.turnId,
+        type: "handoff.link",
+        reason: "handoff-one-way",
+        issues: check.issues,
+      });
+    }
+    return { value: { handoffId, targetThreadId, targetGenesisHash: genesis.hash } };
+  }
+
+  /**
+   * Step 4's read-back (evidence pin §2.1 step 2 "its genesis hash cannot be read back"): the
+   * target file must verify, and its seq-0 line must be the `session.open` this engine just wrote —
+   * same hash, the target seat as its envelope seat, and `handoff` equal to the link (§2.1 (b)).
+   * Anything else is unavailable: the source never cites a genesis it did not read back.
+   */
+  #readTargetGenesis(
+    session: SessionWriter,
+    targetSeatId: string,
+    link: SessionOpenHandoffLink,
+  ): { ok: true; hash: string } | { ok: false; issue: string } {
+    const v = verifySessionFile(session.path, session.threadId, {}, this.#opts.home);
+    if (!v.ok) {
+      return { ok: false, issue: `the target session does not read back (line ${v.line})` };
+    }
+    const open = v.events[0];
+    if (open === undefined || open.type !== "session.open") {
+      return { ok: false, issue: "the target session has no session.open at seq 0" };
+    }
+    if (open.hash !== session.genesisHash || open.seatId !== targetSeatId) {
+      return {
+        ok: false,
+        issue: "the target seq-0 line is not the session.open this engine wrote",
+      };
+    }
+    const cited = (open.payload as Record<string, unknown>).handoff;
+    if (sortedKeyJson(cited) !== sortedKeyJson(link)) {
+      return { ok: false, issue: "the target session.open.handoff does not cite this handoff.out" };
+    }
+    return { ok: true, hash: open.hash };
+  }
+
+  /**
+   * Step 5 (D-M2-A0-3): the attempt is closed with `handoff.aborted` and the failure is answered.
+   * `error` records the target open's own error for `target-open-failed` and is null for
+   * `target-genesis-unavailable` (evidence pin §2.1: "the target thread/start error when there was
+   * one"). An aborted record the writer refuses or cannot append is one stderr line, never a second
+   * protocol error (evidence pin §5); the attempt then stays `handoff-incomplete` in doctor.
+   */
+  #abortHandoff(
+    record: ThreadRecord,
+    out: HandoffOutPayload,
+    reason: HandoffAbortReason,
+    cause: unknown,
+  ): RpcError {
+    const threadId = record.thread.id;
+    let failure: RpcError;
+    if (cause instanceof RpcError) {
+      failure = cause;
+    } else {
+      this.#log(`internal error: ${cause instanceof Error ? cause.message : String(cause)}`);
+      failure = internalError();
+    }
+    try {
+      const line = record.session.append("handoff.aborted", {
+        handoffId: out.handoffId,
+        reason,
+        error:
+          reason === "target-open-failed" ? { code: failure.code, message: failure.message } : null,
+      });
+      record.thread.updatedAt = Math.max(record.thread.updatedAt, line.ts);
+    } catch (err) {
+      if (!(err instanceof RpcError)) throw err;
+      if (err.code === ErrorCode.EvidenceInvalid) {
+        const issues = Array.isArray(err.data?.issues) ? err.data.issues.join("; ") : "";
+        this.#log(`session ${threadId}: handoff.aborted refused (${issues})`);
+      } else {
+        this.#notePoisoned(threadId, record.session);
+        this.#log(`session append failed (handoff.aborted): ${err.message}`);
+      }
+    }
+    return failure;
+  }
+
+  /** The pid of a live process holding `threadId`'s lock on disk, or null (missing, dead, unreadable). */
+  #liveLockHolder(threadId: string): number | null {
+    try {
+      const lock = readLock(threadLockPath(this.#opts.home, threadId));
+      return lock.state === "held" && isPidAlive(lock.pid) ? lock.pid : null;
+    } catch {
+      return null;
+    }
   }
 
   /** Exact values redacted from every session append: the agent's secrets and our lock token. */

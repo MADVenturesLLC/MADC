@@ -71,7 +71,8 @@ test("§5 six item kinds; M1 pin §3 complete request list (M0 six + §3.5 seat/
     ["userMessage", "agentMessage", "toolCall", "toolResult", "error", "servedModel"],
   );
   // M1-A2 (protocol pin §3/§3.5) added the two presence methods; M1-A7 adds `seat/list` and M1-A8
-  // `provider/list`. The M0 methods are unchanged, and there is still no `auth/set` over JSONL (P4).
+  // `provider/list`; M2-A2 adds `thread/handoff` (M2 handoff procedure pin). The M0 methods are
+  // unchanged, and there is still no `auth/set` over JSONL (P4).
   assert.deepEqual(
     [...CLIENT_REQUEST_METHODS],
     [
@@ -85,6 +86,7 @@ test("§5 six item kinds; M1 pin §3 complete request list (M0 six + §3.5 seat/
       "provider/list",
       "auth/status",
       "auth/remove",
+      "thread/handoff",
     ],
   );
 });
