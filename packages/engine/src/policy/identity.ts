@@ -43,8 +43,19 @@ export type RepoIdentityResolution =
 
 export type GitCommandResult = { readonly code: number | null; readonly stdout: string };
 
+/**
+ * Per-call options a caller may pass to a `GitRunner`. `timeoutMs` caps this one invocation below
+ * the runner's own 5 s ceiling (the shutdown re-read shares one deadline across every thread,
+ * Argus P8); a runner that ignores it still answers, it just may take longer.
+ */
+export type GitRunOptions = { readonly timeoutMs?: number };
+
 /** Injectable so tests can drive a failed `git` without needing a broken repository. */
-export type GitRunner = (args: readonly string[], cwd: string) => GitCommandResult;
+export type GitRunner = (
+  args: readonly string[],
+  cwd: string,
+  opts?: GitRunOptions,
+) => GitCommandResult;
 
 /** Injectable so tests can model a `realpath` failure or a path `realpath` does not collapse. */
 export type Realpath = (path: string) => string;
@@ -103,17 +114,31 @@ function gitEnv(): NodeJS.ProcessEnv {
  * stripped, 5 s timeout. Exported (M2-A1) so the worktree identity (`worktree.ts`) and doctor's
  * evidence-ref resolution run `git` under exactly the rules the repo gate does.
  */
-export function defaultGitRunner(args: readonly string[], cwd: string): GitCommandResult {
-  return defaultRunGit(args, cwd);
+export function defaultGitRunner(
+  args: readonly string[],
+  cwd: string,
+  opts?: GitRunOptions,
+): GitCommandResult {
+  return defaultRunGit(args, cwd, opts);
 }
 
-function defaultRunGit(args: readonly string[], cwd: string): GitCommandResult {
+function defaultRunGit(
+  args: readonly string[],
+  cwd: string,
+  opts?: GitRunOptions,
+): GitCommandResult {
+  // A caller's tighter budget wins; nothing ever runs longer than the 5 s ceiling.
+  const requested = opts?.timeoutMs;
+  const timeout =
+    typeof requested === "number" && Number.isFinite(requested) && requested > 0
+      ? Math.min(GIT_TIMEOUT_MS, Math.ceil(requested))
+      : GIT_TIMEOUT_MS;
   let result: SpawnSyncReturns<string>;
   try {
     result = spawnSync("git", [...args], {
       cwd,
       encoding: "utf8",
-      timeout: GIT_TIMEOUT_MS,
+      timeout,
       env: gitEnv(),
       // Never a shell: args are fixed literals, and cwd/config values must not be re-parsed.
       shell: false,

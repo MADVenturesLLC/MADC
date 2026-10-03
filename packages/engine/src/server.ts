@@ -193,6 +193,14 @@ type PresencePhase =
 /** The presence outcome `#beginTurn` records on `turn.start` (seat pin §4.2 S4). */
 type TurnPresence = { readonly presence: Presence; readonly tty?: TurnStartTty };
 
+/**
+ * Argus P8: the total wall-clock budget for every loaded thread's close-time worktree re-read at
+ * one shutdown. Well inside the CLI's 1 s kill budget after a signal or idle deadline
+ * (`packages/cli/src/oneshot.ts` KILL_AFTER_MS) and its 5 s close budget (CLOSE_TIMEOUT_MS), so a
+ * hung `git` can no longer cost a completed turn its `session.close` or leave a stale lock.
+ */
+export const CLOSE_REREAD_BUDGET_MS = 300;
+
 const THREAD_LIST_DEFAULT_LIMIT = 50;
 const THREAD_LIST_MAX_LIMIT = 200;
 
@@ -432,9 +440,13 @@ export class EngineConnection {
       if (active !== undefined) this.#finishTurn(record, active, "interrupted");
     }
     // M2 pin §2.2 (D-M2-A0-5): every clean shutdown writes `session.close`, under the lock this
-    // process still holds, before that lock is released.
-    this.#closeSessions();
-    this.releaseLocks();
+    // process still holds, before that lock is released. The locks are released even if closing
+    // throws (Argus P15): a stale lock would block the next engine until it is reclaimed.
+    try {
+      this.#closeSessions();
+    } finally {
+      this.releaseLocks();
+    }
     this.#closed = true;
     this.#rl?.close();
   }
@@ -447,31 +459,43 @@ export class EngineConnection {
    * error: the operation that needed the line has already answered (pin §5 "Where it surfaces").
    */
   #closeSessions(): void {
+    // Argus P8: ONE deadline for every thread's close-time re-read, so shutdown stays inside the
+    // CLI's kill budget (`oneshot.ts` KILL_AFTER_MS) however many threads are loaded or however
+    // long `git` hangs. A re-read past it records `worktree: null` (doctor WARNs).
+    // Monotonic clock (Argus F7), the same one the bounded runner reads.
+    const deadline = { at: performance.now() + CLOSE_REREAD_BUDGET_MS };
     for (const record of this.#threads.values()) {
       const threadId = record.thread.id;
-      if (record.session.broken || this.#poisoned.has(threadId)) {
-        this.#log(`session ${threadId}: not closed (writer unusable)`);
-        continue;
-      }
-      if (!holdsThreadLock(record.lock)) {
-        this.#log(`session ${threadId}: not closed (thread lock no longer held)`);
-        continue;
-      }
-      const worktree =
-        record.open.worktree === null
-          ? null
-          : rereadWorktreeIdentity(record.open.worktree, this.#opts.worktreeDeps ?? {});
+      // Argus P15: one thread's unexpected fault is logged and the next thread is still closed.
       try {
-        record.session.append("session.close", { reason: "shutdown", worktree });
-      } catch (err) {
-        if (!(err instanceof RpcError)) throw err;
-        if (err.code === ErrorCode.EvidenceInvalid) {
-          const issues = Array.isArray(err.data?.issues) ? err.data.issues.join("; ") : "";
-          this.#log(`session ${threadId}: close record refused (${issues})`);
+        if (record.session.broken || this.#poisoned.has(threadId)) {
+          this.#log(`session ${threadId}: not closed (writer unusable)`);
           continue;
         }
-        this.#notePoisoned(threadId, record.session);
-        this.#log(`session append failed (session.close): ${err.message}`);
+        if (!holdsThreadLock(record.lock)) {
+          this.#log(`session ${threadId}: not closed (thread lock no longer held)`);
+          continue;
+        }
+        const worktree =
+          record.open.worktree === null
+            ? null
+            : rereadWorktreeIdentity(record.open.worktree, this.#opts.worktreeDeps ?? {}, deadline);
+        try {
+          record.session.append("session.close", { reason: "shutdown", worktree });
+        } catch (err) {
+          if (!(err instanceof RpcError)) throw err;
+          if (err.code === ErrorCode.EvidenceInvalid) {
+            const issues = Array.isArray(err.data?.issues) ? err.data.issues.join("; ") : "";
+            this.#log(`session ${threadId}: close record refused (${issues})`);
+            continue;
+          }
+          this.#notePoisoned(threadId, record.session);
+          this.#log(`session append failed (session.close): ${err.message}`);
+        }
+      } catch (err) {
+        this.#log(
+          `session ${threadId}: not closed (${err instanceof Error ? err.message : String(err)})`,
+        );
       }
     }
   }

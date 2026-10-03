@@ -399,6 +399,16 @@ export function inspectSessionV2(
       }
       let lines: readonly SessionEvent[];
       if (ref.path === selfPath) {
+        // Argus P12 (pin §2.3 `:199`, D-M2-A0-4): a same-file ref must name a seq BELOW its own
+        // line. A writer can never produce one at or after it (a line cannot cite a hash that
+        // depends on itself), so it is a wrong cited hash, not a fact doctor could not establish.
+        if (ref.seq >= e.seq) {
+          fail(
+            "evidence-ref-mismatch",
+            `${where}: ${ref.path} seq ${ref.seq} is not below this line's seq ${e.seq}`,
+          );
+          return;
+        }
         lines = events;
       } else {
         const other = chainOf(ref.path.slice("sessions/".length, -".jsonl".length));
@@ -428,6 +438,29 @@ export function inspectSessionV2(
         );
       }
     });
+  }
+
+  // --- reserved tool.call receipts (pin §4.2; Argus P22 option (a), Copilot r4168208974): `call`
+  // and a non-null `result` are same-file refs to `item` lines. Nothing legitimate writes the type
+  // before M4 (D-M2-A0-2), so a ref that does not resolve to an `item` line with that hash is a
+  // wrong cited hash: FAIL `evidence-ref-mismatch`.
+  for (const e of events) {
+    if ((e.type as string) !== "tool.call") continue;
+    const p = payloadOf(e);
+    const pairs: Array<[string, unknown]> = [
+      ["call", p.call],
+      ["result", p.result],
+    ];
+    for (const [name, ref] of pairs) {
+      if (!isPlainRecord(ref)) continue; // `result: null` (denied before it ran); shape is verify's
+      const line = events.find((l) => l.seq === ref.seq);
+      if (line === undefined || line.type !== "item" || line.hash !== ref.hash) {
+        fail(
+          "evidence-ref-mismatch",
+          `tool.call at seq ${e.seq} ${name}: seq ${String(ref.seq)} is not an item line with the cited hash`,
+        );
+      }
+    }
   }
 
   // --- worktree at close (§2.2) and the clean-close rule (D-M2-A0-5), v2 files only
