@@ -459,6 +459,24 @@ export function inspectSessionV2(
           "evidence-ref-mismatch",
           `tool.call at seq ${e.seq} ${name}: seq ${String(ref.seq)} is not an item line with the cited hash`,
         );
+        continue;
+      }
+      // Copilot r4174562336 / Argus PR #48 r1 K3 (pin §4.2 :264, :267-268): `call` names the
+      // `item` line that holds the `toolCall` whose id is the receipt's `callId`, and `result` the
+      // line that holds that call's `toolResult` (its `callId`). Any other item is a wrong cited
+      // line. The detail never echoes the caller's ids.
+      const item = payloadOf(line).item;
+      const kind = name === "call" ? "toolCall" : "toolResult";
+      const linked =
+        isPlainRecord(item) &&
+        item.kind === kind &&
+        typeof p.callId === "string" &&
+        (name === "call" ? item.id : item.callId) === p.callId;
+      if (!linked) {
+        fail(
+          "evidence-ref-mismatch",
+          `tool.call at seq ${e.seq} ${name}: seq ${String(ref.seq)} is not the ${kind} item of the receipt's callId`,
+        );
       }
     }
   }

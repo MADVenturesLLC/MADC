@@ -311,6 +311,51 @@ export function setSessionAppendOpenForTests(opts: OpenNoFollowOptions | null): 
   appendOpenOpts = opts ?? {};
 }
 
+/** Test seams for resume's re-read (Argus pre-check of 15d4d9c, L1): `openNoFollow`'s options plus a
+ * hook that runs after resume's identity check and before the open, and one that runs after the fd
+ * checks and before the read (Argus pre-check of d55725d, M3). Null resets. Internal. */
+export type SessionResumeReadOptions = OpenNoFollowOptions & {
+  beforeOpen?: () => void;
+  beforeRead?: () => void;
+};
+let resumeReadOpts: SessionResumeReadOptions = {};
+export function setSessionResumeReadForTests(opts: SessionResumeReadOptions | null): void {
+  resumeReadOpts = opts ?? {};
+}
+
+/**
+ * Resume's re-read (K2), through one fd like every other read and append here: `openNoFollow`
+ * (O_NOFOLLOW | O_NONBLOCK, so a symlink fails and a FIFO planted at the path cannot block), then
+ * `fstat`: a regular file and, when the caller verified one, that very file (dev + inode). Null on
+ * any failure (missing, a symlink, not a regular file, another file, unreadable).
+ */
+function readSessionForResume(
+  realPath: string,
+  verifiedFile: SessionFileId | undefined,
+): Buffer | null {
+  try {
+    resumeReadOpts.beforeOpen?.();
+    const fd = openNoFollow(realPath, resumeReadOpts);
+    if (fd === null || fd === "symlink") return null;
+    try {
+      const st = fstatSync(fd, { bigint: true });
+      if (!st.isFile()) return null;
+      if (
+        verifiedFile !== undefined &&
+        (st.dev !== verifiedFile.dev || st.ino !== verifiedFile.ino)
+      ) {
+        return null;
+      }
+      resumeReadOpts.beforeRead?.();
+      return readFileSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Open the session file for appending without following a symlink. With O_NOFOLLOW this is one
  * open. Without it (e.g. Windows) it is lstat → open → fstat, and the fd is used only if it is the
@@ -698,6 +743,37 @@ export class SessionWriter {
         "SessionWriter.resume: the chain index does not describe the chain being continued (length / last hash)",
       );
     }
+    // Copilot r4174562359 / Argus PR #48 r1 K2 (completes P11): length and head do not prove the
+    // middle lines. Resume re-verifies the bytes it continues (the verified `expectedEnd`), every
+    // line of the caller's index must be the file's line at that seq (hash and type), and the
+    // writer's index is built from the file's own events, so neither a forged middle line nor a
+    // payload noted under a real hash can become something this writer resolves. An unreadable or
+    // short file, or one that is not a regular file (Argus pre-check of 15d4d9c, L1: read through
+    // one O_NOFOLLOW | O_NONBLOCK fd + fstat, never by path), is -32009 (like the identity checks
+    // above); a chain that is not the one named by `nextSeq` / `lastHash` / `index` is TypeError.
+    const bytes = readSessionForResume(realPath, verifiedFile);
+    if (bytes === null) throw sessionWriteFailed(threadId, path, nextSeq);
+    if (bytes.length < expectedEnd) throw sessionWriteFailed(threadId, path, nextSeq);
+    const onDisk =
+      expectedEnd === 0
+        ? ({ ok: true, events: [], nextSeq: 0, lastHash: GENESIS_HASH } as const)
+        : verifySessionText(bytes.subarray(0, expectedEnd).toString("utf8"), threadId);
+    const fileIndex = onDisk.ok ? SessionChainIndex.fromEvents(onDisk.events) : null;
+    const differs =
+      !onDisk.ok ||
+      fileIndex === null ||
+      onDisk.nextSeq !== nextSeq ||
+      onDisk.lastHash !== lastHash ||
+      Array.from({ length: nextSeq }, (_, seq) => seq).some((seq) => {
+        const mine = own.lineAt(seq);
+        const disk = fileIndex.lineAt(seq);
+        return mine?.hash !== disk?.hash || mine?.type !== disk?.type;
+      });
+    if (differs || fileIndex === null) {
+      throw new TypeError(
+        "SessionWriter.resume: the chain index does not describe the chain being continued (a line differs from the file)",
+      );
+    }
     return new SessionWriter(
       path,
       realPath,
@@ -709,7 +785,7 @@ export class SessionWriter {
       expectedEnd,
       holdsLock,
       hooks,
-      own,
+      fileIndex,
     );
   }
 

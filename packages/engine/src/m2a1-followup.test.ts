@@ -9,23 +9,30 @@
  * or hashed with the seat pin §4.3 formula.
  */
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs, {
+  closeSync,
+  copyFileSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
+  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
+  renameSync,
   rmSync,
   statSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
-import { mock, test } from "node:test";
+import { test } from "node:test";
 import { type Agent, echoAgent } from "./agent.ts";
 import { checkHandoffTarget, inspectSessionV2, type SessionFinding } from "./handoff.ts";
 import { defaultGitRunner, type GitRunner } from "./policy/identity.ts";
@@ -39,6 +46,7 @@ import {
   type SessionOpenPayload,
   SessionWriter,
   sessionEventHash,
+  setSessionResumeReadForTests,
   unguardedSessionWriterForTests,
   verifySessionFile,
   verifySessionText,
@@ -1203,6 +1211,352 @@ test("M2-A1 FU G2 (Argus pre-check, D-377): the index keeps its OWN frozen sessi
   }
 });
 
+test("M2-A1 FU K2 (Copilot r4174562359, completes P11): resume re-verifies the file it continues — an index with a forged middle line, or for a prefix, is refused (TypeError, file unchanged); a payload forged under a real hash never reaches the writer", () => {
+  const f = fixture();
+  try {
+    f.writer.append("turn.start", { turnId: "turn_1", inputText: "x" });
+    f.writer.append("item", {
+      turnId: "turn_1",
+      item: { id: "item_1", kind: "agentMessage", status: "completed", text: "hi" },
+    });
+    const v = verifySessionFile(f.path, "thr_src");
+    assert.ok(v.ok);
+    if (!v.ok || v.size === undefined) return;
+    const resume = (index: SessionChainIndex, nextSeq = v.nextSeq, lastHash = v.lastHash) =>
+      SessionWriter.resume(
+        f.path,
+        "thr_src",
+        "madc-default",
+        nextSeq,
+        lastHash,
+        () => [],
+        f.dir,
+        v.file,
+        { holdsLock: () => true, expectedSize: v.size as number },
+        undefined,
+        index,
+      );
+    const before = snapshot(f.path);
+    // probe-c2 (Argus PR #48 r1): real length and head, forged seq-1 hash.
+    const forgedHash = "e".repeat(64);
+    const forgedMiddle = SessionChainIndex.fromEvents(
+      v.events.map((e) => (e.seq === 1 ? { ...e, hash: forgedHash } : e)),
+    );
+    assert.equal(forgedMiddle.length, v.nextSeq);
+    assert.equal(forgedMiddle.lineAt(v.nextSeq - 1)?.hash, v.lastHash, "head is the real one");
+    assert.throws(() => resume(forgedMiddle), TypeError, "forged middle line");
+    // A forged middle line's TYPE (same hash) is refused too.
+    const forgedType = SessionChainIndex.fromEvents(
+      v.events.map((e) => (e.seq === 1 ? { ...e, type: "servedModel" as never } : e)),
+    );
+    assert.throws(() => resume(forgedType), TypeError, "forged middle type");
+    // An index, nextSeq and lastHash that agree with each other but describe only a prefix.
+    const prefix = v.events.slice(0, -1);
+    assert.throws(
+      () =>
+        resume(
+          SessionChainIndex.fromEvents(prefix),
+          prefix.length,
+          (prefix[prefix.length - 1] as Line).hash,
+        ),
+      TypeError,
+      "an index for a prefix of the file",
+    );
+    // A verified size longer than the file: -32009 at resume (an append would refuse it anyway).
+    assert.throws(
+      () =>
+        SessionWriter.resume(
+          f.path,
+          "thr_src",
+          "madc-default",
+          v.nextSeq,
+          v.lastHash,
+          () => [],
+          f.dir,
+          v.file,
+          { holdsLock: () => true, expectedSize: (v.size as number) + 10 },
+          undefined,
+          SessionChainIndex.fromEvents(v.events),
+        ),
+      (err: unknown) => err instanceof RpcError && err.code === ErrorCode.SessionWriteFailed,
+      "short file",
+    );
+    assert.deepEqual(snapshot(f.path), before, "file unchanged");
+    // Right lines, forged payload under the real seq-1 hash (a ghost turn): the writer's index
+    // is the file's, so the forged turn does not exist for it and the real one does.
+    const forgedPayload = SessionChainIndex.fromEvents(
+      v.events.map((e) =>
+        e.seq === 1 ? { ...e, payload: { turnId: "turn_forged", inputText: "x" } } : e,
+      ),
+    );
+    assert.equal(forgedPayload.hasTurn("turn_forged"), true);
+    const w = resume(forgedPayload);
+    const open = readLines(f.path)[0] as Line;
+    const decision = (turnId: string, seq: number, hash: string, decisionId: string) => ({
+      decisionId,
+      turnId,
+      question: "q",
+      recommendedDefault: "d",
+      evidenceRefs: [{ kind: "session" as const, path: "sessions/thr_src.jsonl", seq, hash }],
+    });
+    const g = { ...f, writer: w };
+    const ghost = expectRefusal(
+      g,
+      "founderDecision",
+      decision("turn_forged", 0, open.hash, "dec_k2a"),
+      "field-invalid",
+      "turn_forged",
+    );
+    assert.deepEqual(ghost.issues, ["turnId names no turn.start in this file"]);
+    // The forged middle hash is refused at write too (this writer never saw it).
+    const r = expectRefusal(
+      g,
+      "founderDecision",
+      decision("turn_1", 1, forgedHash, "dec_k2b"),
+      "evidence-ref-invalid",
+      "turn_1",
+    );
+    assert.equal(r.issues.length, 1);
+    const ok = w.append(
+      "founderDecision",
+      decision("turn_1", 1, (v.events[1] as Line).hash, "dec_k2c"),
+    );
+    assert.equal(ok.seq, v.nextSeq);
+    const after = verifySessionFile(f.path, "thr_src");
+    assert.ok(after.ok);
+    assert.deepEqual(
+      inspectSessionV2(f.dir, after.ok ? after.events : [])
+        .filter((x) => x.level === "fail")
+        .map((x) => x.code),
+      [],
+      "doctor finds no mismatch",
+    );
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("M2-A1 FU L1 (Argus pre-check of 15d4d9c): resume's K2 re-read goes through one O_NOFOLLOW | O_NONBLOCK fd + fstat — a FIFO at the path (in place, or swapped in after the identity check) answers -32009 at once and is left untouched; a swap to a symlink or to another file is -32009", () => {
+  const f = fixture();
+  let keepFd: number | undefined;
+  try {
+    f.writer.append("turn.start", { turnId: "turn_1", inputText: "x" });
+    const v = verifySessionFile(f.path, "thr_src");
+    assert.ok(v.ok);
+    if (!v.ok || v.size === undefined) return;
+    // Argus pre-check of d55725d (M1): hold the original inode open for the whole test, so no later
+    // copy can be given its number (the final "not the verified one" check depends on that).
+    keepFd = openSync(f.path, "r");
+    // No default: `undefined` must reach resume as "verifiedFile omitted".
+    const resume = (file: typeof v.file) =>
+      SessionWriter.resume(
+        f.path,
+        "thr_src",
+        "madc-default",
+        v.nextSeq,
+        v.lastHash,
+        () => [],
+        f.dir,
+        file,
+        { holdsLock: () => true, expectedSize: v.size as number },
+        undefined,
+        SessionChainIndex.fromEvents(v.events),
+      );
+    const isWriteFailed = (err: unknown) =>
+      err instanceof RpcError && err.code === ErrorCode.SessionWriteFailed;
+    const before = snapshot(f.path);
+    // A byte-identical copy outside MADC_HOME, and one inside it.
+    const outside = join(f.dir, "..", `${f.dir.split("/").pop() ?? "x"}-outside.jsonl`);
+    const twin = join(f.dir, "sessions", "twin.jsonl");
+    copyFileSync(f.path, outside);
+    copyFileSync(f.path, twin);
+    // Replace by rename, so the new inode exists before the one it replaces is freed: the copy can
+    // never get the inode it replaces. (An inode freed earlier can be reused; `keepFd` pins v.file.)
+    const replaceWithTwin = () => {
+      const tmp = join(f.dir, "sessions", "twin.tmp");
+      copyFileSync(twin, tmp);
+      renameSync(tmp, f.path);
+    };
+    const toSymlink = () => {
+      rmSync(f.path);
+      symlinkSync(outside, f.path);
+    };
+    try {
+      for (const noFollowFlag of [true, false]) {
+        const label = noFollowFlag ? "O_NOFOLLOW" : "lstat → open → fstat";
+        for (const [what, swap, isSwapped, withId] of [
+          [
+            "a symlink to an outside copy",
+            toSymlink,
+            () => lstatSync(f.path).isSymbolicLink(),
+            true,
+          ],
+          // Argus pre-check of d55725d (M2): with `verifiedFile` omitted there is no dev/inode to
+          // compare, so only O_NOFOLLOW (or the fallback's lstat/fstat compare) refuses the link.
+          [
+            "a symlink to an outside copy, verifiedFile omitted",
+            toSymlink,
+            () => lstatSync(f.path).isSymbolicLink(),
+            false,
+          ],
+          ["a byte-identical regular file (another inode)", replaceWithTwin, () => true, true],
+        ] as const) {
+          // A fresh regular file at the path, verified now: resume's identity check passes, and
+          // the swap happens after it (before the open, or between openNoFollow's lstat and open).
+          replaceWithTwin();
+          const now = verifySessionFile(f.path, "thr_src");
+          assert.ok(now.ok);
+          const id = withId && now.ok ? now.file : undefined;
+          let swapped = 0;
+          const hook = () => {
+            swapped++;
+            swap();
+          };
+          setSessionResumeReadForTests(
+            noFollowFlag ? { beforeOpen: hook } : { noFollowFlag, afterLstat: hook },
+          );
+          try {
+            assert.throws(() => resume(id), isWriteFailed, `${label}: swap to ${what}`);
+          } finally {
+            setSessionResumeReadForTests(null);
+          }
+          assert.equal(swapped, 1, `${label}: the swap ran after the identity check (${what})`);
+          assert.equal(isSwapped(), true, `${label}: ${what} still in place`);
+        }
+      }
+      // With no swap, the same fresh file resumes through the fd (the read path works).
+      replaceWithTwin();
+      const now = verifySessionFile(f.path, "thr_src");
+      assert.ok(now.ok);
+      assert.throws(() => resume(v.file), isWriteFailed, "a replaced file is not the verified one");
+      const w = resume(now.ok ? now.file : undefined);
+      assert.equal(w.nextSeq, v.nextSeq);
+      assert.deepEqual(snapshot(f.path), before, "bytes unchanged");
+      // Argus pre-check of d55725d (M4): every re-read closes its fd, on success and on refusal.
+      // Linux only (/proc/self/fd); the loop is synchronous, so nothing else runs in between.
+      if (existsSync("/proc/self/fd")) {
+        const fds = () => readdirSync("/proc/self/fd").length;
+        const fdsBefore = fds();
+        for (let i = 0; i < 100; i++) {
+          resume(now.ok ? now.file : undefined);
+          assert.throws(
+            () =>
+              SessionWriter.resume(
+                f.path,
+                "thr_src",
+                "madc-default",
+                v.nextSeq,
+                v.lastHash,
+                () => [],
+                f.dir,
+                now.ok ? now.file : undefined,
+                { holdsLock: () => true, expectedSize: (v.size as number) + 10 },
+                undefined,
+                SessionChainIndex.fromEvents(v.events),
+              ),
+            isWriteFailed,
+            "short file",
+          );
+        }
+        assert.ok(fds() - fdsBefore < 10, `fd leak: ${fdsBefore} → ${fds()} over 200 resumes`);
+      }
+    } finally {
+      setSessionResumeReadForTests(null);
+      rmSync(outside, { force: true });
+      rmSync(twin, { force: true });
+    }
+  } finally {
+    setSessionResumeReadForTests(null);
+    if (keepFd !== undefined) closeSync(keepFd);
+    f.cleanup();
+  }
+  // A FIFO at the path: a blocking read would hang the process, so each case runs in a child
+  // with a timeout (as the R-FIFO append test does). POSIX only (mkfifo).
+  if (process.platform === "win32") return;
+  const probe = join(import.meta.dirname, "testing", "fifo-resume-probe.ts");
+  const home = mkdtempSync(join(realpathSync(tmpdir()), "madc-m2a1fu-l1-"));
+  try {
+    // `empty`: a FIFO at the path of an empty chain reads as 0 bytes, so only fstat's regular-file
+    // check stands between it and a writer.
+    // `race-read` (Argus pre-check of d55725d, M3): a FIFO swapped in after the fd checks and before
+    // the read. The read uses the checked fd, so the writer comes back at once (a by-path read
+    // would block on the FIFO).
+    for (const mode of ["nofile", "race", "race-lstat", "empty", "race-read"]) {
+      const dir = join(home, mode);
+      const args =
+        process.versions.bun !== undefined
+          ? [probe, dir, mode]
+          : ["--disable-warning=ExperimentalWarning", probe, dir, mode];
+      const started = Date.now();
+      const res = spawnSync(process.execPath, args, { encoding: "utf8", timeout: 10_000 });
+      assert.equal(res.signal, null, `${mode}: resume blocked on a FIFO (${res.stderr})`);
+      assert.equal(res.status, 0, `${mode}: probe failed (${res.stderr})`);
+      assert.ok(Date.now() - started < 10_000, `${mode}: bounded`);
+      assert.deepEqual(
+        JSON.parse(readFileSync(join(dir, "result.json"), "utf8")),
+        { code: mode === "race-read" ? null : ErrorCode.SessionWriteFailed, fifo: true },
+        `${mode}: ${mode === "race-read" ? "a writer from the checked fd" : "-32009"} and the FIFO is untouched`,
+      );
+    }
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("M2-A1 FU L1 errors (Argus pre-check of d55725d, M5): an exception inside resume's re-read (open's ENXIO on a Unix socket at the path; an injected read-time error) is -32009, never a raw error", () => {
+  const f = fixture();
+  try {
+    f.writer.append("turn.start", { turnId: "turn_1", inputText: "x" });
+    const v = verifySessionFile(f.path, "thr_src");
+    assert.ok(v.ok);
+    if (!v.ok || v.size === undefined) return;
+    const resume = () =>
+      SessionWriter.resume(
+        f.path,
+        "thr_src",
+        "madc-default",
+        v.nextSeq,
+        v.lastHash,
+        () => [],
+        f.dir,
+        undefined,
+        { holdsLock: () => true, expectedSize: v.size as number },
+        undefined,
+        SessionChainIndex.fromEvents(v.events),
+      );
+    const isWriteFailed = (err: unknown) =>
+      err instanceof RpcError && err.code === ErrorCode.SessionWriteFailed;
+    // An error thrown inside the re-read (as a read error, EIO, would be) is caught there.
+    setSessionResumeReadForTests({
+      beforeRead: () => {
+        throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+      },
+    });
+    try {
+      assert.throws(resume, isWriteFailed, "a read-time error is -32009");
+    } finally {
+      setSessionResumeReadForTests(null);
+    }
+    resume(); // the same file, no injected error: a writer
+    // A Unix socket at the path: open answers ENXIO. The engine has no socket code (§8.7, honesty
+    // test), so the socket file is bound by a short python3 child; skipped where there is none.
+    if (process.platform === "win32") return;
+    rmSync(f.path);
+    const bind = spawnSync(
+      "python3",
+      ["-c", "import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])", f.path],
+      { encoding: "utf8", timeout: 10_000 },
+    );
+    if (bind.status !== 0) return;
+    assert.equal(lstatSync(f.path).isSocket(), true);
+    assert.throws(resume, isWriteFailed, "a socket at the path is -32009");
+    assert.equal(lstatSync(f.path).isSocket(), true, "the socket is left in place");
+  } finally {
+    setSessionResumeReadForTests(null);
+    f.cleanup();
+  }
+});
+
 // ===================================================================== a.6 P11
 
 test("M2-A1 FU a.6 P11: SessionWriter.resume refuses a missing, empty, forged or foreign index (TypeError, no writer, file unchanged); the Argus R4 / index / alias probes are refused", () => {
@@ -1363,14 +1717,29 @@ test("M2-A1 FU a.8 P22 (Copilot r4168208974): doctor FAILs evidence-ref-mismatch
         type: "item",
         payload: {
           turnId: "turn_1",
-          item: { id: "item_1", kind: "agentMessage", status: "completed", text: "call" },
+          // K3 (pin §4.2): the receipt's endpoints are the toolCall / toolResult items.
+          item: {
+            id: "item_1",
+            kind: "toolCall",
+            status: "completed",
+            name: "read",
+            arguments: {},
+          },
         },
       },
       {
         type: "item",
         payload: {
           turnId: "turn_1",
-          item: { id: "item_2", kind: "agentMessage", status: "completed", text: "result" },
+          item: {
+            id: "item_2",
+            kind: "toolResult",
+            status: "completed",
+            callId: "item_1",
+            name: "read",
+            output: "ok",
+            isError: false,
+          },
         },
       },
     ];
@@ -1428,6 +1797,100 @@ test("M2-A1 FU a.8 P22 (Copilot r4168208974): doctor FAILs evidence-ref-mismatch
   }
 });
 
+test("M2-A1 FU K3 (Copilot r4174562336, pin §4.2 :264, :267-268): doctor FAILs evidence-ref-mismatch when a tool.call's call/result is a hash-valid item line that is not the receipt's toolCall / toolResult", () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const item = (id: string, body: Record<string, unknown>) => ({
+      type: "item",
+      payload: { turnId: "turn_1", item: { id, status: "completed", ...body } },
+    });
+    const head = [
+      { type: "session.open", payload: { ...V2_OPEN } as Record<string, unknown> },
+      { type: "turn.start", payload: { turnId: "turn_1", inputText: "x" } },
+      item("item_1", { kind: "toolCall", name: "read", arguments: {} }), // seq 2
+      item("item_2", {
+        kind: "toolResult",
+        callId: "item_1",
+        name: "read",
+        output: "ok",
+        isError: false,
+      }), // seq 3
+      item("item_3", { kind: "agentMessage", text: "hi" }), // seq 4
+      item("item_4", { kind: "toolCall", name: "read", arguments: {} }), // seq 5: another call
+      item("item_5", {
+        kind: "toolResult",
+        callId: "item_4",
+        name: "read",
+        output: "ok",
+        isError: false,
+      }), // seq 6: another call's result
+      item("item_6", { kind: "agentMessage", text: "hi", callId: "item_1" }), // seq 7: not a toolResult
+    ];
+    const pre = rawEvents(head);
+    const at = (seq: number) => ({ seq, hash: (pre[seq] as Line).hash });
+    const receipt = (c: unknown, r: unknown, callId = "item_1") => ({
+      type: "tool.call",
+      payload: {
+        turnId: "turn_1",
+        callId,
+        name: "read",
+        server: null,
+        call: c,
+        result: r,
+        // Pin §4.2 :268: `result` is null exactly when the call was denied before it ran.
+        decision: r === null ? "denied" : "allowed",
+        reason: r === null ? "read:*" : null,
+      },
+    });
+    const kindFail = (name: string, kind: string) =>
+      `tool.call at seq 8 ${name}: seq \\d+ is not the ${kind} item of the receipt's callId`;
+    const cases: Array<[string, Record<string, unknown>, string[]]> = [
+      ["linked toolCall / toolResult", receipt(at(2), at(3)), []],
+      ["denied (result null)", receipt(at(2), null), []],
+      ["call is an agentMessage", receipt(at(4), at(3)), [kindFail("call", "toolCall")]],
+      ["result is an agentMessage", receipt(at(2), at(4)), [kindFail("result", "toolResult")]],
+      ["call is the toolResult", receipt(at(3), at(3)), [kindFail("call", "toolCall")]],
+      ["result is the toolCall", receipt(at(2), at(2)), [kindFail("result", "toolResult")]],
+      ["call is another call", receipt(at(5), at(3)), [kindFail("call", "toolCall")]],
+      ["result is another call's", receipt(at(2), at(6)), [kindFail("result", "toolResult")]],
+      // The id links but the kind is wrong (only the kind check catches these).
+      [
+        "call is an agentMessage whose id is the callId",
+        receipt(at(4), null, "item_3"),
+        [kindFail("call", "toolCall")],
+      ],
+      [
+        "result is an agentMessage carrying the callId",
+        receipt(at(2), at(7)),
+        [kindFail("result", "toolResult")],
+      ],
+      [
+        "callId names neither",
+        receipt(at(2), at(3), "item_9"),
+        [kindFail("call", "toolCall"), kindFail("result", "toolResult")],
+      ],
+    ];
+    for (const [name, r, expected] of cases) {
+      const events = rawEvents([...head, r as { type: string; payload: Record<string, unknown> }]);
+      assert.equal(verifySessionText(rawText(events)).ok, true, `${name}: shape-valid, verifies`);
+      const findings = inspectSessionV2(home, events).filter(
+        (x) => x.code !== "not-cleanly-closed",
+      );
+      assert.deepEqual(
+        brief(findings),
+        expected.map(() => "fail evidence-ref-mismatch"),
+        name,
+      );
+      findings.forEach((x, i) => {
+        assert.match(x.detail, new RegExp(`^${expected[i] as string}$`), name);
+        assert.equal(x.detail.includes("item_9"), false, `${name}: no caller id echoed`);
+      });
+    }
+  } finally {
+    cleanup();
+  }
+});
+
 // ===================================================================== a.9 P13
 
 test("M2-A1 FU a.9 P13 (Copilot review 5391183893): a session.open that redaction would rewrite is refused -32010 BEFORE any file is opened — no openSync, no file, no unlink", () => {
@@ -1441,21 +1904,7 @@ test("M2-A1 FU a.9 P13 (Copilot review 5391183893): a session.open that redactio
       handoff: null,
     };
     const path = join(dir, "sessions", "thr_p13.jsonl");
-    const spy = mock.method(fs, "openSync");
-    syncBuiltinESMExports();
-    let calibrated = 0;
-    let onRefusal = -1;
-    try {
-      // Calibration: a valid create opens the file, so the spy sees the store's openSync (Node).
-      unguardedSessionWriterForTests.create(
-        join(dir, "sessions", "thr_ok.jsonl"),
-        "thr_ok",
-        "madc-default",
-        V2_OPEN,
-        () => [],
-      );
-      calibrated = spy.mock.callCount();
-      spy.mock.resetCalls();
+    const refuse = () =>
       assert.throws(
         () =>
           unguardedSessionWriterForTests.create(
@@ -1475,13 +1924,42 @@ test("M2-A1 FU a.9 P13 (Copilot review 5391183893): a session.open that redactio
           return true;
         },
       );
-      onRefusal = spy.mock.callCount();
+    let calibrated = 0;
+    let onRefusal = -1;
+    // Argus PR #48 r1 K1: a plain wrapper, not node:test's `mock.method` (absent in Bun 1.3.11,
+    // the CI pin), so the test runs on every runtime. `syncBuiltinESMExports` makes the store's
+    // named `openSync` import see it where the runtime supports that (calibration says so).
+    type OpenSync = typeof fs.openSync;
+    const writableFs = fs as { openSync: OpenSync };
+    const realOpenSync = fs.openSync;
+    let opens = 0;
+    writableFs.openSync = ((...args: Parameters<OpenSync>) => {
+      opens++;
+      return realOpenSync(...args);
+    }) as OpenSync;
+    syncBuiltinESMExports();
+    try {
+      // Calibration: a valid create opens the file, so the spy sees the store's openSync.
+      unguardedSessionWriterForTests.create(
+        join(dir, "sessions", "thr_ok.jsonl"),
+        "thr_ok",
+        "madc-default",
+        V2_OPEN,
+        () => [],
+      );
+      calibrated = opens;
+      opens = 0;
+      refuse();
+      onRefusal = opens;
     } finally {
-      spy.mock.restore();
+      writableFs.openSync = realOpenSync;
       syncBuiltinESMExports();
     }
-    // Bun's node:fs named exports are not live bindings of the default export, so the spy only
-    // observes the store under Node; the -32010-vs--32009 check below holds on both runtimes.
+    // Bun (1.3.11 and 1.4.2) binds node:fs named imports at link time, so the wrapper is not
+    // observed there (calibration 0) and only the behavioral checks below apply; under Node the
+    // spy must see the calibration open, so the count check can never go silently dead there.
+    assert.equal(fs.openSync, realOpenSync, "openSync restored");
+    if (typeof process.versions.bun !== "string") assert.ok(calibrated > 0, "Node: spy calibrated");
     if (calibrated > 0) assert.equal(onRefusal, 0, "no openSync on the refusal path");
     assert.equal(existsSync(path), false, "no file");
     // Behavioral proof that nothing was opened: with no sessions/ directory an open would fail
