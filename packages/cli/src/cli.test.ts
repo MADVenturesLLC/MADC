@@ -16,6 +16,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -1434,6 +1435,10 @@ test("M2-A1 doctor session row: a one-way handoff (no handoff.link yet) WARNs ha
         chain("thr_src", "daedalus", srcLines).text,
         { mode: 0o600 },
       );
+      // I8 (Argus): the target is set a minute older explicitly, so "newest" never rests on the
+      // 20 ms sleep above landing the two writes in different clock ticks.
+      const older = new Date(Date.now() - 60_000);
+      utimesSync(join(sb.home, "sessions", "thr_tgt.jsonl"), older, older);
       const r = await runCli(sb, ["doctor", "--json"]);
       assert.equal(r.code, 0, r.stderr);
       const report = JSON.parse(r.stdout) as DoctorJson;
@@ -1459,5 +1464,87 @@ test("M2-A1 doctor session row: a one-way handoff (no handoff.link yet) WARNs ha
     } finally {
       sb.cleanup();
     }
+  }
+});
+
+test("M2-A1 follow-up (Argus M52, P12): a FAIL session finding fails doctor's session row (exit 1), never a WARN", {
+  timeout: 60_000,
+}, async () => {
+  const sorted = (value: unknown): string =>
+    JSON.stringify(value, (_k, v: unknown) =>
+      v !== null && typeof v === "object" && !Array.isArray(v)
+        ? Object.fromEntries(
+            Object.keys(v as object)
+              .sort()
+              .map((k) => [k, (v as Record<string, unknown>)[k]]),
+          )
+        : v,
+    );
+  const out: string[] = [];
+  let prevHash = "0".repeat(64);
+  const lines: Array<[string, Record<string, unknown>]> = [
+    [
+      "session.open",
+      {
+        cwd: null,
+        backing: "kimi-code",
+        providerId: "kimi-code",
+        pinnedModel: "m",
+        worktree: null,
+        handoff: null,
+      },
+    ],
+    ["turn.start", { turnId: "turn_1", inputText: "x" }],
+    // A same-file ref to a seq after its own line: FAIL evidence-ref-mismatch (Argus P12).
+    [
+      "founderDecision",
+      {
+        decisionId: "d1",
+        turnId: "turn_1",
+        question: "q",
+        recommendedDefault: "d",
+        evidenceRefs: [
+          { kind: "session", path: "sessions/thr_fd.jsonl", seq: 3, hash: "f".repeat(64) },
+        ],
+      },
+    ],
+    ["session.close", { reason: "shutdown", worktree: null }],
+  ];
+  lines.forEach(([type, payload], seq) => {
+    const body = {
+      v: 1,
+      seq,
+      ts: 1 + seq,
+      type,
+      threadId: "thr_fd",
+      seatId: "madc-default",
+      payload,
+    };
+    const hash = createHash("sha256")
+      .update(`${prevHash}\n${sorted(body)}`, "utf8")
+      .digest("hex");
+    const { payload: p, ...head } = body;
+    out.push(JSON.stringify({ ...head, prevHash, hash, payload: p }));
+    prevHash = hash;
+  });
+  const sb = sandbox();
+  try {
+    mkdirSync(join(sb.home, "sessions"), { recursive: true, mode: 0o700 });
+    writeFileSync(join(sb.home, "sessions", "thr_fd.jsonl"), `${out.join("\n")}\n`, {
+      mode: 0o600,
+    });
+    const r = await runCli(sb, ["doctor", "--json"]);
+    assert.equal(r.code, 1, r.stderr);
+    const row = check(JSON.parse(r.stdout) as DoctorJson, "session");
+    assert.equal(row.status, "fail", row.summary);
+    assert.match(row.summary, /^thr_fd · 4 events · head [0-9a-f]{12} · evidence-ref-mismatch: /);
+    assert.deepEqual(
+      (row.evidence.findings as Array<{ level: string; code: string }>).map(
+        (f) => `${f.level} ${f.code}`,
+      ),
+      ["fail evidence-ref-mismatch"],
+    );
+  } finally {
+    sb.cleanup();
   }
 });

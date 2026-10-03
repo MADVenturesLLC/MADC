@@ -435,6 +435,8 @@ export class SessionChainIndex {
   readonly #lines: ChainLine[] = [];
   readonly #handoffs = new Map<string, HandoffState>();
   readonly #decisions = new Set<string>();
+  /** Every `turnId` a `turn.start` in this file named (a `founderDecision` must name one, P9). */
+  readonly #turns = new Set<string>();
   /** `undefined` while no `session.open` was noted, or the open is a v1 line (no `worktree` key). */
   #openWorktree: WorktreeIdentity | null | undefined = undefined;
 
@@ -456,7 +458,10 @@ export class SessionChainIndex {
     copy.#lines.push(...this.#lines);
     for (const [id, state] of this.#handoffs) copy.#handoffs.set(id, state);
     for (const id of this.#decisions) copy.#decisions.add(id);
-    copy.#openWorktree = this.#openWorktree;
+    for (const id of this.#turns) copy.#turns.add(id);
+    // Argus G2: the copy gets its own frozen worktree, never the caller's or this index's object.
+    const w = this.#openWorktree;
+    copy.#openWorktree = w === undefined || w === null ? w : Object.freeze({ ...w });
     return copy;
   }
 
@@ -477,14 +482,26 @@ export class SessionChainIndex {
     return this.#decisions.has(decisionId);
   }
 
-  /** The `worktree` the file's `session.open` recorded; `undefined` for a v1 open. */
+  /** Whether a `turn.start` in this file named `turnId` (pin §2.3 "the turn that raised it"). */
+  hasTurn(turnId: string): boolean {
+    return this.#turns.has(turnId);
+  }
+
+  /**
+   * The `worktree` the file's `session.open` recorded; `undefined` for a v1 open. A frozen copy the
+   * index owns (Argus G2): neither the payload it was read from nor a caller can change it.
+   */
   get openWorktree(): WorktreeIdentity | null | undefined {
     return this.#openWorktree;
   }
 
-  /** Record one durable line (in seq order). Tolerates malformed payloads: it indexes, never judges. */
+  /**
+   * Record one durable line (in seq order). Tolerates malformed payloads: it indexes, never judges.
+   * Each `ChainLine` is frozen (Argus P11): `lineAt` hands out the index's own object, and a caller
+   * that mutated it could otherwise make a forged hash resolve at write time.
+   */
   note(e: { readonly type: string; readonly hash: string; readonly payload: unknown }): void {
-    this.#lines.push({ hash: e.hash, type: e.type });
+    this.#lines.push(Object.freeze({ hash: e.hash, type: e.type }));
     const p = isPlainRecord(e.payload) ? e.payload : {};
     switch (e.type) {
       case "session.open":
@@ -492,7 +509,7 @@ export class SessionChainIndex {
           const w = p.worktree;
           this.#openWorktree =
             w !== null && checkWorktreeIdentity(w, "worktree").length === 0
-              ? (w as WorktreeIdentity)
+              ? Object.freeze({ ...(w as WorktreeIdentity) })
               : null;
         }
         break;
@@ -509,6 +526,9 @@ export class SessionChainIndex {
         break;
       case "founderDecision":
         if (isStr(p.decisionId)) this.#decisions.add(p.decisionId);
+        break;
+      case "turn.start":
+        if (isStr(p.turnId)) this.#turns.add(p.turnId);
         break;
       default:
         break;
@@ -602,7 +622,9 @@ export function validateForWrite(
     case "handoff.out": {
       const id = p.handoffId as string;
       if (index.handoffState(id) !== undefined) {
-        issues.push(invalid("handoffId", `${id} is already used in this file`));
+        // Argus P21 (pin §5 `:298`, Copilot r4165840814 / r4168209015): `issues` name the field,
+        // never the caller's value — an id may be a configured secret or a token shape.
+        issues.push(invalid("handoffId", "is already used in this file"));
       }
       break;
     }
@@ -611,16 +633,27 @@ export function validateForWrite(
       const id = p.handoffId as string;
       const state = index.handoffState(id);
       if (state === undefined) {
-        issues.push(invalid("handoffId", `${id} has no handoff.out in this file`));
+        issues.push(invalid("handoffId", "has no handoff.out in this file"));
       } else if (state !== "open") {
-        issues.push(invalid("handoffId", `${id} already has a terminal record (${state})`));
+        issues.push(invalid("handoffId", `already has a terminal record (${state})`));
+      }
+      // Argus P23: JSON-RPC error codes are integers. `Infinity` / `-Infinity` / `NaN` would be
+      // serialized as `null` (a line the verifier then FAILs, poisoning the writer's own file) and
+      // a fraction is not a code; refused before redaction, hashing or any I/O (rule 1.5).
+      if (type === "handoff.aborted" && isPlainRecord(p.error) && !Number.isInteger(p.error.code)) {
+        issues.push(invalid("error.code", "must be an integer"));
       }
       break;
     }
     case "founderDecision": {
       const id = p.decisionId as string;
       if (index.hasDecision(id)) {
-        issues.push(invalid("decisionId", `${id} is already used in this file`));
+        issues.push(invalid("decisionId", "is already used in this file"));
+      }
+      // Argus P9 (turnId part; pin §2.3 `:178` "the turn that raised it"): the decision must name
+      // a turn this file started. The key-set part of P9 waits on a pin row (follow-up §(b)).
+      if (!index.hasTurn(p.turnId as string)) {
+        issues.push(invalid("turnId", "names no turn.start in this file"));
       }
       issues.push(
         ...sameFileRefIssues(
@@ -691,15 +724,63 @@ export function structuralView(type: string, payload: unknown): unknown {
   }
 }
 
-/** Paths at which two values differ (own-property order independent). Leaves are compared by `===`. */
-function diffPaths(a: unknown, b: unknown, path: string, out: string[]): void {
+/**
+ * The key names a structural path may name verbatim, per type (pin §2.1, §2.2, §2.3, §3): the
+ * pinned keys of the type's structural view, its nested `handoff` / `worktree` / `error` objects
+ * and its `EvidenceRef`s. Argus F1 (pin §5 `:298`, completes P21): any other key is caller-chosen
+ * and may be a configured secret or a token shape, so a refusal names it only as `<extra key>`.
+ */
+const WORKTREE_KEYS = ["topLevel", "remote", "head"] as const;
+const PINNED_STRUCTURAL_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
+  "session.open": new Set([
+    "handoff",
+    "worktree",
+    ...WORKTREE_KEYS,
+    "sourceThreadId",
+    "sourceSeatId",
+    "handoffId",
+    "sourceSeq",
+    "sourceHash",
+  ]),
+  "session.close": new Set(["worktree", ...WORKTREE_KEYS]),
+  "handoff.out": new Set(["handoffId", "turnId", "targetSeatId", "brief"]),
+  "handoff.link": new Set(["handoffId", "targetThreadId", "targetSeatId", "targetGenesisHash"]),
+  "handoff.aborted": new Set(["handoffId", "reason", "error", "code", "message"]),
+  founderDecision: new Set([
+    "decisionId",
+    "turnId",
+    "question",
+    "recommendedDefault",
+    "evidenceRefs",
+    "kind",
+    "path",
+    "seq",
+    "hash",
+    "sha",
+    "remote",
+  ]),
+};
+const EXTRA_KEY = "<extra key>";
+
+/**
+ * Paths at which two values differ (own-property order independent). Leaves are compared by `===`.
+ * `name` maps an object key to the segment written into the path (never the raw caller key unless
+ * it is pinned, F1).
+ */
+function diffPaths(
+  a: unknown,
+  b: unknown,
+  path: string,
+  out: string[],
+  name: (key: string) => string,
+): void {
   if (Array.isArray(a) || Array.isArray(b)) {
     if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) {
       out.push(path);
       return;
     }
     a.forEach((v, i) => {
-      diffPaths(v, b[i], `${path}[${i}]`, out);
+      diffPaths(v, b[i], `${path}[${i}]`, out, name);
     });
     return;
   }
@@ -710,7 +791,8 @@ function diffPaths(a: unknown, b: unknown, path: string, out: string[]): void {
     }
     const keys = new Set([...Object.keys(a), ...Object.keys(b)]);
     for (const k of [...keys].sort()) {
-      diffPaths(a[k], b[k], path === "" ? k : `${path}.${k}`, out);
+      const segment = name(k);
+      diffPaths(a[k], b[k], path === "" ? segment : `${path}.${segment}`, out, name);
     }
     return;
   }
@@ -724,10 +806,16 @@ export function redactionRefusal(
   after: unknown,
 ): WriteRefusal | null {
   const out: string[] = [];
-  diffPaths(structuralView(type, before), structuralView(type, after), "", out);
+  const pinned = PINNED_STRUCTURAL_KEYS[type];
+  const name = (key: string): string => (pinned?.has(key) === true ? key : EXTRA_KEY);
+  diffPaths(structuralView(type, before), structuralView(type, after), "", out, name);
   if (out.length === 0) return null;
+  // An extra key and its redacted twin map to the same path: report it once.
+  const paths = [...new Set(out)];
   return {
     reason: "field-invalid",
-    issues: out.map((p) => `redaction would rewrite structural field ${p === "" ? "payload" : p}`),
+    issues: paths.map(
+      (p) => `redaction would rewrite structural field ${p === "" ? "payload" : p}`,
+    ),
   };
 }

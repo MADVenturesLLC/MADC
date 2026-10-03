@@ -34,6 +34,7 @@ import {
   RESERVED_EVENT_TYPES,
   rebuildSession,
   SESSION_EVENT_TYPES,
+  SessionChainIndex,
   type SessionEvent,
   type SessionOpenPayload,
   SessionWriter,
@@ -1026,30 +1027,41 @@ test("M2 D-M2-A0-4: the writer's index — genesisHash, lineAt, and a resume tha
       ],
     });
     assert.equal(ok.seq, 5);
-    // A resume WITHOUT the verified events gets an empty index and fails closed on a same-file ref.
-    const blind = SessionWriter.resume(
-      f.path,
-      "thr_src",
-      "madc-default",
-      6,
-      ok.hash,
-      () => [],
-      f.dir,
-      undefined,
-      { holdsLock: () => true, expectedSize: statSync(f.path).size },
-    );
-    const g = { dir: f.dir, path: f.path, writer: blind, cleanup: () => {} };
+    // Kept (Argus P11 moved the blind-writer case below to resume): the fail-closed same-file rule
+    // that case exercised still refuses a ref that is not below the next seq, on the real index.
+    const g = { dir: f.dir, path: f.path, writer: resumed, cleanup: () => {} };
     const d = expectRefusal(
       g,
       "founderDecision",
       decision(
-        [{ kind: "session", path: "sessions/thr_src.jsonl", seq: 0, hash: open.hash }],
+        [{ kind: "session", path: "sessions/thr_src.jsonl", seq: 6, hash: open.hash }],
         "dec_2",
       ),
       "evidence-ref-invalid",
       "turn_1",
     );
-    assert.match(String(d.issues), /not below the next seq 0/);
+    assert.match(String(d.issues), /not below the next seq 6/);
+    // A resume WITHOUT the verified events (an empty index) is now refused at resume itself
+    // (Argus P11): no writer exists that could resolve, or fail to resolve, a same-file ref.
+    const before = snapshot(f.path);
+    assert.throws(
+      () =>
+        SessionWriter.resume(
+          f.path,
+          "thr_src",
+          "madc-default",
+          6,
+          ok.hash,
+          () => [],
+          f.dir,
+          undefined,
+          { holdsLock: () => true, expectedSize: statSync(f.path).size },
+          undefined,
+          new SessionChainIndex(),
+        ),
+      TypeError,
+    );
+    assert.deepEqual(snapshot(f.path), before, "nothing appended by the refused resume");
     independentVerify(f.path);
   } finally {
     f.cleanup();

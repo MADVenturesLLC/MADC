@@ -62,8 +62,11 @@ function headOf(
   const ref = symbolic.stdout.trim();
   if (!ref.startsWith("refs/heads/")) return { ok: false };
   // The branch HEAD names must not exist yet; one that exists but did not resolve is corrupt.
+  // Only `show-ref --verify --quiet` exit 1 means "no such ref" (Argus P6, Copilot r4165840875):
+  // exit 0 (the ref exists), a timeout or spawn failure (code null), git's fatal 128, or any other
+  // code is not evidence of an unborn branch, so no identity is recorded.
   const exists = runGit(["show-ref", "--verify", "--quiet", ref], topLevel);
-  return exists.code === 0 ? { ok: false } : { ok: true, head: null };
+  return exists.code === 1 ? { ok: true, head: null } : { ok: false };
 }
 
 function identityAt(topLevel: string, runGit: GitRunner): WorktreeIdentity | null {
@@ -90,18 +93,59 @@ export function resolveWorktreeIdentity(
 }
 
 /**
+ * A shared deadline for close-time `git` (Argus P8): `at` is a `performance.now()` instant shared
+ * by every thread's re-read at one shutdown. Monotonic (Argus F7): a wall-clock step during
+ * shutdown can neither stretch nor zero the budget. `now` is a clock seam (default
+ * `performance.now`).
+ */
+export type GitDeadline = { readonly at: number; readonly now?: () => number };
+
+/**
+ * `runGit` bounded by `deadline`: each call's timeout is what is left of the shared budget, and
+ * once nothing is left no further `git` is started. `expired()` says whether any call ran into
+ * (or was refused by) the deadline, so a partial read is never recorded as an identity.
+ */
+function boundedRunner(
+  runGit: GitRunner,
+  deadline: GitDeadline,
+): { readonly run: GitRunner; readonly expired: () => boolean } {
+  const now = deadline.now ?? (() => performance.now());
+  let expired = false;
+  const run: GitRunner = (args, cwd) => {
+    const left = deadline.at - now();
+    if (left <= 0) {
+      expired = true;
+      return { code: null, stdout: "" };
+    }
+    const result = runGit(args, cwd, { timeoutMs: left });
+    if (now() >= deadline.at) expired = true;
+    return result;
+  };
+  return { run, expired: () => expired };
+}
+
+/**
  * The identity recorded on `session.close` (pin §2.2 "At close", D-M2-A0-5): `HEAD` re-read at
  * the RECORDED `topLevel`, not at the current `cwd`. Null when that top-level can no longer be
  * read as the same work tree (gone, or `git` now reports another top-level there), which doctor
- * reports as `worktree-head-unreadable`.
+ * reports as `worktree-head-unreadable`. With `deadline` (the shutdown path), every `git` call
+ * shares that one budget and a re-read that runs past it is null too (Argus P8): shutdown must stay
+ * inside the CLI's kill budget, and a half-read identity is never written. `deadline.at` is an
+ * instant on the `performance.now()` clock, NOT `Date.now()` (Argus F7): pass
+ * `performance.now() + budgetMs`; a `Date.now()`-based value would never expire.
  */
 export function rereadWorktreeIdentity(
   recorded: WorktreeIdentity,
   deps: RepoIdentityDeps = {},
+  deadline?: GitDeadline,
 ): WorktreeIdentity | null {
-  const runGit = deps.runGit ?? defaultGitRunner;
+  const baseRunGit = deps.runGit ?? defaultGitRunner;
+  const bounded = deadline === undefined ? null : boundedRunner(baseRunGit, deadline);
+  const runGit = bounded === null ? baseRunGit : bounded.run;
   const realpath = deps.realpath ?? ((path: string) => realpathSync(path));
   const topLevel = topLevelOf(recorded.topLevel, runGit, realpath);
   if (topLevel === null || topLevel !== recorded.topLevel) return null;
-  return identityAt(topLevel, runGit);
+  const identity = identityAt(topLevel, runGit);
+  if (bounded?.expired() === true) return null;
+  return identity;
 }
