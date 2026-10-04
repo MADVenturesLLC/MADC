@@ -15,3 +15,12 @@
 - M1-A0 (pins), M1-A1 (registry v2), M1-A2 (keychain credential store), M1-A3 (generic direct-key port plus Ollama Cloud), M1-A4 (direct-key batch: Mistral, DeepSeek, Gemini, xAI API), M1-A5 (interactive-only MiniMax Token Plan and Alibaba Coding Plan), M1-A6 (generic ACP client plus Grok Build), M1-A7 (seat roster v1 with five seeded seats), and M1-A8 (CLI surfaces and doctor lanes report) are merged on main.
 - The M0 Witness terminal CLI is on main (PR #35). Rev 6.2 conformance remains unverified.
 - M1-A8 left turn-time catalog staleness for a follow-up, and the Witness stays headless. Lanes verified on 2026-09-24 show denied in doctor from 2026-10-25 while turns still serve them until terms are re-verified or the turn check receives the current date.
+
+## GitHub credentials and identity (agent sessions)
+
+Agent sessions run GitHub operations on two separate credential legs. Both are intentional — do not "align" them or substitute one for the other.
+
+- **`gh` (API, PRs, comments) acts as the agent PAT `daley40-lab`,** exported as `GH_TOKEN` by the session launcher from `~/.secrets/mad-agent-env.sh`. That PAT is the intended `gh` identity for agent work. Never unset `GH_TOKEN`, never bypass it with the human keyring login (`decivantiq`), and never print, echo, or commit the token value.
+- **Git transport is separate.** SSH remotes (`git@github.com:…`) push with the SSH key as `decivantiq`; HTTPS remotes resolve through the `gh` credential helper. A session pushing over SSH as `decivantiq` while `gh pr create` acts as `daley40-lab` is normal, not a misconfiguration.
+- **On any `gh` 401: run `gh auth status`, stop, and report** — no keyring fallback, no `env -u GH_TOKEN`, no improvised retry. The token file is prefixed (`GITHUB_TOKEN=…`); extract it exactly as the loader does, and test any copy by API probe, never by printing it.
+- **A session relaunched after a stop must have a valid `GH_TOKEN` before it runs** — check `gh auth status` first; if the token is invalid, stop and report rather than pushing with the wrong identity.
