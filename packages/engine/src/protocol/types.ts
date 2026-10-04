@@ -173,6 +173,25 @@ export type ThreadResumeResult = { thread: Thread };
 export type ThreadListParams = { limit?: number; cursor?: string };
 export type ThreadListResult = { data: ThreadSummary[]; nextCursor: string | null };
 
+/**
+ * M2 handoff procedure pin §2 (`docs/plan/PIN-madc-M2-handoff-procedure.md`): the M2 evidence pin
+ * §2.1 order, performed in-process. `threadId` is the SOURCE thread (loaded on this connection,
+ * its lock held); `turnId` is the source turn that raised the handoff, or null between turns. The
+ * `handoffId` and the target thread id are engine-assigned. No turn is started on the target.
+ */
+export type ThreadHandoffParams = {
+  threadId: string;
+  targetSeatId: string;
+  brief: string;
+  turnId: string | null;
+};
+export type ThreadHandoffResult = {
+  handoffId: string;
+  targetThreadId: string;
+  /** The target file's seq-0 hash (G), as read back from disk and cited by `handoff.link`. */
+  targetGenesisHash: string;
+};
+
 /** P3: `mode` is optional; absent means `headless` (fail-closed). */
 export type TurnStartParams = { threadId: string; input: UserInput[]; mode?: TurnMode };
 export type TurnStartResult = { turn: Turn };
@@ -281,7 +300,8 @@ export type ProviderListResult = { data: ProviderSummary[] };
 
 /**
  * Client → server requests (complete M0 list plus the M1 §3.5 methods: `seat/list`,
- * `provider/list`, `auth/status`, `auth/remove`).
+ * `provider/list`, `auth/status`, `auth/remove`; plus `thread/handoff`, the one method the M2
+ * handoff procedure pin authorizes — `protocolVersion` is unchanged, see that pin §2).
  */
 export type ClientRequests = {
   initialize: { params: InitializeParams; result: InitializeResult };
@@ -294,6 +314,8 @@ export type ClientRequests = {
   "provider/list": { params: ProviderListParams; result: ProviderListResult };
   "auth/status": { params: AuthStatusParams; result: AuthStatusResult };
   "auth/remove": { params: AuthRemoveParams; result: AuthRemoveResult };
+  /** M2 handoff procedure pin: the one method that pin authorizes. */
+  "thread/handoff": { params: ThreadHandoffParams; result: ThreadHandoffResult };
 };
 
 export type ClientRequestMethod = keyof ClientRequests;
@@ -335,6 +357,7 @@ export const CLIENT_REQUEST_METHODS: readonly ClientRequestMethod[] = Object.fre
   "provider/list",
   "auth/status",
   "auth/remove",
+  "thread/handoff",
 ]);
 
 /**
@@ -356,6 +379,7 @@ export const CLIENT_REQUEST_PARAM_FIELDS: Readonly<Record<ClientRequestMethod, r
     "provider/list": [],
     "auth/status": ["providerId"],
     "auth/remove": ["providerId"],
+    "thread/handoff": ["threadId", "targetSeatId", "brief", "turnId"],
   });
 
 // ---------------------------------------------------------------------------

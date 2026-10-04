@@ -183,8 +183,9 @@ test("A2 §3.5/P4 there is no auth/set over JSONL: -32601, the secret is never e
 
 test("A2 schema test: no JSONL method accepts a secret value (pin §8.3)", () => {
   // The complete M1 method list, as pinned (protocol pin §3): M0's six, the two presence methods
-  // (M1-A2), `seat/list` (M1-A7) and `provider/list` (M1-A8). No `auth/set`, and nothing whose
-  // name suggests a secret-carrying request.
+  // (M1-A2), `seat/list` (M1-A7) and `provider/list` (M1-A8); plus `thread/handoff`, the one
+  // method the M2 handoff procedure pin authorizes (M2-A2). No `auth/set`, and nothing whose name
+  // suggests a secret-carrying request.
   assert.deepStrictEqual(
     [...CLIENT_REQUEST_METHODS],
     [
@@ -198,6 +199,7 @@ test("A2 schema test: no JSONL method accepts a secret value (pin §8.3)", () =>
       "provider/list",
       "auth/status",
       "auth/remove",
+      "thread/handoff",
     ],
   );
   assert.ok(!CLIENT_REQUEST_METHODS.some((m) => /set|secret|credential|token/i.test(m)));
@@ -218,6 +220,10 @@ test("A2 schema test: no JSONL method accepts a secret value (pin §8.3)", () =>
     "mode",
     "turnId",
     "providerId",
+    // M2-A2 (`thread/handoff`): a seat id, and the brief — free text like `input`, redacted before
+    // it is hashed and written (evidence pin rule 1.4) and never echoed in an error's `data`.
+    "targetSeatId",
+    "brief",
   ]);
   for (const [method, fields] of Object.entries(CLIENT_REQUEST_PARAM_FIELDS)) {
     // `seat/list` and `provider/list` are the two methods protocol pin §3.5 gives empty params
