@@ -627,17 +627,21 @@ test("M2-A1 FU F7 (Argus pre-check): the shutdown deadline is monotonic — a wa
 
 // ===================================================================== a.10 P15
 
-test("M2-A1 FU a.5 P8 (default runner): a caller's timeoutMs caps the real git invocation below the 5 s ceiling", {
-  skip: process.platform === "win32" ? "POSIX sh alias" : false,
-}, () => {
-  // A git alias that execs `sleep 3` with its own stdio detached, so killing git ends the call.
-  const hang = ["-c", "alias.madcfuhang=!exec sleep 3 >/dev/null 2>&1 </dev/null", "madcfuhang"];
-  const t0 = Date.now();
-  const r = defaultGitRunner(hang, tmpdir(), { timeoutMs: 200 });
-  const took = Date.now() - t0;
-  assert.equal(r.code, null, "killed at the caller's budget");
-  assert.ok(took < 2000, `took ${took} ms`);
-});
+// `test.skip`, not `{ skip }`: Bun 1.3.11's node:test runs a test whose options say `skip` (Argus
+// pre-check of c2f6954, Q1).
+const shAliasSkip = process.platform === "win32" ? "POSIX sh alias" : null;
+(shAliasSkip !== null ? test.skip : test)(
+  "M2-A1 FU a.5 P8 (default runner): a caller's timeoutMs caps the real git invocation below the 5 s ceiling",
+  () => {
+    // A git alias that execs `sleep 3` with its own stdio detached, so killing git ends the call.
+    const hang = ["-c", "alias.madcfuhang=!exec sleep 3 >/dev/null 2>&1 </dev/null", "madcfuhang"];
+    const t0 = Date.now();
+    const r = defaultGitRunner(hang, tmpdir(), { timeoutMs: 200 });
+    const took = Date.now() - t0;
+    assert.equal(r.code, null, "killed at the caller's budget");
+    assert.ok(took < 2000, `took ${took} ms`);
+  },
+);
 
 test("M2-A1 FU a.10 P15: a close-time fault on one thread is logged and the next thread is still closed; shutdown does not throw and every lock is released", async () => {
   const { home, cleanup } = makeHome();
@@ -1433,11 +1437,11 @@ test("M2-A1 FU L1 (Argus pre-check of 15d4d9c): resume's K2 re-read goes through
       const w = resume(now.ok ? now.file : undefined);
       assert.equal(w.nextSeq, v.nextSeq);
       assert.deepEqual(snapshot(f.path), before, "bytes unchanged");
-      // Argus pre-checks of d55725d (M4) and 69f0c86 (N2): the re-read closes its fd on success, on
-      // a refusal after the read (short file), on the fd's dev/inode refusal (a twin swapped in after
-      // the identity check) and when the read throws. (The not-a-regular-file refusal needs a FIFO,
-      // so it runs only in the child cases below and is not counted.) Linux only (/proc/self/fd);
-      // the loops are synchronous, so nothing else runs in between.
+      // Argus pre-checks of d55725d (M4), 69f0c86 (N2) and c2f6954 (Q3): the re-read closes its fd on
+      // success, on a refusal after the read (short file), on the fd's dev/inode refusal (a twin
+      // swapped in after the identity check), on the not-a-regular-file refusal (a directory swapped
+      // in after the identity check: it opens O_RDONLY and fstat says "not a file") and when the read
+      // throws. Linux only (/proc/self/fd); the loops are synchronous, so nothing else runs in between.
       if (existsSync("/proc/self/fd")) {
         const fds = () => readdirSync("/proc/self/fd").length;
         const fdsBefore = fds();
@@ -1486,7 +1490,30 @@ test("M2-A1 FU L1 (Argus pre-check of 15d4d9c): resume's K2 re-read goes through
             setSessionResumeReadForTests(null);
           }
         }
-        assert.ok(fds() - fdsBefore < 10, `fd leak: ${fdsBefore} → ${fds()} over 400 resumes`);
+        const cur = verifySessionFile(f.path, "thr_src");
+        assert.ok(cur.ok);
+        const aside = join(f.dir, "sessions", "aside.jsonl");
+        for (let i = 0; i < 100; i++) {
+          setSessionResumeReadForTests({
+            beforeOpen: () => {
+              renameSync(f.path, aside);
+              mkdirSync(f.path);
+            },
+          });
+          try {
+            assert.throws(
+              () => resume(cur.ok ? cur.file : undefined),
+              isWriteFailed,
+              "a directory swapped in",
+            );
+          } finally {
+            setSessionResumeReadForTests(null);
+            rmSync(f.path, { recursive: true, force: true });
+            renameSync(aside, f.path);
+          }
+        }
+        resume(cur.ok ? cur.file : undefined); // the same inode is back: a writer
+        assert.ok(fds() - fdsBefore < 10, `fd leak: ${fdsBefore} → ${fds()} over 501 resumes`);
       }
     } finally {
       setSessionResumeReadForTests(null);
@@ -1585,7 +1612,21 @@ test("M2-A1 FU L1 errors (Argus pre-checks of d55725d, M5, and 69f0c86, N1): an 
     } finally {
       setSessionResumeReadForTests(null);
     }
-    resume(); // the same file, no injected error: a writer
+    // Argus pre-check of c2f6954 (Q2): beforeRead must sit between the fd checks and the read (the M3
+    // race-read case relies on it). A same-inode truncate there is seen by the read: a short file.
+    const keep = readFileSync(f.path);
+    setSessionResumeReadForTests({ beforeRead: () => fs.truncateSync(f.path, 0) });
+    try {
+      assert.throws(
+        resume,
+        isWriteFailed,
+        "beforeRead runs before the read: a same-inode truncate there is seen (short file)",
+      );
+    } finally {
+      setSessionResumeReadForTests(null);
+      writeFileSync(f.path, keep);
+    }
+    resume(); // the same file, restored, no injected error: a writer
   } finally {
     setSessionResumeReadForTests(null);
     f.cleanup();
