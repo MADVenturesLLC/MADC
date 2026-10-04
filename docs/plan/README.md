@@ -3,7 +3,8 @@
 Planning documents behind madc. Edit rule, keyed to each file's status line:
 
 - **Accepted or frozen** (Founder-accepted plans, build pins that gated a merged act, ADRs): never
-  edited, except for one added `Amended by <file>` pointer line directly under the status line.
+  edited, except for one added `Amended by <file>` pointer line per amendment (not per file),
+  directly under the status line.
 - **Draft** (status says draft, proposed or not yet accepted): may be edited in place by a
   Founder-merged PR that says so in its body.
 - **Amendments are new files** that name the base file. Verbatim research copies are never edited.
