@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs, {
+  chmodSync,
   closeSync,
   copyFileSync,
   existsSync,
@@ -1432,13 +1433,30 @@ test("M2-A1 FU L1 (Argus pre-check of 15d4d9c): resume's K2 re-read goes through
       const w = resume(now.ok ? now.file : undefined);
       assert.equal(w.nextSeq, v.nextSeq);
       assert.deepEqual(snapshot(f.path), before, "bytes unchanged");
-      // Argus pre-check of d55725d (M4): every re-read closes its fd, on success and on refusal.
-      // Linux only (/proc/self/fd); the loop is synchronous, so nothing else runs in between.
+      // Argus pre-checks of d55725d (M4) and 69f0c86 (N2): the re-read closes its fd on success, on
+      // a refusal after the read (short file), on the fd's dev/inode refusal (a twin swapped in after
+      // the identity check) and when the read throws. (The not-a-regular-file refusal needs a FIFO,
+      // so it runs only in the child cases below and is not counted.) Linux only (/proc/self/fd);
+      // the loops are synchronous, so nothing else runs in between.
       if (existsSync("/proc/self/fd")) {
         const fds = () => readdirSync("/proc/self/fd").length;
         const fdsBefore = fds();
         for (let i = 0; i < 100; i++) {
           resume(now.ok ? now.file : undefined);
+          setSessionResumeReadForTests({
+            beforeRead: () => {
+              throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
+            },
+          });
+          try {
+            assert.throws(
+              () => resume(now.ok ? now.file : undefined),
+              isWriteFailed,
+              "read throws",
+            );
+          } finally {
+            setSessionResumeReadForTests(null);
+          }
           assert.throws(
             () =>
               SessionWriter.resume(
@@ -1458,7 +1476,17 @@ test("M2-A1 FU L1 (Argus pre-check of 15d4d9c): resume's K2 re-read goes through
             "short file",
           );
         }
-        assert.ok(fds() - fdsBefore < 10, `fd leak: ${fdsBefore} → ${fds()} over 200 resumes`);
+        for (let i = 0; i < 100; i++) {
+          const cur = verifySessionFile(f.path, "thr_src");
+          assert.ok(cur.ok);
+          setSessionResumeReadForTests({ beforeOpen: replaceWithTwin });
+          try {
+            assert.throws(() => resume(cur.ok ? cur.file : undefined), isWriteFailed, "twin swap");
+          } finally {
+            setSessionResumeReadForTests(null);
+          }
+        }
+        assert.ok(fds() - fdsBefore < 10, `fd leak: ${fdsBefore} → ${fds()} over 400 resumes`);
       }
     } finally {
       setSessionResumeReadForTests(null);
@@ -1503,7 +1531,7 @@ test("M2-A1 FU L1 (Argus pre-check of 15d4d9c): resume's K2 re-read goes through
   }
 });
 
-test("M2-A1 FU L1 errors (Argus pre-check of d55725d, M5): an exception inside resume's re-read (open's ENXIO on a Unix socket at the path; an injected read-time error) is -32009, never a raw error", () => {
+test("M2-A1 FU L1 errors (Argus pre-checks of d55725d, M5, and 69f0c86, N1): an error at open time (ENXIO, as open gives for a Unix socket, thrown inside openNoFollow) or at read time (an injected EIO) is -32009, never a raw error", () => {
   const f = fixture();
   try {
     f.writer.append("turn.start", { turnId: "turn_1", inputText: "x" });
@@ -1526,7 +1554,27 @@ test("M2-A1 FU L1 errors (Argus pre-check of d55725d, M5): an exception inside r
       );
     const isWriteFailed = (err: unknown) =>
       err instanceof RpcError && err.code === ErrorCode.SessionWriteFailed;
-    // An error thrown inside the re-read (as a read error, EIO, would be) is caught there.
+    // Open time: the fallback path's afterLstat hook runs inside openNoFollow's try, which rethrows
+    // anything but ENOENT / ELOOP: the same path a real ENXIO from open takes.
+    let opened = 0;
+    setSessionResumeReadForTests({
+      noFollowFlag: false,
+      afterLstat: () => {
+        opened++;
+        throw Object.assign(new Error("ENXIO: no such device or address, open"), { code: "ENXIO" });
+      },
+    });
+    try {
+      assert.throws(resume, isWriteFailed, "an open-time ENXIO is -32009");
+    } finally {
+      setSessionResumeReadForTests(null);
+    }
+    assert.equal(
+      opened,
+      1,
+      "the ENXIO was thrown inside openNoFollow (between its lstat and open)",
+    );
+    // Read time: an error thrown inside the re-read (as a read error, EIO, would be).
     setSessionResumeReadForTests({
       beforeRead: () => {
         throw Object.assign(new Error("EIO: i/o error, read"), { code: "EIO" });
@@ -1538,24 +1586,66 @@ test("M2-A1 FU L1 errors (Argus pre-check of d55725d, M5): an exception inside r
       setSessionResumeReadForTests(null);
     }
     resume(); // the same file, no injected error: a writer
-    // A Unix socket at the path: open answers ENXIO. The engine has no socket code (§8.7, honesty
-    // test), so the socket file is bound by a short python3 child; skipped where there is none.
-    if (process.platform === "win32") return;
-    rmSync(f.path);
-    const bind = spawnSync(
-      "python3",
-      ["-c", "import socket, sys; socket.socket(socket.AF_UNIX).bind(sys.argv[1])", f.path],
-      { encoding: "utf8", timeout: 10_000 },
-    );
-    if (bind.status !== 0) return;
-    assert.equal(lstatSync(f.path).isSocket(), true);
-    assert.throws(resume, isWriteFailed, "a socket at the path is -32009");
-    assert.equal(lstatSync(f.path).isSocket(), true, "the socket is left in place");
   } finally {
     setSessionResumeReadForTests(null);
     f.cleanup();
   }
 });
+
+// A real EACCES at open (mode 000). Root opens it anyway and Windows has no POSIX modes, so there
+// the case is a reported skip. `test.skip`, not `{ skip }`: Bun 1.3.11's node:test runs a test
+// whose options say `skip` (1.4.2 and Node skip it).
+const eaccesSkip =
+  process.getuid?.() === 0
+    ? "runs as root (root ignores mode 000)"
+    : process.platform === "win32"
+      ? "no POSIX file modes"
+      : null;
+if (eaccesSkip !== null) console.log(`SKIP M2-A1 FU L1 errors, EACCES: ${eaccesSkip}`);
+(eaccesSkip !== null ? test.skip : test)(
+  "M2-A1 FU L1 errors, EACCES (Argus pre-check of 69f0c86, N1): a session file that can't be opened (mode 000) is -32009 at resume, never a raw EACCES",
+  () => {
+    const f = fixture();
+    try {
+      f.writer.append("turn.start", { turnId: "turn_1", inputText: "x" });
+      const v = verifySessionFile(f.path, "thr_src");
+      assert.ok(v.ok);
+      if (!v.ok || v.size === undefined) return;
+      const resume = () =>
+        SessionWriter.resume(
+          f.path,
+          "thr_src",
+          "madc-default",
+          v.nextSeq,
+          v.lastHash,
+          () => [],
+          f.dir,
+          v.file,
+          { holdsLock: () => true, expectedSize: v.size as number },
+          undefined,
+          SessionChainIndex.fromEvents(v.events),
+        );
+      chmodSync(f.path, 0o000);
+      try {
+        assert.throws(
+          () => openSync(f.path, "r"),
+          { code: "EACCES" },
+          "the file really can't be opened",
+        );
+        assert.throws(
+          resume,
+          (err: unknown) => err instanceof RpcError && err.code === ErrorCode.SessionWriteFailed,
+          "an open-time EACCES is -32009",
+        );
+      } finally {
+        chmodSync(f.path, 0o600);
+      }
+      resume(); // readable again: a writer
+    } finally {
+      f.cleanup();
+    }
+  },
+);
 
 // ===================================================================== a.6 P11
 
