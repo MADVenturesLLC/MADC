@@ -311,6 +311,51 @@ export function setSessionAppendOpenForTests(opts: OpenNoFollowOptions | null): 
   appendOpenOpts = opts ?? {};
 }
 
+/** Test seams for resume's re-read (Argus pre-check of 15d4d9c, L1): `openNoFollow`'s options plus a
+ * hook that runs after resume's identity check and before the open, and one that runs after the fd
+ * checks and before the read (Argus pre-check of d55725d, M3). Null resets. Internal. */
+export type SessionResumeReadOptions = OpenNoFollowOptions & {
+  beforeOpen?: () => void;
+  beforeRead?: () => void;
+};
+let resumeReadOpts: SessionResumeReadOptions = {};
+export function setSessionResumeReadForTests(opts: SessionResumeReadOptions | null): void {
+  resumeReadOpts = opts ?? {};
+}
+
+/**
+ * Resume's re-read (K2), through one fd like every other read and append here: `openNoFollow`
+ * (O_NOFOLLOW | O_NONBLOCK, so a symlink fails and a FIFO planted at the path cannot block), then
+ * `fstat`: a regular file and, when the caller verified one, that very file (dev + inode). Null on
+ * any failure (missing, a symlink, not a regular file, another file, unreadable).
+ */
+function readSessionForResume(
+  realPath: string,
+  verifiedFile: SessionFileId | undefined,
+): Buffer | null {
+  try {
+    resumeReadOpts.beforeOpen?.();
+    const fd = openNoFollow(realPath, resumeReadOpts);
+    if (fd === null || fd === "symlink") return null;
+    try {
+      const st = fstatSync(fd, { bigint: true });
+      if (!st.isFile()) return null;
+      if (
+        verifiedFile !== undefined &&
+        (st.dev !== verifiedFile.dev || st.ino !== verifiedFile.ino)
+      ) {
+        return null;
+      }
+      resumeReadOpts.beforeRead?.();
+      return readFileSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Open the session file for appending without following a symlink. With O_NOFOLLOW this is one
  * open. Without it (e.g. Windows) it is lstat → open → fstat, and the fd is used only if it is the
@@ -545,6 +590,20 @@ export class SessionWriter {
         issues: refusal.issues,
       });
     }
+    // Argus P13 (Copilot review 5391183893): the structural-redaction refusal for `session.open`
+    // (an id, path or remote redaction would rewrite) is ALSO decided before the file exists, so
+    // that refusal leaves nothing on disk either — no create-then-unlink window. The same check
+    // still runs again in `append` below (unchanged), on the same payload and secrets.
+    const structural = redactionRefusal("session.open", open, createRedactor(secrets())(open));
+    if (structural !== null) {
+      throw evidenceInvalid({
+        threadId,
+        turnId: null,
+        type: "session.open",
+        reason: structural.reason,
+        issues: structural.issues,
+      });
+    }
     let created: { dev: bigint; ino: bigint };
     try {
       const fd = openSync(path, APPEND_FLAGS | constants.O_CREAT | constants.O_EXCL, 0o600);
@@ -618,10 +677,11 @@ export class SessionWriter {
    * file to still be exactly that long (plus this writer's own writes).
    *
    * M2 (D-M2-A0-4): `index` is the chain index of the verified events (`SessionChainIndex
-   * .fromEvents(verified.events)`), so same-file evidence refs resolve at write time. A caller that
-   * passes none gets an EMPTY index: every same-file ref, every `handoff.link` / `handoff.aborted`
-   * and every non-null `session.close.worktree` is then refused (fail-closed), never resolved
-   * against a file the writer did not read.
+   * .fromEvents(verified.events)`), so same-file evidence refs resolve at write time. It is
+   * REQUIRED (Argus P11): there is no default empty index any more — an empty one made a v2 file
+   * look like v1, so the writer accepted a keyless `session.close` its own verifier then FAILed.
+   * The index must describe the chain being continued: `index.length === nextSeq` and its last
+   * line's hash is `lastHash` (genesis for an empty chain), else `TypeError` and no writer.
    */
   static resume(
     path: string,
@@ -634,7 +694,7 @@ export class SessionWriter {
     verifiedFile: SessionFileId | undefined,
     guards: SessionResumeGuards,
     hooks: SessionWriterHooks = {},
-    index: SessionChainIndex = new SessionChainIndex(),
+    index: SessionChainIndex,
   ): SessionWriter {
     // Amendment 3 item 3 (Option A): `guards` is a required parameter — resume binds the lock and
     // the verified size, and omitting either is a tsc error AND a run-time throw (3c).
@@ -644,6 +704,13 @@ export class SessionWriter {
     if (typeof guards.expectedSize !== "number") {
       throw new TypeError(
         "SessionWriter.resume requires the verified size (expectedSize) (Amendment 3 item 3)",
+      );
+    }
+    // Argus P11: the index is required and must be the index of THIS chain (length and head
+    // hash), so a caller cannot hand the writer an index for another file, a forged one, or none.
+    if (!(index instanceof SessionChainIndex)) {
+      throw new TypeError(
+        "SessionWriter.resume requires the chain index of the verified events (SessionChainIndex.fromEvents)",
       );
     }
     const holdsLock = guards.holdsLock;
@@ -666,6 +733,47 @@ export class SessionWriter {
         throw sessionWriteFailed(threadId, path, nextSeq);
       }
     }
+    // Argus F2: the writer keeps its OWN copy. The caller's object stays mutable after resume (its
+    // `note()`), and a line noted on it later must never become a line this writer resolves.
+    const own = index.clone();
+    // Argus P11: checked after the file checks above, so their -32009 keeps its precedence.
+    const indexHead = nextSeq === 0 ? GENESIS_HASH : own.lineAt(nextSeq - 1)?.hash;
+    if (own.length !== nextSeq || indexHead !== lastHash) {
+      throw new TypeError(
+        "SessionWriter.resume: the chain index does not describe the chain being continued (length / last hash)",
+      );
+    }
+    // Copilot r4174562359 / Argus PR #48 r1 K2 (completes P11): length and head do not prove the
+    // middle lines. Resume re-verifies the bytes it continues (the verified `expectedEnd`), every
+    // line of the caller's index must be the file's line at that seq (hash and type), and the
+    // writer's index is built from the file's own events, so neither a forged middle line nor a
+    // payload noted under a real hash can become something this writer resolves. An unreadable or
+    // short file, or one that is not a regular file (Argus pre-check of 15d4d9c, L1: read through
+    // one O_NOFOLLOW | O_NONBLOCK fd + fstat, never by path), is -32009 (like the identity checks
+    // above); a chain that is not the one named by `nextSeq` / `lastHash` / `index` is TypeError.
+    const bytes = readSessionForResume(realPath, verifiedFile);
+    if (bytes === null) throw sessionWriteFailed(threadId, path, nextSeq);
+    if (bytes.length < expectedEnd) throw sessionWriteFailed(threadId, path, nextSeq);
+    const onDisk =
+      expectedEnd === 0
+        ? ({ ok: true, events: [], nextSeq: 0, lastHash: GENESIS_HASH } as const)
+        : verifySessionText(bytes.subarray(0, expectedEnd).toString("utf8"), threadId);
+    const fileIndex = onDisk.ok ? SessionChainIndex.fromEvents(onDisk.events) : null;
+    const differs =
+      !onDisk.ok ||
+      fileIndex === null ||
+      onDisk.nextSeq !== nextSeq ||
+      onDisk.lastHash !== lastHash ||
+      Array.from({ length: nextSeq }, (_, seq) => seq).some((seq) => {
+        const mine = own.lineAt(seq);
+        const disk = fileIndex.lineAt(seq);
+        return mine?.hash !== disk?.hash || mine?.type !== disk?.type;
+      });
+    if (differs || fileIndex === null) {
+      throw new TypeError(
+        "SessionWriter.resume: the chain index does not describe the chain being continued (a line differs from the file)",
+      );
+    }
     return new SessionWriter(
       path,
       realPath,
@@ -677,7 +785,7 @@ export class SessionWriter {
       expectedEnd,
       holdsLock,
       hooks,
-      index,
+      fileIndex,
     );
   }
 
@@ -722,6 +830,22 @@ export class SessionWriter {
   }
 
   /**
+   * The `turnId` a -32010 `data` may echo (Argus G1; the D-350/D-375 class): the payload's
+   * well-formed id only when redaction leaves it unchanged, else null. A refused payload never
+   * reaches the redactor, so a configured secret or a token-shaped id would otherwise leave the
+   * engine verbatim in the error. A secrets source that throws fails closed to null.
+   */
+  #echoableTurnId(payload: unknown): string | null {
+    const t = turnIdOf(payload);
+    if (t === null) return null;
+    try {
+      return createRedactor(this.#secrets())(t) === t ? t : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * Append several events as one unit (consecutive seqs, one write through one fd): either all of
    * them are durable or none is (rolled back on failure). Used for the servedModel dual write.
    *
@@ -749,7 +873,7 @@ export class SessionWriter {
     const refuse = (type: string, payload: unknown, refusal: WriteRefusal): RpcError =>
       evidenceInvalid({
         threadId: this.threadId,
-        turnId: turnIdOf(payload),
+        turnId: this.#echoableTurnId(payload),
         type,
         reason: refusal.reason,
         issues: refusal.issues,
@@ -910,9 +1034,21 @@ export const unguardedSessionWriterForTests = {
       throw sessionWriteFailed(threadId, path, nextSeq);
     }
     // M2: a test resume reads the file it continues, so same-file refs resolve exactly as the
-    // engine's resume (which builds the index from the events it verified) resolves them.
+    // engine's resume (which builds the index from the events it verified) resolves them. A file
+    // the confined verifier refuses (a fixture outside the home, a symlinked fixture) is read as
+    // text so the required index (Argus P11) still describes it; anything else gets an empty
+    // index, which resume then refuses unless the chain is empty.
     const verified = verifySessionFile(path, threadId, {}, home);
-    const index = verified.ok ? SessionChainIndex.fromEvents(verified.events) : undefined;
+    let events: readonly SessionEvent[] | undefined = verified.ok ? verified.events : undefined;
+    if (events === undefined) {
+      try {
+        const text = verifySessionText(readFileSync(realpathSync(path), "utf8"), threadId);
+        if (text.ok) events = text.events;
+      } catch {
+        // unreadable: fall through to an empty index
+      }
+    }
+    const index = SessionChainIndex.fromEvents(events ?? []);
     return SessionWriter.resume(
       path,
       threadId,

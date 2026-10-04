@@ -38,6 +38,8 @@ import { seedDefaultSeat, serializeSeat, setSeedHooksForTests } from "./seat-sto
 import { EngineConnection } from "./server.ts";
 import {
   GENESIS_HASH,
+  SessionChainIndex,
+  type SessionEvent,
   SessionWriter,
   setSessionCloseForTests,
   setSessionFsyncForTests,
@@ -162,6 +164,12 @@ const SAMPLE_OPEN = {
   providerId: "kimi-code",
   pinnedModel: "m",
 } as const;
+
+/** The verified events of a session file (the chain index a resume now requires, Argus P11). */
+function verifiedEvents(path: string): readonly SessionEvent[] {
+  const v = verifySessionText(readFileSync(path, "utf8"));
+  return v.ok ? v.events : [];
+}
 
 /** Hash of the last line of a session file (the chain head). */
 function readLastHash(path: string): string {
@@ -812,6 +820,9 @@ test("A3 3a (PROBE-G, kills 17-E): a resumed writer that lost its lock answers -
       undefined,
       undefined,
       { holdsLock: () => held, expectedSize: statSync(path).size },
+      undefined,
+      // Argus P11: resume now requires the verified chain's index.
+      SessionChainIndex.fromEvents(verifiedEvents(path)),
     );
     held = false; // the lock is lost, with no foreign append yet
     const before = readFileSync(path);
@@ -846,6 +857,9 @@ test("A3 3b (kills 17-D): an external append between verification and resume fai
       home,
       verified.file,
       { holdsLock: () => true, expectedSize: verified.size as number },
+      undefined,
+      // Argus P11: resume now requires the verified chain's index.
+      SessionChainIndex.fromEvents(verified.events),
     );
     assert.throws(
       () => w.append("turn.start", { turnId: "turn_2", inputText: "x" }),
@@ -888,6 +902,8 @@ test("A3 3c: create / resume without the guards fail at the type level (tsc) and
         undefined,
         // @ts-expect-error Amendment 3 item 3: resume requires the verified expectedSize
         { holdsLock: () => true },
+        undefined,
+        new SessionChainIndex(),
       );
     }, TypeError);
     assert.equal(existsSync(path), false, "no file created by the refused calls");

@@ -26,6 +26,7 @@ import {
   rmSync,
   statSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -349,6 +350,10 @@ test("M2 §10.2 one-way is refused: no handoff.link → -32010 handoff-one-way o
       assert.ok((await e.request("thread/resume", { threadId: "thr_src" })).result);
       await serve(e, "thr_src", "carry on");
       await e.close();
+      // I8 (Argus): "newest" is decided by mtime; the target is set a minute older explicitly, so
+      // the assertion below never depends on two writes landing in different clock ticks.
+      const older = new Date(Date.now() - 60_000);
+      utimesSync(sessionPath(home, "thr_tgt"), older, older);
       // doctor's home report carries the finding for the newest session.
       const report = inspectMadcHome(home);
       assert.equal(report.lastSession?.threadId, "thr_src");

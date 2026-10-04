@@ -30,6 +30,7 @@ import type { Turn } from "./protocol/types.ts";
 import { seedDefaultSeat } from "./seat-store.ts";
 import { EngineConnection } from "./server.ts";
 import {
+  SessionChainIndex,
   SessionWriter,
   setSessionFsyncForTests,
   unguardedSessionWriterForTests,
@@ -471,6 +472,9 @@ test("A2 §8.3 resume is bound to the verified size: bytes appended after verifi
         holdsLock: () => true,
         expectedSize,
       },
+      undefined,
+      // Argus P11: resume now requires the verified chain's index.
+      SessionChainIndex.fromEvents(v.events),
     );
     assert.throws(
       () => w.append("turn.start", { turnId: "turn_1", inputText: "a" }),
