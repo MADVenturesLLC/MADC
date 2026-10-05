@@ -1,8 +1,10 @@
 # madc M2 build plan — the room: multi-seat work + evidence schema v2
 
-*Daedalus · 2026-10-04 · Venue: `MADVenturesLLC/MADC` only · Status: **draft**. It is not a merge authorization, it authorizes no act, and it does not start until the Founder accepts it (D-M2-1).*
+*Daedalus · 2026-10-04 · Venue: `MADVenturesLLC/MADC` only · Status: **accepted and commissionable** (Founder, 2026-10-05: "Accept the plan and the defaults"). It is not a merge authorization: each act still needs its own Founder commission and its own Founder merge at an exact head SHA.*
 
 *Revised by Surface Architect after Argus review at `4915e5b` (2026-10-05): Argus findings H1–H3, M1–M7 and L1–L9, and the six Copilot threads on PR #53. Daedalus wrote the original draft; this revision edits the draft in place under the README edit rule and rules nothing.*
+
+*Founder acceptance recorded 2026-10-05 (Founder): "Accept the plan and the defaults". This is the D-M2-1 acceptance itself, stated explicitly so it is not read as "accept defaults" alone. All nine D-M2 decisions are ruled as their recommended defaults (§12). D-M2-9's default is not a value: it requires the per-seat cap to be ruled before M2-A5 starts, so the cap's shape is still the Founder's to set. The plan merged as PR #53 at head `aa18875d76fda6ac9a28fbbb41ff5efd105b6b8b`, merge commit `2b44e6bb9d6ee281a4d5795f768c36806db93431`, at which point the file still read **draft**; this line is the acceptance, landed by a later docs-only PR under the README draft edit rule.*
 
 *Base: `main` @ `1580a44be4dc21776f35f9755c2520397935aaa4` (the PR #51 merge). Every file, line count and SHA-256 below was read at that commit. The pins are cited by hash, not by memory. Revision base: `main` @ `a4b2ab36f3d4abbd677ceeb3303f8e105b148fcd` (the PR #52 merge). PR #52 changes `AGENTS.md` lines 4, 15 and 17 only, so every hash in §1 is unchanged at `a4b2ab3`.*
 
@@ -258,7 +260,7 @@ Surface Architect owns the pins. In M2 the pattern that worked for A0 and A2 hol
 
 ## 11. Handoff notes for Hephaestus
 
-1. Wait for the Founder to accept this plan (D-M2-1). A3 does not start before carried obligation 1 (the turnId follow-up and handoff amendment 1) has merged. A3's own PR adds the M2 A0–A2 state line to `AGENTS.md`. `main` carries no M2 state line, and PR #52 added none.
+1. The Founder accepted this plan (D-M2-1, 2026-10-05). A3 does not start before carried obligation 1 (the turnId follow-up and handoff amendment 1) has merged. A3's own PR adds the M2 A0–A2 state line to `AGENTS.md`. `main` carries no M2 state line, and PR #52 added none.
 2. Base every PR on current `main`. Name the exact head SHA in every merge ask. Never merge.
 3. Pin before code when an act changes a pin's subject. A3, A4, A5 and A6 each land their pin text with their code, or the pin first, as the Founder's merge settles.
 4. Quote the pins by SHA-256. If a pin's text and this plan disagree, the pin governs and the report says so.
@@ -267,18 +269,18 @@ Surface Architect owns the pins. In M2 the pattern that worked for A0 and A2 hol
 
 ## 12. FOUNDER_DECISION_REQUIRED
 
-Nothing below is ruled. Each row is a proposal with a recommended default.
+Ruled by the Founder on 2026-10-05: "Accept the plan and the defaults". D-M2-1 is recorded as acceptance of this plan as commissionable, not as "accept defaults" alone. D-M2-2 to D-M2-8 are recorded as their recommended defaults. D-M2-9 is recorded as its default, which is itself a requirement to rule the cap before M2-A5 starts: that ruling is still open.
 
-| # | Decision | Recommended default | Rationale |
-| --- | --- | --- | --- |
-| **D-M2-1** | Accept this plan as commissionable? | Plan stays **draft** until the Founder states acceptance explicitly. | The M1 precedent (D-M1-1): "accept defaults" was correctly read as *not* acceptance. |
-| **D-M2-2** | Worktree isolation: (a) where does the field live (a new seat-pin field, or an engine-only convention with no seat file change)? (b) is worktree mode mandatory for room seats, or opt-in per seat? | **(a) A new seat-pin field. (b) Opt-in per seat**, with criterion C scoped to opted-in seats. | A confinement rule that no seat can state is not a rule; the pin is where the confined root is defined. Opt-in keeps v1 seat files and non-git `cwd` seats loading unchanged; making it mandatory would turn a non-git `cwd` into a refusal for every room seat. |
-| **D-M2-3** | How does a handoff deliver work: does the target's next `turn/start` carry the brief, or does the engine start a turn on the target? | **The target's next `turn/start` carries the brief once.** No engine-started turn. | It preserves A2's own rule that no turn starts inside a procedure, and it keeps every running agent a deliberate act. |
-| **D-M2-4** | Worktree lifetime: leave every tree on close, or remove a clean one? | **Leave every tree.** A removal is a separate act with its own refusal rules. | Removing is the irreversible half; leaving costs disk, and disk is cheap next to lost work. |
-| **D-M2-5** | Is the decision inbox a protocol method or a CLI-only read over existing chain state? | **A protocol method**, with `madc decisions ls` as one client of it. | M3 binds to the same schema next; a CLI-only read is a second source of truth. |
-| **D-M2-6** | Does M2 include merging a worktree branch back? | **No.** Out of M2; a later, separately authorized act. | Isolation is the milestone's claim; merge-back is an integration authority this plan does not need to prove the room works. |
-| **D-M2-7** | `protocolVersion`: stay `madc-m1/1` with additive methods, or bump for M2? | **Decide in P-M2-3, and prefer additive** unless a method's semantics change under an existing name. | The envelope precedent (D-M2-A0-6) is the same argument: additive buys compatibility and costs nothing a version string would enforce. |
-| **D-M2-8** | Commission M2-A3…A9 as stacked PRs, one act each? | **Yes**; the Founder merges each SHA. | The M1 program ran this way and each act stayed reviewable. |
-| **D-M2-9** | Per-seat rate cap for parallel Claude Code seats: required in M2, and if so where is it stated and enforced? | **Rule it before A5 starts.** If yes, the seat pin carries a per-seat cap field (P-M2-2) and A5 enforces it; the cap's value and unit are the Founder's to set. | The roadmap flags it (`:121`, "should be rate-capped per seat"; `:48`, parallel vendor agents "burn subscription limits faster"), but the cap's shape is product design this plan does not invent. |
+| # | Decision | Recommended default | Rationale | Founder ruling (2026-10-05) |
+| --- | --- | --- | --- | --- |
+| **D-M2-1** | Accept this plan as commissionable? | Plan stays **draft** until the Founder states acceptance explicitly. | The M1 precedent (D-M1-1): "accept defaults" was correctly read as *not* acceptance. | **Accepted.** "Accept the plan and the defaults" (Founder, 2026-10-05). The plan is commissionable; each act still needs its own commission and its own merge. |
+| **D-M2-2** | Worktree isolation: (a) where does the field live (a new seat-pin field, or an engine-only convention with no seat file change)? (b) is worktree mode mandatory for room seats, or opt-in per seat? | **(a) A new seat-pin field. (b) Opt-in per seat**, with criterion C scoped to opted-in seats. | A confinement rule that no seat can state is not a rule; the pin is where the confined root is defined. Opt-in keeps v1 seat files and non-git `cwd` seats loading unchanged; making it mandatory would turn a non-git `cwd` into a refusal for every room seat. | **Default accepted.** |
+| **D-M2-3** | How does a handoff deliver work: does the target's next `turn/start` carry the brief, or does the engine start a turn on the target? | **The target's next `turn/start` carries the brief once.** No engine-started turn. | It preserves A2's own rule that no turn starts inside a procedure, and it keeps every running agent a deliberate act. | **Default accepted.** |
+| **D-M2-4** | Worktree lifetime: leave every tree on close, or remove a clean one? | **Leave every tree.** A removal is a separate act with its own refusal rules. | Removing is the irreversible half; leaving costs disk, and disk is cheap next to lost work. | **Default accepted.** |
+| **D-M2-5** | Is the decision inbox a protocol method or a CLI-only read over existing chain state? | **A protocol method**, with `madc decisions ls` as one client of it. | M3 binds to the same schema next; a CLI-only read is a second source of truth. | **Default accepted.** |
+| **D-M2-6** | Does M2 include merging a worktree branch back? | **No.** Out of M2; a later, separately authorized act. | Isolation is the milestone's claim; merge-back is an integration authority this plan does not need to prove the room works. | **Default accepted.** |
+| **D-M2-7** | `protocolVersion`: stay `madc-m1/1` with additive methods, or bump for M2? | **Decide in P-M2-3, and prefer additive** unless a method's semantics change under an existing name. | The envelope precedent (D-M2-A0-6) is the same argument: additive buys compatibility and costs nothing a version string would enforce. | **Default accepted.** |
+| **D-M2-8** | Commission M2-A3…A9 as stacked PRs, one act each? | **Yes**; the Founder merges each SHA. | The M1 program ran this way and each act stayed reviewable. | **Default accepted.** |
+| **D-M2-9** | Per-seat rate cap for parallel Claude Code seats: required in M2, and if so where is it stated and enforced? | **Rule it before A5 starts.** If yes, the seat pin carries a per-seat cap field (P-M2-2) and A5 enforces it; the cap's value and unit are the Founder's to set. | The roadmap flags it (`:121`, "should be rate-capped per seat"; `:48`, parallel vendor agents "burn subscription limits faster"), but the cap's shape is product design this plan does not invent. | **Default accepted: the cap must be ruled before A5 starts.** The value and unit are still the Founder's to set. |
 
 *End of the draft M2 build plan.*
