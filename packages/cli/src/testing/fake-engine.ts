@@ -55,6 +55,16 @@ const record = (what: string) => {
   if (mark !== undefined) appendFileSync(mark, `${what}\n`);
 };
 
+/**
+ * §3e E6/E7 test anchor. `MADC_TEST_FAKE_READY_MARK` is appended once, when the fake's first
+ * request arrives (its `initialize`). By then the CLI has finished module load, armed the
+ * signal backstop and reached the probe, so a test that waits for this mark and then signals
+ * measures process teardown, not module-load time — which is unbounded on a loaded runner.
+ * Distinct from `MADC_TEST_FAKE_MARK`, whose scenario-gated writes other tests depend on.
+ */
+const readyMark = process.env.MADC_TEST_FAKE_READY_MARK;
+let readyRecorded = false;
+
 let answeredFirst = false;
 const rl = createInterface({ input: process.stdin });
 // "exit-nonzero": the turn completes normally, then the engine exits 7 on stdin EOF.
@@ -103,6 +113,10 @@ const receipt = (itemId: string, servedModel: string, backing = "kimi-code") => 
 });
 
 rl.on("line", (line) => {
+  if (readyMark !== undefined && !readyRecorded) {
+    readyRecorded = true;
+    appendFileSync(readyMark, "ready\n");
+  }
   const msg = JSON.parse(line) as { id?: number; method: string; params?: Record<string, unknown> };
   if (msg.id === undefined) return;
   // "e1-client" (allowance A1 client tests): the FIRST request gets a malformed error body
