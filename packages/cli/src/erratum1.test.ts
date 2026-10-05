@@ -1265,7 +1265,18 @@ test("§3e E6: a signal before the engine is spawned → nothing spawned, exit 1
       },
     });
     assert.equal(r.code, 143, r.stdout + r.stderr);
-    assert.ok(Date.now() - signalledAt < 1_000, "abandoned the stdin read at once");
+    // Abandoning the stdin read is proven by the process EXITING while stdin was still open:
+    // `r.code === 143` above means the CLI handled the signal and never had to be SIGKILLed, and
+    // `keepStdinOpen` means it saw no EOF to release the read. The former tight bound here
+    // (< 1000 ms) measured none of that; it measured the module tree still loading after the
+    // signal, which is unbounded on a loaded runner. CI measured > 1000 ms on this assertion
+    // while the three E7 tests passed under the same load. Kept as a generous hang guard, well
+    // inside the 15 s SIGKILL deadline below.
+    assert.equal(r.signal, null, "the CLI exited on its own; the test never had to SIGKILL it");
+    assert.ok(
+      Date.now() - signalledAt < 5_000,
+      `the signal was abandoned, not waited out (${Date.now() - signalledAt} ms)`,
+    );
     const out = parseJson(r.stdout);
     assert.equal(out.exitCode, 143);
     assert.equal(out.seatId, "madc-default");
