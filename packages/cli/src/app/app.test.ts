@@ -1,1 +1,1 @@
-file:///workspace/madc-tokyo-night/packages/cli/src/app/app.test.ts
+@/workspace/madc-tokyo-night/packages/cli/src/app/app.test.ts
