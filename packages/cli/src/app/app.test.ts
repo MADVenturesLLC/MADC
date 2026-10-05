@@ -16,13 +16,12 @@ import { spawnEngine } from "@madc/engine/client";
 import type { Check } from "../doctor.ts";
 import { EXIT } from "../exit-codes.ts";
 import type { CliIO } from "../io.ts";
-import { RecordingOut, ScreenModel, VirtualTty } from "../testing/virtual-tty.ts";
+import { RecordingOut, VirtualTty } from "../testing/virtual-tty.ts";
 import { type KeyValue, WitnessApp } from "./app.ts";
 import type { BannerData, DoctorSummary } from "./frames.ts";
 import { runInlineApp } from "./inline.ts";
 import { runWitnessApp, seatFields, uiNoteFor } from "./launch.ts";
 import { runLineModeApp } from "./line-mode.ts";
-import { visibleWidth } from "./style.ts";
 
 const APP_FIXTURE = fileURLToPath(new URL("../testing/app-fixture.ts", import.meta.url));
 
@@ -255,9 +254,10 @@ describe("Witness app (tier W)", () => {
       await r.app.start();
       let frame = r.tty.lastFrame().join("\n");
       assert.match(frame, /madc 0\.0\.0/);
-      assert.match(frame, /Seat/);
-      assert.match(frame, /Doctor at launch/);
-      assert.match(frame, /thread none yet/);
+      assert.match(frame, /seat/);
+      // Doctor rows and the old thread line are not drawn on the startup box (Q13).
+      assert.doesNotMatch(frame, /Doctor at launch/);
+      assert.doesNotMatch(frame, /thread none yet/);
       r.app.onDoctorFinished(214);
       sendTurn(r.tty, "What does exit 2 mean?");
       await until(
@@ -265,16 +265,16 @@ describe("Witness app (tier W)", () => {
         "first turn + verify",
       );
       frame = r.tty.lastFrame().join("\n");
-      // Banner collapsed to the header (§5.1).
-      assert.match(frame, /MADC madc-default · kimi-code · madc-m0\/1/);
-      assert.doesNotMatch(frame, /thread none yet/);
-      // Solid rail with the verified chain, from the REAL disk verify (worker).
-      assert.match(frame, /┗━ seq 4 · head [0-9a-f]{12} · chain VERIFIED · turn 1/);
-      // The green verdict: earned only because the verify passed and turn.end names the turn.
-      assert.match(frame, /chain VERIFIED · exit 0/);
-      assert.match(frame, /C.*O.*M.*P.*L.*E.*T.*E.*D/s);
-      // Pills show the served model from the receipt item.
-      assert.match(frame, /served: kimi-for-coding/);
+      // Startup box hides after the first turn. Status bar keeps the seat; the model
+      // slot is the served model only after the receipt.
+      assert.match(frame, /madc-default/);
+      assert.doesNotMatch(frame, /version {3}madc/);
+      // One green verdict line from the real disk verify. No block-art card.
+      assert.match(frame, /✓ seq 4 · head [0-9a-f]{12} · chain VERIFIED/);
+      assert.doesNotMatch(frame, /chain VERIFIED · turn 1/);
+      assert.doesNotMatch(frame, /████/);
+      assert.match(frame, /kimi-for-coding/);
+      assert.doesNotMatch(frame, /requested /);
       r.app.onSigint(); // quit by interrupt (idle)
       await r.cleanup();
     } catch (e) {
@@ -295,8 +295,11 @@ describe("Witness app (tier W)", () => {
       );
       const frame = r.tty.lastFrame().join("\n");
       assert.doesNotMatch(frame, /chain VERIFIED · turn 1/);
-      assert.match(frame, /UNVERIFIED: the chain's last turn\.end does not name this turn/);
-      // No verdict card in this frame: nothing was earned on disk evidence.
+      assert.equal(r.app.turns[0]?.unverified, "the chain's last turn.end does not name this turn");
+      // The line wraps beside the git panel, so the sentence is not one regex span.
+      assert.match(frame, /UNVERIFIED:/);
+      assert.match(frame, /this turn/);
+      assert.doesNotMatch(frame, /✓/);
       assert.doesNotMatch(frame, /· exit 0 ·/);
       await r.cleanup();
     } catch (e) {
@@ -317,8 +320,9 @@ describe("Witness app (tier W)", () => {
       );
       const frame = r.tty.lastFrame().join("\n");
       assert.match(frame, /read_file docs\/plan\/PIN-madc-M0-cli\.md/);
-      assert.match(frame, /toolCall → toolResult · isError=false/);
-      assert.match(frame, /235 lines · §4 Exit codes, lines 182-195/);
+      // The tool result body and the toolCall→toolResult meta line are not drawn.
+      assert.doesNotMatch(frame, /toolCall → toolResult/);
+      assert.doesNotMatch(frame, /235 lines/);
       await r.cleanup();
     } catch (e) {
       await r.cleanup();
@@ -340,7 +344,8 @@ describe("Witness app (tier W)", () => {
       );
       const frame = r.tty.lastFrame().join("\n");
       assert.match(frame, /chain FAILED line \d+/);
-      assert.match(frame, /input disabled/);
+      assert.match(frame, /chain failed/);
+      assert.doesNotMatch(frame, /input disabled/);
       // Enter does nothing in this state (§5.8); /new resets the thread.
       r.tty.key("enter");
       assert.equal(r.app.phase === "chain-failed" || r.app.phase === "torn-tail", true);
@@ -362,10 +367,11 @@ describe("Witness app (tier W)", () => {
       sendTurn(r.tty, "hi");
       await until(() => r.app.phase === "engine-stopped", "engine gone");
       const frame = r.tty.lastFrame().join("\n");
-      // §7: the EXIT 3 card is as big as COMPLETED — the big block art plus the class and code.
-      assert.match(frame, /engine · exit 3/);
-      assert.match(frame, /████████╗/);
-      assert.match(frame, /engine exited \(code 3\)/);
+      // Status center names the stop. The turn line is red. No EXIT block art.
+      assert.match(frame, /engine stopped/);
+      assert.match(frame, /engine exited/);
+      assert.doesNotMatch(frame, /████/);
+      assert.doesNotMatch(frame, /✓/);
       // Enter restarts (§5.8): back to idle; the engine respawns on the next send.
       r.tty.key("enter");
       await until(() => r.app.phase === "idle", "restart");
@@ -387,11 +393,13 @@ describe("Witness app (tier W)", () => {
         "turn",
       );
       r.tty.key("tab");
+      assert.equal(r.app.evidenceOpen, true);
       let frame = r.tty.lastFrame().join("\n");
-      assert.match(frame, /EVIDENCE/);
-      assert.match(frame, /sha256/);
-      assert.match(frame, /CHAIN/);
+      // The evidence pane is retired. Tab still toggles the flag and paints nothing new.
+      assert.doesNotMatch(frame, /EVIDENCE/);
+      assert.doesNotMatch(frame, /evidence pane/);
       r.tty.key("tab");
+      assert.equal(r.app.evidenceOpen, false);
       frame = r.tty.lastFrame().join("\n");
       assert.doesNotMatch(frame, /EVIDENCE/);
       type(r.tty, "/help");
@@ -498,7 +506,10 @@ describe("Witness app (tier W)", () => {
       const frame = r.tty.lastFrame().join("\n");
       // The interrupt raced or answered the turn; either way the segment never earns a solid
       // rail and the end line stays an honest UNVERIFIED (warn), never green.
-      assert.match(frame, /UNVERIFIED: /);
+      // Never green. A verify whose last turn.end does not name this turn uses the decided
+      // UNVERIFIED line. The interrupt glyph that would combine with a passing verify is Q10.
+      assert.match(frame, /UNVERIFIED:|interrupted/);
+      assert.doesNotMatch(frame, /✓/);
       // O-5: an in-app interrupted turn counts 0 — a NORMAL quit (Ctrl-D) exits 0, shown
       // INTERRUPTED. (A second Ctrl-C here would still be inside the interrupt grace and would
       // quit by interrupt with 130 — a different, also-ruled path.)
@@ -576,7 +587,9 @@ describe("Witness app (tier W)", () => {
         "literal turn",
       );
       const frame = r.tty.lastFrame().join("\n");
-      assert.match(frame, /you \/help me/);
+      assert.equal(r.app.turns[0]?.userText, "/help me");
+      assert.match(frame, /\/help me/);
+      assert.doesNotMatch(frame, /commands and keys/);
       await r.cleanup();
     } catch (e) {
       await r.cleanup();
@@ -794,7 +807,7 @@ describe("§3.4 production tier routing (runWitnessApp)", () => {
       tty,
     });
     await until(() => tty.chunks.length > 0, "first paint");
-    assert.match(tty.text(), /Seat/); // the tier-W banner
+    assert.match(tty.text(), /madc 0\.0\.0/); // the tier-W startup box
     assert.doesNotMatch(out.text(), /line mode/);
     // Teardown: the app has no turns; dispose via the quit path.
     tty.key("ctrl-d");
@@ -804,8 +817,8 @@ describe("§3.4 production tier routing (runWitnessApp)", () => {
   });
 });
 
-describe("§5.7 evidence overlay at 80-109 columns", () => {
-  it("Tab at 90 columns opens the pane as an overlay over the transcript", async () => {
+describe("§5.7 evidence pane retired", () => {
+  it("Tab toggles the flag and does not paint an evidence pane", async () => {
     const r = rig([{ kind: "ok" }]);
     (r.tty as VirtualTty).resize(90, 30);
     try {
@@ -817,12 +830,13 @@ describe("§5.7 evidence overlay at 80-109 columns", () => {
         "turn",
       );
       r.tty.key("tab");
+      assert.equal(r.app.evidenceOpen, true);
       const frame = r.tty.lastFrame().join("\n");
-      assert.match(frame, /evidence/);
-      assert.match(frame, /Tab hide/);
-      assert.match(frame, /SEAT/);
-      assert.match(frame, /CHAIN/);
-      r.tty.key("tab"); // closes
+      assert.doesNotMatch(frame, /EVIDENCE/);
+      assert.doesNotMatch(frame, /Tab hide/);
+      assert.doesNotMatch(frame, /evidence pane/);
+      r.tty.key("tab");
+      assert.equal(r.app.evidenceOpen, false);
       await r.cleanup();
     } catch (e) {
       await r.cleanup();
@@ -831,133 +845,13 @@ describe("§5.7 evidence overlay at 80-109 columns", () => {
   });
 });
 
-describe("§5.1 banner doctor counts track the live launch doctor", () => {
-  it("streamed rows update the banner PASS/WARN/FAIL/SKIP line and warn rows print under the banner while it runs; ms lands on finish", async () => {
-    // The real launch builds the banner with an EMPTY, still-running doctor summary and streams
-    // rows into the app afterwards (launch.ts) — the banner must reflect those rows live.
-    const r = rig([], {
-      doctor: {
-        running: true,
-        pass: 0,
-        warn: 0,
-        fail: 0,
-        skip: 0,
-        ms: null,
-        warnRows: [],
-        allRows: [],
-        failAtLaunch: false,
-      },
-    });
-    try {
-      await r.app.start();
-      const row = (id: string, status: Check["status"], summary: string): Check => ({
-        id,
-        status,
-        summary,
-        evidence: {},
-      });
-      r.app.onDoctorRow(row("runtime", "pass", "node v26.5.1 (floor 22.19)"));
-      r.app.onDoctorRow(row("engine", "pass", "engine probe answered initialize"));
-      r.app.onDoctorRow(row("home", "pass", "MADC_HOME default · sessions/ writable"));
-      r.app.onDoctorRow(
-        row(
-          "cred.kimi-code",
-          "warn",
-          "KIMI_API_KEY not set: provider rows stay WARN until a key exists",
-        ),
-      );
-      r.app.onDoctorRow(row("bin.claude", "skip", "claude binary not on PATH"));
-      const mid = r.tty.lastFrame().join("\n");
-      // Mid-stream: the counts are already live (the banner must not sit at 0 while checks run).
-      assert.match(mid, /✓ 3 PASS · ▲ 1 WARN · ✕ 0 FAIL · ○ 1 SKIP/);
-      // §5.1: the WARN row prints in full under the banner.
-      assert.match(mid, /▲ cred\.kimi-code: KIMI_API_KEY not set/);
-      r.app.onDoctorFinished(214);
-      const frame = r.tty.lastFrame().join("\n");
-      assert.match(frame, /✓ 3 PASS · ▲ 1 WARN · ✕ 0 FAIL · ○ 1 SKIP/);
-      assert.match(frame, /Doctor at launch {2}read-only {2}214 ms/);
-      await r.cleanup();
-    } catch (e) {
-      await r.cleanup();
-      throw e;
-    }
-  });
-});
-
-describe("§5.9 /doctor overlay leaves no screen remnants at 143×44", () => {
-  // Screen-STATE assertions: replay every recorded write into a terminal emulator and check
-  // the visible grid, not the latest frame string — stale cells from shorter lines painted
-  // over longer ones, or from frames taller than the screen, must not survive any step.
-  const COLS = 143;
-  const ROWS = 44;
-  const overlayBoxWidth = 96; // overlayWidth(143) = min(max(143-4, 40), 96)
-
-  const screenOf = (tty: VirtualTty): ScreenModel => {
-    const s = new ScreenModel(COLS, ROWS);
-    s.feed(tty.chunks.join(""));
-    return s;
-  };
-
-  /** The invariants that hold whenever the overlay is OPEN (banner collapsed, pane closed). */
-  const assertOpenScreen = (s: ScreenModel): void => {
-    const lines = s.lines();
-    const text = lines.join("\n");
-    assert.match(text, /\/doctor/, "overlay title row present");
-    assert.match(text, /Esc close · r re-run/, "overlay hint present");
-    const boxRows = lines.filter((l) => l.includes("│"));
-    assert.ok(boxRows.length >= 3, `overlay box rows present (got ${boxRows.length})`);
-    for (const line of boxRows) {
-      // A clean box row is exactly the box: border + inner + border. Anything wider is a
-      // stale cell from an earlier frame (old elapsed/pill/prompt text beside the overlay).
-      assert.equal(
-        visibleWidth(line),
-        overlayBoxWidth,
-        `stale remnant beside the overlay box: ${JSON.stringify(line)}`,
-      );
-    }
-    // Exactly one prompt line, one hints line, one elapsed pill — duplicates are stale rows.
-    assert.equal(lines.filter((l) => l.includes("❯")).length, 1, "exactly one prompt line");
-    assert.equal(
-      lines.filter((l) => l.includes("evidence pane")).length,
-      1,
-      "exactly one hints line",
-    );
-    assert.equal(
-      lines.filter((l) => /idle · \d+(\.\d+)?s/.test(l)).length,
-      1,
-      "exactly one elapsed pill row",
-    );
-  };
-
-  /** The invariants that hold once the overlay is CLOSED again. */
-  const assertClosedScreen = (s: ScreenModel): void => {
-    const lines = s.lines();
-    const text = lines.join("\n");
-    assert.ok(!text.includes("Esc close"), "overlay hint gone");
-    assert.deepEqual(
-      [],
-      lines.filter((l) => l.includes("│")),
-      "no overlay box borders remain",
-    );
-    assert.equal(lines.filter((l) => l.includes("❯")).length, 1, "exactly one prompt line");
-    assert.equal(
-      lines.filter((l) => l.includes("evidence pane")).length,
-      1,
-      "exactly one hints line",
-    );
-    assert.equal(
-      lines.filter((l) => /idle · \d+(\.\d+)?s/.test(l)).length,
-      1,
-      "exactly one elapsed pill row",
-    );
-  };
-
-  it("opening /doctor, re-running with r, and closing with Esc leaves a clean screen", async () => {
+describe("§5.9 /doctor does not paint an overlay", () => {
+  it("/doctor sets the flag and Esc clears it; doctor rows stay off the screen", async () => {
     const r = rig([
       { kind: "ok", text: "first fixture reply fills the transcript" },
       { kind: "ok", text: "second fixture reply lengthens the transcript" },
     ]);
-    (r.tty as VirtualTty).resize(COLS, ROWS);
+    (r.tty as VirtualTty).resize(143, 44);
     try {
       await r.app.start();
       r.app.onDoctorFinished(10);
@@ -971,33 +865,18 @@ describe("§5.9 /doctor overlay leaves no screen remnants at 143×44", () => {
           `turn ${prompt}`,
         );
       }
-      assertClosedScreen(screenOf(r.tty)); // baseline: the pre-overlay screen is clean
-
-      // Open: the overlay streams rows in; the final visible grid must hold no stale cells.
       type(r.tty, "/doctor");
       r.tty.key("enter");
-      await until(() => r.app.doctorOverlayOpen, "overlay open");
-      // `lanes` (M1-A8) is the last doctor row.
-      await until(
-        () => r.tty.lastFrame().join("\n").includes("lanes"),
-        "overlay rows finished streaming",
-      );
-      assertOpenScreen(screenOf(r.tty));
-
-      // Re-run with r: the box shrinks to the placeholder then regrows — no remnants may
-      // survive the shrink/regrow cycle either.
-      const before = r.tty.chunks.length;
-      r.tty.key({ char: "r" } as KeyValue);
-      await until(
-        () => r.tty.chunks.length > before + 2 && r.tty.lastFrame().join("\n").includes("lanes"),
-        "overlay re-run finished streaming",
-      );
-      assertOpenScreen(screenOf(r.tty));
-
-      // Close with Esc: the frame shrinks back; nothing of the overlay may remain.
+      await until(() => r.app.doctorOverlayOpen, "overlay flag");
+      const open = r.tty.lastFrame().join("\n");
+      assert.doesNotMatch(open, /Esc close/);
+      assert.doesNotMatch(open, /lanes/);
+      assert.match(open, /git/);
       r.tty.key("esc");
       await until(() => !r.app.doctorOverlayOpen, "overlay closed");
-      assertClosedScreen(screenOf(r.tty));
+      const closed = r.tty.lastFrame().join("\n");
+      assert.doesNotMatch(closed, /Esc close/);
+      assert.match(closed, /✓ seq /);
       await r.cleanup();
     } catch (e) {
       await r.cleanup();
@@ -1006,121 +885,22 @@ describe("§5.9 /doctor overlay leaves no screen remnants at 143×44", () => {
   });
 });
 
-describe("§5.7 docked evidence pane at 143×44", () => {
-  // The pane docks at >=110 columns: the transcript keeps width-38 columns and the pane box
-  // takes 36. Screen-STATE assertions (the §5.9 emulator): the banner must honour the width it
-  // actually occupies — rendering it at the full terminal width and clipping afterwards split
-  // ANSI colour sequences mid-span and pushed the pane borders off their columns.
-  const COLS = 143;
-  const ROWS = 44;
-  const REGION = COLS - 38; // the 105-column transcript region beside the docked pane
-  const PANE_W = 36;
-
-  const screenOf = (tty: VirtualTty): ScreenModel => {
-    const s = new ScreenModel(COLS, ROWS);
-    s.feed(tty.chunks.join(""));
-    return s;
-  };
-
-  // Pane rows start with the box's left border glyph — │ for content rows, ╭/╰ for the
-  // titled top and bottom rows — and end with its mirror (│/╮/╯) 36 columns later.
-  const PANE_START = new Set(["│", "╭", "╰"]);
-  const PANE_END = new Set(["│", "╮", "╯"]);
-
-  const paneRowsOf = (lines: readonly string[]): readonly string[] =>
-    lines.filter((l) => l.length > REGION && PANE_START.has(l[REGION] ?? ""));
-
-  /** Invariants whenever the pane is docked: fixed border columns, one prompt/hints/pill line
-   *  each — and no escape bytes or SGR parameters left as visible cells. */
-  const assertPaneDocked = (s: ScreenModel): void => {
-    const lines = s.lines();
-    const text = lines.join("\n");
-    // A clip that splits an SGR span leaves its parameter digits as cells (`…38;5;238m`).
-    assert.ok(!text.includes("\u001b"), "escape byte rendered as a visible cell");
-    assert.ok(!/(?:38;5;|38;2;|48;5;)\d+/.test(text), "SGR parameters leaked as text");
-    // Pane box: both borders at fixed columns on every pane row; a pane row is exactly the
-    // region plus the 36-column pane — anything else is a clipped or stale cell.
-    const paneRows = paneRowsOf(lines);
-    assert.ok(paneRows.length >= 10, `pane rows present (got ${paneRows.length})`);
-    for (const [i, l] of paneRows.entries()) {
-      assert.ok(
-        PANE_END.has(l[REGION + PANE_W - 1] ?? ""),
-        `pane right border drifted on row ${i}`,
-      );
-      assert.equal(
-        visibleWidth(l),
-        REGION + PANE_W,
-        `row ${i} exceeds region+pane: ${JSON.stringify(l)}`,
-      );
-    }
-    assert.equal(lines.filter((l) => l.includes("❯")).length, 1, "exactly one prompt line");
-    assert.equal(
-      lines.filter((l) => l.includes("evidence pane")).length,
-      1,
-      "exactly one hints line",
-    );
-    assert.equal(
-      lines.filter((l) => /idle · \d+(\.\d+)?s/.test(l)).length,
-      1,
-      "exactly one elapsed pill row",
-    );
-  };
-
-  /** The expanded banner beside the docked pane: the doctor summary and registry policy render
-   *  complete inside the region (not cut at the pane column mid-row), and the banner box rows
-   *  that continue below the pane keep borders at columns 0 and REGION-3 — never under the
-   *  pane. The responsive banner fills its region (W-1): the box is REGION-2 wide. */
-  const assertBannerBesidePane = (s: ScreenModel): void => {
-    assertPaneDocked(s);
-    const lines = s.lines();
-    const text = lines.join("\n");
-    const box = REGION - 2;
-    assert.match(text, /✓ 7 PASS · ▲ 0 WARN · ✕ 0 FAIL · ○ 2 SKIP/);
-    assert.match(text, /Doctor at launch {2}read-only {2}214 ms/);
-    assert.match(text, /policy +7 direct · 3 via vendor · 2 interactive · 4 forbidden/);
-    for (const [i, l] of lines.entries()) {
-      if (l.includes("│") && paneRowsOf([l]).length === 0) {
-        assert.equal(l[0], "│", `banner row ${i} does not start at its box border`);
-        assert.equal(l[box - 1], "│", `banner row ${i} box border pushed past the box`);
-        assert.equal(
-          visibleWidth(l),
-          box,
-          `banner row ${i} ignores its available width: ${JSON.stringify(l)}`,
-        );
-      }
-    }
-  };
-
-  /** Invariants once the pane is closed again with Tab. */
-  const assertPaneClosed = (s: ScreenModel): void => {
-    const lines = s.lines();
-    assert.deepEqual([], paneRowsOf(lines), "no docked pane borders remain");
-    assert.equal(lines.filter((l) => l.includes("❯")).length, 1, "exactly one prompt line");
-    assert.equal(
-      lines.filter((l) => l.includes("evidence pane")).length,
-      1,
-      "exactly one hints line",
-    );
-  };
-
-  it("Tab docks the pane beside a banner that respects its region; Tab again closes clean", async () => {
+describe("§5.7 no docked evidence pane at 143×44", () => {
+  it("Tab does not dock a pane; both turns keep their own verdict", async () => {
     const r = rig([
       { kind: "ok", text: "first fixture reply fills the transcript" },
       { kind: "ok", text: "second fixture reply lengthens the transcript" },
     ]);
-    (r.tty as VirtualTty).resize(COLS, ROWS);
+    (r.tty as VirtualTty).resize(143, 44);
     try {
       await r.app.start();
       r.app.onDoctorFinished(214);
-      assertPaneClosed(screenOf(r.tty)); // banner expanded, no pane: clean baseline
-
-      // Dock while the banner is still expanded: the doctor counts, the registry policy row
-      // and the box borders must all fit the 105-column region, complete and aligned.
       r.tty.key("tab");
-      await until(() => r.app.evidenceOpen, "pane docked beside the banner");
-      assertBannerBesidePane(screenOf(r.tty));
-
-      // Two turns collapse the banner to the header; the pane keeps its columns.
+      await until(() => r.app.evidenceOpen, "flag on");
+      const open = r.tty.lastFrame().join("\n");
+      assert.doesNotMatch(open, /EVIDENCE/);
+      assert.doesNotMatch(open, /evidence pane/);
+      assert.match(open, /git/);
       for (const prompt of ["hi", "hi again"]) {
         sendTurn(r.tty, prompt);
         await until(
@@ -1131,11 +911,10 @@ describe("§5.7 docked evidence pane at 143×44", () => {
           `turn ${prompt}`,
         );
       }
-      assertPaneDocked(screenOf(r.tty));
-
-      r.tty.key("tab"); // closes the pane
-      await until(() => !r.app.evidenceOpen, "pane closed");
-      assertPaneClosed(screenOf(r.tty));
+      const frame = r.tty.lastFrame().join("\n");
+      assert.equal(frame.split("chain VERIFIED").length - 1, 2);
+      r.tty.key("tab");
+      await until(() => !r.app.evidenceOpen, "flag off");
       await r.cleanup();
     } catch (e) {
       await r.cleanup();
@@ -1248,7 +1027,7 @@ describe("§5.11/§7 thread/start failure classification (tier W)", () => {
         true,
       );
       const frame = r.tty.lastFrame().join("\n");
-      assert.match(frame, /session error -32009/);
+      assert.match(frame, /error -32009/);
       await r.cleanup();
     } catch (e) {
       await r.cleanup();
@@ -1546,8 +1325,9 @@ describe("§5.8 engine stopped: Enter spawns a fresh engine and the second turn 
       // The restarted engine re-reads the same script; with the die-once marker it completes
       // the turn instead of dying — the restart semantics under test are: fresh spawn, turn
       // completes, chain verifies on the new engine's session file.
-      assert.match(frame, /chain VERIFIED · turn 1/);
-      assert.match(frame, /served: kimi-for-coding/);
+      assert.match(frame, /✓ seq \d+ · head [0-9a-f]{12} · chain VERIFIED/);
+      assert.match(frame, /kimi-for-coding/);
+      assert.doesNotMatch(frame, /served:/);
       await r.cleanup();
     } catch (e) {
       await r.cleanup();
@@ -1603,26 +1383,26 @@ describe("W-2 launch doctor evidence retention (§5.1 full rows, §5.7 pane rows
       r.app.onDoctorRow(row("cred.kimi", "fail", "kimi credential missing from keychain"));
       r.app.onDoctorRow(row("bin.codex", "skip", "codex not on PATH"));
       r.app.onDoctorFinished(50);
+      // Rows are retained on the app. They are not drawn (Q13). The FAIL ack line is.
+      assert.equal(r.app.doctor.pass, 1);
+      assert.equal(r.app.doctor.warn, 1);
+      assert.equal(r.app.doctor.fail, 1);
+      assert.equal(r.app.doctor.skip, 1);
+      assert.equal(r.app.doctor.allRows.length, 4);
       const frame = r.tty.lastFrame().join("\n");
-      assert.match(frame, /✓ 1 PASS · ▲ 1 WARN · ✕ 1 FAIL · ○ 1 SKIP/);
-      // §5.1: WARN and FAIL rows in full, under the banner, in their pinned wording.
-      assert.match(
+      assert.doesNotMatch(frame, /PASS ·/);
+      assert.doesNotMatch(
         frame,
         /locks thr_ed00 · pid 48121 · age 912s: pid 48121 not visible in this PID namespace/,
       );
-      assert.match(frame, /kimi credential missing from keychain/);
       assert.match(r.tty.text(), /a launch doctor row FAILED/);
-      // §5.7: the pane's DOCTOR AT LAUNCH section keeps every row — PASS and SKIP included.
       r.tty.key("tab");
-      await until(() => r.app.evidenceOpen, "pane opens");
+      await until(() => r.app.evidenceOpen, "flag toggles");
       const pane = r.tty.lastFrame().join("\n");
-      assert.match(pane, /runtime +node v26\.5\.1/);
-      assert.match(pane, /bin\.codex +codex not on PATH/);
-      // Long summaries take the pane's middle ellipsis; the row (not its full text) is what
-      // §5.7 requires the pane to retain — the full wording prints under the banner above.
-      assert.match(pane, /locks +locks/);
+      assert.doesNotMatch(pane, /EVIDENCE/);
+      assert.doesNotMatch(pane, /DOCTOR AT LAUNCH/);
       r.tty.key("tab");
-      await until(() => !r.app.evidenceOpen, "pane closes");
+      await until(() => !r.app.evidenceOpen, "flag clears");
       await r.cleanup();
     } catch (e) {
       await r.cleanup();
@@ -1639,7 +1419,8 @@ describe("W-2 launch doctor evidence retention (§5.1 full rows, §5.7 pane rows
       // §5.1: a FAIL at launch keeps the banner expanded and disables input until Enter.
       assert.equal(r.app.bannerExpanded, true);
       const frame = r.tty.lastFrame().join("\n");
-      assert.match(frame, /kimi credential missing from keychain/);
+      assert.equal(r.app.doctor.fail, 1);
+      assert.doesNotMatch(frame, /kimi credential missing from keychain/);
       assert.match(frame, /a launch doctor row FAILED/);
       r.tty.key("enter");
       await until(() => r.app.phase === "idle", "fail acknowledged");
@@ -1656,8 +1437,8 @@ describe("W-3 displayed elapsed values respect the 5 Hz ceiling (§5.5, §10)", 
     const m = tty
       .lastFrame()
       .join("\n")
-      .match(/idle · (\d+\.\d)s/);
-    return m === null ? null : Number(m[1]);
+      .match(/(\d+\.\d)s \/ (\d+\.\d)s/);
+    return m === null ? null : Number(m[2]);
   };
   const changesAcross = (values: readonly number[]): number => {
     let changes = 0;
@@ -1708,17 +1489,17 @@ describe("W-3 displayed elapsed values respect the 5 Hz ceiling (§5.5, §10)", 
     try {
       await r.app.start();
       r.app.onDoctorFinished(10);
-      assert.match(r.tty.lastFrame().join("\n"), /idle/);
+      assert.match(r.tty.lastFrame().join("\n"), /ready/);
       sendTurn(r.tty, "hello");
       await until(() => r.app.phase === "turn" || r.app.turns.length === 1, "turn starts");
       if (r.app.phase === "turn") {
-        assert.match(r.tty.lastFrame().join("\n"), /streaming \d+\.\d+s/);
+        assert.match(r.tty.lastFrame().join("\n"), /streaming[\s\S]*\d+\.\d+s \/ \d+\.\d+s/);
       }
       await until(
         () => r.app.phase === "idle" && r.app.turns[0]?.verify != null,
         "turn completes and verifies",
       );
-      assert.match(r.tty.lastFrame().join("\n"), /idle/);
+      assert.match(r.tty.lastFrame().join("\n"), /ready/);
       await r.cleanup();
     } catch (e) {
       await r.cleanup();
@@ -1750,10 +1531,12 @@ describe("§5.7 evidence values derived from disk verification", () => {
       sendTurn(r.tty, "verify me");
       await until(() => r.app.phase === "idle" && r.app.turns[0]?.verify != null, "verified turn");
       r.tty.key("tab");
-      await until(() => r.app.evidenceOpen, "pane opens");
+      await until(() => r.app.evidenceOpen, "flag toggles");
       const pane = r.tty.lastFrame().join("\n");
-      assert.match(pane, /turns +1:\d+-\d+/, "numeric per-turn seq range");
-      assert.match(pane, /served +kimi-for.*· seq \d+/, "servedModel event seq from the verify");
+      assert.equal(typeof r.app.turns[0]?.seqStart, "number");
+      assert.equal(typeof r.app.turns[0]?.seqEnd, "number");
+      assert.doesNotMatch(pane, /turns +1:/);
+      assert.doesNotMatch(pane, /EVIDENCE/);
       r.tty.key("tab");
       await r.cleanup();
     } catch (e) {
@@ -1791,9 +1574,10 @@ describe("correction round: historical replay, evidence binding, R-b (§5.3 R-b,
       const all = r.tty.text();
       assert.match(all, /first distinct reply/);
       assert.match(all, /second distinct reply/);
-      assert.match(all, /turn +COMPLETED +turn_app0000/);
-      assert.match(all, /turn +COMPLETED +turn_app0001/);
-      assert.match(r.tty.lastFrame().join("\n"), /chain VERIFIED · turn 2/);
+      // Per-turn receipt cards are retired. Each turn keeps its own verdict line.
+      assert.equal(all.split("chain VERIFIED").length - 1 >= 2, true);
+      assert.match(r.tty.lastFrame().join("\n"), /chain VERIFIED/);
+      assert.doesNotMatch(r.tty.lastFrame().join("\n"), /turn +COMPLETED/);
       await r.cleanup();
     } catch (e) {
       await r.cleanup();
@@ -1886,11 +1670,11 @@ describe("correction round: historical replay, evidence binding, R-b (§5.3 R-b,
       assert.equal(r.app.turns[1]?.seqStart, 5);
       assert.equal(r.app.turns[1]?.seqEnd, 8);
       r.tty.key("tab");
-      await until(() => r.app.evidenceOpen, "pane opens");
+      await until(() => r.app.evidenceOpen, "flag toggles");
       const pane = r.tty.lastFrame().join("\n");
-      assert.match(pane, /turns +1:1-4 2:5-8/);
+      assert.doesNotMatch(pane, /turns +1:1-4/);
       assert.doesNotMatch(pane, /2:1-8/);
-      assert.match(pane, /served +kimi-for-coding · seq 7/);
+      assert.doesNotMatch(pane, /EVIDENCE/);
       r.tty.key("tab");
       await r.cleanup();
     } catch (e) {
@@ -1912,12 +1696,11 @@ describe("correction round: historical replay, evidence binding, R-b (§5.3 R-b,
         "turn 2 chain failure",
       );
       r.tty.key("tab");
-      await until(() => r.app.evidenceOpen, "pane opens");
+      await until(() => r.app.evidenceOpen, "flag toggles");
       const pane = r.tty.lastFrame().join("\n");
-      // turn 1 keeps its learned range; turn 2 learned none from the failed verify.
-      assert.match(pane, /turns +1:1-4 2:—/);
-      // The served model on screen is turn 2's; it must not carry turn 1's servedModel seq.
+      assert.equal(r.app.turns[1]?.seqEnd ?? null, null);
       assert.doesNotMatch(pane, /served +kimi-for-coding · seq 3/);
+      assert.doesNotMatch(pane, /✓.*chain FAILED/);
       r.tty.key("tab");
       await r.cleanup();
     } catch (e) {
@@ -1947,7 +1730,7 @@ describe("correction round: historical replay, evidence binding, R-b (§5.3 R-b,
       // The corrupt path persists no turn-2 items, so turn 2's turn.end is line 7 (seq 6):
       // turn 1 ended at seq 4, before seq N−1 = 6, so its verified rail stays solid (§5.3 R-b)
       // — asserted on the settled screen, never on history or an intermediate frame.
-      assert.match(frame, /┗━ seq 4 · head [0-9a-f]{12} · chain VERIFIED · turn 1/);
+      assert.match(frame, /✓ seq 4 · head [0-9a-f]{12} · chain VERIFIED/);
       assert.match(frame, /chain FAILED line 7/);
       assert.doesNotMatch(frame, /╳[^\n]*turn 1/);
       await r.cleanup();
@@ -2185,7 +1968,7 @@ describe("round 3: cutoff race and the unanswered-interrupt engine stop", () => 
       // Settled restart hints (not a mid-verify frame).
       const settled = r.tty.lastFrame().join("\n");
       assert.match(settled, /engine stopped/);
-      assert.match(settled, /Enter restart engine/);
+      assert.doesNotMatch(settled, /Enter restart engine/);
       // Enter restarts: a fresh engine completes and verifies the next turn.
       r.tty.key("enter");
       await until(() => r.app.phase === "idle", "restart lands in idle");
@@ -2194,7 +1977,7 @@ describe("round 3: cutoff race and the unanswered-interrupt engine stop", () => 
         () => r.app.phase === "idle" && r.app.turns[0]?.verify != null,
         "post-restart turn completes and verifies",
       );
-      assert.match(r.tty.lastFrame().join("\n"), /chain VERIFIED · turn 1/);
+      assert.match(r.tty.lastFrame().join("\n"), /✓ seq \d+ · head [0-9a-f]{12} · chain VERIFIED/);
       // The restarted engine is a NEW, live owned engine — and the decoy outlived it all.
       const restarted = ownedEnginePid();
       assert.ok(restarted !== null && restarted !== owned, "a fresh engine owns the new thread");

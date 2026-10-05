@@ -24,26 +24,20 @@ import { EXIT } from "../exit-codes.ts";
 import type { CliIO } from "../io.ts";
 import { claimMode } from "../mode.ts";
 import { buildReceiptData } from "./app-receipt.ts";
-import { overlayWidth, renderOverlay } from "./doctor-view.ts";
 import {
   type AppStateView,
   type BannerData,
   type DoctorRow,
   type DoctorSummary,
-  renderBanner,
-  renderHeader,
   renderHelp,
-  renderHints,
-  renderPills,
-  renderTurn,
   summarizeDoctor,
 } from "./frames.ts";
 import { receiptPlain } from "./receipt.ts";
 import { sanitizeItem, sanitizeText, stripControls } from "./sanitize.ts";
 import { type ChainVerify, type SessionCode, type TurnRecord, worstExit } from "./state.ts";
-import { type Glyphs, glyphsFor, padVisible, Style, truncateChrome } from "./style.ts";
+import { type Glyphs, glyphsFor, type Role, Style } from "./style.ts";
 import { asciiForced, colorDepth } from "./tiers.ts";
-import { renderSessionStartFailedCard, renderVerdictCard, type Verdict } from "./verdict.ts";
+import { doctorCommandStarts, readGitPanel, renderTokyoFrame } from "./tokyo.ts";
 import {
   runVerifyBounded,
   VERIFY_DEADLINE_MS,
@@ -211,7 +205,10 @@ export class WitnessApp {
   threadId: string | null = null;
   threadStatus: string | null = null;
   served: import("./receipt.ts").ServedModel | null = null;
-  /** Seq of the servedModel event, learned from a passing disk verify (§5.7); null until then. */
+  /** Seq of the servedModel event, learned from a passing disk verify (§5.7); null until then.
+   *  The evidence pane that drew it is retired. The value stays so a later draw (Q13/Q16) is not a guess.
+   */
+  // biome-ignore lint/correctness/noUnusedPrivateClassMembers: recorded, not drawn (Q13/Q16 open)
   #servedSeq: number | null = null;
   /** The launch note from the banner (persistent: §5.0's unrecognised-MADC_UI wording). */
   readonly #launchNote: string | null;
@@ -272,251 +269,80 @@ export class WitnessApp {
   #frame(): string[] {
     const width = this.#tty.columns();
     const rows = Math.max(this.#tty.rows(), 10);
-    if (width < 80 || rows < 24) {
-      const msg = `terminal too small · need 80×24 · now ${width}×${rows}`;
-      const pad = Math.max(0, Math.floor((width - msg.length) / 2));
-      return ["", " ".repeat(pad) + msg, ""];
-    }
-    const lines: string[] = [];
-    // The docked pane (>=110) takes a 38-column right column; the banner, header and
-    // transcript render at the width they actually occupy so cards/wraps align to the rail,
-    // not the full screen — and the banner is never drawn wider than its region and clipped
-    // afterwards (§5.7), because a clip cannot repair a box composed too wide.
-    const paneDocked = this.evidenceOpen && width >= 110;
-    const transcriptWidth = paneDocked ? width - 38 : width;
-    if (this.bannerExpanded) {
-      lines.push(...renderBanner(this.#bannerView(), transcriptWidth, this.#style, this.#g));
-    } else {
-      lines.push(
-        renderHeader(
-          {
-            seatId: this.#banner.seatId,
-            backing: this.#banner.backing,
-            protocol: this.#banner.protocol,
-            cwd: this.#banner.cwd,
-            userHome: this.#banner.userHome,
-            threadId: this.threadId,
-          },
-          transcriptWidth,
-          this.#style,
-        ),
-      );
-    }
+    const notes: { parts: { text: string; role: Role }[]; col: number }[] = [];
     if (this.doctor.failAtLaunch && this.phase === "launching") {
-      lines.push(
-        this.#style.role(
-          "err",
-          "a launch doctor row FAILED: press Enter to acknowledge and enable input",
-        ),
-      );
-    }
-    for (const turn of this.turns) {
-      const number = this.turns.indexOf(turn) + 1;
-      lines.push(
-        ...renderTurn(
-          turn,
+      notes.push({
+        col: 2,
+        parts: [
           {
-            seatId: this.#banner.seatId,
-            requestedModel: this.#banner.requested,
-            userText: this.#userTextOf(turn),
-            nowMs: this.#now(),
-            turnNumber: number,
+            text: "a launch doctor row FAILED: press Enter to acknowledge and enable input",
+            role: "err",
           },
-          transcriptWidth,
-          this.#style,
-          this.#g,
-        ),
-      );
-      const verdict = this.#earnedVerdict(turn);
-      if (verdict !== null) {
-        lines.push(
-          ...renderVerdictCard(
-            verdict,
-            buildReceiptData({
-              turn,
-              served: this.#servedOf(turn),
-              session: this.#sessionOf(turn),
-              error: this.#errorOf(turn),
-              exit: turn.exitCode,
-            }),
-            width,
-            this.#style,
-            this.#g,
-          ),
-        );
-      }
+        ],
+      });
     }
-    if (this.phase === "session-start-failed" && this.sessionCodes.length > 0) {
-      const sc = this.sessionCodes[this.sessionCodes.length - 1];
-      if (sc !== undefined) {
-        lines.push(...renderSessionStartFailedCard(-32009, sc.reason, width, this.#style, this.#g));
-      }
+    if (this.#launchNote !== null) {
+      notes.push({ col: 2, parts: [{ text: this.#launchNote, role: "warn" }] });
     }
-    if (this.phase === "engine-stopped" && this.turns.length > 0) {
-      // §7 engine row: engine gone / violation / idle timeout → the EXIT 3 card, always as big
-      // as COMPLETED (failure is never quieter than success).
-      const last = this.turns[this.turns.length - 1];
-      if (last !== undefined) {
-        const worst = this.#worstCode(null);
-        lines.push(
-          ...renderVerdictCard(
-            worst === EXIT.engine ? { kind: "exit", code: worst } : { kind: "failed" },
-            buildReceiptData({
-              turn: last,
-              served: this.#servedOf(last),
-              session: this.#sessionOf(last),
-              error: this.#errorOf(last),
-              exit: last.exitCode,
-            }),
-            width,
-            this.#style,
-            this.#g,
-          ),
-        );
-      }
-    }
-    lines.push(renderPills(this.#view(), this.#style, this.#g));
     if (this.uiNote !== null) {
-      lines.push(this.#style.role("warn", this.uiNote));
+      notes.push({
+        col: 2,
+        parts: [{ text: this.uiNote, role: this.uiNote.startsWith("▲") ? "warn" : "dim" }],
+      });
     }
     if (this.#now() < this.#helpUntil) {
-      lines.push(...this.#helpLines);
-    }
-    if (this.phase === "chain-failed" || this.phase === "torn-tail") {
-      lines.push(
-        this.#style.role(
-          "warn",
-          `${this.#g.cross} this thread's chain failed verify: input disabled · /doctor · /new`,
-        ),
-      );
-    }
-    const prompt =
-      this.phase === "turn" || this.phase === "verifying"
-        ? `${this.#style.role("accent", this.#g.prompt)} turn in progress: typing kept; Enter and /commands wait for turn + verify`
-        : `${this.#style.role("accent", this.#g.prompt)} ${this.input}${this.#style.role("accent", "▊")}`;
-    lines.push(prompt);
-    lines.push(renderHints(this.#view(), this.evidenceOpen, this.#style, this.#g));
-    const merged = this.#mergeEvidence(lines, width);
-    if (this.doctorOverlayOpen) {
-      return [
-        ...merged.slice(0, Math.max(0, merged.length - 3)),
-        ...renderOverlay(
-          "/doctor",
-          this.doctorOverlayRows,
-          overlayWidth(width),
-          this.#style,
-          this.#g,
-          "Esc close · r re-run",
-        ),
-        ...merged.slice(Math.max(0, merged.length - 3)),
-      ];
-    }
-    return merged;
-  }
-
-  #mergeEvidence(left: string[], width: number): string[] {
-    if (!this.evidenceOpen || width < 110) {
-      // §5.7: at 80-109 columns the pane opens as an overlay over the transcript (the state
-      // under it is kept; Esc restores the full frame).
-      if (this.evidenceOpen && width >= 80) {
-        const overlay = renderOverlay(
-          "evidence",
-          this.#evidenceLines(),
-          overlayWidth(width),
-          this.#style,
-          this.#g,
-          "Tab hide",
-        );
-        const top = Math.max(0, Math.floor((left.length - overlay.length) / 2) - 2);
-        return [...left.slice(0, top), ...overlay, ...left.slice(top + overlay.length)];
+      for (const line of this.#helpLines) {
+        notes.push({ col: 2, parts: [{ text: line, role: "fg" }] });
       }
-      return left;
     }
-    // Montage style: a bordered evidence column (rounded top/bottom, EVIDENCE title with the
-    // Tab hide hint) docked on the right at >=110 — the same box shape as the /doctor overlay.
-    const pane = renderOverlay(
-      "EVIDENCE",
-      this.#evidenceLines(),
-      36,
-      this.#style,
-      this.#g,
-      "Tab hide",
-    );
-    const out: string[] = [];
-    const height = Math.max(left.length, pane.length);
-    for (let i = 0; i < height; i++) {
-      const l = left[i] ?? "";
-      const r = pane[i] ?? "";
-      const col = width - 38;
-      const trimmed = truncateChrome(l, col);
-      const padded = padVisible(trimmed, col);
-      out.push(`${padded}${r}`);
+    if (this.phase === "session-start-failed" && this.sessionStartError !== null) {
+      const sc = this.sessionStartError;
+      notes.push({
+        col: 2,
+        parts: [{ text: `${this.#g.cross} error ${sc.code} ${sc.message}`, role: "err" }],
+      });
     }
-    return out;
-  }
-
-  #evidenceLines(): string[] {
-    const s = this.#style;
-    const dim = (label: string, value: string): string =>
-      `${s.role("dim", label.padEnd(10))} ${value}`;
-    const rows: string[] = [
-      `${s.role("accent", "EVIDENCE")}  ${s.keycap("Tab")} hide`,
-      "",
-      s.role("accent", "SEAT"),
-      dim("seat", this.#banner.seatId),
-      dim("sha256", this.#banner.seatSha ?? "—"),
-      dim("backing", this.#banner.backing),
-      dim("requested", this.#banner.requested ?? "—"),
-      dim(
-        "served",
-        this.served === null
-          ? s.role("warn", "▲ NO RECEIPT yet")
-          : s.role(
-              "accent2",
-              `${this.served.servedModel}${this.#servedSeq === null ? "" : ` · seq ${this.#servedSeq}`}`,
-            ),
-      ),
-      "",
-      s.role("accent", "THREAD"),
-      dim("thread", this.threadId === null ? "—" : this.threadId),
-      dim("status", this.threadStatus ?? "—"),
-      dim("file", this.sessionPath ?? "—"),
-      "",
-      s.role("accent", "CHAIN"),
-      dim(
-        "last",
-        this.lastVerify === null
-          ? s.role("dim", "nothing yet")
-          : this.lastVerify.kind === "verified"
-            ? s.role("ok", `✓ VERIFIED seq ${this.lastVerify.seq}`)
-            : this.lastVerify.kind === "failed"
-              ? s.role("err", `✕ FAILED line ${this.lastVerify.line}`)
-              : s.role("warn", "▲ in progress"),
-      ),
-      dim(
-        "head",
-        this.lastVerify?.kind === "verified" ? this.lastVerify.headHash.slice(0, 12) : "—",
-      ),
-      dim(
-        "turns",
-        this.turns
-          .map(
-            (t, i) =>
-              // §5.7: numeric per-turn seq ranges, learned from passing verifies (R-a); a
-              // turn the client never learned a range for shows "—", never a rail word.
-              `${i + 1}:${t.seqStart === null ? "—" : `${t.seqStart}-${t.seqEnd ?? "?"}`}`,
-          )
-          .join(" ") || "—",
-      ),
-      "",
-      s.role("accent", "DOCTOR AT LAUNCH"),
-      ...this.doctor.allRows.map((r) => dim(r.id, r.summary)),
-      "",
-      ...(this.#launchNote === null ? [] : [s.role("warn", this.#launchNote)]),
-      ...(this.uiNote === null ? [] : [s.role("warn", this.uiNote)]),
-      ...this.stderrRows.slice(-4).map((r) => s.role("faint", `engine stderr: ${r}`)),
-    ];
-    return rows;
+    const last = this.turns[this.turns.length - 1];
+    const turnSeconds =
+      this.phase === "turn" && this.#streamSeconds !== null
+        ? this.#streamSeconds
+        : last === undefined || last.endTime === null
+          ? 0
+          : Math.max(0, (last.endTime - last.startTime) / 1000);
+    const showStartup = this.bannerExpanded || this.turns.length === 0;
+    const startup = showStartup
+      ? {
+          version: this.#banner.version,
+          protocol: this.#banner.protocol,
+          seatId: this.#banner.seatId,
+          model: this.#banner.requested ?? "",
+          cwd: this.#banner.cwd,
+          userHome: this.#banner.userHome,
+          tools: this.#banner.tools ?? [],
+          skills: this.#banner.skills ?? [],
+        }
+      : null;
+    return renderTokyoFrame({
+      width,
+      height: rows,
+      startup,
+      turns: this.turns,
+      verifying: this.phase === "verifying",
+      git: readGitPanel(this.#banner.cwd, this.#now()),
+      status: {
+        seatId: this.#banner.seatId,
+        phase: this.phase,
+        turns: this.turns,
+        turnSeconds,
+        totalSeconds: this.#elapsedSample,
+        requestedModel: this.#banner.requested,
+        servedModel: this.served?.servedModel ?? null,
+      },
+      composer: this.input,
+      composerRole: "fg",
+      notes,
+      style: this.#style,
+    });
   }
 
   paint(): void {
@@ -531,25 +357,6 @@ export class WitnessApp {
     // must not leave the old tail beside it (old elapsed text, prompt/hint rows, box borders).
     // \u001b[J then clears everything below the frame, so the screen can hold no remnants.
     this.#tty.write(`\u001b[H${visible.join("\u001b[K\n")}\u001b[K\u001b[J`);
-  }
-
-  #bannerView(): BannerData {
-    // The banner's doctor block is the LIVE summary (§5.1: counts move as the launch doctor
-    // streams; ms lands on finish), not the frozen construction-time fixture.
-    return {
-      ...this.#banner,
-      doctor: this.doctor,
-      threadId: this.threadId,
-      uiNote: this.#launchNote,
-    };
-  }
-
-  #userTextOf(turn: TurnRecord): string | null {
-    const item = turn.items.find((i) => i.kind === "userMessage");
-    if (item !== undefined && item.kind === "userMessage") {
-      return item.content.map((c) => c.text).join("");
-    }
-    return turn.userText ?? null;
   }
 
   #servedOf(turn: TurnRecord): import("./receipt.ts").ServedModel | null {
@@ -616,40 +423,6 @@ export class WitnessApp {
   }
 
   /** The verdict the turn has EARNED on disk evidence (§7): green only after the verify passed. */
-  #earnedVerdict(turn: TurnRecord): Verdict | null {
-    if (turn.status === "running") return null;
-    if (turn.revoked || turn.verify?.kind === "failed") return { kind: "failed" };
-    if (turn.verify?.kind === "verified" && turn.unverified === null) {
-      if (turn.status === "completed" && turn.exitCode === 0) return { kind: "completed" };
-      if (turn.status === "failed" || turn.status === "interrupted") {
-        return turn.exitCode === 0 ? null : { kind: "failed" };
-      }
-      return null;
-    }
-    return null;
-  }
-
-  #view(): AppStateView {
-    return {
-      phase: this.phase,
-      seatId: this.#banner.seatId,
-      threadId: this.threadId,
-      threadStatus: this.threadStatus,
-      sessionPath: this.sessionPath,
-      turns: this.turns,
-      served: this.served,
-      lastVerify: this.lastVerify,
-      streamSeconds: this.#streamSeconds,
-      elapsedSeconds: this.#elapsedSample,
-      idleSeconds: this.#streamSeconds === null ? this.#elapsedSample : null,
-      doctor: this.doctor,
-      turnCount: this.turns.length,
-      lastEndNamesTurn: this.lastEndNamesTurn,
-      exitHint: this.#worstCode(null),
-      sessionCode: this.sessionCodes[this.sessionCodes.length - 1] ?? null,
-    };
-  }
-
   #worstCode(signal: "SIGINT" | "SIGTERM" | "SIGHUP" | null): number {
     return worstExit({
       turns: this.turns,
@@ -794,7 +567,8 @@ export class WitnessApp {
     // IQW4-3: during a turn or a verify the input stays editable but Enter and every /word do
     // nothing and print nothing. The text is kept and can be sent once the state is idle.
     if (this.phase === "turn" || this.phase === "verifying") return;
-    const text = this.input.trim();
+    const raw = this.input;
+    const text = raw.trim();
     if (text === "") return; // never sent empty (CLI:35)
     if (Buffer.byteLength(this.input, "utf8") > 1024 * 1024) {
       this.uiNote = "▲ prompt exceeds 1 MiB; not sent";
@@ -806,6 +580,9 @@ export class WitnessApp {
     const sendBlocked = this.phase === "chain-failed" || this.phase === "torn-tail";
     if (this.phase === "session-start-failed") return;
     if (text.startsWith("/") && !text.startsWith("//")) {
+      const word = text.split(/\s+/)[0] ?? text;
+      // /doctor starts only when `/` is the first character typed, not after trim.
+      if (word === "/doctor" && !doctorCommandStarts(raw)) return;
       this.#command(text);
       return;
     }

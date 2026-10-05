@@ -50,9 +50,8 @@ import {
   spawnEngine,
   verifySessionFile,
 } from "@madc/engine/client";
-import { doctorHeaderW, doctorPendingRowW, doctorResultW, doctorRowW } from "./app/doctor-view.ts";
 import { stripControls } from "./app/sanitize.ts";
-import { glyphsFor, Style } from "./app/style.ts";
+import { Style } from "./app/style.ts";
 import { asciiForced, colorDepth } from "./app/tiers.ts";
 import { takeEarlySignal } from "./early-signal.ts";
 import { EXIT } from "./exit-codes.ts";
@@ -1447,40 +1446,20 @@ export function laneTableLines(c: Check): string[] {
 }
 
 export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number> {
-  const style = doctorStyle(io);
-  const g = glyphsFor(style.ascii);
-  const w = doctorTierW(io);
   const color = !opts.json && colorEnabled(io);
-  const width = io.columns ?? 80;
   if (!opts.json) {
-    io.stdout.write(
-      w
-        ? `${doctorHeaderW(MADC_VERSION, PROTOCOL_VERSION, style, g)}\n`
-        : `madc doctor · madc ${MADC_VERSION} · protocol ${PROTOCOL_VERSION}\n`,
-    );
+    // The doctor card/header band is retired. This is the pinned identity line.
+    io.stdout.write(`madc doctor · madc ${MADC_VERSION} · protocol ${PROTOCOL_VERSION}\n`);
   }
-  let lastPending = false;
   const hooks: DoctorHooks = opts.json
     ? {}
     : {
-        onStart: (id) => {
-          if (w) {
-            io.stdout.write(`${doctorPendingRowW(id, style, g)}\n`);
-            lastPending = true;
-          }
+        onStart: () => {
+          // No pending placeholder card. Rows print when the check finishes (CLI pin §3).
         },
         onRow: (c) => {
-          if (w) {
-            // The pending placeholder is replaced in place (§8): rows are short, ids ≤ 14.
-            if (lastPending) io.stdout.write("\u001b[1F\r\u001b[K");
-            lastPending = false;
-            for (const line of doctorRowW(c, style, g, width)) {
-              io.stdout.write(`${line}\n`);
-            }
-          } else {
-            // Tier A/P bytes: the pinned `WORD  id  summary` rows, coloured only on a TTY.
-            io.stdout.write(renderRow(c, color));
-          }
+          // Pinned `WORD  id  summary` rows. Colour only on a TTY. No card chrome.
+          io.stdout.write(renderRow(c, color));
           // M1-A8: the lanes table prints under its row, indented so it never reads as a row.
           for (const line of laneTableLines(c)) io.stdout.write(`${line}\n`);
         },
@@ -1498,16 +1477,8 @@ export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number>
         counts: run.counts,
       })}\n`,
     );
-  } else if (w) {
-    io.stdout.write(
-      `${doctorResultW(
-        `RESULT  ${run.counts.fail} FAIL · ${run.counts.warn} WARN · ${run.counts.skip} SKIP · ${run.ms} ms   exit ${run.exitCode}`,
-        run.counts.fail,
-        run.counts.warn,
-        style,
-      )}\n`,
-    );
   } else {
+    // One line, no result tint (the card fill is retired). Spans stay the §6.6 RESULT spans.
     io.stdout.write(
       `${resultTierA(
         run.counts.fail,
