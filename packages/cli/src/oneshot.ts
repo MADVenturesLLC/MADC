@@ -27,7 +27,7 @@ import {
 } from "./app/receipt.ts";
 import { glyphsFor, Style } from "./app/style.ts";
 import { decideTier } from "./app/tiers.ts";
-import { renderVerdictCard, type Verdict } from "./app/verdict.ts";
+import type { Verdict } from "./app/verdict.ts";
 import {
   classifyMessage,
   isDomainId,
@@ -855,17 +855,12 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
       exit,
     };
     if (tier.tier === "W" && io.stderrIsTTY) {
-      // §6.1: the pinned receipt rows verbatim inside the verdict card (stderr, one write).
-      // Engine-supplied values are sanitised at the data boundary (§5.10 E-a); the card's own
-      // chrome must never run through the control-char replacer.
-      const card = renderVerdictCard(
-        oneShotVerdict(exit, session, finalTurn),
-        sanitizeReceiptData(data),
-        io.columns ?? 80,
-        style,
-        g,
-      );
-      io.stderr.write(`${card.join("\n")}\n`);
+      // One-line verdict instead of the retired card. The pinned receipt rows follow,
+      // with the same §6.2 spans tier A uses (bytes of the receipt itself unchanged).
+      const line = oneShotVerdictLine(oneShotVerdict(exit, session, finalTurn), session, style, g);
+      const clean = sanitizeReceiptData(data);
+      const receipt = tier.depth === "none" ? receiptPlain(clean) : receiptTierA(clean);
+      io.stderr.write(`${line}\n${receipt}`);
     } else if (tier.tier === "A") {
       // §6.2 spans are chrome: engine values were sanitised at the data boundary, so the
       // assembled receipt must not run through the control-char replacer.
@@ -888,6 +883,45 @@ export async function runOneShot(io: CliIO, opts: OneShotOptions): Promise<numbe
     }
   }
   return exit;
+}
+
+/** One line, same weight as the chat verdict. No block art. Green only when verified. */
+function oneShotVerdictLine(
+  verdict: Verdict,
+  session: SessionOut | null,
+  style: Style,
+  g: ReturnType<typeof glyphsFor>,
+): string {
+  const head = session?.headHash?.slice(0, 12) ?? "";
+  const seq = session?.seq;
+  let text: string;
+  let role: "ok" | "err" | "warn" = "err";
+  if (
+    verdict.kind === "completed" &&
+    session?.chain === "verified" &&
+    seq !== null &&
+    head !== ""
+  ) {
+    text = `${g.check} seq ${seq} · head ${head} · chain VERIFIED`;
+    role = "ok";
+  } else if (session?.chain === "failed") {
+    text = `${g.cross} chain FAILED line ${session.line}: ${session.reason}`;
+    role = "err";
+  } else if (verdict.kind === "unverified") {
+    const why = session?.chain === "unverified" ? session.reason : "UNVERIFIED";
+    text =
+      seq !== null && head !== ""
+        ? `${g.warn} seq ${seq} · head ${head} · UNVERIFIED: ${why}`
+        : `${g.warn} UNVERIFIED: ${why}`;
+    role = "warn";
+  } else if (verdict.kind === "exit") {
+    text = `${g.cross} engine exited · turn not recorded as ended`;
+    role = "err";
+  } else {
+    text = `${g.cross} chain FAILED`;
+    role = "err";
+  }
+  return style.role(role, text);
 }
 
 /** §6.1 verdict rule: COMPLETED only on chain VERIFIED + exit 0; FAILED for turn/chain failure;
@@ -922,8 +956,9 @@ export function statusPill(text: string, io: CliIO): string {
     json: false,
     human: true,
   });
-  if (tier.tier !== "W") return text;
-  return Style.forDepth(tier.depth, tier.ascii).filled("accent", text);
+  // Pills are retired. The pinned status text is unchanged in every tier.
+  void tier;
+  return text;
 }
 
 /** Read-only re-read + verify of `sessions/<threadId>.jsonl` (CLI pin §2 `session` line). */
