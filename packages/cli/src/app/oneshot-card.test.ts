@@ -68,7 +68,9 @@ describe("§6.1 madc -p tier-W verdict card", () => {
     assert.equal(code, 0);
     const card = stderr.plain();
     // Title row, the big art, and the pinned receipt rows verbatim inside the card.
-    assert.match(card, /✓ chain VERIFIED · exit 0/);
+    assert.match(card, /✓ seq \d+ · head [0-9a-f]{12} · chain VERIFIED/);
+    assert.doesNotMatch(card, /✓ chain VERIFIED · exit 0/);
+    assert.doesNotMatch(card, /████/);
     assert.match(card, /─ receipt /);
     assert.match(card, / turn {5}COMPLETED/);
     // The fake engine's default turn carries no servedModel item: the pinned NO RECEIPT row.
@@ -370,10 +372,9 @@ describe("round 8: statusPill uses the REAL terminal facts (P-7)", () => {
       text,
       io({ columns: 40, rows: 10, stdoutIsTTY: false }, new Rec(), new Rec(), newHome()),
     );
-    // The capable io (TTY, 110 cols) wraps the SAME text in the tier-W fill.
-    assert.ok(capable.includes("\u001b["), "tier-W fill styles the pill");
-    assert.ok(capable.includes(text), "the P-7 text is unchanged inside the fill");
-    // The limited io keeps the pill plain — no SGR anywhere.
+    // Pills are retired. Both terminals keep the pinned text with no fill.
+    assert.equal(capable, text, "capable terminal: pinned text, no fill");
+    assert.ok(!capable.includes("\u001b["), "no SGR fill");
     assert.equal(limited, text, "limited terminal: plain text, no SGR");
   });
 });

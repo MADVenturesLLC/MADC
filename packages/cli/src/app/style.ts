@@ -1,27 +1,35 @@
 /**
- * Colour tokens, glyphs and chrome helpers (DESIGN-SPEC rev 6.2 §3.1, §4, §5.6, §10).
- *
- * A `Style` is decided once per output from the tier decision: `depth: "none"` emits zero SGR
- * (NO_COLOR, no TTY, TERM=dumb — bold and reverse included, IQ-16), while the layout, glyphs and
- * words stay. Truecolor tints collapse to the 256 palette (234/235) and to none in 16-colour
- * mode; the rail and glyph always carry the state, so the tint is never the only signal.
+ * Colour tokens and glyphs (Tokyo Night CLI spec §4, §7). Depth rules are rev 6.2 §3.3 with
+ * the palette swapped: `depth: "none"` emits zero SGR (NO_COLOR, no TTY, TERM=dumb). Green is
+ * the verified-evidence role only. `darker` (#0e0e14) is not a CLI token.
  */
 
 export type ColorDepth = "none" | "16" | "256" | "true";
 
-/** §3.1 role SGR per depth (dark palette; 16-colour column of the spec table). */
+/**
+ * Omarchy Tokyo Night (§4.1). 16-colour column is the spec's SGR column. 256 column is the
+ * nearest xterm index. `accent2` is the same blue as `accent` (the spec has one accent).
+ * `dim` and `faint` are both muted: tool lines, elapsed times and git hashes use `fg`, not these.
+ */
 const ROLE_SGR = {
-  fg: { true: "97", 256: "97", 16: "39" },
-  dim: { true: "38;2;165;171;191", 256: "38;5;145", 16: "37" },
-  faint: { true: "38;2;100;107;130", 256: "38;5;60", 16: "90" },
-  border: { true: "38;2;59;64;88", 256: "38;5;238", 16: "90" },
-  accent: { true: "38;2;182;156;255", 256: "38;5;147", 16: "95" },
-  accent2: { true: "38;2;125;249;255", 256: "38;5;123", 16: "96" },
-  ok: { true: "38;2;94;232;160", 256: "38;5;79", 16: "92" },
-  warn: { true: "38;2;255;204;102", 256: "38;5;221", 16: "93" },
-  err: { true: "38;2;255;107;125", 256: "38;5;204", 16: "91" },
-  /** Filled-pill text: terminal background colour, so a role fill keeps contrast (§3.1). */
-  bgText: { true: "38;2;13;14;20", 256: "38;5;233", 16: "30" },
+  fg: { true: "38;2;169;177;214", 256: "38;5;146", 16: "39" },
+  bright: { true: "38;2;192;202;245", 256: "38;5;153", 16: "97" },
+  dim: { true: "38;2;86;95;137", 256: "38;5;60", 16: "90" },
+  faint: { true: "38;2;86;95;137", 256: "38;5;60", 16: "90" },
+  border: { true: "38;2;65;72;104", 256: "38;5;239", 16: "90" },
+  accent: { true: "38;2;122;162;247", 256: "38;5;111", 16: "34" },
+  accent2: { true: "38;2;122;162;247", 256: "38;5;111", 16: "34" },
+  ok: { true: "38;2;158;206;106", 256: "38;5;149", 16: "32" },
+  warn: { true: "38;2;224;175;104", 256: "38;5;179", 16: "33" },
+  err: { true: "38;2;247;118;142", 256: "38;5;210", 16: "31" },
+  /** Text on a filled chip: the screen background, so a fill keeps contrast. */
+  bgText: { true: "38;2;26;27;38", 256: "38;5;234", 16: "30" },
+} as const;
+
+/** Screen and status-bar fills. 16-colour and NO_COLOR paint nothing (§4.2). */
+export const SURFACE_BG = {
+  screen: { true: "48;2;26;27;38", 256: "48;5;234", 16: null },
+  bar: { true: "48;2;36;40;59", 256: "48;5;236", 16: null },
 } as const;
 
 /** Truecolor-only card tints (§3.1); 256 collapses to 234/235, 16-colour to none. */
@@ -61,6 +69,18 @@ export class Style {
   role(r: Role, text: string): string {
     if (this.depth === "none") return text;
     return `\u001b[${ROLE_SGR[r][this.depth]}m${text}\u001b[0m`;
+  }
+
+  /** Foreground SGR for a role, or null when this depth paints no colour. */
+  fgSgr(r: Role): string | null {
+    if (this.depth === "none") return null;
+    return ROLE_SGR[r][this.depth];
+  }
+
+  /** Background fill for the screen or the status bar. Null in 16-colour and NO_COLOR. */
+  surfaceBg(which: keyof typeof SURFACE_BG): string | null {
+    if (this.depth === "none" || this.depth === "16") return null;
+    return SURFACE_BG[which][this.depth];
   }
 
   /** Bold variant (used by FAIL rows, chain FAILED inside a red value, exit digits ≠ 0). */
@@ -137,12 +157,13 @@ export type Glyphs = {
   readonly boxBottomRight: string;
   readonly boxHorizontal: string;
   readonly boxVertical: string;
+  readonly hollow: string;
 };
 
 const UTF8_GLYPHS: Glyphs = {
   check: "✓",
   warn: "▲",
-  cross: "✕",
+  cross: "✗",
   idle: "○",
   running: "●",
   diamond: "◆",
@@ -158,12 +179,14 @@ const UTF8_GLYPHS: Glyphs = {
   middleDot: "·",
   emDash: "─",
   ellipsis: "…",
-  boxTopLeft: "╭",
-  boxTopRight: "╮",
-  boxBottomLeft: "╰",
-  boxBottomRight: "╯",
+  boxTopLeft: "┌",
+  boxTopRight: "┐",
+  boxBottomLeft: "└",
+  boxBottomRight: "┘",
   boxHorizontal: "─",
   boxVertical: "│",
+  /** Agent mark and Skills mark (§7). ASCII is `*`, same as the section diamond. */
+  hollow: "◇",
 };
 
 const ASCII_GLYPHS: Glyphs = {
@@ -191,6 +214,7 @@ const ASCII_GLYPHS: Glyphs = {
   boxBottomRight: "+",
   boxHorizontal: "-",
   boxVertical: "|",
+  hollow: "*",
 };
 
 export function glyphsFor(ascii: boolean): Glyphs {

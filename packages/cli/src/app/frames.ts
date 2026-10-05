@@ -94,6 +94,10 @@ export type BannerData = {
   readonly doctor: DoctorSummary;
   readonly registry: RegistrySummary | null;
   readonly uiNote: string | null;
+  /** Tool names from the seat (`tools.allow`). Empty when the seat has no allow list. */
+  readonly tools?: readonly string[];
+  /** Skill names from the seat. The seat schema has no skills field, so this stays empty. */
+  readonly skills?: readonly string[];
 };
 
 /** Round 9 (§4): the banner's status chrome comes from the SELECTED glyph set — ASCII mode
