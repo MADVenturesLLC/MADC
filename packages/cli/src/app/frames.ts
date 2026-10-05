@@ -99,3 +99,34 @@ export type BannerData = {
   /** Skill names from the seat. The seat schema has no skills field, so this stays empty. */
   readonly skills?: readonly string[];
 };
+
+/** Round 9 (§4): the banner's status chrome comes from the SELECTED glyph set — ASCII mode
+ * renders `v 7 PASS`, `! 2 WARN`, `x 1 FAIL`, `- 0 SKIP`, the awaiting-receipt `-` and the
+ * warn-detail `!` prefix, never the hard-coded Unicode marks. The pinned `·` separators
+ * stay verbatim in every mode (§4's receipt-rule carve-out). */
+const bannerStatusGlyphs = (
+  g: Glyphs,
+): {
+  readonly ok: string;
+  readonly warn: string;
+  readonly err: string;
+  readonly idle: string;
+} => ({
+  ok: g.check,
+  warn: g.warn,
+  err: g.cross,
+  idle: g.idle,
+});
+
+/** `~/code/madc` form for the banner cwd and header (§5.1); outside $HOME stays absolute. */
+export function displayCwd(cwd: string, home: string): string {
+  if (home !== "" && cwd === home) return "~";
+  if (home !== "" && cwd.startsWith(`${home}/`)) return `~${cwd.slice(home.length)}`;
+  return cwd;
+}
+
+/** Thread id with the head…tail ellipsis used across the chrome (§9: head 8 + … + tail 4). */
+export function shortId(id: string): string {
+  if (id.length <= 13) return id;
+  return `${id.slice(0, 8)}…${id.slice(-4)}`;
+}
