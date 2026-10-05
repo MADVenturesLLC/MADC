@@ -4,6 +4,8 @@
 
 *Amended by `PIN-madc-M0-cli-erratum-1.md` (2026-09-25, rev. 2026-09-26): `locks` row start-time rule; interpretations for Founder confirmation; §3a–§3d one-shot close exit, engine-message and shape checks, turn idle deadline (`MADC_TURN_IDLE_MS`), and exit precedence for CLI §4; §3e–§3f pin or triage the A7 failure inventory (`343da29`), including one engine-client fix under Founder allowance A1, which overrides CLI §5 (CLI:200, :206) only to that extent: it covers the A7 follow-up PR (`hephaestus/m0-a7-followup-validation`) only, and "No other engine-client change is allowed by this."*
 
+*Amended by `PIN-madc-M0-amendment-3.md` (2026-09-25, rev. 2026-09-26): item 5 rule 4, the doctor `locks` row WARN for a `sessions/` directory without owner read (0300 unsupported in M0), additive.*
+
 **Authority:**
 
 - `docs/plan/PLAN-madc-M0-build-plan.md` §10 Act M0-A7, Criterion B, and §6 import rule. The plan was Founder-accepted and merged via PR #2 (head `bdf45f42b0b27ee07dcdc30fbc24485de2219417`).
