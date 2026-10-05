@@ -161,32 +161,32 @@ export type Glyphs = {
 };
 
 const UTF8_GLYPHS: Glyphs = {
-  check: "\u2713",
-  warn: "\u25b2",
-  cross: "\u2717",
-  idle: "\u25cb",
-  running: "\u25cf",
-  diamond: "\u25c6",
-  railDotted: "\u2506",
-  railSolid: "\u2503",
-  railBreak: "\u2573",
-  railEndVerified: "\u2517\u2501",
-  railEndUnverified: "\u2575",
-  band: "\u258c",
-  prompt: "\u276f",
-  // Pinned bytes (§4): \u00b7 \u2500 \u2192 \u2026 stay exactly as pinned in every mode, ASCII included.
-  arrow: "\u2192",
-  middleDot: "\u00b7",
-  emDash: "\u2500",
-  ellipsis: "\u2026",
-  boxTopLeft: "\u250c",
-  boxTopRight: "\u2510",
-  boxBottomLeft: "\u2514",
-  boxBottomRight: "\u2518",
-  boxHorizontal: "\u2500",
-  boxVertical: "\u2502",
+  check: "✓",
+  warn: "▲",
+  cross: "✗",
+  idle: "○",
+  running: "●",
+  diamond: "◆",
+  railDotted: "┆",
+  railSolid: "┃",
+  railBreak: "╳",
+  railEndVerified: "┗━",
+  railEndUnverified: "╵",
+  band: "▌",
+  prompt: "❯",
+  // Pinned bytes (§4): · ─ → … stay exactly as pinned in every mode, ASCII included.
+  arrow: "→",
+  middleDot: "·",
+  emDash: "─",
+  ellipsis: "…",
+  boxTopLeft: "┌",
+  boxTopRight: "┐",
+  boxBottomLeft: "└",
+  boxBottomRight: "┘",
+  boxHorizontal: "─",
+  boxVertical: "│",
   /** Agent mark and Skills mark (§7). ASCII is `*`, same as the section diamond. */
-  hollow: "\u25c7",
+  hollow: "◇",
 };
 
 const ASCII_GLYPHS: Glyphs = {
@@ -203,11 +203,11 @@ const ASCII_GLYPHS: Glyphs = {
   railEndUnverified: "'",
   band: "|",
   prompt: ">",
-  // The receipt rule's \u2500 and the \u00b7 separators are pinned bytes, not chrome glyphs (§4).
-  arrow: "\u2192",
-  middleDot: "\u00b7",
-  emDash: "\u2500",
-  ellipsis: "\u2026",
+  // The receipt rule's ─ and the · separators are pinned bytes, not chrome glyphs (§4).
+  arrow: "→",
+  middleDot: "·",
+  emDash: "─",
+  ellipsis: "…",
   boxTopLeft: "+",
   boxTopRight: "+",
   boxBottomLeft: "+",
@@ -228,7 +228,7 @@ export function visibleWidth(s: string): number {
   let width = 0;
   for (const ch of bare) {
     const code = ch.codePointAt(0) ?? 0;
-    // The block art (\u2588 \u2557 \u2554 \u255a \u255d \u2550 \u2551 \u258c \u258e \u2506 \u2503 \u2573 \u2517 \u2575 \u276f \u2713 \u25b2 \u2715 \u25cb \u25cf \u25c6) is single-cell in practice.
+    // The block art (█ ╗ ╔ ╚ ╝ ═ ║ ▌ ▎ ┆ ┃ ╳ ┗ ╵ ❯ ✓ ▲ ✕ ○ ● ◆) is single-cell in practice.
     width += 1;
     if (code >= 0x1f300 && code <= 0x1faff) width += 1; // defensive: never expected in this UI
   }
@@ -260,7 +260,7 @@ export function wordWrap(text: string, width: number): string[] {
         line = word;
       }
       // A single word longer than the width is hard-split (chrome only; pinned rows are never
-      // re-wrapped \u2014 engine text is agent content, so this is the wrap-at-the-rail-column case).
+      // re-wrapped — engine text is agent content, so this is the wrap-at-the-rail-column case).
       while (visibleWidth(line) > width && width > 0) {
         let cut = 0;
         let acc = 0;
@@ -280,16 +280,16 @@ export function wordWrap(text: string, width: number): string[] {
 
 /**
  * Clip tokens of `s`: SGR spans and visible characters, in order. A span is one zero-width
- * token \u2014 a clip may drop it whole but never split it, because a dangling `\u001b[38;\u2026`
- * prints its parameter bytes as cells and corrupts every width computed after it (\u00a75.7 docked
- * pane, \u00a79 chrome truncation).
+ * token — a clip may drop it whole but never split it, because a dangling `\u001b[38;…`
+ * prints its parameter bytes as cells and corrupts every width computed after it (§5.7 docked
+ * pane, §9 chrome truncation).
  */
 function clipTokens(s: string): { esc: boolean; text: string }[] {
   const toks: { esc: boolean; text: string }[] = [];
   let i = 0;
   while (i < s.length) {
     if (s[i] === "\u001b") {
-      // Style-built lines are well-formed `\u001b[\u2026m`; a malformed escape degrades to one
+      // Style-built lines are well-formed `\u001b[…m`; a malformed escape degrades to one
       // zero-width char rather than swallowing the text that follows it.
       // biome-ignore lint/suspicious/noControlCharactersInRegex: SGR sequences are exactly what we match here.
       const m = s.slice(i).match(/^\u001b\[[0-9;]*m/);
@@ -305,7 +305,7 @@ function clipTokens(s: string): { esc: boolean; text: string }[] {
   return toks;
 }
 
-/** Truncate to `width` with an ellipsis when over (chrome only; \u00a79 truncation rules). */
+/** Truncate to `width` with an ellipsis when over (chrome only; §9 truncation rules). */
 export function truncateChrome(s: string, width: number): string {
   if (width <= 1) return s;
   if (visibleWidth(s) <= width) return s;
@@ -327,7 +327,7 @@ export function truncateChrome(s: string, width: number): string {
   return out + glyphs.ellipsis + reset;
 }
 
-/** Middle-ellipsize to `width` (\u00a79 chrome truncation: paths keep head+tail around a \u2026). */
+/** Middle-ellipsize to `width` (§9 chrome truncation: paths keep head+tail around a …). */
 export function middleEllipsize(s: string, width: number): string {
   if (width <= 1 || visibleWidth(s) <= width) return s;
   const e = glyphsFor(false).ellipsis;
@@ -357,7 +357,7 @@ export function middleEllipsize(s: string, width: number): string {
     back = t.text + back;
   }
   // The retained tail must keep the colour it had in `s`, not the head's: the span that styled
-  // it can sit before chars the cut dropped (red 12345 / green 67890 \u2192 the green opener is
+  // it can sit before chars the cut dropped (red 12345 / green 67890 → the green opener is
   // left of the dropped `67`). Scan past the dropped visible chars to the escape run that was
   // active at the tail's first kept char and carry it over. A run of `\u001b[0m` means the
   // tail was default-coloured; anything before that run was already closed, so the scan stops
