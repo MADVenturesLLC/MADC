@@ -11,6 +11,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, it } from "node:test";
 import type { CliIO } from "../io.ts";
+import { RecordingOut, VirtualTty } from "../testing/virtual-tty.ts";
 import { WitnessApp } from "./app.ts";
 import type { BannerData } from "./frames.ts";
 import type { TurnRecord } from "./state.ts";
@@ -23,7 +24,6 @@ import {
   renderTokyoFrame,
   verdictOf,
 } from "./tokyo.ts";
-import { RecordingOut, VirtualTty } from "../testing/virtual-tty.ts";
 
 const FG = "38;2;169;177;214";
 const MUTED = "38;2;86;95;137";
