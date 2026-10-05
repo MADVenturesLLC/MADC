@@ -108,9 +108,9 @@ describe("§5.1 pre-conversation banner (110×32)", () => {
   const lines = renderBanner(banner, 110, style, g);
   const text = lines.join("\n");
   it("is one rounded box titled madc <version>", () => {
-    assert.match(lines[0] ?? "", /^╭─ madc 0\.0\.0/);
+    assert.match(lines[0] ?? "", /^┌─ madc 0\.0\.0/);
     assert.ok(
-      lines.some((l) => /^╰─+╯$/.test(l)),
+      lines.some((l) => /^└─+┘$/.test(l)),
       `no box bottom found in: ${JSON.stringify(lines.slice(-3))}`,
     );
   });
@@ -122,7 +122,7 @@ describe("§5.1 pre-conversation banner (110×32)", () => {
   });
   it("carries the doctor summary with counts and the /doctor hint", () => {
     assert.match(text, /Doctor at launch/);
-    assert.match(text, /✓ 7 PASS · ▲ 1 WARN · ✕ 0 FAIL · ○ 2 SKIP/);
+    assert.match(text, /✓ 7 PASS · ▲ 1 WARN · ✗ 0 FAIL · ○ 2 SKIP/);
     assert.match(text, /\/doctor for rows/);
   });
   it("prints every WARN row in full under the banner (pinned locks wording)", () => {
@@ -187,7 +187,7 @@ describe("W-1 responsive banner geometry (§5.1 mandatory fields, §9 widths, §
           assert.ok(lw > 0, `width ${w} line ${i}: under-box row lost`);
         } else {
           assert.equal(lw, boxW, `width ${w} line ${i} breaks the box border (${lw} vs ${boxW})`);
-          if (/^╰─*╯$/.test(line)) pastBox = true;
+          if (/^└─*┘$/.test(line)) pastBox = true;
         }
       }
       assert.ok(pastBox, `width ${w}: the box never closes`);
@@ -417,7 +417,7 @@ describe("§5.3–§5.4 turn rendering", () => {
     assert.match(text, /toolCall → toolResult · isError=false/);
     assert.match(text, /235 lines · §4 Exit codes, lines 182-195/);
   });
-  it("an isError tool result switches to the ✕ err edge; never green", () => {
+  it("an isError tool result switches to the ✗ err edge; never green", () => {
     const lines = renderTurn(
       turn({
         items: [
@@ -444,7 +444,7 @@ describe("§5.3–§5.4 turn rendering", () => {
       style,
       g,
     );
-    assert.match(lines.join("\n"), /✕/);
+    assert.match(lines.join("\n"), /✗/);
   });
   it("an error item renders the err-edge card with its code (IQW-8)", () => {
     const lines = renderTurn(
@@ -470,7 +470,7 @@ describe("§5.3–§5.4 turn rendering", () => {
       style,
       g,
     );
-    assert.match(lines.join("\n"), /✕ error -32008 no-credentials/);
+    assert.match(lines.join("\n"), /✗ error -32008 no-credentials/);
   });
   it("interrupted turn ends ╵ interrupted (§5.8)", () => {
     const lines = renderTurn(
@@ -551,7 +551,7 @@ describe("§5.6 status pills", () => {
       colorStyle,
       g,
     );
-    assert.match(p, /✕ chain FAILED line 4/);
+    assert.match(p, /✗ chain FAILED line 4/);
   });
   it("NO_COLOR pills become [words] with zero SGR and the ASCII glyph forms (§5.6)", () => {
     const p = renderPills(view({ phase: "turn", streamSeconds: 2.6 }), style, g);
@@ -659,7 +659,7 @@ describe("round 9: banner status chrome uses the SELECTED glyph set (§4)", () =
       .join("\n")
       // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping the SGR spans under test.
       .replace(/\u001b\[[0-9;]*m/g, "");
-    assert.match(bare, /✓ 7 PASS · ▲ 1 WARN · ✕ 0 FAIL · ○ 2 SKIP/);
+    assert.match(bare, /✓ 7 PASS · ▲ 1 WARN · ✗ 0 FAIL · ○ 2 SKIP/);
     assert.match(bare, /served +○ awaiting servedModel receipt/);
     assert.match(bare, /^▲ locks thr_ed00/m);
   });

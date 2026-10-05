@@ -116,7 +116,7 @@ describe("M1-A8 madc -s <seatId> on the interactive entry", () => {
         sessionSeats(home).every((s) => s === "daedalus"),
         "the engine was asked for daedalus",
       );
-      assert.match(tty.lastFrame().join("\n"), /MADC daedalus · claude-code/);
+      assert.match(tty.lastFrame().join("\n"), /seat {2}daedalus/);
     } finally {
       await app.dispose();
       delete process.env.MADC_TEST_APP_TURNS;
