@@ -349,7 +349,7 @@ describe("§7 EXIT 5 card for -32009 on thread/start", () => {
     const text = rows.join("\n");
     assert.match(text, /session error -32009/);
     // UTF-8 keeps the block art under NO_COLOR (§10); it spells EXIT 5, never EXIT -32009.
-    assert.match(text, /████████╗ {2}███████/);
+    assert.match(text, /████████╗ {2}███████╗/);
     assert.doesNotMatch(text, /EXIT -32009/);
     // The ASCII glyph fallback (§4) uses the #### WORD #### form.
     const asciiStyle = Style.forDepth("none", true);
