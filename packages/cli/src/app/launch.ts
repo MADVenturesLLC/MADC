@@ -79,11 +79,11 @@ export function uiNoteFor(env: { readonly MADC_UI?: string }): string | null {
 export function seatFields(
   home: string,
   seatId: string,
-): { backing: string | null; requested: string | null } {
+): { backing: string | null; requested: string | null; tools: readonly string[] } {
   // Parent confinement first: `seats/` must be a real directory resolving under the real
   // home — a symlinked parent (even to an innocent-looking tree) fails closed.
   const parentBefore = confinedDirId(home, "seats");
-  if (parentBefore === null) return { backing: null, requested: null };
+  if (parentBefore === null) return { backing: null, requested: null, tools: [] };
   const path = join(home, "seats", `${seatId}.json`);
   let fd: number | undefined;
   try {
@@ -91,27 +91,34 @@ export function seatFields(
     // Without O_NOFOLLOW (Windows): lstat → open → fstat, and the opened inode must be the
     // one lstat saw, so a symlink is never followed.
     const pre = nofollow === undefined ? lstatSync(path) : null;
-    if (pre !== null && !pre.isFile()) return { backing: null, requested: null };
+    if (pre !== null && !pre.isFile()) return { backing: null, requested: null, tools: [] };
     fd = openSync(path, constants.O_RDONLY | (nofollow ?? 0) | (constants.O_NONBLOCK ?? 0));
     const st = fstatSync(fd);
-    if (!st.isFile()) return { backing: null, requested: null };
+    if (!st.isFile()) return { backing: null, requested: null, tools: [] };
     if (pre !== null && (pre.ino !== st.ino || pre.dev !== st.dev)) {
-      return { backing: null, requested: null };
+      return { backing: null, requested: null, tools: [] };
     }
     // Re-derive the parent identity AFTER the open: the same real directory, unchanged
     // while the leaf was being opened (no swapped parent under the race window).
     if (!sameDirId(parentBefore, confinedDirId(home, "seats"))) {
-      return { backing: null, requested: null };
+      return { backing: null, requested: null, tools: [] };
     }
     const raw = JSON.parse(readFileSync(fd, "utf8")) as {
       preferredBacking?: unknown;
       pinnedModel?: unknown;
+      tools?: { allow?: unknown };
     };
     const clean = (v: unknown): string | null =>
       typeof v === "string" && v !== "" ? stripControls(v) : null;
-    return { backing: clean(raw.preferredBacking), requested: clean(raw.pinnedModel) };
+    const allow = raw.tools?.allow;
+    const tools = Array.isArray(allow)
+      ? allow
+          .filter((v): v is string => typeof v === "string" && v !== "")
+          .map((v) => stripControls(v))
+      : [];
+    return { backing: clean(raw.preferredBacking), requested: clean(raw.pinnedModel), tools };
   } catch {
-    return { backing: null, requested: null };
+    return { backing: null, requested: null, tools: [] };
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
@@ -197,6 +204,8 @@ function bannerData(
     doctor: doctorSummary(rows, ms === null, ms),
     registry: buildRegistrySummary(),
     uiNote,
+    tools: seat.tools,
+    skills: [],
   };
 }
 
