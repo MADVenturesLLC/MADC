@@ -518,7 +518,12 @@ test("M2 §10.4 worktree HEAD: session.open records the top-level, normalized or
     const nonGit = join(root, "plain");
     mkdirSync(nonGit);
 
-    const e = inProcess(home);
+    // This test loads five threads and each close-time re-read is three real `git` spawns. Under a
+    // loaded machine those can spend the production 300 ms shutdown budget (Argus P8), after which
+    // a re-read records `worktree: null` BY DESIGN and the assertions below dereference null. The
+    // test asserts the identity rules, not the machine's git latency, so it uses the seam. The
+    // bounded-shutdown property itself is asserted by the a.5 P8 tests, unmodified.
+    const e = inProcess(home, echoAgent, { closeRereadBudgetMs: 30_000 });
     await e.init();
     const start = async (cwd: string) => {
       const r = await e.request("thread/start", { cwd });
@@ -882,7 +887,10 @@ test("Argus 5391475289 miss 3 (Copilot 4165236178): head is null only for an unb
     const repo = join(root, "repo");
     initRepo(repo);
     const head1 = commit(repo, "one");
-    const e = inProcess(home);
+    // Same close-time reason as §10.4: several threads, three real `git` spawns per re-read, and
+    // the production 300 ms shutdown budget can be spent on a loaded machine. The seam lets the
+    // test assert the HEAD rules rather than the machine's git latency.
+    const e = inProcess(home, echoAgent, { closeRereadBudgetMs: 30_000 });
     await e.init();
     const healthy = await start2(e, repo);
     writeFileSync(join(repo, ".git", "HEAD"), `${"0".repeat(39)}1\n`);
@@ -911,7 +919,7 @@ test("Argus 5391475289 miss 3 (Copilot 4165236178): head is null only for an unb
     initRepo(orphan);
     commit(orphan, "x");
     git(orphan, ["checkout", "--quiet", "--orphan", "fresh"]);
-    const e2 = inProcess(home);
+    const e2 = inProcess(home, echoAgent, { closeRereadBudgetMs: 30_000 });
     await e2.init();
     const tUnborn = await start2(e2, unborn);
     const tOrphan = await start2(e2, orphan);
