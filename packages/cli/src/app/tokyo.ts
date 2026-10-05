@@ -40,6 +40,38 @@ const GIT_CACHE: { cwd: string; at: number; snap: GitSnapshot } = {
   snap: { kind: "not-repo" },
 };
 
+/**
+ * Git variables that retarget `git` at another repository or config scope than `cwd`. Inherited
+ * values must not decide whether `cwd` looks like a repo: git EXPORTS `GIT_DIR` (and
+ * `GIT_PREFIX`) to a hook, so a panel read started from inside a hook — the pre-push hook runs
+ * the test suite — would report an unrelated directory as inside a work tree. Same list and
+ * rationale as the engine's `GIT_REPO_OVERRIDE_KEYS` (`packages/engine/src/policy/identity.ts`),
+ * duplicated here because the CLI may not import engine internals (§8.5 import rule).
+ */
+const GIT_REPO_OVERRIDE_KEYS: ReadonlySet<string> = new Set([
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_COMMON_DIR",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_INDEX_FILE",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_NAMESPACE",
+  "GIT_CEILING_DIRECTORIES",
+  "GIT_CONFIG",
+  "GIT_CONFIG_GLOBAL",
+  "GIT_CONFIG_SYSTEM",
+  "GIT_CONFIG_NOSYSTEM",
+]);
+
+/** The child environment for a panel read: the ambient environment minus every repo override. */
+function panelGitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, GIT_TERMINAL_PROMPT: "0" };
+  for (const key of Object.keys(env)) {
+    if (GIT_REPO_OVERRIDE_KEYS.has(key) || key.startsWith("GIT_CONFIG_")) delete env[key];
+  }
+  return env;
+}
+
 function gitOut(cwd: string, args: readonly string[]): string | null {
   try {
     return execFileSync("git", args, {
@@ -47,6 +79,7 @@ function gitOut(cwd: string, args: readonly string[]): string | null {
       encoding: "utf8",
       timeout: 1500,
       stdio: ["ignore", "pipe", "ignore"],
+      env: panelGitEnv(),
     }).trim();
   } catch {
     return null;
