@@ -4,7 +4,9 @@
  * the write-time validator (rule 1.5: checked BEFORE redaction and hashing, nothing appended on a
  * fault), the structural-field rule redaction must respect (Copilot 4160774703 on #46), and the
  * chain index a writer keeps so same-file evidence refs resolve at write time (D-M2-A0-4) and a
- * second terminal record for one handoff is refused (Copilot 4160774801 on #46).
+ * second terminal record for one handoff is refused (Copilot 4160774801 on #46). M2-A4 adds the
+ * served marker of `docs/plan/PIN-madc-M2-brief-delivery.md` §3 (`turn.start.briefServed`): its
+ * shape, where it may stand, and its structural fields.
  *
  * Pure: no I/O and no import of the session store, so the store can import this module without a
  * cycle. The envelope and the hash formula are untouched (rules 1.1, 1.2; D-M2-A0-6).
@@ -46,6 +48,17 @@ export type HandoffOutPayload = {
   targetSeatId: string;
   /** The work handed over, verbatim; non-empty after trim. */
   brief: string;
+};
+
+/**
+ * M2 brief-delivery pin §3: the served marker on a handoff target's FIRST `turn.start`. It cites
+ * the source `handoff.out` line whose brief that turn served, by seq and hash (H), and carries no
+ * brief text. Each field equals the same field of the target's `session.open.handoff`.
+ */
+export type BriefServedMarker = {
+  handoffId: string;
+  sourceSeq: number;
+  sourceHash: string;
 };
 
 /** §2.1 step 3 (source chain). */
@@ -258,6 +271,54 @@ export function checkHandoffLink(v: unknown, where = "handoff"): ShapeIssue[] {
   return out;
 }
 
+const BRIEF_SERVED_KEYS: readonly string[] = ["handoffId", "sourceSeq", "sourceHash"];
+
+/** Brief-delivery pin §3: `turn.start.briefServed`, a closed three-field object (no null form). */
+function checkBriefServed(v: unknown): ShapeIssue[] {
+  if (!isPlainRecord(v)) return [invalid("briefServed", "must be an object")];
+  const out: ShapeIssue[] = [];
+  const at = "briefServed.";
+  field(v, "handoffId", isValidId, "must match the id grammar", out, at);
+  field(v, "sourceSeq", isSeq, "must be a non-negative integer", out, at);
+  field(v, "sourceHash", isHex64, "must be 64 lowercase hex", out, at);
+  // The key is never named (Argus F1): an extra key is caller-chosen and may be a secret shape.
+  if (Object.keys(v).some((k) => v[k] !== undefined && !BRIEF_SERVED_KEYS.includes(k))) {
+    out.push(invalid("briefServed", "has a key outside handoffId, sourceSeq and sourceHash"));
+  }
+  return out;
+}
+
+/**
+ * Brief-delivery pin §3: where a well-formed `briefServed` marker may stand. `openHandoff` is the
+ * file's `session.open.handoff` (null when the file is not a handoff target, undefined for a v1
+ * open); `priorTurnStarts` counts the `turn.start` lines before this one. The brief is served
+ * once, by the target's first `turn.start`, and the marker names exactly the link the file opened
+ * with. Shared by the writer (before any byte) and doctor (over a verified chain). Issues name the
+ * field, never a value.
+ */
+export function briefServedPlacementIssues(
+  marker: BriefServedMarker,
+  openHandoff: SessionOpenHandoffLink | null | undefined,
+  priorTurnStarts: number,
+): ShapeIssue[] {
+  if (openHandoff === null || openHandoff === undefined) {
+    return [invalid("briefServed", "stands in a file whose session.open has no handoff link")];
+  }
+  if (priorTurnStarts > 0) {
+    return [
+      invalid("briefServed", "stands after an earlier turn.start (the brief is served once)"),
+    ];
+  }
+  if (
+    marker.handoffId !== openHandoff.handoffId ||
+    marker.sourceSeq !== openHandoff.sourceSeq ||
+    marker.sourceHash !== openHandoff.sourceHash
+  ) {
+    return [invalid("briefServed", "differs from session.open.handoff")];
+  }
+  return [];
+}
+
 function checkHandoffOut(p: Record<string, unknown>): ShapeIssue[] {
   const out: ShapeIssue[] = [];
   field(p, "handoffId", isValidId, "must match the id grammar", out);
@@ -380,7 +441,8 @@ function checkToolCall(p: Record<string, unknown>): ShapeIssue[] {
  * The schema-v2 shape of one payload (§2–§4). For `session.open` and `session.close` only the
  * additive v2 fields are checked here: the M1 fields keep their M1 checks in the store. A
  * `session.open` with `handoff` or `worktree` but not both is a fault (§2.2 verifier rule); one
- * with neither is a v1 line. Every other M1 type has no v2 fields and reports nothing.
+ * with neither is a v1 line. A `turn.start` is checked on its additive `briefServed` marker only
+ * (brief-delivery pin §3). Every other M1 type has no v2 fields and reports nothing.
  */
 export function checkV2Payload(
   type: string,
@@ -388,6 +450,8 @@ export function checkV2Payload(
   ctx: ShapeContext = {},
 ): ShapeIssue[] {
   switch (type) {
+    case "turn.start":
+      return present(p, "briefServed") ? checkBriefServed(p.briefServed) : [];
     case "session.open": {
       const hasHandoff = present(p, "handoff");
       const hasWorktree = present(p, "worktree");
@@ -439,6 +503,10 @@ export class SessionChainIndex {
   readonly #turns = new Set<string>();
   /** `undefined` while no `session.open` was noted, or the open is a v1 line (no `worktree` key). */
   #openWorktree: WorktreeIdentity | null | undefined = undefined;
+  /** Brief-delivery pin §3: the open's `handoff` link; null for a non-target, undefined for v1. */
+  #openHandoff: SessionOpenHandoffLink | null | undefined = undefined;
+  /** Brief-delivery pin §3: how many `turn.start` lines this file holds. */
+  #turnStarts = 0;
 
   static fromEvents(
     events: ReadonlyArray<{
@@ -462,6 +530,9 @@ export class SessionChainIndex {
     // Argus G2: the copy gets its own frozen worktree, never the caller's or this index's object.
     const w = this.#openWorktree;
     copy.#openWorktree = w === undefined || w === null ? w : Object.freeze({ ...w });
+    const h = this.#openHandoff;
+    copy.#openHandoff = h === undefined || h === null ? h : Object.freeze({ ...h });
+    copy.#turnStarts = this.#turnStarts;
     return copy;
   }
 
@@ -495,6 +566,16 @@ export class SessionChainIndex {
     return this.#openWorktree;
   }
 
+  /** The `handoff` link the file's `session.open` recorded (a frozen copy); null / undefined as `#openHandoff`. */
+  get openHandoff(): SessionOpenHandoffLink | null | undefined {
+    return this.#openHandoff;
+  }
+
+  /** How many `turn.start` lines this file holds (a served marker stands only on the first). */
+  get turnStarts(): number {
+    return this.#turnStarts;
+  }
+
   /**
    * Record one durable line (in seq order). Tolerates malformed payloads: it indexes, never judges.
    * Each `ChainLine` is frozen (Argus P11): `lineAt` hands out the index's own object, and a caller
@@ -510,6 +591,13 @@ export class SessionChainIndex {
           this.#openWorktree =
             w !== null && checkWorktreeIdentity(w, "worktree").length === 0
               ? Object.freeze({ ...(w as WorktreeIdentity) })
+              : null;
+        }
+        if (this.#lines.length === 1 && present(p, "handoff")) {
+          const h = p.handoff;
+          this.#openHandoff =
+            h !== null && checkHandoffLink(h).length === 0
+              ? Object.freeze({ ...(h as SessionOpenHandoffLink) })
               : null;
         }
         break;
@@ -528,6 +616,7 @@ export class SessionChainIndex {
         if (isStr(p.decisionId)) this.#decisions.add(p.decisionId);
         break;
       case "turn.start":
+        this.#turnStarts++;
         if (isStr(p.turnId)) this.#turns.add(p.turnId);
         break;
       default:
@@ -619,6 +708,20 @@ export function validateForWrite(
   if (issues.length > 0) return toRefusal(issues);
   const p = payload;
   switch (type) {
+    case "turn.start": {
+      // Brief-delivery pin §3: a served marker only on a target's first turn.start, naming its own
+      // link. A second delivery is refused here, before any byte, whatever the engine believed.
+      if (present(p, "briefServed")) {
+        issues.push(
+          ...briefServedPlacementIssues(
+            p.briefServed as BriefServedMarker,
+            index.openHandoff,
+            index.turnStarts,
+          ),
+        );
+      }
+      break;
+    }
     case "handoff.out": {
       const id = p.handoffId as string;
       if (index.handoffState(id) !== undefined) {
@@ -690,7 +793,7 @@ export function validateForWrite(
  * link unresolvable. The structural view of a payload is everything except its free-text fields;
  * the view must be byte-identical before and after redaction, else the event is refused before
  * the append. M1 types have no structural rule (unchanged); `session.open` / `session.close` are
- * checked on their v2 subtrees only.
+ * checked on their v2 subtrees only, and `turn.start` on its served marker only.
  */
 export function structuralView(type: string, payload: unknown): unknown {
   if (!isPlainRecord(payload)) return null;
@@ -703,6 +806,9 @@ export function structuralView(type: string, payload: unknown): unknown {
       };
     case "session.close":
       return present(p, "worktree") ? { worktree: p.worktree } : {};
+    case "turn.start":
+      // Brief-delivery pin §3: the served marker's ids and hash are structural; `inputText` is not.
+      return present(p, "briefServed") ? { briefServed: p.briefServed } : null;
     case "handoff.out": {
       const { brief: _brief, ...rest } = p;
       return rest;
@@ -743,6 +849,7 @@ const PINNED_STRUCTURAL_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
     "sourceHash",
   ]),
   "session.close": new Set(["worktree", ...WORKTREE_KEYS]),
+  "turn.start": new Set(["briefServed", ...BRIEF_SERVED_KEYS]),
   "handoff.out": new Set(["handoffId", "turnId", "targetSeatId", "brief"]),
   "handoff.link": new Set(["handoffId", "targetThreadId", "targetSeatId", "targetGenesisHash"]),
   "handoff.aborted": new Set(["handoffId", "reason", "error", "code", "message"]),

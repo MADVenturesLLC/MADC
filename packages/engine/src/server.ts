@@ -12,7 +12,7 @@ import {
 } from "@madc/registry";
 import type { Agent, AgentTurnContext, TurnSink } from "./agent.ts";
 import { type CredentialStore, createCredentialStore } from "./credentials/store.ts";
-import { checkHandoffTarget } from "./handoff.ts";
+import { checkHandoffTarget, type HandoffTargetCheck, readHandoffBrief } from "./handoff.ts";
 import { confinedPath, sessionsOwnerReadUnsupported } from "./home.ts";
 import {
   acquireThreadLock,
@@ -93,11 +93,12 @@ import {
   SessionWriter,
   sessionWriteFailed,
   sortedKeyJson,
+  type TurnStartPayload,
   type TurnStartTty,
   verifySessionFile,
   type WorktreeIdentity,
 } from "./session-store.ts";
-import { checkV2Payload } from "./session-v2.ts";
+import { type BriefServedMarker, checkV2Payload } from "./session-v2.ts";
 import { rereadWorktreeIdentity, resolveWorktreeIdentity } from "./worktree.ts";
 
 export const ENGINE_VERSION = "0.0.0";
@@ -551,18 +552,48 @@ export class EngineConnection {
       genesisHash: record.open.genesisHash,
       link,
     });
-    if (!check.ok) {
-      record.handoffVerified = false;
-      this.#log(`handoff gate ${threadId}: refused (${check.kind}): ${check.issues.join("; ")}`);
-      throw evidenceInvalid({
-        threadId,
-        turnId: null,
-        type: "session.open",
-        reason: "handoff-one-way",
-        issues: check.issues,
-      });
-    }
+    if (!check.ok) throw this.#oneWay(record, check);
     record.handoffVerified = true;
+  }
+
+  /** The gate's refusal: `-32010 handoff-one-way`; `issues` name seqs, ids and files, never a brief. */
+  #oneWay(record: ThreadRecord, check: Exclude<HandoffTargetCheck, { ok: true }>): RpcError {
+    const threadId = record.thread.id;
+    record.handoffVerified = false;
+    this.#log(`handoff gate ${threadId}: refused (${check.kind}): ${check.issues.join("; ")}`);
+    return evidenceInvalid({
+      threadId,
+      turnId: null,
+      type: "session.open",
+      reason: "handoff-one-way",
+      issues: check.issues,
+    });
+  }
+
+  /**
+   * M2 brief-delivery pin §2 (D-M2-3): an UNSERVED handoff target — its file holds no `turn.start`
+   * yet (`record.turns` holds exactly the file's `turn.start` ids for this load: rebuilt from the
+   * verified file, then set only once a `turn.start` is durable) — opens its next turn with the
+   * brief. The engine starts no turn here; this runs inside the client's own `turn/start`. The
+   * brief is read from the source's `handoff.out` on
+   * the same verified read that re-checks §2.1 (b) and (c) (never from a caller or a cache), so a
+   * link that no longer holds refuses here with nothing appended. Returns the input part to serve
+   * first and the marker its `turn.start` records; null for any other thread or turn.
+   */
+  #unservedBrief(record: ThreadRecord): { part: UserInput; marker: BriefServedMarker } | null {
+    const link = record.open.handoff;
+    if (link === null || record.turns.size > 0) return null;
+    const read = readHandoffBrief(this.#opts.home, {
+      threadId: record.thread.id,
+      seatId: record.thread.seatId,
+      genesisHash: record.open.genesisHash,
+      link,
+    });
+    if (!read.ok) throw this.#oneWay(record, read);
+    return {
+      part: { type: "text", text: read.brief },
+      marker: { handoffId: link.handoffId, sourceSeq: link.sourceSeq, sourceHash: link.sourceHash },
+    };
   }
 
   /** stdout is gone: nothing can be answered any more, so stop and clean up (same path as EOF). */
@@ -1539,7 +1570,11 @@ export class EngineConnection {
     // link, checked here before the first turn of this load — before the presence phase, the repo
     // gate (whose `repo.decision` would be an append) and preflight. Nothing is appended on refusal.
     this.#handoffGate(record);
-    const ctx = this.#turnContext(record, input);
+    // M2 brief-delivery pin §2: an unserved target's turn opens with the brief, read here — after
+    // the gate, before the presence phase, the repo gate and preflight. Nothing is appended yet.
+    const brief = this.#unservedBrief(record);
+    const ctx = this.#turnContext(record, brief === null ? input : [brief.part, ...input]);
+    const briefServed = brief?.marker ?? null;
     // M1-A4: the repo-policy gate runs before preflight (D-M1-8 must be observable on a clean
     // install), and its pinned receipt names the turn it gated — so the turn id is minted here.
     // Minting an id is pure, so Amendment 3 C3's ordering (preflight at step 4, the `turn.start`
@@ -1558,10 +1593,15 @@ export class EngineConnection {
       const pendingRecord = record;
       return this.#awaitPresence(pendingRecord, phase.facts).then((confirmed) => {
         if (!confirmed) throw this.#presenceRefusal(pendingRecord, backing, "not confirmed");
-        return this.#beginTurn(pendingRecord, ctx, turnId, input, claim, {
-          presence: "verified",
-          tty: { ...phase.facts, confirmation: "keypress" },
-        });
+        return this.#beginTurn(
+          pendingRecord,
+          ctx,
+          turnId,
+          input,
+          claim,
+          { presence: "verified", tty: { ...phase.facts, confirmation: "keypress" } },
+          briefServed,
+        );
       });
     }
     return this.#beginTurn(
@@ -1573,6 +1613,7 @@ export class EngineConnection {
       phase.kind === "verified"
         ? { presence: "verified", tty: { ...phase.facts, confirmation: "carried" } }
         : { presence: "absent" },
+      briefServed,
     );
   }
 
@@ -1580,6 +1621,10 @@ export class EngineConnection {
    * C3 steps 4–5 and the turn itself, once every gate before preflight has passed: preflight exactly
    * once against the record that will append, then the durable `turn.start` (now with the claim,
    * the presence result and — when verified — the TTY facts, seat pin §4.2 S4), then the turn.
+   *
+   * `input` is what the caller sent (`inputText`); `ctx.input` is what the turn serves. They differ
+   * only on an unserved handoff target, whose `turn.start` then carries `briefServed` (M2
+   * brief-delivery pin §3): the marker and the turn are one line, durable together or not at all.
    */
   #beginTurn(
     record: ThreadRecord,
@@ -1588,6 +1633,7 @@ export class EngineConnection {
     input: UserInput[],
     claim: TurnMode,
     presence: TurnPresence,
+    briefServed: BriefServedMarker | null,
   ): DispatchResult {
     const threadId = record.thread.id;
     const turnCtx: Omit<AgentTurnContext, "turnId"> = {
@@ -1601,20 +1647,20 @@ export class EngineConnection {
     this.#opts.agent.preflight?.(turnCtx);
 
     const now = Date.now();
+    // The served marker is an additive schema-v2 field (brief-delivery pin §3), outside the M1
+    // `TurnStartPayload` type; the writer validates it before any byte.
+    const start: TurnStartPayload & { briefServed?: BriefServedMarker } = {
+      turnId,
+      inputText: input.map((part) => part.text).join("\n"),
+      mode: claim,
+      presence: presence.presence,
+      ...(presence.tty === undefined ? {} : { tty: presence.tty }),
+      ...(briefServed === null ? {} : { briefServed }),
+    };
     // turn.start is durable before the turn exists: an append failure is a -32009 response error.
     try {
       // C3 step 5: only after preflight, append turn.start.
-      record.session.append(
-        "turn.start",
-        {
-          turnId,
-          inputText: input.map((part) => part.text).join("\n"),
-          mode: claim,
-          presence: presence.presence,
-          ...(presence.tty === undefined ? {} : { tty: presence.tty }),
-        },
-        now, // == turn.startedAt
-      );
+      record.session.append("turn.start", start, now); // ts == turn.startedAt
     } catch (err) {
       this.#notePoisoned(threadId, record.session);
       throw err;
@@ -1638,7 +1684,9 @@ export class EngineConnection {
     record.activeTurnId = turn.id;
     record.thread.status = "active";
     record.thread.updatedAt = now;
-    if (record.thread.preview === "") record.thread.preview = input[0]?.text ?? "";
+    // The first user text the turn serves, as `rebuildSession` reads it back from the `userMessage`
+    // item (for a target's first turn, the brief as redacted on disk).
+    if (record.thread.preview === "") record.thread.preview = ctx.input[0]?.text ?? "";
 
     const snapshot = structuredClone(turn);
     return {

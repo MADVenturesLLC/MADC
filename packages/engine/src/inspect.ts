@@ -40,8 +40,9 @@ export type SessionReport = {
       };
   /**
    * M2 pin §7: the schema-v2 findings over a chain that verifies (handoff links from either side,
-   * duplicate ids, evidence refs, the close-time worktree, a v2 thread never closed). Empty when
-   * the chain does not verify (the chain row already FAILs) and for a v1 file with no v2 lines.
+   * duplicate ids, evidence refs, the close-time worktree, a v2 thread never closed, and — M2
+   * brief-delivery pin §5 — a handoff target that has not served its brief). Empty when the chain
+   * does not verify (the chain row already FAILs) and for a v1 file with no v2 lines.
    */
   readonly findings: readonly SessionFinding[];
 };

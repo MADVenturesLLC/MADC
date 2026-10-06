@@ -3,7 +3,9 @@
  * engine runs on a handoff TARGET before its first `turn/start` and on every `thread/resume`, and
  * the read-only findings a verifier reports over one session file — handoff state from either
  * side, duplicate ids, a second terminal record (Copilot 4160774801 on #46), evidence refs
- * (same-file, cross-file and `git`), the close-time worktree, and a v2 thread never closed.
+ * (same-file, cross-file and `git`), the close-time worktree, and a v2 thread never closed. M2-A4
+ * (`docs/plan/PIN-madc-M2-brief-delivery.md`) adds the brief read a target's next `turn/start`
+ * serves, and doctor's `brief-unserved` finding and served-marker check.
  *
  * Directional, per Copilot 4160774858 on #46: a target whose source cannot be read is
  * `handoff-unverifiable` and may NOT serve (the engine refuses `-32010 handoff-one-way`); a source
@@ -20,6 +22,9 @@ import {
   verifySessionFile,
 } from "./session-store.ts";
 import {
+  type BriefServedMarker,
+  briefServedPlacementIssues,
+  checkV2Payload,
   type EvidenceRef,
   type SessionOpenHandoffLink,
   sessionRefPath,
@@ -30,10 +35,12 @@ export type SessionFindingLevel = "warn" | "fail";
 /**
  * Pin §7 names, plus `handoff-terminal-conflict` (Copilot 4160774801), `not-cleanly-closed`, and
  * `integrity` (pin §7 "malformed v2 payload … FAIL (integrity)", rule 1.5) for a hash-valid line
- * whose schema-v2 payload is malformed — reported, never thrown (Copilot 4165236079).
+ * whose schema-v2 payload is malformed — reported, never thrown (Copilot 4165236079); and
+ * `brief-unserved` (M2 brief-delivery pin §5) for a verified target that has not served its brief.
  */
 export type SessionFindingCode =
   | "integrity"
+  | "brief-unserved"
   | "handoff-mismatch"
   | "handoff-terminal-conflict"
   | "evidence-ref-mismatch"
@@ -97,6 +104,11 @@ function payloadOf(e: SessionEvent): Record<string, unknown> {
   return e.payload as Record<string, unknown>;
 }
 
+/** Evidence pin rule 1.6: "missing" is absent or `undefined`. */
+function present(p: Record<string, unknown>, key: string): boolean {
+  return Object.hasOwn(p, key) && p[key] !== undefined;
+}
+
 /** The terminal records (`handoff.link` / `handoff.aborted`) naming `handoffId` after seq `after`. */
 function terminalsFor(
   events: readonly SessionEvent[],
@@ -111,23 +123,63 @@ function terminalsFor(
   );
 }
 
+function unverifiableSource(
+  link: SessionOpenHandoffLink,
+  reason: string,
+): Exclude<HandoffTargetCheck, { ok: true }> {
+  return {
+    ok: false,
+    kind: "unverifiable",
+    issues: [
+      `source session ${link.sourceThreadId} cannot be read or does not verify (${reason}): the link is unverifiable (handoff-unverifiable), so this target cannot serve`,
+    ],
+  };
+}
+
 /**
  * §2.1 (b) and (c) checked from the TARGET against the source file. Every `ok: false` is a
  * refusal to serve (`-32010 handoff-one-way`); `kind` says which §2.1 row applies.
  */
 export function checkHandoffTarget(home: string, target: HandoffTargetFacts): HandoffTargetCheck {
-  const { link } = target;
-  const source = readChain(home, link.sourceThreadId);
-  if (!source.ok) {
+  const source = readChain(home, target.link.sourceThreadId);
+  if (!source.ok) return unverifiableSource(target.link, source.reason);
+  return checkLinkIn(source.events, target);
+}
+
+export type HandoffBriefRead =
+  | { readonly ok: true; readonly brief: string }
+  | Exclude<HandoffTargetCheck, { ok: true }>;
+
+/**
+ * M2 brief-delivery pin §2: the brief an unserved target's next `turn/start` serves, read from the
+ * source's own `handoff.out` (hash-pinned, redacted on disk) on the SAME verified read that
+ * re-checks §2.1 (b) and (c). Never from a caller and never from a cache: a link that does not
+ * verify at this read yields no brief, and its issues never carry the brief text.
+ */
+export function readHandoffBrief(home: string, target: HandoffTargetFacts): HandoffBriefRead {
+  const source = readChain(home, target.link.sourceThreadId);
+  if (!source.ok) return unverifiableSource(target.link, source.reason);
+  const check = checkLinkIn(source.events, target);
+  if (!check.ok) return check;
+  // (b) held: this is the `handoff.out` at sourceSeq with hash H, whose `brief` the verifier
+  // shape-checked as a non-empty string (evidence pin rule 1.5). Fail closed regardless.
+  const brief = payloadOf(source.events[target.link.sourceSeq] as SessionEvent).brief;
+  if (typeof brief !== "string") {
     return {
       ok: false,
-      kind: "unverifiable",
-      issues: [
-        `source session ${link.sourceThreadId} cannot be read or does not verify (${source.reason}): the link is unverifiable (handoff-unverifiable), so this target cannot serve`,
-      ],
+      kind: "mismatch",
+      issues: [`source line ${target.link.sourceSeq} carries no brief`],
     };
   }
-  const events = source.events;
+  return { ok: true, brief };
+}
+
+/** §2.1 (b) and (c) of `target` against the source's verified `events`. */
+function checkLinkIn(
+  events: readonly SessionEvent[],
+  target: HandoffTargetFacts,
+): HandoffTargetCheck {
+  const { link } = target;
   const issues: string[] = [];
   const out = events[link.sourceSeq];
   if (out === undefined) {
@@ -271,15 +323,45 @@ export function inspectSessionV2(
   const openWorktree = (openPayload.worktree ?? null) as WorktreeIdentity | null;
 
   // --- this thread as a handoff TARGET (§2.1 (b)/(c) against the source file)
-  const link = openPayload.handoff;
+  const link = openPayload.handoff as SessionOpenHandoffLink | null | undefined;
+  let linkVerified = false;
   if (link !== undefined && link !== null) {
-    const check = checkHandoffTarget(home, {
-      threadId,
-      seatId,
-      genesisHash: open.hash,
-      link: link as SessionOpenHandoffLink,
-    });
+    const check = checkHandoffTarget(home, { threadId, seatId, genesisHash: open.hash, link });
     if (!check.ok) findings.push(targetFinding(check));
+    linkVerified = check.ok;
+  }
+
+  // --- the brief (M2 brief-delivery pin §3, §5). A served marker stands only on a target's first
+  // turn.start and names its own link; anything else is FAIL `integrity` (rule 1.5, read side).
+  // A target whose link verifies and whose brief was not served WARNs `brief-unserved`. Details
+  // name ids and seqs only, never the brief.
+  const starts = events.filter((e) => e.type === "turn.start");
+  starts.forEach((e, prior) => {
+    const p = payloadOf(e);
+    if (!present(p, "briefServed")) return;
+    const shape = checkV2Payload("turn.start", p);
+    const issues =
+      shape.length > 0
+        ? shape
+        : briefServedPlacementIssues(p.briefServed as BriefServedMarker, link, prior);
+    if (issues.length > 0) {
+      fail("integrity", `line ${e.seq + 1}: ${issues.map((i) => i.issue).join("; ")}`);
+    }
+  });
+  if (link !== undefined && link !== null && linkVerified) {
+    const where = `handoff ${link.handoffId} (source ${link.sourceThreadId} seq ${link.sourceSeq})`;
+    const first = starts[0];
+    if (first === undefined) {
+      warn(
+        "brief-unserved",
+        `${where}: no turn.start yet; this target's next turn/start serves it`,
+      );
+    } else if (!present(payloadOf(first), "briefServed")) {
+      warn(
+        "brief-unserved",
+        `${where}: the first turn.start (seq ${first.seq}) carries no briefServed; the brief was never served`,
+      );
+    }
   }
 
   // --- this thread as a handoff SOURCE
