@@ -12,6 +12,10 @@
  *   target is refused `-32010 handoff-one-way`;
  * - redaction: a secret-shaped brief is `[REDACTED]` on disk and both chains still verify.
  *
+ * M2-A3 retarget (`docs/plan/PIN-madc-M2-seat-handoff-allowlist.md`): every cross-seat handoff
+ * runs from a source seat whose `handoffs.targets` names its target; the refusals carry the
+ * allowlist row (§3 row 9); a self-handoff needs no entry (D-445).
+ *
  * Network-free: in-process engines with a spy around the echo agent, real temporary git
  * repositories for the worktree identity (fixture `git` children with the runner's `GIT_*`
  * stripped, M1-A9). No engine code creates a worktree; no fixture here does either.
@@ -42,6 +46,7 @@ import { type Agent, echoAgent } from "./agent.ts";
 import { checkHandoffTarget, inspectSessionV2, type SessionFinding } from "./handoff.ts";
 import { ID_PATTERN } from "./protocol/ids.ts";
 import { MADC_DEFAULT_SEAT } from "./seat.ts";
+import { DAEDALUS_SEAT, HEPHAESTUS_SEAT } from "./seats/roster.ts";
 import { EngineConnection, type EngineOptions } from "./server.ts";
 import {
   REDACTED,
@@ -70,6 +75,17 @@ const sessionFiles = (home: string) =>
     .filter((n) => n.endsWith(".jsonl"))
     .sort();
 const snapshot = (path: string) => ({ size: statSync(path).size, sha: sha256(path) });
+
+/**
+ * M2-A3: the roster seat `daedalus` as a v2 file whose `handoffs.targets` is `targets`. Written
+ * before the engine starts, so the roster seed finds it and never overwrites it.
+ */
+function allowHandoffs(home: string, targets: readonly string[]): string {
+  return writeSeatFile(home, {
+    ...seatFileBody(DAEDALUS_SEAT),
+    handoffs: { enabled: true, targets: [...targets] },
+  });
+}
 
 /** The echo agent, counting every preflight and run: a turn inside `thread/handoff` shows here. */
 function spyAgent(): { agent: Agent; calls: { preflight: number; run: number } } {
@@ -209,10 +225,11 @@ function git(dir: string, args: string[]): string {
 
 // ------------------------------------------------------------------ success
 
-test("M2-A2 success: the source has handoff.out then handoff.link; the target's seq 0 cites H; the link cites G; doctor reports no handoff finding; the target lock is not held on return; no turn ran inside the method", async () => {
+test("M2-A2 success (M2-A3: an allowlisted target; a self-handoff needs no entry, D-445): the source has handoff.out then handoff.link; the target's seq 0 cites H; the link cites G; doctor reports no handoff finding; the target lock is not held on return; no turn ran inside the method", async () => {
   const root = mkdtempSync(join(realpathSync(tmpdir()), "madc-m2a2-ok-"));
   const { home, cleanup } = makeHome();
   try {
+    allowHandoffs(home, ["hephaestus"]);
     const repo = join(root, "repo");
     initRepo(repo);
     git(repo, ["config", "--local", "remote.origin.url", "git@github.com:Owner/Repo.git"]);
@@ -333,6 +350,22 @@ test("M2-A2 success: the source has handoff.out then handoff.link; the target's 
 
     // The source thread keeps serving after the handoff.
     await serve(e, src, "carry on");
+
+    // D-445 (seat pin §4): a self-handoff stays allowed and needs no allowlist entry. `daedalus`
+    // lists only `hephaestus`; `prometheus` has handoffs disabled.
+    const lone = await startThread(e, "prometheus");
+    for (const [threadId, seatId] of [
+      [src, "daedalus"],
+      [lone, "prometheus"],
+    ] as const) {
+      const self = await e.request("thread/handoff", {
+        threadId,
+        targetSeatId: seatId,
+        brief: "Carry it on yourself.",
+        turnId: null,
+      });
+      assert.ok(self.result, `${seatId} self-handoff: ${JSON.stringify(self.error)}`);
+    }
     await e.close();
     assert.equal(types(sessionPath(home, src)).at(-1), "session.close");
     assert.deepEqual(types(sessionPath(home, tgt)), ["session.open"], "the target is not ours");
@@ -350,7 +383,7 @@ test("M2-A2 success: the source has handoff.out then handoff.link; the target's 
 
 // -------------------------------------------------------------- refusals
 
-test("M2-A2 refusals before any append: a missing or invalid target seat, the seat gate, an empty brief, a bad id and a missing key leave the source's size, sha256 and next seq unchanged; nothing else is created", async () => {
+test("M2-A2 refusals before any append (M2-A3: the allowlist row): a missing or invalid target seat, a target the source seat's handoffs.targets does not name exactly, the seat gate, an empty brief, a bad id and a missing key leave the source's size, sha256 and next seq unchanged; nothing else is created", async () => {
   const { home, cleanup } = makeHome();
   try {
     writeSeatFile(home, { id: "broken" }, "{ not json\n");
@@ -364,6 +397,33 @@ test("M2-A2 refusals before any append: a missing or invalid target seat, the se
       id: "ho-targets",
       handoffs: { enabled: false, targets: ["hephaestus"] },
     });
+    writeSeatFile(home, {
+      ...seatFileBody(HEPHAESTUS_SEAT),
+      id: "ho-v2-empty",
+      handoffs: { enabled: true, targets: [] },
+    });
+    // Loadable seats whose ids are a prefix of, or extend, the allowlisted `hephaestus`.
+    for (const id of ["heph", "hephaestus-2"]) {
+      writeSeatFile(home, { ...seatFileBody(MADC_DEFAULT_SEAT), id });
+    }
+    // The gate cases are allowlisted, so their refusal is the target's own gate, not the list.
+    // `no-such-seat` and `prometheus` are not: one does not exist, the other is a real seat.
+    const daedalusPath = allowHandoffs(home, [
+      "hephaestus",
+      "broken",
+      "ho-on",
+      "ho-targets",
+      "ho-v2-empty",
+    ]);
+    const notAllowed = (m: Wire) => {
+      const err = errorOf(m);
+      assert.equal(err.code, -32006);
+      assert.deepEqual(err.data, {
+        seatId: "daedalus",
+        path: daedalusPath,
+        issues: ["handoffs.targets does not name targetSeatId"],
+      });
+    };
     const e = inProcess(home);
     await e.init();
     const src = await startThread(e, "daedalus");
@@ -386,6 +446,30 @@ test("M2-A2 refusals before any append: a missing or invalid target seat, the se
         { ...ok, targetSeatId: "broken" },
         (m) => {
           assert.equal(errorOf(m).code, -32006);
+          assert.equal(errorOf(m).data.seatId, "broken", "the target's own load refused it");
+        },
+      ],
+      [
+        "target absent from the source's handoffs.targets",
+        { ...ok, targetSeatId: "prometheus" },
+        notAllowed,
+      ],
+      ["a prefix of an allowlisted id", { ...ok, targetSeatId: "heph" }, notAllowed],
+      ["an allowlisted id is a prefix of it", { ...ok, targetSeatId: "hephaestus-2" }, notAllowed],
+      [
+        "a caller's targets param never reaches the engine",
+        { ...ok, targetSeatId: "prometheus", targets: ["prometheus"] },
+        notAllowed,
+      ],
+      [
+        "seat gate: a v2 target with handoffs.enabled and targets: []",
+        { ...ok, targetSeatId: "ho-v2-empty" },
+        (m) => {
+          const err = errorOf(m);
+          assert.equal(err.code, -32006);
+          assert.deepEqual(err.data.issues, [
+            "handoffs.targets must list at least one seat id when handoffs.enabled is true",
+          ]);
         },
       ],
       [
@@ -497,6 +581,7 @@ test("M2-A2 refusals before any append: a missing or invalid target seat, the se
 test("M2 handoff amendment 1 (D-389): a turnId that names no turn.start in the source file is refused -32010 field-invalid before any append (before the target seat loads); size, sha256 and next seq unchanged; a served turnId and null still hand off", async () => {
   const { home, cleanup } = makeHome();
   try {
+    allowHandoffs(home, ["hephaestus"]);
     const e = inProcess(home);
     await e.init();
     const src = await startThread(e, "daedalus");
@@ -646,6 +731,7 @@ test("M2-A2 the caller must hold the source thread lock: another engine's thread
 test("M2-A2 the target open fails after handoff.out: handoff.aborted (target-open-failed) carries the open's error, no handoff.link, the error is answered, no target lock is left", async () => {
   const { home, cleanup } = makeHome();
   try {
+    allowHandoffs(home, ["hephaestus"]);
     const ids = ["thr_src", "thr_taken"];
     const e = inProcess(home, echoAgent, { newThreadId: () => ids.shift() ?? "thr_spare" });
     await e.init();
@@ -694,6 +780,7 @@ test("M2-A2 the target exists but its genesis cannot be read back: handoff.abort
   const target = sessionPath(home, "thr_tgt");
   const aside = `${target}.aside`;
   try {
+    allowHandoffs(home, ["hephaestus"]);
     const e = inProcess(home, echoAgent, { newThreadId: () => ids.shift() ?? "thr_spare" });
     await e.init();
     const src = await startThread(e, "daedalus");
@@ -784,6 +871,7 @@ test("M2-A2 redaction: a brief containing secret shapes is [REDACTED] on disk, n
   try {
     const KEY = `sk-${"A1b2C3d4".repeat(4)}`;
     const BEARER = "Bearer abcdefghijklmnop0123";
+    allowHandoffs(home, ["prometheus"]);
     const e = inProcess(home);
     await e.init();
     const src = await startThread(e, "daedalus");

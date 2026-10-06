@@ -76,7 +76,7 @@ import {
   listProviderSummaries,
   type ProviderPresence,
 } from "./providers/list.ts";
-import { type LoadedSeat, loadSeat } from "./seat-store.ts";
+import { type LoadedSeat, loadSeat, seatInvalid } from "./seat-store.ts";
 import { listSeatSummaries } from "./seats/list.ts";
 import { ensureSeatMemoryFile } from "./seats/memory.ts";
 import { seedRosterSeats } from "./seats/roster.ts";
@@ -982,9 +982,21 @@ export class EngineConnection {
       });
     }
 
-    // Step 1c — the target seat loads exactly as `thread/start` loads one: -32005 / -32006, the
-    // seat gate (`handoffs.enabled` / `handoffs.targets`) included. `targets` is not consulted.
+    // Step 1c (row 9, M2 seat handoff allowlist pin §3) — the target seat loads exactly as
+    // `thread/start` loads one: -32005 / -32006, its own seat gate included. Then the SOURCE seat's
+    // `handoffs.targets`, as this connection loaded it, must name the target by exact equality (no
+    // wildcard, prefix or case fold), unless the target is the source's own seat (D-445). Only the
+    // seat file supplies `targets`; a caller cannot. Refused -32006 before any append.
     const targetSeat = loadSeat(this.#opts.home, out.targetSeatId);
+    const source = record.seat.seat.handoffs;
+    if (
+      out.targetSeatId !== record.seat.seat.id &&
+      !(source.enabled && source.targets.includes(out.targetSeatId))
+    ) {
+      throw seatInvalid(record.seat.seat.id, record.seat.path, [
+        "handoffs.targets does not name targetSeatId",
+      ]);
+    }
     this.#noteSeatWarnings(targetSeat);
 
     // Step 2 — `handoff.out` (H) through the existing v2 writer: validated, redacted (`brief` by the
