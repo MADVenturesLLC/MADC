@@ -2,6 +2,8 @@
 
 *Surface Architect · 2026-09-27 · Venue: `MADVenturesLLC/MADC` · Status: **build pin** — gates Hephaestus Acts M1-A1 … M1-A9. Docs only.*
 
+*Amended by `PIN-madc-M2-brief-delivery.md` (2026-10-06, M2-A4, P-M2-3's brief-delivery slice): a handoff target's first `turn/start` serves the source's hash-pinned brief once as `input[0]`, under the recorded `turn.start.briefServed` marker; no method, param, result, notification, item kind or code changes; `protocolVersion` stays `madc-m1/1`; additive.*
+
 *Supersedes `docs/plan/PIN-madc-M0-protocol-messages.md` **for M1 work**. The M0 pin stays frozen and is not edited (M1-A0; Founder, 2026-09-25). M0 Amendments 2 and 3 are separate frozen files, unedited and not superseded here; they remain binding as written, and their references to M0-pin sections read against the matching sections of this pin.*
 
 *Carried forward unchanged: **M0 Amendment 1** (merged PR #8). The frozen M0 pin's record line: `*Amendment 1 (2026-09-24): lock token, fixes A2 Copilot W1 (PR #7), Founder-authorized.*` Its normative text stands in §3.3 ("Cross-process ownership") and §8 (item 9).*

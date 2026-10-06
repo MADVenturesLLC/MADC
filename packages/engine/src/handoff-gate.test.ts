@@ -13,6 +13,11 @@
  * `git` children run with the runner's `GIT_*` stripped, M1-A9) and fixture chains written by the
  * engine's own writer. No worktree is created by ENGINE code: the one linked worktree below is a
  * test fixture made with `git worktree add` in a temp dir, so item 4's rule can be checked.
+ *
+ * M2-A4 (`docs/plan/PIN-madc-M2-brief-delivery.md`, the commission's Part D rows): a handoff
+ * target's first `turn/start` serves the source's brief once under the recorded `briefServed`
+ * marker. Those tests drive the production provider agent on fake model ports, so every model call
+ * and every `servedModel` receipt they check is the engine's own, and no paid call is made.
  */
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
@@ -34,15 +39,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough, Writable } from "node:stream";
 import { test } from "node:test";
+import { type ProviderPort, resolveKimiPinnedModel } from "@madc/adapters";
 import { type Agent, echoAgent } from "./agent.ts";
 import { checkHandoffTarget, inspectSessionV2, type SessionFinding } from "./handoff.ts";
 import { inspectMadcHome } from "./inspect.ts";
+import { ErrorCode, RpcError } from "./protocol/errors.ts";
+import { createProviderAgent } from "./provider-agent.ts";
 import { MADC_DEFAULT_SEAT } from "./seat.ts";
-import { HEPHAESTUS_SEAT } from "./seats/roster.ts";
+import { DAEDALUS_SEAT, HEPHAESTUS_SEAT } from "./seats/roster.ts";
 import type { EngineOptions } from "./server.ts";
 import { EngineConnection } from "./server.ts";
 import {
   GENESIS_HASH,
+  REDACTED,
   type SessionEvent,
   type SessionOpenPayload,
   sessionEventHash,
@@ -986,5 +995,647 @@ test("Argus 5391475289 miss 3 (Copilot 4165236178): head is null only for an unb
     });
   } finally {
     cleanup3();
+  }
+});
+
+// ------------------------------------------------- M2-A4: the target serves the brief
+
+/** The brief `writePair` hands over (fixture text). */
+const PAIR_BRIEF = "Implement §2.1.";
+/** The brief the engine-driven room tests hand over (fixture text). */
+const ROOM_BRIEF = "Write the runbook section on brief delivery; cite the pin by hash.";
+const occurrences = (hay: string, needle: string) => hay.split(needle).length - 1;
+const snapshotOf = (path: string) => ({ size: statSync(path).size, sha: sha256(path) });
+const turnStarts = (path: string) => readLines(path).filter((l) => l.type === "turn.start");
+/** Each `userMessage` item of a file, as its text parts. */
+const userTexts = (path: string): string[][] =>
+  readLines(path)
+    .filter((l) => l.type === "item" && (l.payload.item as { kind: string }).kind === "userMessage")
+    .map((l) =>
+      (l.payload.item as { content: Array<{ text: string }> }).content.map((c) => c.text),
+    );
+const briefFindings = (findings: readonly SessionFinding[]) =>
+  findings.filter((f) => f.code === "brief-unserved");
+
+/** The echo agent, recording each turn's served input; `refuseNext.on` refuses one preflight. */
+function recordingEcho(): { agent: Agent; inputs: string[][]; refuseNext: { on: boolean } } {
+  const inputs: string[][] = [];
+  const refuseNext = { on: false };
+  const agent: Agent = {
+    name: "recording-echo",
+    preflight() {
+      if (!refuseNext.on) return;
+      refuseNext.on = false;
+      throw new RpcError(ErrorCode.ProviderUnavailable, "Provider unavailable", {
+        providerId: "codex",
+        reason: "binary-missing",
+      });
+    },
+    run(ctx, sink) {
+      inputs.push(ctx.input.map((part) => part.text));
+      return echoAgent.run(ctx, sink);
+    },
+  };
+  return { agent, inputs, refuseNext };
+}
+
+type ModelCall = { readonly providerId: string; readonly text: string };
+
+/** A fake model port: records the user message it is sent and answers "ok". */
+function fakePort(providerId: string, calls: ModelCall[]): ProviderPort {
+  return {
+    providerId,
+    async streamTurn(request) {
+      calls.push({ providerId, text: request.messages.map((m) => m.text).join("\n") });
+      request.onTextDelta("ok");
+      return { text: "ok", requestedModelId: request.modelId, servedModel: request.modelId };
+    },
+  };
+}
+
+/**
+ * The production provider agent on fake ports: `daedalus` serves on `claude-code`
+ * (allowed-via-vendor-agent) and `prometheus` on `kimi-code` (allowed-direct), so a receipt that
+ * named the other seat's lane would show.
+ */
+function roomAgent(calls: ModelCall[]): Agent {
+  return createProviderAgent({
+    directLanes: [
+      {
+        providerId: "kimi-code",
+        credential: "fake-kimi-credential",
+        createPort: () => fakePort("kimi-code", calls),
+        resolvePinnedModel: resolveKimiPinnedModel,
+      },
+    ],
+    createClaudePort: () => fakePort("claude-code", calls),
+    detectClaudeBinary: () => "/fake/bin/claude",
+  });
+}
+
+/** `daedalus` may hand off to `prometheus`; written before the engine seeds the roster. */
+function allowPrometheus(home: string): void {
+  writeSeatFile(home, {
+    ...seatFileBody(DAEDALUS_SEAT),
+    handoffs: { enabled: true, targets: ["prometheus"] },
+  });
+}
+
+/** A `daedalus` source serves one turn, then hands `brief` to a new `prometheus` target. */
+async function handOff(
+  e: Engine,
+  brief = ROOM_BRIEF,
+): Promise<{ src: string; tgt: string; handoffId: string }> {
+  const started = await e.request("thread/start", { seatId: "daedalus" });
+  assert.ok(started.result, JSON.stringify(started.error));
+  const src = (started.result as { thread: { id: string } }).thread.id;
+  await serve(e, src, "plan the room");
+  const r = await e.request("thread/handoff", {
+    threadId: src,
+    targetSeatId: "prometheus",
+    brief,
+    turnId: null,
+  });
+  const result = r.result as { handoffId: string; targetThreadId: string } | undefined;
+  assert.ok(result, `thread/handoff: ${JSON.stringify(r.error)}`);
+  return { src, tgt: result.targetThreadId, handoffId: result.handoffId };
+}
+
+test("M2-A4 D1/D2/D3/D6: a target's first turn/start serves the brief once, read from the source's handoff.out under the recorded briefServed marker; no later turn carries it, a restarted engine included; its servedModel receipt names its own seat and lane; the source file is byte-identical across the target's turns", async () => {
+  const { home, cleanup } = makeHome();
+  try {
+    allowPrometheus(home);
+    const calls: ModelCall[] = [];
+    const e = inProcess(home, roomAgent(calls));
+    await e.init();
+    const { src, tgt, handoffId } = await handOff(e);
+    const source = sessionPath(home, src);
+    const target = sessionPath(home, tgt);
+    assert.deepEqual(types(target), ["session.open"], "thread/handoff started no turn");
+    const before = snapshotOf(source);
+    assert.ok((await e.request("thread/resume", { threadId: tgt })).result);
+    await serve(e, tgt, "first");
+    await serve(e, tgt, "second");
+    // D6: size and SHA-256 of the source, unchanged by the target's turns.
+    assert.deepEqual(snapshotOf(source), before);
+
+    // D1 / D2: what the target's model was sent — the brief first and exactly once, then never.
+    const sent = calls.filter((c) => c.providerId === "kimi-code").map((c) => c.text);
+    assert.deepEqual(sent, [`${ROOM_BRIEF}\nfirst`, "second"]);
+    assert.equal(occurrences(sent[0] ?? "", ROOM_BRIEF), 1);
+
+    // The marker on the first turn.start cites the source's handoff.out by seq and hash (H).
+    const link = (readLines(target)[0] as Line).payload.handoff as {
+      handoffId: string;
+      sourceSeq: number;
+      sourceHash: string;
+    };
+    assert.equal(link.handoffId, handoffId);
+    const out = readLines(source)[link.sourceSeq] as Line;
+    assert.equal(out.type, "handoff.out");
+    assert.equal(out.hash, link.sourceHash);
+    assert.equal(out.payload.brief, ROOM_BRIEF);
+    const starts = turnStarts(target);
+    assert.deepEqual(starts[0]?.payload.briefServed, {
+      handoffId,
+      sourceSeq: link.sourceSeq,
+      sourceHash: link.sourceHash,
+    });
+    assert.equal(starts[0]?.payload.inputText, "first", "inputText stays what the caller sent");
+    assert.equal(Object.hasOwn(starts[1]?.payload ?? {}, "briefServed"), false);
+    assert.deepEqual(userTexts(target), [[ROOM_BRIEF, "first"], ["second"]]);
+    assert.equal(occurrences(readFileSync(target, "utf8"), ROOM_BRIEF), 1, "one copy, on disk");
+
+    // D3: each receipt names the seat (envelope) and lane that served it.
+    const receipts = (path: string) =>
+      readLines(path)
+        .filter((l) => l.type === "servedModel")
+        .map((l) => ({
+          seatId: l.seatId,
+          backing: l.payload.backing,
+          providerId: l.payload.providerId,
+          lane: l.payload.lane,
+        }));
+    const own = {
+      seatId: "prometheus",
+      backing: "kimi-code",
+      providerId: "kimi-code",
+      lane: "allowed-direct",
+    };
+    assert.deepEqual(receipts(target), [own, own]);
+    assert.deepEqual(receipts(source), [
+      {
+        seatId: "daedalus",
+        backing: "claude-code",
+        providerId: "claude-code",
+        lane: "allowed-via-vendor-agent",
+      },
+    ]);
+    assert.deepEqual(
+      e.received.filter((m) => m.error !== undefined),
+      [],
+    );
+    await e.close();
+
+    // D2 across a restart: a new engine resumes the target from disk and never re-delivers.
+    const closed = snapshotOf(source); // the first engine's shutdown closed the source
+    const calls2: ModelCall[] = [];
+    const e2 = inProcess(home, roomAgent(calls2));
+    await e2.init();
+    assert.ok((await e2.request("thread/resume", { threadId: tgt })).result);
+    await serve(e2, tgt, "third");
+    await e2.close();
+    assert.deepEqual(
+      calls2.map((c) => c.text),
+      ["third"],
+    );
+    assert.equal(turnStarts(target).length, 3);
+    assert.equal(Object.hasOwn(turnStarts(target)[2]?.payload ?? {}, "briefServed"), false);
+    assert.deepEqual(snapshotOf(source), closed);
+    // D10: no finding, log line or error of either engine carries the brief.
+    const texts = [
+      ...[...findingsOf(home, src), ...findingsOf(home, tgt)].map((f) => f.detail),
+      ...e.logs,
+      ...e2.logs,
+      ...[...e.received, ...e2.received]
+        .filter((m) => m.error !== undefined)
+        .map((m) => JSON.stringify(m)),
+    ];
+    assert.ok(!texts.some((t) => t.includes(ROOM_BRIEF)));
+  } finally {
+    cleanup();
+  }
+});
+
+test("M2-A4 D4: a turn started by the source after the handoff does not deliver the brief — its model call, turn.start and userMessage carry none — while the target's first turn does", async () => {
+  const { home, cleanup } = makeHome();
+  try {
+    allowPrometheus(home);
+    const calls: ModelCall[] = [];
+    const e = inProcess(home, roomAgent(calls));
+    await e.init();
+    const { src, tgt } = await handOff(e);
+    await serve(e, src, "carry on");
+    assert.ok((await e.request("thread/resume", { threadId: tgt })).result);
+    await serve(e, tgt, "first");
+    await e.close();
+    const sentBy = (providerId: string) =>
+      calls.filter((c) => c.providerId === providerId).map((c) => c.text);
+    assert.deepEqual(sentBy("claude-code"), ["plan the room", "carry on"]);
+    assert.deepEqual(sentBy("kimi-code"), [`${ROOM_BRIEF}\nfirst`]);
+    const source = sessionPath(home, src);
+    assert.deepEqual(userTexts(source), [["plan the room"], ["carry on"]]);
+    assert.ok(turnStarts(source).every((l) => !Object.hasOwn(l.payload, "briefServed")));
+    assert.notEqual(turnStarts(sessionPath(home, tgt))[0]?.payload.briefServed, undefined);
+  } finally {
+    cleanup();
+  }
+});
+
+test("M2-A4 D5: delivering twice is refused -32010 field-invalid, nothing appended and the writer usable — a second briefServed after the target's first turn.start; so are a marker on a thread that is not a target, one that differs from the link and malformed ones", async () => {
+  const { home, cleanup } = makeHome();
+  try {
+    allowPrometheus(home);
+    const e = inProcess(home, roomAgent([]));
+    await e.init();
+    const one = await handOff(e);
+    const two = await handOff(e, "A second brief, for the refusal cases.");
+    assert.ok((await e.request("thread/resume", { threadId: one.tgt })).result);
+    await serve(e, one.tgt, "first");
+    await e.close();
+    const markerOf = (id: string) => {
+      const h = (readLines(sessionPath(home, id))[0] as Line).payload.handoff as Record<
+        string,
+        unknown
+      >;
+      return { handoffId: h.handoffId, sourceSeq: h.sourceSeq, sourceHash: h.sourceHash };
+    };
+    const writerFor = (id: string, seatId: string) => {
+      const path = sessionPath(home, id);
+      const v = verifySessionFile(path, id, {}, home);
+      assert.ok(v.ok, id);
+      return unguardedSessionWriterForTests.resume(
+        path,
+        id,
+        seatId,
+        v.nextSeq,
+        v.lastHash,
+        () => [],
+        home,
+      );
+    };
+    const start = (turnId: string, briefServed: unknown) =>
+      ({ turnId, inputText: "again", mode: "headless", presence: "absent", briefServed }) as never;
+    const refused = (
+      id: string,
+      seatId: string,
+      briefServed: unknown,
+      reason: string,
+      issue: string,
+    ) => {
+      const path = sessionPath(home, id);
+      const w = writerFor(id, seatId);
+      const before = { ...snapshotOf(path), next: w.nextSeq };
+      assert.throws(
+        () => w.append("turn.start", start("turn_twice", briefServed)),
+        (err: unknown) => {
+          assert.ok(err instanceof RpcError, String(err));
+          assert.equal(err.code, -32010);
+          assert.equal(err.data?.type, "turn.start");
+          assert.equal(err.data?.reason, reason, issue);
+          assert.deepEqual(err.data?.issues, [issue]);
+          return true;
+        },
+      );
+      assert.deepEqual(
+        { ...snapshotOf(path), next: w.nextSeq },
+        before,
+        `${issue}: nothing appended`,
+      );
+      assert.equal(w.broken, false, issue);
+      return w;
+    };
+    const twice = "briefServed stands after an earlier turn.start (the brief is served once)";
+    // D5: the target served its brief on its first turn.start; a second delivery is refused.
+    const w1 = refused(one.tgt, "prometheus", markerOf(one.tgt), "field-invalid", twice);
+    w1.append("turn.start", {
+      turnId: "turn_plain",
+      inputText: "plain",
+      mode: "headless",
+      presence: "absent",
+    });
+    refused(
+      one.src,
+      "daedalus",
+      markerOf(one.tgt),
+      "field-invalid",
+      "briefServed stands in a file whose session.open has no handoff link",
+    );
+    // The second target is unserved: another link's marker and malformed markers are refused.
+    refused(
+      two.tgt,
+      "prometheus",
+      markerOf(one.tgt),
+      "field-invalid",
+      "briefServed differs from session.open.handoff",
+    );
+    refused(
+      two.tgt,
+      "prometheus",
+      { ...markerOf(two.tgt), sourceHash: "f" },
+      "field-invalid",
+      "briefServed.sourceHash must be 64 lowercase hex",
+    );
+    const { sourceHash: _dropped, ...noHash } = markerOf(two.tgt);
+    refused(two.tgt, "prometheus", noHash, "field-missing", "briefServed.sourceHash is required");
+    refused(
+      two.tgt,
+      "prometheus",
+      { ...markerOf(two.tgt), extra: "x" },
+      "field-invalid",
+      "briefServed has a key outside handoffId, sourceSeq and sourceHash",
+    );
+    refused(two.tgt, "prometheus", null, "field-invalid", "briefServed must be an object");
+    // Positive control: the second target's own marker is accepted once, then refused.
+    writerFor(two.tgt, "prometheus").append("turn.start", start("turn_first", markerOf(two.tgt)));
+    refused(two.tgt, "prometheus", markerOf(two.tgt), "field-invalid", twice);
+    for (const id of [one.tgt, one.src, two.tgt]) {
+      assert.equal(verifySessionFile(sessionPath(home, id), id, {}, home).ok, true, id);
+    }
+  } finally {
+    cleanup();
+  }
+});
+
+test("M2-A4 D7/D10: a target whose link does not verify at its next turn/start refuses -32010 handoff-one-way before serving — nothing appended, the agent not run, no brief text in the refusal or the log; the brief is read on the read that re-checks the link, so a gate result cached by an earlier refused turn/start never serves a source changed since", async () => {
+  // (a) The link breaks after the target loaded; restored, the same target serves its brief.
+  for (const breakage of ["no handoff.link", "source deleted"] as const) {
+    const { home, cleanup } = makeHome();
+    try {
+      const { out } = writePair(home, "link");
+      const rec = recordingEcho();
+      const e = inProcess(home, rec.agent);
+      await e.init();
+      assert.ok((await e.request("thread/resume", { threadId: "thr_tgt" })).result);
+      const src = sessionPath(home, "thr_src");
+      const saved = readFileSync(src);
+      if (breakage === "no handoff.link") {
+        const kept = readLines(src).slice(0, -1);
+        writeFileSync(src, `${kept.map((l) => JSON.stringify(l)).join("\n")}\n`);
+      } else {
+        unlinkSync(src);
+      }
+      const target = sessionPath(home, "thr_tgt");
+      const before = snapshotOf(target);
+      const m = await e.request("turn/start", { threadId: "thr_tgt", input: text("go") });
+      expectEvidenceInvalid(m, "thr_tgt", "handoff-one-way");
+      assert.ok(!JSON.stringify(m).includes(PAIR_BRIEF), `${breakage}: no brief in the refusal`);
+      assert.deepEqual(snapshotOf(target), before, `${breakage}: nothing appended`);
+      assert.deepEqual(rec.inputs, [], `${breakage}: the agent never ran`);
+      assert.ok(!e.received.some((x) => x.method === "turn/started"));
+      writeFileSync(src, saved);
+      await serve(e, "thr_tgt", "go");
+      assert.deepEqual(rec.inputs, [[PAIR_BRIEF, "go"]], `${breakage}: served once restored`);
+      assert.deepEqual(turnStarts(target)[0]?.payload.briefServed, {
+        handoffId: "ho_1",
+        sourceSeq: out.seq,
+        sourceHash: out.hash,
+      });
+      assert.ok(!e.logs.some((l) => l.includes(PAIR_BRIEF)), `${breakage}: no brief in the log`);
+      await e.close();
+    } finally {
+      cleanup();
+    }
+  }
+  // (b) The gate passes and is cached by a turn/start that preflight then refuses; the source's
+  // handoff.out is rewritten (its file stays self-consistent); the next turn/start refuses.
+  const { home, cleanup } = makeHome();
+  try {
+    writePair(home, "link");
+    const rec = recordingEcho();
+    const e = inProcess(home, rec.agent);
+    await e.init();
+    assert.ok((await e.request("thread/resume", { threadId: "thr_tgt" })).result);
+    const target = sessionPath(home, "thr_tgt");
+    const before = snapshotOf(target);
+    rec.refuseNext.on = true;
+    const first = await e.request("turn/start", { threadId: "thr_tgt", input: text("go") });
+    assert.equal((first.error as { code: number } | undefined)?.code, -32008, "preflight refused");
+    const TAMPERED = "Implement §2.2 instead.";
+    rewriteLine(sessionPath(home, "thr_src"), 3, (p) => {
+      p.brief = TAMPERED;
+    });
+    const m = await e.request("turn/start", { threadId: "thr_tgt", input: text("go") });
+    const r = expectEvidenceInvalid(m, "thr_tgt", "handoff-one-way");
+    assert.match(r.issues.join(" "), /hash differs from the recorded sourceHash/);
+    for (const brief of [PAIR_BRIEF, TAMPERED]) {
+      assert.ok(!JSON.stringify(m).includes(brief), "no brief in the refusal");
+      assert.ok(!e.logs.some((l) => l.includes(brief)), "no brief in the log");
+    }
+    assert.deepEqual(snapshotOf(target), before, "nothing appended");
+    assert.deepEqual(rec.inputs, [], "the agent never ran");
+    await e.close();
+  } finally {
+    cleanup();
+  }
+});
+
+test("M2-A4 D8/D10: inspectSessionV2 and doctor report an unserved target as WARN brief-unserved — ids and seqs, never the brief — until its first turn serves it; thread/list carries no served state; a target whose first turn.start has no marker is reported and never served late; an orphaned target is not reported", async () => {
+  // (a) Unserved, then served.
+  {
+    const { home, cleanup } = makeHome();
+    try {
+      writePair(home, "link");
+      const unserved = briefFindings(findingsOf(home, "thr_tgt"));
+      assert.deepEqual(unserved, [
+        {
+          level: "warn",
+          code: "brief-unserved",
+          detail:
+            "handoff ho_1 (source thr_src seq 3): no turn.start yet; this target's next turn/start serves it",
+        },
+      ]);
+      assert.deepEqual(briefFindings(findingsOf(home, "thr_src")), [], "a source is no target");
+      // doctor's home report, with the target as the newest session.
+      const older = new Date(Date.now() - 60_000);
+      utimesSync(sessionPath(home, "thr_src"), older, older);
+      const report = inspectMadcHome(home);
+      assert.equal(report.lastSession?.threadId, "thr_tgt");
+      assert.deepEqual(
+        briefFindings(report.lastSession?.findings ?? []).map((f) => `${f.level} ${f.code}`),
+        ["warn brief-unserved"],
+      );
+      // thread/list: the six summary keys and nothing about handoffs or serving.
+      const rec = recordingEcho();
+      const e = inProcess(home, rec.agent);
+      await e.init();
+      const rowsOf = async (engine: Engine) =>
+        (
+          (await engine.request("thread/list", {})).result as {
+            data: Array<Record<string, unknown>>;
+          }
+        ).data;
+      const rows = await rowsOf(e);
+      for (const row of rows) {
+        assert.deepEqual(Object.keys(row).sort(), [
+          "createdAt",
+          "id",
+          "preview",
+          "seatId",
+          "status",
+          "updatedAt",
+        ]);
+      }
+      assert.equal(rows.find((row) => row.id === "thr_tgt")?.preview, "");
+      assert.ok(!JSON.stringify(rows).includes(PAIR_BRIEF));
+      assert.ok((await e.request("thread/resume", { threadId: "thr_tgt" })).result);
+      await serve(e, "thr_tgt", "go");
+      assert.deepEqual(rec.inputs, [[PAIR_BRIEF, "go"]]);
+      assert.deepEqual(briefFindings(findingsOf(home, "thr_tgt")), [], "served: no WARN");
+      // `preview` is the first user text the turn served, live and rebuilt alike (pin §4).
+      const live = (await rowsOf(e)).find((row) => row.id === "thr_tgt");
+      await e.close();
+      const e2 = inProcess(home);
+      await e2.init();
+      const cold = (await rowsOf(e2)).find((row) => row.id === "thr_tgt");
+      await e2.close();
+      assert.equal(live?.preview, PAIR_BRIEF);
+      assert.equal(cold?.preview, live?.preview);
+      const details = [...findingsOf(home, "thr_src"), ...findingsOf(home, "thr_tgt"), ...unserved];
+      assert.ok(details.every((f) => !f.detail.includes(PAIR_BRIEF)));
+    } finally {
+      cleanup();
+    }
+  }
+  // (b) A target whose first turn.start was written without a marker (an engine before M2-A4).
+  {
+    const { home, cleanup } = makeHome();
+    try {
+      writePair(home, "link");
+      const target = sessionPath(home, "thr_tgt");
+      const v = verifySessionFile(target, "thr_tgt", {}, home);
+      assert.ok(v.ok);
+      const w = unguardedSessionWriterForTests.resume(
+        target,
+        "thr_tgt",
+        "hephaestus",
+        v.nextSeq,
+        v.lastHash,
+        () => [],
+        home,
+      );
+      w.append("turn.start", { turnId: "turn_early", inputText: "earlier" }, 1006);
+      w.append("turn.end", { turnId: "turn_early", status: "completed", error: null }, 1007);
+      assert.deepEqual(
+        briefFindings(findingsOf(home, "thr_tgt")).map((f) => f.detail),
+        [
+          "handoff ho_1 (source thr_src seq 3): the first turn.start (seq 1) carries no briefServed; the brief was never served",
+        ],
+      );
+      const rec = recordingEcho();
+      const e = inProcess(home, rec.agent);
+      await e.init();
+      assert.ok((await e.request("thread/resume", { threadId: "thr_tgt" })).result);
+      await serve(e, "thr_tgt", "go");
+      await e.close();
+      assert.deepEqual(rec.inputs, [["go"]], "its first turn has passed: never served late");
+      assert.ok(turnStarts(target).every((l) => !Object.hasOwn(l.payload, "briefServed")));
+    } finally {
+      cleanup();
+    }
+  }
+  // (c) An orphaned target already has its handoff finding and can never serve.
+  {
+    const { home, cleanup } = makeHome();
+    try {
+      writePair(home, "aborted");
+      assert.deepEqual(briefFindings(findingsOf(home, "thr_tgt")), []);
+      assert.deepEqual(codes(findingsOf(home, "thr_tgt")), ["warn handoff-incomplete"]);
+    } finally {
+      cleanup();
+    }
+  }
+});
+
+test("M2-A4 pin §3 read side: a briefServed marker that differs from the link, stands on a later turn.start or stands in a thread that is not a target is doctor FAIL integrity (no brief text); the chain verifier tolerates the additive field, and the engine never re-delivers on such a file", async () => {
+  const integrity = (home: string, id: string) =>
+    findingsOf(home, id)
+      .filter((f) => f.code === "integrity")
+      .map((f) => f.detail);
+  const servedPair = async (home: string) => {
+    writePair(home, "link");
+    const e = inProcess(home);
+    await e.init();
+    assert.ok((await e.request("thread/resume", { threadId: "thr_tgt" })).result);
+    await serve(e, "thr_tgt", "go");
+    await serve(e, "thr_tgt", "again");
+    await e.close();
+    return sessionPath(home, "thr_tgt");
+  };
+  // (a) The marker differs from the link.
+  {
+    const { home, cleanup } = makeHome();
+    try {
+      const target = await servedPair(home);
+      assert.deepEqual(integrity(home, "thr_tgt"), []);
+      const seq = (turnStarts(target)[0] as Line).seq;
+      rewriteLine(target, seq, (p) => {
+        (p.briefServed as Record<string, unknown>).sourceHash = "f".repeat(64);
+      });
+      assert.deepEqual(integrity(home, "thr_tgt"), [
+        `line ${seq + 1}: briefServed differs from session.open.handoff`,
+      ]);
+      const rec = recordingEcho();
+      const e = inProcess(home, rec.agent);
+      await e.init();
+      assert.ok((await e.request("thread/resume", { threadId: "thr_tgt" })).result);
+      await serve(e, "thr_tgt", "third");
+      await e.close();
+      assert.deepEqual(rec.inputs, [["third"]], "never re-delivered");
+    } finally {
+      cleanup();
+    }
+  }
+  // (b) The marker moved from the first turn.start to the second.
+  {
+    const { home, cleanup } = makeHome();
+    try {
+      const target = await servedPair(home);
+      const [first, second] = turnStarts(target) as [Line, Line];
+      const marker = first.payload.briefServed;
+      rewriteLine(target, first.seq, (p) => {
+        p.briefServed = undefined;
+      });
+      rewriteLine(target, second.seq, (p) => {
+        p.briefServed = marker;
+      });
+      assert.deepEqual(integrity(home, "thr_tgt"), [
+        `line ${second.seq + 1}: briefServed stands after an earlier turn.start (the brief is served once)`,
+      ]);
+      assert.deepEqual(
+        briefFindings(findingsOf(home, "thr_tgt")).map((f) => f.code),
+        ["brief-unserved"],
+      );
+    } finally {
+      cleanup();
+    }
+  }
+  // (c) A marker in a thread that is not a target.
+  {
+    const { home, cleanup } = makeHome();
+    try {
+      writePair(home, "link");
+      rewriteLine(sessionPath(home, "thr_src"), 1, (p) => {
+        p.briefServed = { handoffId: "ho_1", sourceSeq: 3, sourceHash: "a".repeat(64) };
+      });
+      assert.deepEqual(integrity(home, "thr_src"), [
+        "line 2: briefServed stands in a file whose session.open has no handoff link",
+      ]);
+    } finally {
+      cleanup();
+    }
+  }
+});
+
+test("M2-A4 B1: the brief served is the source's handoff.out as written — redacted on disk — never the caller's thread/handoff value or a copy cached by the engine that took the handoff", async () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const KEY = `sk-${"A1b2C3d4".repeat(4)}`;
+    allowPrometheus(home);
+    const calls: ModelCall[] = [];
+    const e = inProcess(home, roomAgent(calls));
+    await e.init();
+    const { tgt } = await handOff(e, `Retire the old key ${KEY} before release.`);
+    assert.ok((await e.request("thread/resume", { threadId: tgt })).result);
+    await serve(e, tgt, "first");
+    await e.close();
+    assert.deepEqual(
+      calls.filter((c) => c.providerId === "kimi-code").map((c) => c.text),
+      [`Retire the old key ${REDACTED} before release.\nfirst`],
+    );
+    assert.ok(!JSON.stringify(e.received).includes(KEY), "the wire never carries the key");
+    assert.ok(!readFileSync(sessionPath(home, tgt), "utf8").includes(KEY));
+  } finally {
+    cleanup();
   }
 });
