@@ -951,9 +951,13 @@ describe("E11 sanitisation of engine text in the full-screen frame", () => {
       await r.app.start();
       r.app.onDoctorFinished(10);
       sendTurn(r.tty, "hi");
+      // The wait is a hang guard, not the assertion: the turn spawns a fixture engine and runs a
+      // verify, which on a loaded machine exceeds the 15 s default (CI is fine; a loaded local
+      // hook is not). Raised so the test asserts the rendering, not the machine's scheduler.
       await until(
         () => r.app.phase === "idle" && r.app.turns.length === 1 && r.app.turns[0]?.verify != null,
         "ctrl turn",
+        60_000,
       );
       const raw = r.tty.chunks.join("");
       // The engine's own bytes never reach the screen: its exact ESC-after-"clean" is gone.
@@ -1900,7 +1904,9 @@ describe("round 3: cutoff race and the unanswered-interrupt engine stop", () => 
   });
 
   it("B-2 the unanswered interrupt stops the engine; Enter restarts it", {
-    timeout: 30_000,
+    // Three spawned fixture engines and two restarts; 30 s was clipped under load (32.3 s
+    // observed). The cap is a hang guard, so it is raised rather than the scenario shortened.
+    timeout: 90_000,
   }, async () => {
     const r = rig([
       { kind: "ok", text: "before interrupt" },

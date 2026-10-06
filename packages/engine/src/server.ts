@@ -147,6 +147,15 @@ export type EngineOptions = {
   providerPresence?: ProviderPresence;
   /** M1-A8 test seam: the clock `provider/list` judges terms freshness by (default `Date.now`). */
   now?: () => number;
+  /**
+   * Argus P8 test seam: the total wall-clock budget for every loaded thread's close-time worktree
+   * re-read at one shutdown. Default `CLOSE_REREAD_BUDGET_MS` (300 ms), the production value, which
+   * keeps shutdown inside the CLI's 1 s kill budget. A test that loads many threads and drives real
+   * `git` under a loaded machine can spend it and record `worktree: null` by design — a test seam
+   * lets that test assert the null-recording and bounded-shutdown properties instead of timing the
+   * machine. Production never passes this.
+   */
+  closeRereadBudgetMs?: number;
 };
 
 type TurnRecord = {
@@ -484,7 +493,9 @@ export class EngineConnection {
     // CLI's kill budget (`oneshot.ts` KILL_AFTER_MS) however many threads are loaded or however
     // long `git` hangs. A re-read past it records `worktree: null` (doctor WARNs).
     // Monotonic clock (Argus F7), the same one the bounded runner reads.
-    const deadline = { at: performance.now() + CLOSE_REREAD_BUDGET_MS };
+    const deadline = {
+      at: performance.now() + (this.#opts.closeRereadBudgetMs ?? CLOSE_REREAD_BUDGET_MS),
+    };
     for (const record of this.#threads.values()) {
       const threadId = record.thread.id;
       // Argus P15: one thread's unexpected fault is logged and the next thread is still closed.
