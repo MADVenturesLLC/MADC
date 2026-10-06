@@ -1245,21 +1245,38 @@ test("§3e E6: a signal before the engine is spawned → nothing spawned, exit 1
   const sb = sandbox();
   try {
     const mark = join(sb.root, "mark");
+    const backstop = join(sb.root, "backstop");
     let signalledAt = 0;
     const r = await runCli(sb, ["-p", "-", "--json"], {
       engine: FAKE,
       keepStdinOpen: true,
-      env: { MADC_TEST_FAKE_MARK: mark },
+      env: { MADC_TEST_FAKE_MARK: mark, MADC_TEST_BACKSTOP_MARK: backstop },
       onSpawn: (child) => {
-        setTimeout(() => {
-          signalledAt = Date.now();
-          child.kill("SIGTERM");
-        }, 300);
-        setTimeout(() => child.kill("SIGKILL"), 10_000).unref();
+        // §3e E6: signal only once the backstop is armed (see cli-launcher.ts). Module load is
+        // unbounded on a loaded runner; a fixed delay races it, and the signal is then handled
+        // after the load finishes, so the measured interval would be module load + teardown.
+        waitForFile(backstop, "backstop")
+          .then(() => {
+            signalledAt = Date.now();
+            child.kill("SIGTERM");
+          })
+          .catch(() => child.kill("SIGKILL"));
+        setTimeout(() => child.kill("SIGKILL"), 15_000).unref();
       },
     });
     assert.equal(r.code, 143, r.stdout + r.stderr);
-    assert.ok(Date.now() - signalledAt < 1_000, "abandoned the stdin read at once");
+    // Abandoning the stdin read is proven by the process EXITING while stdin was still open:
+    // `r.code === 143` above means the CLI handled the signal and never had to be SIGKILLed, and
+    // `keepStdinOpen` means it saw no EOF to release the read. The former tight bound here
+    // (< 1000 ms) measured none of that; it measured the module tree still loading after the
+    // signal, which is unbounded on a loaded runner. CI measured > 1000 ms on this assertion
+    // while the three E7 tests passed under the same load. Kept as a generous hang guard, well
+    // inside the 15 s SIGKILL deadline below.
+    assert.equal(r.signal, null, "the CLI exited on its own; the test never had to SIGKILL it");
+    assert.ok(
+      Date.now() - signalledAt < 5_000,
+      `the signal was abandoned, not waited out (${Date.now() - signalledAt} ms)`,
+    );
     const out = parseJson(r.stdout);
     assert.equal(out.exitCode, 143);
     assert.equal(out.seatId, "madc-default");
@@ -1283,15 +1300,24 @@ test("§3e E7: doctor on a signal kills the probe, removes the temp dir, exits 1
   mkdirSync(tmp);
   try {
     let signalledAt = 0;
+    const ready = join(sb.root, "ready");
     const r = await runCli(sb, ["doctor", "--json"], {
       engine: FAKE,
-      env: { MADC_TEST_FAKE_SCENARIO: "never-answer-init", TMPDIR: tmp },
+      env: {
+        MADC_TEST_FAKE_SCENARIO: "never-answer-init",
+        MADC_TEST_FAKE_READY_MARK: ready,
+        TMPDIR: tmp,
+      },
       onSpawn: (child) => {
-        setTimeout(() => {
-          signalledAt = Date.now();
-          child.kill("SIGTERM");
-        }, 300);
-        setTimeout(() => child.kill("SIGKILL"), 10_000).unref();
+        // §3e E7: signal once the probe has reached the engine (its initialize arrived), so the
+        // measured interval is the kill, not module load (see fake-engine.ts READY_MARK).
+        waitForFile(ready, "ready")
+          .then(() => {
+            signalledAt = Date.now();
+            child.kill("SIGTERM");
+          })
+          .catch(() => child.kill("SIGKILL"));
+        setTimeout(() => child.kill("SIGKILL"), 15_000).unref();
       },
     });
     assert.equal(r.code, 143, r.stdout + r.stderr);
@@ -1321,17 +1347,25 @@ test("§3e E7: a signal during the probe's stdin-EOF wait kills the probe at onc
   mkdirSync(tmp);
   try {
     let signalledAt = 0;
+    const ready = join(sb.root, "ready");
     const r = await runCli(sb, ["doctor", "--json"], {
       engine: FAKE,
       // The fake answers initialize, then never exits on EOF: without the kill the probe would
       // sit out the rest of its 5 s budget.
-      env: { MADC_TEST_FAKE_SCENARIO: "init-then-hang", TMPDIR: tmp },
+      env: {
+        MADC_TEST_FAKE_SCENARIO: "init-then-hang",
+        MADC_TEST_FAKE_READY_MARK: ready,
+        TMPDIR: tmp,
+      },
       onSpawn: (child) => {
-        setTimeout(() => {
-          signalledAt = Date.now();
-          child.kill("SIGTERM");
-        }, 600);
-        setTimeout(() => child.kill("SIGKILL"), 10_000).unref();
+        // §3e E7: signal once the probe has reached the engine, not after a fixed delay.
+        waitForFile(ready, "ready")
+          .then(() => {
+            signalledAt = Date.now();
+            child.kill("SIGTERM");
+          })
+          .catch(() => child.kill("SIGKILL"));
+        setTimeout(() => child.kill("SIGKILL"), 15_000).unref();
       },
     });
     assert.equal(r.code, 143, r.stdout + r.stderr);
@@ -1357,17 +1391,21 @@ test("§3e E7: a signal during --init runs no further rows (only the rows so far
   const sb = sandbox();
   try {
     let signalledAt = 0;
+    const ready = join(sb.root, "ready");
     const r = await runCli(sb, ["doctor", "--init", "--json"], {
       engine: FAKE,
       // The fake answers initialize, then never exits on EOF: the init probe's budget is 30 s,
       // so a prompt exit proves the kill, and checks == ["init"] proves no further rows ran.
-      env: { MADC_TEST_FAKE_SCENARIO: "init-then-hang" },
+      env: { MADC_TEST_FAKE_SCENARIO: "init-then-hang", MADC_TEST_FAKE_READY_MARK: ready },
       onSpawn: (child) => {
-        setTimeout(() => {
-          signalledAt = Date.now();
-          child.kill("SIGTERM");
-        }, 600);
-        setTimeout(() => child.kill("SIGKILL"), 10_000).unref();
+        // §3e E7: signal once the probe has reached the engine, not after a fixed delay.
+        waitForFile(ready, "ready")
+          .then(() => {
+            signalledAt = Date.now();
+            child.kill("SIGTERM");
+          })
+          .catch(() => child.kill("SIGKILL"));
+        setTimeout(() => child.kill("SIGKILL"), 15_000).unref();
       },
     });
     assert.equal(r.code, 143, r.stdout + r.stderr);
