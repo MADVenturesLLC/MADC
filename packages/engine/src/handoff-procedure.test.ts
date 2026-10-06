@@ -415,7 +415,7 @@ test("M2-A2 refusals before any append: a missing or invalid target seat, the se
             type: "handoff.out",
             reason: "field-invalid",
           });
-          assert.equal(r.turnId, turnId);
+          assert.equal(r.turnId, null, "row 2 never echoes the caller's turnId (D-399)");
           assert.deepEqual(r.issues, ["brief must be a non-empty string"]);
         },
       ],
@@ -486,6 +486,119 @@ test("M2-A2 refusals before any append: a missing or invalid target seat, the se
     assert.ok(r.result, JSON.stringify(r.error));
     const out = readLines(path).find((l) => l.type === "handoff.out") as Line;
     assert.equal(out.seq, linesBefore, "nextSeq was unchanged by every refusal");
+    await e.close();
+  } finally {
+    cleanup();
+  }
+});
+
+// ------------------------------------------------- handoff amendment 1
+
+test("M2 handoff amendment 1 (D-389): a turnId that names no turn.start in the source file is refused -32010 field-invalid before any append (before the target seat loads); size, sha256 and next seq unchanged; a served turnId and null still hand off", async () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const e = inProcess(home);
+    await e.init();
+    const src = await startThread(e, "daedalus");
+    const served = await serve(e, src);
+    // A turn.start that exists, but in another thread's file: it does not name one in the source.
+    const other = await startThread(e, "prometheus");
+    const elsewhere = await serve(e, other);
+    const path = sessionPath(home, src);
+    const before = snapshot(path);
+    const linesBefore = readLines(path).length;
+    const files = sessionFiles(home);
+    const NEVER = `turn_${"0123456789abcdef".repeat(2)}`;
+
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["a well-formed turnId no turn.start named", { targetSeatId: "hephaestus", turnId: NEVER }],
+      ["a turn.start of another thread", { targetSeatId: "hephaestus", turnId: elsewhere }],
+      // Row 8a precedes row 9: the turnId is refused before the target seat is even loaded.
+      ["before an unknown target seat", { targetSeatId: "no-such-seat", turnId: NEVER }],
+    ];
+    for (const [name, params] of cases) {
+      const m = await e.request("thread/handoff", { threadId: src, brief: "go", ...params });
+      const r = expectEvidenceInvalid(m, {
+        threadId: src,
+        type: "handoff.out",
+        reason: "field-invalid",
+      });
+      assert.deepEqual(r.issues, ["turnId names no turn.start in the source file"], name);
+      assert.equal(r.turnId, null, `${name}: the caller's turnId is not echoed`);
+      assert.ok(!JSON.stringify(m.error).includes(params.turnId as string), `${name}: no echo`);
+      assert.deepEqual(snapshot(path), before, `${name}: source size and sha256 unchanged`);
+      assert.deepEqual(sessionFiles(home), files, `${name}: no session file created`);
+    }
+
+    // The writer is neither advanced nor broken; a turnId naming a turn.start here hands off.
+    const ok = await e.request("thread/handoff", {
+      threadId: src,
+      targetSeatId: "hephaestus",
+      brief: "go",
+      turnId: served,
+    });
+    assert.ok(ok.result, JSON.stringify(ok.error));
+    const out = readLines(path).find((l) => l.type === "handoff.out") as Line;
+    assert.equal(out.seq, linesBefore, "nextSeq was unchanged by every refusal");
+    assert.equal(out.payload.turnId, served);
+    // null still means "raised between turns" and is not checked against the file.
+    const between = await e.request("thread/handoff", {
+      threadId: src,
+      targetSeatId: "hephaestus",
+      brief: "go",
+      turnId: null,
+    });
+    assert.ok(between.result, JSON.stringify(between.error));
+    await e.close();
+  } finally {
+    cleanup();
+  }
+});
+
+test("M2 handoff amendment 1 (D-399): step 1 row 2's refusal never echoes a raw turnId: data.turnId is null and neither data nor data.issues carry the caller's value", async () => {
+  const { home, cleanup } = makeHome();
+  try {
+    const e = inProcess(home);
+    await e.init();
+    const src = await startThread(e, "daedalus");
+    const served = await serve(e, src);
+    const path = sessionPath(home, src);
+    const before = snapshot(path);
+    // Well-formed ids (row 2 does not refuse them for their own sake): one a turn this file
+    // started, one shaped like a secret (seat pin §4.2), one plain id that names nothing.
+    const SECRETISH = `sk-${"A1b2C3d4".repeat(4)}`;
+    const PLAIN = `turn_${"fedcba9876543210".repeat(2)}`;
+    const cases: Array<[string, Record<string, unknown>, string, string]> = [
+      ["served turnId, empty brief", { turnId: served, brief: " " }, served, "field-invalid"],
+      [
+        "secret-shaped turnId, empty brief",
+        { turnId: SECRETISH, brief: "" },
+        SECRETISH,
+        "field-invalid",
+      ],
+      ["plain turnId, brief missing", { turnId: PLAIN }, PLAIN, "field-missing"],
+      [
+        "served turnId, targetSeatId outside the grammar",
+        { turnId: served, brief: "go", targetSeatId: "../x" },
+        served,
+        "field-invalid",
+      ],
+      ["turnId outside the grammar", { turnId: `${PLAIN} x`, brief: "go" }, PLAIN, "field-invalid"],
+    ];
+    for (const [name, params, raw, reason] of cases) {
+      const m = await e.request("thread/handoff", {
+        threadId: src,
+        targetSeatId: "hephaestus",
+        ...params,
+      });
+      const r = expectEvidenceInvalid(m, { threadId: src, type: "handoff.out", reason });
+      assert.equal(r.turnId, null, `${name}: data.turnId is null`);
+      const err = errorOf(m);
+      assert.ok(!JSON.stringify(err.data).includes(raw), `${name}: data carries no raw turnId`);
+      assert.ok(!r.issues.join("\n").includes(raw), `${name}: issues carry no raw turnId`);
+      assert.ok(!JSON.stringify(m).includes(raw), `${name}: nothing on the wire carries it`);
+      assert.deepEqual(snapshot(path), before, `${name}: nothing appended`);
+    }
     await e.close();
   } finally {
     cleanup();
