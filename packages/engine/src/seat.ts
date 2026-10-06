@@ -12,6 +12,9 @@
  * what makes "never rewritten" observable, and what `serializeSeat` round-trips). Key sets are
  * version-scoped: a v1 file is still the closed M0 schema, so `displayName` / `fallbacks` in a v1
  * file are unknown keys and fail load exactly as any other M0 unknown key did.
+ *
+ * M2-A3 (`PIN-madc-M2-seat-handoff-allowlist.md`): a v2 file may set `handoffs.enabled: true` with
+ * a non-empty `handoffs.targets` allowlist of exact seat ids. A v1 file keeps the M0 gate unchanged.
  */
 import { posix } from "node:path";
 import { getById } from "@madc/registry";
@@ -31,7 +34,11 @@ export type SeatToolsPolicy = {
   readonly allow?: readonly string[];
 };
 
-export type SeatHandoffsStub = { readonly enabled: false; readonly targets: readonly string[] };
+/**
+ * `handoffs` (seat pin §2; M2 seat handoff allowlist pin §2): `enabled: false` with `targets: []`,
+ * or, in a v2 file only, `enabled: true` with a non-empty list of exact seat ids.
+ */
+export type SeatHandoffsStub = { readonly enabled: boolean; readonly targets: readonly string[] };
 
 /** One seat file, as validated. */
 export type EngineSeat = {
@@ -247,13 +254,39 @@ export function validateSeat(raw: unknown, expectedId: string): SeatValidation {
   }
 
   const handoffs = raw.handoffs;
+  // The allowlist this seat may hand off to (M2 seat handoff allowlist pin §2); empty unless valid.
+  let allowlist: readonly string[] = [];
   if (!isRecord(handoffs)) {
     issues.push("handoffs must be an object");
   } else {
     unknownKeys(handoffs, ["enabled", "targets"], "handoffs.", issues);
-    if (handoffs.enabled !== false) issues.push("handoffs.enabled must be false in M0");
-    if (!Array.isArray(handoffs.targets) || handoffs.targets.length !== 0) {
-      issues.push("handoffs.targets must be [] in M0");
+    const targets = handoffs.targets;
+    if (version !== 2) {
+      // A v1 file is the closed M0 schema (S2): the M0 gate, unchanged.
+      if (handoffs.enabled !== false) issues.push("handoffs.enabled must be false in M0");
+      if (!Array.isArray(targets) || targets.length !== 0) {
+        issues.push("handoffs.targets must be [] in M0");
+      }
+    } else if (handoffs.enabled === true) {
+      // The one relaxation: a non-empty list of seat ids, matched exactly at `thread/handoff`.
+      if (!Array.isArray(targets) || targets.length === 0) {
+        issues.push(
+          "handoffs.targets must list at least one seat id when handoffs.enabled is true",
+        );
+      } else {
+        targets.forEach((target: unknown, i) => {
+          if (!isValidId(target)) {
+            issues.push(`handoffs.targets[${i}] must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`);
+          }
+        });
+        allowlist = targets as string[];
+      }
+    } else if (handoffs.enabled === false) {
+      if (!Array.isArray(targets) || targets.length !== 0) {
+        issues.push("handoffs.targets must be [] when handoffs.enabled is false");
+      }
+    } else {
+      issues.push("handoffs.enabled must be a boolean");
     }
   }
 
@@ -284,7 +317,10 @@ export function validateSeat(raw: unknown, expectedId: string): SeatValidation {
     policy: Object.freeze({
       headlessOk: (policy as Record<string, unknown>).headlessOk as boolean,
     }),
-    handoffs: Object.freeze({ enabled: false as const, targets: Object.freeze([]) }),
+    handoffs: Object.freeze({
+      enabled: allowlist.length > 0,
+      targets: Object.freeze([...allowlist]),
+    }),
   });
   return { ok: true, seat };
 }

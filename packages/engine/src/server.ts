@@ -76,7 +76,7 @@ import {
   listProviderSummaries,
   type ProviderPresence,
 } from "./providers/list.ts";
-import { type LoadedSeat, loadSeat } from "./seat-store.ts";
+import { type LoadedSeat, loadSeat, seatInvalid } from "./seat-store.ts";
 import { listSeatSummaries } from "./seats/list.ts";
 import { ensureSeatMemoryFile } from "./seats/memory.ts";
 import { seedRosterSeats } from "./seats/roster.ts";
@@ -97,7 +97,7 @@ import {
   verifySessionFile,
   type WorktreeIdentity,
 } from "./session-store.ts";
-import { checkV2Payload, turnIdOf } from "./session-v2.ts";
+import { checkV2Payload } from "./session-v2.ts";
 import { rereadWorktreeIdentity, resolveWorktreeIdentity } from "./worktree.ts";
 
 export const ENGINE_VERSION = "0.0.0";
@@ -909,13 +909,14 @@ export class EngineConnection {
   /**
    * `thread/handoff` (M2 handoff procedure pin §4): the M2 evidence pin §2.1 order, performed
    * in-process on the SOURCE thread this connection holds. Step 1 refuses before any append (the
-   * params, the source lock, the target seat); step 2 appends `handoff.out` (H) through the
-   * source writer, which redacts `brief`; step 3 opens the target through `#openThread` with
-   * `session.open.handoff` citing H (no JSON-RPC `thread/start`, no notification, no turn); step 4
-   * reads the target's genesis hash G back from disk, releases the target lock, appends
-   * `handoff.link` (G) and answers only when §2.1 (a), (b) and (c) hold against the files. A failure
-   * of step 3 or 4 after `handoff.out` exists appends `handoff.aborted` instead (step 5) and answers
-   * that failure. Synchronous throughout: no other request interleaves with the procedure.
+   * params, the source lock, the source turn of amendment 1, the target seat); step 2 appends
+   * `handoff.out` (H) through the source writer, which redacts `brief`; step 3 opens the target
+   * through `#openThread` with `session.open.handoff` citing H (no JSON-RPC `thread/start`, no
+   * notification, no turn); step 4 reads the target's genesis hash G back from disk, releases the
+   * target lock, appends `handoff.link` (G) and answers only when §2.1 (a), (b) and (c) hold against
+   * the files. A failure of step 3 or 4 after `handoff.out` exists appends `handoff.aborted` instead
+   * (step 5) and answers that failure. Synchronous throughout: no other request interleaves with
+   * the procedure.
    */
   #threadHandoff(params: unknown): { value: ThreadHandoffResult } {
     const p = paramsObject(params);
@@ -939,7 +940,9 @@ export class EngineConnection {
     if (firstFault !== undefined) {
       throw evidenceInvalid({
         threadId,
-        turnId: turnIdOf(candidate),
+        // Handoff amendment 1 (D-399): the source is not located yet, so no `turnId` has been shown
+        // to name a `turn.start` (D-389). The caller's value is never echoed; the key stays, null.
+        turnId: null,
         type: "handoff.out",
         reason: firstFault.reason,
         issues: faults.map((f) => f.issue),
@@ -966,10 +969,34 @@ export class EngineConnection {
     // A source that is itself a handoff target hands work on only while its own link verifies
     // (evidence pin §2.1: an orphaned target serves nothing). Nothing is appended on refusal.
     this.#handoffGate(record);
+    // Handoff amendment 1 row 8a (D-389): a non-null `turnId` must name a `turn.start` in the source
+    // file. `record.turns` holds exactly those ids for this load: rebuilt from the verified file at
+    // resume, and set only once a `turn.start` append is durable. The caller's value is not echoed.
+    if (out.turnId !== null && !record.turns.has(out.turnId)) {
+      throw evidenceInvalid({
+        threadId,
+        turnId: null,
+        type: "handoff.out",
+        reason: "field-invalid",
+        issues: ["turnId names no turn.start in the source file"],
+      });
+    }
 
-    // Step 1c — the target seat loads exactly as `thread/start` loads one: -32005 / -32006, the
-    // seat gate (`handoffs.enabled` / `handoffs.targets`) included. `targets` is not consulted.
+    // Step 1c (row 9, M2 seat handoff allowlist pin §3) — the target seat loads exactly as
+    // `thread/start` loads one: -32005 / -32006, its own seat gate included. Then the SOURCE seat's
+    // `handoffs.targets`, as this connection loaded it, must name the target by exact equality (no
+    // wildcard, prefix or case fold), unless the target is the source's own seat (D-445). Only the
+    // seat file supplies `targets`; a caller cannot. Refused -32006 before any append.
     const targetSeat = loadSeat(this.#opts.home, out.targetSeatId);
+    const source = record.seat.seat.handoffs;
+    if (
+      out.targetSeatId !== record.seat.seat.id &&
+      !(source.enabled && source.targets.includes(out.targetSeatId))
+    ) {
+      throw seatInvalid(record.seat.seat.id, record.seat.path, [
+        "handoffs.targets does not name targetSeatId",
+      ]);
+    }
     this.#noteSeatWarnings(targetSeat);
 
     // Step 2 — `handoff.out` (H) through the existing v2 writer: validated, redacted (`brief` by the

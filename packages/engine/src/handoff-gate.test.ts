@@ -4,7 +4,8 @@
  * three link lines is FAIL `handoff-mismatch` from the other file), item 2 (one-way is refused
  * on turn/start and thread/resume, nothing appended, doctor WARNs `handoff-incomplete`), item 4
  * (worktree HEAD at open and close, subdirectory, non-git cwd, linked worktree), item 6 (the seat
- * gate is unchanged: `handoffs.enabled: true` still fails -32006) and D-M2-A0-5 (`session.close`
+ * gate, retargeted in M2-A3 to `PIN-madc-M2-seat-handoff-allowlist.md`: only a v2 seat with
+ * `handoffs.enabled: true` and a non-empty allowlist relaxes it) and D-M2-A0-5 (`session.close`
  * on every clean shutdown); plus Copilot 4160774858 on #46 (an unreadable source is
  * `handoff-unverifiable` and the target may not serve; a readable source serves).
  *
@@ -37,6 +38,7 @@ import { type Agent, echoAgent } from "./agent.ts";
 import { checkHandoffTarget, inspectSessionV2, type SessionFinding } from "./handoff.ts";
 import { inspectMadcHome } from "./inspect.ts";
 import { MADC_DEFAULT_SEAT } from "./seat.ts";
+import { HEPHAESTUS_SEAT } from "./seats/roster.ts";
 import type { EngineOptions } from "./server.ts";
 import { EngineConnection } from "./server.ts";
 import {
@@ -742,30 +744,43 @@ test("M2 D-M2-A0-5: every clean shutdown writes session.close — after a served
 
 // ------------------------------------------------------------------ item 6
 
-test("M2 §10.6 seat gate unchanged: handoffs.enabled: true or a non-empty targets list still fails thread/start with -32006 (no new seat pin)", async () => {
+test("M2 §10.6 seat gate, retargeted to the M2-A3 seat handoff allowlist pin: only a v2 seat with handoffs.enabled: true and a non-empty targets list of seat ids is relaxed; enabled: true with targets: [], a non-empty list with enabled: false, a wildcard entry and any v1 seat with handoffs on still fail thread/start with -32006", async () => {
   const { home, cleanup } = makeHome();
   try {
-    writeSeatFile(home, {
-      ...seatFileBody(MADC_DEFAULT_SEAT),
-      id: "ho-on",
-      handoffs: { enabled: true, targets: [] },
-    });
-    writeSeatFile(home, {
-      ...seatFileBody(MADC_DEFAULT_SEAT),
-      id: "ho-targets",
-      handoffs: { enabled: false, targets: ["hephaestus"] },
-    });
+    const seat = (id: string, version: 1 | 2, enabled: boolean, targets: string[]) =>
+      writeSeatFile(home, {
+        ...seatFileBody(version === 1 ? MADC_DEFAULT_SEAT : HEPHAESTUS_SEAT),
+        id,
+        handoffs: { enabled, targets },
+      });
+    seat("ho-on", 1, true, []);
+    seat("ho-targets", 1, false, ["hephaestus"]);
+    seat("ho-v1-list", 1, true, ["hephaestus"]);
+    seat("ho-v2-empty", 2, true, []);
+    seat("ho-v2-off-list", 2, false, ["hephaestus"]);
+    seat("ho-v2-wild", 2, true, ["*"]);
+    seat("ho-v2-allow", 2, true, ["hephaestus"]);
     const e = inProcess(home);
     await e.init();
     for (const [seatId, issue] of [
       ["ho-on", "handoffs.enabled must be false in M0"],
       ["ho-targets", "handoffs.targets must be [] in M0"],
+      ["ho-v1-list", "handoffs.enabled must be false in M0"],
+      [
+        "ho-v2-empty",
+        "handoffs.targets must list at least one seat id when handoffs.enabled is true",
+      ],
+      ["ho-v2-off-list", "handoffs.targets must be [] when handoffs.enabled is false"],
+      ["ho-v2-wild", "handoffs.targets[0] must match ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"],
     ] as const) {
       const r = await e.request("thread/start", { seatId });
       const err = r.error as { code: number; data: { issues: string[] } };
       assert.equal(err.code, -32006, seatId);
       assert.ok(err.data.issues.includes(issue), `${seatId}: ${JSON.stringify(err.data.issues)}`);
     }
+    // The one relaxation: an allowlisted v2 seat now starts.
+    const allowed = await e.request("thread/start", { seatId: "ho-v2-allow" });
+    assert.ok(allowed.result, `ho-v2-allow: ${JSON.stringify(allowed.error)}`);
     await e.close();
   } finally {
     cleanup();
