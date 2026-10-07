@@ -1647,9 +1647,9 @@ export class EngineConnection {
     this.#opts.agent.preflight?.(turnCtx);
 
     const now = Date.now();
-    // The served marker is an additive schema-v2 field (brief-delivery pin §3), outside the M1
-    // `TurnStartPayload` type; the writer validates it before any byte.
-    const start: TurnStartPayload & { briefServed?: BriefServedMarker } = {
+    // The served marker is an additive schema-v2 field (brief-delivery pin §3), carried by the
+    // canonical `TurnStartPayload` type; the writer validates it before any byte.
+    const start: TurnStartPayload = {
       turnId,
       inputText: input.map((part) => part.text).join("\n"),
       mode: claim,

@@ -31,6 +31,7 @@ import {
 import { isValidId } from "./protocol/ids.ts";
 import type { Item, RpcErrorBody, Thread, Turn, TurnMode, TurnStatus } from "./protocol/types.ts";
 import {
+  type BriefServedMarker,
   checkV2Payload,
   type FounderDecisionPayload,
   type HandoffAbortedPayload,
@@ -87,6 +88,12 @@ export type TurnStartPayload = {
   mode?: TurnMode;
   presence?: Presence;
   tty?: TurnStartTty;
+  /**
+   * Brief-delivery pin §3 (M2-A4): the served marker on a handoff target's FIRST `turn.start`.
+   * Optional: a line written before M2-A4, or on a target that served no brief, carries none.
+   * Its shape and its once-only placement are validated by `checkV2Payload` / `briefServedPlacementIssues`.
+   */
+  briefServed?: BriefServedMarker;
 };
 export type ItemPayload = { turnId: string; item: Item };
 export type ServedModelPayload = {

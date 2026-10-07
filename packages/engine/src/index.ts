@@ -214,6 +214,7 @@ export {
   type WorktreeIdentity,
 } from "./session-store.ts";
 export {
+  type BriefServedMarker,
   checkEvidenceRef,
   checkHandoffLink,
   checkV2Payload,
