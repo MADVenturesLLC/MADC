@@ -18,7 +18,10 @@
  */
 import { MADC_VERSION } from "@madc/core";
 import {
+  checkEvidenceRef,
+  type EvidenceRef,
   isValidId,
+  type OpenDecisionSummary,
   PROTOCOL_VERSION,
   resolveMadcHome,
   type SeatSummary,
@@ -57,7 +60,7 @@ function installSignals(): { sig: ListSignal; remove: () => void } {
   };
 }
 
-type ListKind = "providers" | "seats";
+type ListKind = "providers" | "seats" | "decisions";
 
 /** The one `--json` object for a failed listing: the same keys as success, the list `null`. */
 function failureJson(
@@ -75,7 +78,9 @@ function failureJson(
   const body =
     kind === "providers"
       ? { ...base, providers: null, error }
-      : { ...base, home, seats: null, error };
+      : kind === "seats"
+        ? { ...base, home, seats: null, error }
+        : { ...base, home, decisions: null, error };
   return `${JSON.stringify(body)}\n`;
 }
 
@@ -316,6 +321,169 @@ export async function runSeatsLs(io: CliIO, json: boolean): Promise<number> {
       return EXIT.ok;
     }
     for (const line of renderSeatsTable(seats)) io.stdout.write(`${line}\n`);
+    return EXIT.ok;
+  } finally {
+    remove();
+  }
+}
+
+// ------------------------------------------------------------------------ decisions ls
+
+const EVENT_HASH_RE = /^[0-9a-f]{64}$/;
+
+/**
+ * Strict read of a `decision/list` result against the M2-A6 `OpenDecisionSummary` projection.
+ * Only the 10 pinned fields are copied (in a fixed key order), and every `EvidenceRef` is checked
+ * by `checkEvidenceRef`. `null` = malformed (a protocol violation).
+ */
+export function parseDecisionList(result: unknown): OpenDecisionSummary[] | null {
+  if (!isRecord(result) || !Array.isArray(result.data)) return null;
+  const out: OpenDecisionSummary[] = [];
+  for (const raw of result.data as unknown[]) {
+    if (!isRecord(raw)) return null;
+    const {
+      threadId,
+      seatId,
+      seq,
+      hash,
+      ts,
+      decisionId,
+      turnId,
+      question,
+      recommendedDefault,
+      evidenceRefs,
+    } = raw;
+    if (
+      !isValidId(threadId) ||
+      !isValidId(seatId) ||
+      !isValidId(decisionId) ||
+      !isValidId(turnId)
+    ) {
+      return null;
+    }
+    if (typeof seq !== "number" || !Number.isInteger(seq) || seq < 0) return null;
+    if (typeof hash !== "string" || !EVENT_HASH_RE.test(hash)) return null;
+    if (typeof ts !== "number" || !Number.isFinite(ts)) return null;
+    if (typeof question !== "string" || question.trim().length === 0) return null;
+    if (typeof recommendedDefault !== "string" || recommendedDefault.trim().length === 0) {
+      return null;
+    }
+    if (!Array.isArray(evidenceRefs) || evidenceRefs.length === 0) return null;
+    const refs: EvidenceRef[] = [];
+    for (const ref of evidenceRefs as unknown[]) {
+      if (checkEvidenceRef(ref, "evidenceRef").length > 0) return null;
+      const r = ref as EvidenceRef;
+      refs.push(
+        r.kind === "git"
+          ? { kind: "git", sha: r.sha, remote: r.remote }
+          : { kind: r.kind, path: r.path, seq: r.seq, hash: r.hash },
+      );
+    }
+    out.push({
+      threadId,
+      seatId,
+      seq,
+      hash,
+      ts,
+      decisionId,
+      turnId,
+      question,
+      recommendedDefault,
+      evidenceRefs: refs,
+    });
+  }
+  return out;
+}
+
+/**
+ * The human decisions table (`madc decisions ls`). Every string is stripped of control bytes so a
+ * decision question or default cannot inject terminal sequences.
+ */
+export function renderDecisionsTable(decisions: readonly OpenDecisionSummary[]): string[] {
+  const clean = (s: string): string => stripControls(s);
+  const header = ["DECISION", "THREAD", "SEAT", "TURN", "SEQ", "REFS", "DEFAULT", "QUESTION"];
+  const cells = decisions.map((d) => [
+    d.decisionId,
+    d.threadId,
+    d.seatId,
+    d.turnId,
+    String(d.seq),
+    String(d.evidenceRefs.length),
+    clean(d.recommendedDefault),
+    clean(d.question),
+  ]);
+  const widths = header.map((h, i) => Math.max(h.length, ...cells.map((c) => (c[i] ?? "").length)));
+  const line = (c: readonly string[]): string =>
+    c.map((cell, i) => (i === c.length - 1 ? cell : cell.padEnd(widths[i] ?? 0))).join("  ");
+  return [line(header), ...cells.map(line)];
+}
+
+export async function runDecisionsLs(io: CliIO, json: boolean): Promise<number> {
+  const early = takeEarlySignal();
+  if (early !== null) return interrupted(io, json, "decisions", early);
+  let home: string;
+  try {
+    home = resolveMadcHome(io.env as NodeJS.ProcessEnv);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return fail(io, json, "decisions", EXIT.usage, { code: null, message, class: "usage" });
+  }
+  const state = classifyHomePath(home);
+  if (state.kind === "not-directory" || state.kind === "invalid") {
+    const message =
+      state.kind === "invalid" ? state.message : `MADC_HOME ${home} exists but is not a directory`;
+    return fail(io, json, "decisions", EXIT.usage, { code: null, message, class: "usage" }, home);
+  }
+  const { sig, remove } = installSignals();
+  try {
+    const r = await callEngineOnce(io, {
+      env: { MADC_HOME: home },
+      clientName: "madc-decisions",
+      method: "decision/list",
+      budgetMs: LIST_BUDGET_MS,
+      sig,
+    });
+    if (sig.exit !== null) return interrupted(io, json, "decisions", sig.exit, home);
+    if (!r.ok) {
+      return fail(
+        io,
+        json,
+        "decisions",
+        r.exit,
+        { code: r.code, message: r.reason, class: r.class },
+        home,
+      );
+    }
+    const decisions = parseDecisionList(r.result);
+    if (decisions === null) {
+      return fail(
+        io,
+        json,
+        "decisions",
+        EXIT.engine,
+        {
+          code: null,
+          message: "protocol violation: decision/list returned a malformed payload",
+          class: "engine",
+        },
+        home,
+      );
+    }
+    if (json) {
+      io.stdout.write(
+        `${JSON.stringify({
+          ok: true,
+          exitCode: EXIT.ok,
+          madcVersion: MADC_VERSION,
+          protocolVersion: PROTOCOL_VERSION,
+          home,
+          decisions,
+          error: null,
+        })}\n`,
+      );
+      return EXIT.ok;
+    }
+    for (const line of renderDecisionsTable(decisions)) io.stdout.write(`${line}\n`);
     return EXIT.ok;
   } finally {
     remove();

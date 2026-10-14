@@ -12,6 +12,7 @@ import {
 } from "@madc/registry";
 import type { Agent, AgentTurnContext, TurnSink } from "./agent.ts";
 import { type CredentialStore, createCredentialStore } from "./credentials/store.ts";
+import { listOpenDecisions } from "./decisions.ts";
 import { checkHandoffTarget, type HandoffTargetCheck, readHandoffBrief } from "./handoff.ts";
 import { confinedPath, sessionsOwnerReadUnsupported } from "./home.ts";
 import {
@@ -53,6 +54,9 @@ import {
   type AuthStatusResult,
   DEFAULT_SEAT_ID,
   DEFAULT_TURN_MODE,
+  type DecisionListResult,
+  type DecisionRaiseResult,
+  type DecisionResolveResult,
   type InitializeResult,
   type Item,
   PROTOCOL_VERSION,
@@ -81,6 +85,8 @@ import { listSeatSummaries } from "./seats/list.ts";
 import { ensureSeatMemoryFile } from "./seats/memory.ts";
 import { seedRosterSeats } from "./seats/roster.ts";
 import {
+  type FounderDecisionPayload,
+  type FounderDecisionResolvedPayload,
   type HandoffAbortReason,
   type HandoffOutPayload,
   type RebuiltSession,
@@ -690,9 +696,188 @@ export class EngineConnection {
         return this.#authStatus(params);
       case "auth/remove":
         return this.#authRemove(params);
+      case "decision/raise":
+        return this.#decisionRaise(params);
+      case "decision/list":
+        return { value: this.#decisionList(params) };
+      case "decision/resolve":
+        return this.#decisionResolve(params);
       default:
         throw methodNotFound(method);
     }
+  }
+
+  // ---------------------------------------------------------------- decisions
+
+  /**
+   * M2-A6 (`docs/plan/PIN-madc-M2-founder-decision-inbox.md` §4.1): typed `founderDecision` raise
+   * on a loaded thread. Validates the candidate payload (including closed key sets on
+   * `founderDecision` and `EvidenceRef`, D-439) before any lock or thread lookup, then appends
+   * through the thread's `SessionWriter`.
+   */
+  #decisionRaise(params: unknown): { value: DecisionRaiseResult } {
+    const p = paramsObject(params);
+    const issues: string[] = [];
+    const threadId = requireId(p, "threadId", issues);
+    throwIfIssues(issues);
+
+    const candidate: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(p)) {
+      if (k !== "threadId") candidate[k] = v;
+    }
+    if (!Object.hasOwn(candidate, "decisionId") || candidate.decisionId === undefined) {
+      candidate.decisionId = newId("dec");
+    }
+    const faults = checkV2Payload("founderDecision", candidate);
+    const firstFault = faults[0];
+    if (firstFault !== undefined) {
+      throw evidenceInvalid({
+        threadId,
+        turnId: null,
+        type: "founderDecision",
+        reason: firstFault.reason,
+        issues: faults.map((f) => f.issue),
+      });
+    }
+
+    const poisoned = this.#poisoned.get(threadId);
+    if (poisoned !== undefined) throw sessionWriteFailed(threadId, poisoned.path, poisoned.seq);
+    const record = this.#threads.get(threadId);
+    if (record === undefined) {
+      const holder = this.#liveLockHolder(threadId);
+      if (holder !== null) throw turnAlreadyActive(threadId, null, holder);
+      throw threadNotFound(threadId);
+    }
+    if (record.confirming) throw turnAlreadyActive(threadId, null);
+    if (!holdsThreadLock(record.lock)) {
+      throw turnAlreadyActive(threadId, null, this.#liveLockHolder(threadId) ?? undefined);
+    }
+    if (record.session.broken) {
+      throw sessionWriteFailed(threadId, record.session.path, record.session.nextSeq);
+    }
+    this.#handoffGate(record);
+
+    let line: SessionEvent<"founderDecision">;
+    try {
+      line = record.session.append("founderDecision", candidate as FounderDecisionPayload);
+    } catch (err) {
+      this.#notePoisoned(threadId, record.session);
+      throw err;
+    }
+    record.thread.updatedAt = Math.max(record.thread.updatedAt, line.ts);
+    return {
+      value: {
+        threadId,
+        decisionId: line.payload.decisionId,
+        seq: line.seq,
+        hash: line.hash,
+      },
+    };
+  }
+
+  /**
+   * M2-A6 (`docs/plan/PIN-madc-M2-founder-decision-inbox.md` §4.2): `{ data: OpenDecisionSummary[] }`
+   * across all verified session chains in `$MADC_HOME/sessions`. Read-only; takes no params.
+   */
+  #decisionList(params: unknown): DecisionListResult {
+    const p = paramsObject(params);
+    const unexpected = Object.keys(p);
+    if (unexpected.length > 0) {
+      throw invalidParams([`decision/list takes no params (got ${unexpected.join(", ")})`]);
+    }
+    return {
+      data: listOpenDecisions(this.#opts.home, (threadId, reason) =>
+        this.#log(`decision/list: skipping ${threadId} (${reason})`),
+      ),
+    };
+  }
+
+  /**
+   * M2-A6 (`docs/plan/PIN-madc-M2-founder-decision-inbox.md` §4.3): append-only Founder resolution
+   * of an open `founderDecision` under the thread lock. Refuses when a turn is active on the thread
+   * (`-32004`) so an executing turn cannot resolve its own decision.
+   */
+  #decisionResolve(params: unknown): { value: DecisionResolveResult } {
+    const p = paramsObject(params);
+    const issues: string[] = [];
+    const threadId = requireId(p, "threadId", issues);
+    throwIfIssues(issues);
+
+    const candidate: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(p)) {
+      if (k !== "threadId") candidate[k] = v;
+    }
+    const resolutionOmittedForDefault =
+      candidate.outcome === "accepted-default" &&
+      (!Object.hasOwn(candidate, "resolution") || candidate.resolution === undefined);
+    const precheck = resolutionOmittedForDefault
+      ? { ...candidate, resolution: "__default__" }
+      : candidate;
+    const faults = checkV2Payload("founderDecision.resolved", precheck);
+    const firstFault = faults[0];
+    if (firstFault !== undefined) {
+      throw evidenceInvalid({
+        threadId,
+        turnId: null,
+        type: "founderDecision.resolved",
+        reason: firstFault.reason,
+        issues: faults.map((f) => f.issue),
+      });
+    }
+
+    const poisoned = this.#poisoned.get(threadId);
+    if (poisoned !== undefined) throw sessionWriteFailed(threadId, poisoned.path, poisoned.seq);
+    let record = this.#threads.get(threadId);
+    if (record !== undefined) {
+      if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
+      if (record.confirming) throw turnAlreadyActive(threadId, null);
+      if (!holdsThreadLock(record.lock)) {
+        throw turnAlreadyActive(threadId, null, this.#liveLockHolder(threadId) ?? undefined);
+      }
+      if (record.session.broken) {
+        throw sessionWriteFailed(threadId, record.session.path, record.session.nextSeq);
+      }
+      this.#handoffGate(record);
+    } else {
+      const lock = acquireThreadLock(this.#opts.home, threadId);
+      if (!lock.ok) throw turnAlreadyActive(threadId, null, lock.holderPid ?? undefined);
+      const handle = lock.handle;
+      try {
+        record = this.#loadColdThread(threadId, handle);
+      } catch (err) {
+        if (this.#poisoned.has(threadId)) this.#strayLocks.push(handle);
+        else this.#releaseOrKeep(handle);
+        throw err;
+      }
+      this.#threads.set(threadId, record);
+    }
+
+    if (resolutionOmittedForDefault) {
+      const origin = record.session.decisionAt(String(candidate.decisionId));
+      candidate.resolution = origin?.recommendedDefault ?? "__default__";
+    }
+
+    let line: SessionEvent<"founderDecision.resolved">;
+    try {
+      line = record.session.append(
+        "founderDecision.resolved",
+        candidate as FounderDecisionResolvedPayload,
+      );
+    } catch (err) {
+      this.#notePoisoned(threadId, record.session);
+      throw err;
+    }
+    record.thread.updatedAt = Math.max(record.thread.updatedAt, line.ts);
+    return {
+      value: {
+        threadId,
+        decisionId: line.payload.decisionId,
+        seq: line.seq,
+        hash: line.hash,
+        outcome: line.payload.outcome,
+        resolution: line.payload.resolution,
+      },
+    };
   }
 
   // -------------------------------------------------------------------- seats

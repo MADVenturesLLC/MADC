@@ -87,6 +87,9 @@ test("§5 six item kinds; M1 pin §3 complete request list (M0 six + §3.5 seat/
       "auth/status",
       "auth/remove",
       "thread/handoff",
+      "decision/raise",
+      "decision/list",
+      "decision/resolve",
     ],
   );
 });
@@ -139,7 +142,7 @@ test("id grammar (honesty: rejects traversal / separators / dots / whitespace / 
   ]) {
     assert.equal(isValidId(bad), false, JSON.stringify(bad));
   }
-  for (const prefix of ["thr", "turn", "item"] as const) {
+  for (const prefix of ["thr", "turn", "item", "ho", "dec"] as const) {
     const id = newId(prefix);
     assert.ok(id.startsWith(`${prefix}_`));
     assert.equal(isValidId(id), true);

@@ -32,7 +32,9 @@ import { isValidId } from "./protocol/ids.ts";
 import type { Item, RpcErrorBody, Thread, Turn, TurnMode, TurnStatus } from "./protocol/types.ts";
 import {
   checkV2Payload,
+  type DecisionChainEntry,
   type FounderDecisionPayload,
+  type FounderDecisionResolvedPayload,
   type HandoffAbortedPayload,
   type HandoffLinkPayload,
   type HandoffOutPayload,
@@ -141,8 +143,11 @@ export type RepoDecisionPayload = {
 export type SessionClosePayload = { reason: string; worktree?: WorktreeIdentity | null };
 
 export type {
+  DecisionChainEntry,
   EvidenceRef,
   FounderDecisionPayload,
+  FounderDecisionResolutionOutcome,
+  FounderDecisionResolvedPayload,
   HandoffAbortedPayload,
   HandoffAbortReason,
   HandoffLinkPayload,
@@ -153,7 +158,11 @@ export type {
   ToolCallReceiptPayload,
   WorktreeIdentity,
 } from "./session-v2.ts";
-export { RESERVED_EVENT_TYPES, SessionChainIndex } from "./session-v2.ts";
+export {
+  FOUNDER_DECISION_OUTCOMES,
+  RESERVED_EVENT_TYPES,
+  SessionChainIndex,
+} from "./session-v2.ts";
 
 export type SessionPayloads = {
   "session.open": SessionOpenPayload;
@@ -170,6 +179,7 @@ export type SessionPayloads = {
   "handoff.link": HandoffLinkPayload;
   "handoff.aborted": HandoffAbortedPayload;
   founderDecision: FounderDecisionPayload;
+  "founderDecision.resolved": FounderDecisionResolvedPayload;
 };
 export type SessionEventType = keyof SessionPayloads;
 /** The WRITABLE set. A reserved M4 name entering it before the M4 pin fails the §10 item 8 guard. */
@@ -186,6 +196,7 @@ export const SESSION_EVENT_TYPES: readonly SessionEventType[] = Object.freeze([
   "handoff.link",
   "handoff.aborted",
   "founderDecision",
+  "founderDecision.resolved",
 ]);
 
 export type SessionEvent<T extends SessionEventType = SessionEventType> = {
@@ -803,6 +814,11 @@ export class SessionWriter {
     return this.#index.lineAt(seq);
   }
 
+  /** Indexed `founderDecision` facts for `decisionId` in this file, or `undefined` (M2-A6). */
+  decisionAt(decisionId: string): DecisionChainEntry | undefined {
+    return this.#index.decisionAt(decisionId);
+  }
+
   get broken(): boolean {
     return this.#broken;
   }
@@ -1232,6 +1248,7 @@ export function v2LineIssue(
     case "handoff.link":
     case "handoff.aborted":
     case "founderDecision":
+    case "founderDecision.resolved":
     case "memory.write":
     case "tool.call":
       return checkV2Payload(type, payload, { seatId: ctx.seatId }).length === 0
@@ -1411,6 +1428,7 @@ function checkPayload(
     case "handoff.link":
     case "handoff.aborted":
     case "founderDecision":
+    case "founderDecision.resolved":
     case "memory.write":
     case "tool.call":
       return v2LineIssue(type, p, ctx);

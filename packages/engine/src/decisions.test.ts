@@ -1,0 +1,874 @@
+/**
+ * M2-A6 Founder Decision Inbox acceptance & regression tests
+ * (`docs/plan/PIN-madc-M2-founder-decision-inbox.md`, M2 build plan §7 M2-A6, §9 P-M2-3, D-439).
+ *
+ * Covers:
+ * 1. Typed `founderDecision` creation via `decision/raise` (explicit and engine-minted `dec_…` id,
+ *    same-file and `git` `EvidenceRef`s, no free-text fallback from `agentMessage`).
+ * 2. Closed key sets on `founderDecision`, `EvidenceRef` (`session`, `servedModel`, `git`), and
+ *    `founderDecision.resolved` (D-439) — refused with `-32010` before redaction, hashing or I/O,
+ *    never echoing the caller key; read-side verifier refuses hand-crafted extra keys.
+ * 3. Open decisions retrieved across threads (`listOpenDecisions` + `decision/list`), sorted
+ *    deterministically by `(ts, threadId, seq)`, skipping unverified/corrupt session files.
+ * 4. Append-only Founder decision resolution (`founderDecision.resolved` via `decision/resolve`) on
+ *    both warm and cold threads (`accepted-default` with omitted or matching `resolution`, and
+ *    `decided` with custom `resolution`), preserving the original `founderDecision` line untouched.
+ * 5. Authorization and integrity checks: `decision/resolve` refused while a turn is active (`-32004`)
+ *    or when another live process holds the thread lock (`-32004`); `TurnSink` exposes no resolution
+ *    capability; `-32010` refusals on unknown `decisionId`, duplicate resolution, `decisionSeq` /
+ *    `decisionHash` mismatch, or `accepted-default` resolution mismatch; and `inspectSessionV2`
+ *    `decision-resolution-mismatch` findings without echoing payload text.
+ */
+import assert from "node:assert/strict";
+import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+import { PassThrough } from "node:stream";
+import { test } from "node:test";
+import { type Agent, echoAgent, type TurnSink } from "./agent.ts";
+import { listOpenDecisions, openDecisionsInChain } from "./decisions.ts";
+import { inspectSessionV2 } from "./handoff.ts";
+import { acquireThreadLock, releaseThreadLock } from "./lock.ts";
+import { ErrorCode } from "./protocol/errors.ts";
+import { seedRosterSeats } from "./seats/roster.ts";
+import { EngineConnection, type EngineOptions } from "./server.ts";
+import {
+  GENESIS_HASH,
+  type SessionEvent,
+  sessionEventHash,
+  verifySessionFile,
+} from "./session-store.ts";
+import { makeHome } from "./testing/harness.ts";
+
+type WireResponse = {
+  id: number | string | null;
+  result?: Record<string, unknown>;
+  error?: { code: number; message: string; data?: Record<string, unknown> };
+};
+
+function createHarness(home: string, opts: Partial<EngineOptions> = {}) {
+  seedRosterSeats(home);
+  const input = new PassThrough();
+  const output = new PassThrough();
+  const messages: Array<Record<string, unknown>> = [];
+  let buf = "";
+  output.setEncoding("utf8");
+  output.on("data", (chunk: string) => {
+    buf += chunk;
+    let nl = buf.indexOf("\n");
+    while (nl !== -1) {
+      const line = buf.slice(0, nl);
+      buf = buf.slice(nl + 1);
+      if (line.trim().length > 0) {
+        messages.push(JSON.parse(line) as Record<string, unknown>);
+      }
+      nl = buf.indexOf("\n");
+    }
+  });
+  const logs: string[] = [];
+  const conn = new EngineConnection({
+    input,
+    output,
+    home,
+    agent: echoAgent,
+    log: (m) => logs.push(m),
+    ...opts,
+  });
+  const call = (id: number, method: string, params?: unknown): WireResponse => {
+    const before = messages.length;
+    conn.handleLine(JSON.stringify({ id, method, ...(params === undefined ? {} : { params }) }));
+    const reply = messages.slice(before).find((m) => m.id === id) as WireResponse | undefined;
+    assert.ok(reply !== undefined, `expected synchronous reply for ${method} (id=${id})`);
+    return reply;
+  };
+  const init = () => {
+    const r = call(1, "initialize", { clientInfo: { name: "test", version: "0.0.0" } });
+    assert.equal(r.error, undefined);
+    conn.handleLine(JSON.stringify({ method: "initialized", params: {} }));
+  };
+  return { conn, call, init, messages, logs, shutdown: () => conn.shutdown() };
+}
+
+function readEvents(home: string, threadId: string): readonly SessionEvent[] {
+  const path = join(home, "sessions", `${threadId}.jsonl`);
+  const v = verifySessionFile(path, threadId, {}, home);
+  assert.equal(v.ok, true, v.ok ? "" : `line ${v.line}: ${v.reason}`);
+  return v.events;
+}
+
+function waitTurnCompleted(messages: ReadonlyArray<Record<string, unknown>>, turnId: string) {
+  return new Promise<void>((resolve, reject) => {
+    const deadline = Date.now() + 5_000;
+    const tick = () => {
+      const found = messages.some(
+        (m) =>
+          m.method === "turn/completed" &&
+          (m.params as { turn?: { id?: string } } | undefined)?.turn?.id === turnId,
+      );
+      if (found) {
+        resolve();
+        return;
+      }
+      if (Date.now() > deadline) {
+        reject(new Error(`timed out waiting for turn/completed (${turnId})`));
+        return;
+      }
+      setTimeout(tick, 10);
+    };
+    tick();
+  });
+}
+
+const threadIdOf = (r: WireResponse): string => (r.result as { thread: { id: string } }).thread.id;
+const turnIdOf = (r: WireResponse): string => (r.result as { turn: { id: string } }).turn.id;
+
+test("M2-A6 capability 1 & 2: decision/raise appends a typed founderDecision with verified EvidenceRef[]; free-text agent prose never creates a decision", async () => {
+  const h = makeHome();
+  const eng = createHarness(h.home);
+  try {
+    eng.init();
+    const startRes = eng.call(2, "thread/start", {});
+    const threadId = threadIdOf(startRes);
+
+    // Run a normal turn whose agent output contains prose that looks like a decision request.
+    const turnRes = eng.call(3, "turn/start", {
+      threadId,
+      input: [{ type: "text", text: "FOUNDER_DECISION_REQUIRED: should we ship?" }],
+    });
+    const turnId = turnIdOf(turnRes);
+    await waitTurnCompleted(eng.messages, turnId);
+
+    // No founderDecision is ever inferred from free-text prose or agentMessage items.
+    assert.deepEqual(listOpenDecisions(h.home), []);
+    const listBefore = eng.call(4, "decision/list", {});
+    assert.deepEqual(listBefore.result, { data: [] });
+
+    // Read the verified session events so we can cite the turn.start line in evidenceRefs.
+    const eventsBefore = readEvents(h.home, threadId);
+    const turnStartEvent = eventsBefore.find((e) => e.type === "turn.start");
+    assert.ok(turnStartEvent !== undefined);
+
+    // Raise a typed founderDecision (omitting decisionId so the engine mints dec_<32 hex>).
+    const raise1 = eng.call(5, "decision/raise", {
+      threadId,
+      turnId,
+      question: "Approve schema v2 cutover?",
+      recommendedDefault: "Proceed with dual-read window",
+      evidenceRefs: [
+        {
+          kind: "session",
+          path: `sessions/${threadId}.jsonl`,
+          seq: turnStartEvent.seq,
+          hash: turnStartEvent.hash,
+        },
+        {
+          kind: "git",
+          sha: "7ef9d41785844235ffe97949e57a502830166d64",
+          remote: null,
+        },
+      ],
+    });
+    assert.equal(raise1.error, undefined);
+    const raised = raise1.result as {
+      threadId: string;
+      decisionId: string;
+      seq: number;
+      hash: string;
+    };
+    assert.equal(raised.threadId, threadId);
+    assert.match(raised.decisionId, /^dec_[0-9a-f]{32}$/);
+
+    // Also raise one with an explicit caller-supplied decisionId.
+    const raise2 = eng.call(6, "decision/raise", {
+      threadId,
+      turnId,
+      decisionId: "dec_explicit_01",
+      question: "Keep fallback lane warm?",
+      recommendedDefault: "No, keep single-lane strict",
+      evidenceRefs: [
+        {
+          kind: "session",
+          path: `sessions/${threadId}.jsonl`,
+          seq: turnStartEvent.seq,
+          hash: turnStartEvent.hash,
+        },
+      ],
+    });
+    assert.equal(raise2.error, undefined);
+    assert.equal(raise2.result?.decisionId, "dec_explicit_01");
+
+    const open = listOpenDecisions(h.home);
+    assert.equal(open.length, 2);
+    assert.equal(open[0]?.decisionId, raised.decisionId);
+    assert.equal(open[1]?.decisionId, "dec_explicit_01");
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("M2-A6 D-439 closed key sets: extra keys on founderDecision, EvidenceRef, and founderDecision.resolved refuse -32010 without echoing the key", async () => {
+  const h = makeHome();
+  const eng = createHarness(h.home);
+  try {
+    eng.init();
+    const startRes = eng.call(2, "thread/start", {});
+    const threadId = threadIdOf(startRes);
+    const turnRes = eng.call(3, "turn/start", {
+      threadId,
+      input: [{ type: "text", text: "hello" }],
+    });
+    const turnId = turnIdOf(turnRes);
+    await waitTurnCompleted(eng.messages, turnId);
+
+    const events = readEvents(h.home, threadId);
+    const openEvent = events[0] as SessionEvent;
+    const sessionRef = {
+      kind: "session" as const,
+      path: `sessions/${threadId}.jsonl`,
+      seq: openEvent.seq,
+      hash: openEvent.hash,
+    };
+
+    const secretKey = "sk-extra-caller-key-never-echoed-9999";
+
+    // 1. Extra key on founderDecision (via decision/raise)
+    const rExtraDecision = eng.call(4, "decision/raise", {
+      threadId,
+      turnId,
+      decisionId: "dec_extra_1",
+      question: "Q?",
+      recommendedDefault: "D",
+      evidenceRefs: [sessionRef],
+      [secretKey]: "leaked-value",
+    });
+    assert.equal(rExtraDecision.error?.code, ErrorCode.EvidenceInvalid);
+    assert.deepEqual(rExtraDecision.error?.data?.issues, [
+      "founderDecision has a key outside decisionId, turnId, question, recommendedDefault and evidenceRefs",
+    ]);
+    assert.equal(JSON.stringify(rExtraDecision).includes(secretKey), false);
+
+    // 2. Extra key on session EvidenceRef
+    const rExtraSessionRef = eng.call(5, "decision/raise", {
+      threadId,
+      turnId,
+      decisionId: "dec_extra_2",
+      question: "Q?",
+      recommendedDefault: "D",
+      evidenceRefs: [{ ...sessionRef, [secretKey]: "v" }],
+    });
+    assert.equal(rExtraSessionRef.error?.code, ErrorCode.EvidenceInvalid);
+    assert.deepEqual(rExtraSessionRef.error?.data?.issues, [
+      "evidenceRefs[0] has a key outside kind, path, seq and hash",
+    ]);
+    assert.equal(JSON.stringify(rExtraSessionRef).includes(secretKey), false);
+
+    // 3. Extra key on git EvidenceRef
+    const rExtraGitRef = eng.call(6, "decision/raise", {
+      threadId,
+      turnId,
+      decisionId: "dec_extra_3",
+      question: "Q?",
+      recommendedDefault: "D",
+      evidenceRefs: [
+        {
+          kind: "git",
+          sha: "7ef9d41785844235ffe97949e57a502830166d64",
+          remote: null,
+          [secretKey]: "v",
+        },
+      ],
+    });
+    assert.equal(rExtraGitRef.error?.code, ErrorCode.EvidenceInvalid);
+    assert.deepEqual(rExtraGitRef.error?.data?.issues, [
+      "evidenceRefs[0] has a key outside kind, sha and remote",
+    ]);
+    assert.equal(JSON.stringify(rExtraGitRef).includes(secretKey), false);
+
+    // 4. Missing or empty evidenceRefs refuses -32010
+    const rEmptyRefs = eng.call(7, "decision/raise", {
+      threadId,
+      turnId,
+      decisionId: "dec_empty_refs",
+      question: "Q?",
+      recommendedDefault: "D",
+      evidenceRefs: [],
+    });
+    assert.equal(rEmptyRefs.error?.code, ErrorCode.EvidenceInvalid);
+    assert.equal(rEmptyRefs.error?.data?.reason, "evidence-ref-missing");
+
+    // 5. Raise a valid decision, then test extra key on founderDecision.resolved
+    const okRaise = eng.call(8, "decision/raise", {
+      threadId,
+      turnId,
+      decisionId: "dec_valid_1",
+      question: "Q?",
+      recommendedDefault: "Default answer",
+      evidenceRefs: [sessionRef],
+    });
+    assert.equal(okRaise.error, undefined);
+    const { seq: decisionSeq, hash: decisionHash } = okRaise.result as {
+      seq: number;
+      hash: string;
+    };
+
+    const rExtraResolve = eng.call(9, "decision/resolve", {
+      threadId,
+      decisionId: "dec_valid_1",
+      decisionSeq,
+      decisionHash,
+      outcome: "accepted-default",
+      [secretKey]: "v",
+    });
+    assert.equal(rExtraResolve.error?.code, ErrorCode.EvidenceInvalid);
+    assert.deepEqual(rExtraResolve.error?.data?.issues, [
+      "founderDecision.resolved has a key outside decisionId, decisionSeq, decisionHash, outcome and resolution",
+    ]);
+    assert.equal(JSON.stringify(rExtraResolve).includes(secretKey), false);
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("M2-A6 capability 3 & 6: open decisions across threads, deterministic ordering, and append-only resolution (warm and cold threads)", async () => {
+  const h = makeHome();
+  const eng1 = createHarness(h.home);
+  let threadA = "";
+  let threadB = "";
+  let decA1 = { decisionId: "dec_a1", seq: 0, hash: "" };
+  let decA2 = { decisionId: "dec_a2", seq: 0, hash: "" };
+  let decB1 = { decisionId: "dec_b1", seq: 0, hash: "" };
+
+  try {
+    eng1.init();
+    threadA = threadIdOf(eng1.call(2, "thread/start", {}));
+    threadB = threadIdOf(eng1.call(3, "thread/start", { seatId: "hephaestus" }));
+
+    const turnA = turnIdOf(
+      eng1.call(4, "turn/start", { threadId: threadA, input: [{ type: "text", text: "a" }] }),
+    );
+    await waitTurnCompleted(eng1.messages, turnA);
+
+    const turnB = turnIdOf(
+      eng1.call(5, "turn/start", { threadId: threadB, input: [{ type: "text", text: "b" }] }),
+    );
+    await waitTurnCompleted(eng1.messages, turnB);
+
+    const openA = readEvents(h.home, threadA)[0] as SessionEvent;
+    const openB = readEvents(h.home, threadB)[0] as SessionEvent;
+
+    const rA1 = eng1.call(6, "decision/raise", {
+      threadId: threadA,
+      turnId: turnA,
+      decisionId: "dec_a1",
+      question: "Question A1?",
+      recommendedDefault: "Default A1",
+      evidenceRefs: [
+        { kind: "session", path: `sessions/${threadA}.jsonl`, seq: openA.seq, hash: openA.hash },
+      ],
+    });
+    assert.equal(rA1.error, undefined);
+    decA1 = rA1.result as typeof decA1;
+
+    await new Promise((r) => setTimeout(r, 5));
+    const rB1 = eng1.call(7, "decision/raise", {
+      threadId: threadB,
+      turnId: turnB,
+      decisionId: "dec_b1",
+      question: "Question B1?",
+      recommendedDefault: "Default B1",
+      evidenceRefs: [
+        { kind: "session", path: `sessions/${threadB}.jsonl`, seq: openB.seq, hash: openB.hash },
+      ],
+    });
+    assert.equal(rB1.error, undefined);
+    decB1 = rB1.result as typeof decB1;
+
+    await new Promise((r) => setTimeout(r, 5));
+    const rA2 = eng1.call(8, "decision/raise", {
+      threadId: threadA,
+      turnId: turnA,
+      decisionId: "dec_a2",
+      question: "Question A2?",
+      recommendedDefault: "Default A2",
+      evidenceRefs: [
+        { kind: "session", path: `sessions/${threadA}.jsonl`, seq: openA.seq, hash: openA.hash },
+      ],
+    });
+    assert.equal(rA2.error, undefined);
+    decA2 = rA2.result as typeof decA2;
+
+    // Warm resolution of dec_a1 on threadA using "accepted-default" (with resolution omitted).
+    const rawLineBefore = readFileSync(join(h.home, "sessions", `${threadA}.jsonl`), "utf8")
+      .trimEnd()
+      .split("\n")[decA1.seq];
+    const resA1 = eng1.call(9, "decision/resolve", {
+      threadId: threadA,
+      decisionId: "dec_a1",
+      decisionSeq: decA1.seq,
+      decisionHash: decA1.hash,
+      outcome: "accepted-default",
+    });
+    assert.equal(resA1.error, undefined);
+    assert.equal(resA1.result?.outcome, "accepted-default");
+    assert.equal(resA1.result?.resolution, "Default A1");
+
+    // Original founderDecision line at decA1.seq is byte-for-byte unchanged (append-only).
+    const linesAfter = readFileSync(join(h.home, "sessions", `${threadA}.jsonl`), "utf8")
+      .trimEnd()
+      .split("\n");
+    assert.equal(linesAfter[decA1.seq], rawLineBefore);
+
+    // decision/list now returns only dec_b1 and dec_a2.
+    const list1 = eng1.call(10, "decision/list", {});
+    assert.equal(list1.error, undefined);
+    const data1 = (list1.result as { data: Array<{ decisionId: string }> }).data;
+    assert.deepEqual(
+      data1.map((d) => d.decisionId),
+      ["dec_b1", "dec_a2"],
+    );
+  } finally {
+    eng1.shutdown();
+  }
+
+  // Cold resolution in a fresh engine process (threadB is not loaded yet when decision/resolve arrives).
+  const eng2 = createHarness(h.home);
+  try {
+    eng2.init();
+    const resB1 = eng2.call(2, "decision/resolve", {
+      threadId: threadB,
+      decisionId: "dec_b1",
+      decisionSeq: decB1.seq,
+      decisionHash: decB1.hash,
+      outcome: "decided",
+      resolution: "Founder custom direction for B1",
+    });
+    assert.equal(resB1.error, undefined);
+    assert.equal(resB1.result?.outcome, "decided");
+    assert.equal(resB1.result?.resolution, "Founder custom direction for B1");
+
+    const list2 = eng2.call(3, "decision/list", {});
+    const data2 = (list2.result as { data: Array<{ decisionId: string }> }).data;
+    assert.deepEqual(
+      data2.map((d) => d.decisionId),
+      ["dec_a2"],
+    );
+
+    // Both session chains pass verifySessionFile and inspectSessionV2 with zero findings.
+    for (const tid of [threadA, threadB]) {
+      const events = readEvents(h.home, tid);
+      assert.deepEqual(inspectSessionV2(h.home, events), []);
+    }
+  } finally {
+    eng2.shutdown();
+    h.cleanup();
+  }
+});
+
+test("M2-A6 capability 7: authorization boundary & decisionId grammar (positive & negative executable proofs)", async () => {
+  const h = makeHome();
+  let sinkKeys: string[] = [];
+  let releaseTurn1!: () => void;
+  const gate1 = new Promise<void>((r) => {
+    releaseTurn1 = r;
+  });
+  let releaseTurn2!: () => void;
+  const gate2 = new Promise<void>((r) => {
+    releaseTurn2 = r;
+  });
+  let turnCount = 0;
+  let midTurnResolveAttempt: WireResponse | null = null;
+  let activeThreadId = "";
+  let raisedSeq = 0;
+  let raisedHash = "";
+
+  const probingAgent: Agent = {
+    name: "probing",
+    async run(_ctx, sink: TurnSink) {
+      turnCount += 1;
+      sinkKeys = Object.keys(sink);
+      if (turnCount === 1) {
+        await gate1;
+        return;
+      }
+      // Negative proof (agent mid-turn self-resolution attempt): while turn 2 is inProgress, any
+      // attempt to invoke decision/resolve on the connection is refused with -32004 TurnAlreadyActive.
+      midTurnResolveAttempt = eng.call(200, "decision/resolve", {
+        threadId: activeThreadId,
+        decisionId: "dec_guard_1",
+        decisionSeq: raisedSeq,
+        decisionHash: raisedHash,
+        outcome: "accepted-default",
+      });
+      await gate2;
+    },
+  };
+  const eng = createHarness(h.home, { agent: probingAgent });
+  try {
+    // 1. Negative proof: uninitialized protocol caller cannot invoke decision/resolve, decision/raise, or decision/list (-32000 NotInitialized).
+    const uninitResolve = eng.call(90, "decision/resolve", {
+      threadId: "thr_uninit",
+      decisionId: "dec_guard_1",
+      decisionSeq: 1,
+      decisionHash: "0".repeat(64),
+      outcome: "accepted-default",
+    });
+    assert.equal(uninitResolve.error?.code, ErrorCode.NotInitialized);
+    const uninitRaise = eng.call(91, "decision/raise", { threadId: "thr_uninit" });
+    assert.equal(uninitRaise.error?.code, ErrorCode.NotInitialized);
+    const uninitList = eng.call(92, "decision/list", {});
+    assert.equal(uninitList.error?.code, ErrorCode.NotInitialized);
+
+    eng.init();
+    const threadId = threadIdOf(eng.call(2, "thread/start", {}));
+    activeThreadId = threadId;
+    const sessionPath = join(h.home, "sessions", `${threadId}.jsonl`);
+    const turn1 = turnIdOf(
+      eng.call(3, "turn/start", { threadId, input: [{ type: "text", text: "first" }] }),
+    );
+    releaseTurn1();
+    await waitTurnCompleted(eng.messages, turn1);
+
+    // 2. Negative proof: TurnSink passed to Agent.run exposes only item/receipt callbacks and
+    // never exposes EngineConnection, SessionWriter, or any decision/resolve capability.
+    assert.deepEqual([...sinkKeys].sort(), [
+      "completeItem",
+      "delta",
+      "fallbackRejected",
+      "newItemId",
+      "repoDecision",
+      "signal",
+      "startItem",
+    ]);
+    assert.equal(
+      sinkKeys.some((k) => /founderDecision|resolve|session|connection/i.test(k)),
+      false,
+      `TurnSink keys must not expose decision resolution: ${sinkKeys.join(", ")}`,
+    );
+
+    const openEvent = readEvents(h.home, threadId)[0] as SessionEvent;
+    const validRef = {
+      kind: "session" as const,
+      path: `sessions/${threadId}.jsonl`,
+      seq: openEvent.seq,
+      hash: openEvent.hash,
+    };
+
+    // 3. Decision ID grammar enforcement on decision/raise (PIN-madc-M1-protocol-messages.md §1,
+    // PIN-madc-M2-evidence-schema-v2.md §1 rule 9: ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$).
+    const beforeBadIdBytes = readFileSync(sessionPath, "utf8");
+    for (const badId of [
+      "",
+      "../traversal",
+      "dec/slash",
+      "dec\\backslash",
+      "dec.dot",
+      "dec space",
+      "_leading_underscore",
+      "-leading-dash",
+      "a".repeat(129),
+      42,
+      null,
+    ]) {
+      const badRaise = eng.call(100, "decision/raise", {
+        threadId,
+        turnId: turn1,
+        decisionId: badId,
+        question: "Grammar check?",
+        recommendedDefault: "Reject invalid id",
+        evidenceRefs: [validRef],
+      });
+      assert.equal(badRaise.error?.code, ErrorCode.EvidenceInvalid, JSON.stringify(badId));
+      assert.equal(badRaise.error?.data?.reason, "field-invalid", JSON.stringify(badId));
+      assert.deepEqual(badRaise.error?.data?.issues, ["decisionId must match the id grammar"]);
+    }
+    assert.equal(readFileSync(sessionPath, "utf8"), beforeBadIdBytes);
+
+    // Raise a valid decision to test resolution boundaries.
+    const raiseRes = eng.call(4, "decision/raise", {
+      threadId,
+      turnId: turn1,
+      decisionId: "dec_guard_1",
+      question: "Guard test?",
+      recommendedDefault: "Default guard",
+      evidenceRefs: [validRef],
+    });
+    assert.equal(raiseRes.error, undefined);
+    const { seq: decisionSeq, hash: decisionHash } = raiseRes.result as {
+      seq: number;
+      hash: string;
+    };
+    raisedSeq = decisionSeq;
+    raisedHash = decisionHash;
+    const snapshotAfterRaise = readFileSync(sessionPath, "utf8");
+
+    // 4. Decision ID grammar enforcement on decision/resolve.
+    for (const badId of ["", "../traversal", "dec/slash", "dec.dot", "dec space", "_bad", 42]) {
+      const badResolve = eng.call(101, "decision/resolve", {
+        threadId,
+        decisionId: badId,
+        decisionSeq,
+        decisionHash,
+        outcome: "accepted-default",
+      });
+      assert.equal(badResolve.error?.code, ErrorCode.EvidenceInvalid, JSON.stringify(badId));
+      assert.equal(badResolve.error?.data?.reason, "field-invalid", JSON.stringify(badId));
+      assert.deepEqual(badResolve.error?.data?.issues, ["decisionId must match the id grammar"]);
+    }
+    assert.equal(readFileSync(sessionPath, "utf8"), snapshotAfterRaise);
+
+    // 5. Negative proof: while turn 2 is inProgress on this thread, BOTH an in-turn agent attempt
+    // AND an external protocol call on the same connection are refused with -32004 TurnAlreadyActive.
+    const turn2 = turnIdOf(
+      eng.call(5, "turn/start", { threadId, input: [{ type: "text", text: "second" }] }),
+    );
+    const snapshotDuringTurn2 = readFileSync(sessionPath, "utf8");
+    const activeTurnCall = eng.call(6, "decision/resolve", {
+      threadId,
+      decisionId: "dec_guard_1",
+      decisionSeq,
+      decisionHash,
+      outcome: "accepted-default",
+    });
+    assert.equal(activeTurnCall.error?.code, ErrorCode.TurnAlreadyActive);
+    assert.equal(activeTurnCall.error?.data?.activeTurnId, turn2);
+    assert.equal(readFileSync(sessionPath, "utf8"), snapshotDuringTurn2);
+
+    // 6. Negative proof: while eng holds the thread lock on disk, a separate engine connection
+    // (such as a subprocess spawned by a vendor agent) attempting decision/resolve is refused with
+    // -32004 TurnAlreadyActive and lockHolderPid === process.pid.
+    const engForeign = createHarness(h.home);
+    try {
+      engForeign.init();
+      const foreignLockRes = engForeign.call(2, "decision/resolve", {
+        threadId,
+        decisionId: "dec_guard_1",
+        decisionSeq,
+        decisionHash,
+        outcome: "accepted-default",
+      });
+      assert.equal(foreignLockRes.error?.code, ErrorCode.TurnAlreadyActive);
+      assert.equal(foreignLockRes.error?.data?.activeTurnId, null);
+      assert.equal(foreignLockRes.error?.data?.lockHolderPid, process.pid);
+    } finally {
+      engForeign.shutdown();
+    }
+
+    // Complete turn 2 and verify the agent's own mid-turn attempt inside Agent.run was also refused -32004.
+    releaseTurn2();
+    await waitTurnCompleted(eng.messages, turn2);
+    assert.ok(midTurnResolveAttempt !== null);
+    assert.equal((midTurnResolveAttempt as WireResponse).error?.code, ErrorCode.TurnAlreadyActive);
+    assert.equal((midTurnResolveAttempt as WireResponse).error?.data?.activeTurnId, turn2);
+    assert.deepEqual(
+      listOpenDecisions(h.home).map((d) => d.decisionId),
+      ["dec_guard_1"],
+    );
+
+    // 7. Integrity refusals (-32010): wrong decisionSeq, wrong decisionHash, mismatched accepted-default, unknown decisionId.
+    const badSeq = eng.call(7, "decision/resolve", {
+      threadId,
+      decisionId: "dec_guard_1",
+      decisionSeq: decisionSeq + 99,
+      decisionHash,
+      outcome: "accepted-default",
+    });
+    assert.equal(badSeq.error?.code, ErrorCode.EvidenceInvalid);
+    assert.deepEqual(badSeq.error?.data?.issues, [
+      "decisionSeq differs from the founderDecision line",
+    ]);
+
+    const badHash = eng.call(8, "decision/resolve", {
+      threadId,
+      decisionId: "dec_guard_1",
+      decisionSeq,
+      decisionHash: "0".repeat(64),
+      outcome: "accepted-default",
+    });
+    assert.equal(badHash.error?.code, ErrorCode.EvidenceInvalid);
+    assert.deepEqual(badHash.error?.data?.issues, [
+      "decisionHash differs from the founderDecision line",
+    ]);
+
+    const badDefault = eng.call(9, "decision/resolve", {
+      threadId,
+      decisionId: "dec_guard_1",
+      decisionSeq,
+      decisionHash,
+      outcome: "accepted-default",
+      resolution: "Not the recommended default",
+    });
+    assert.equal(badDefault.error?.code, ErrorCode.EvidenceInvalid);
+    assert.deepEqual(badDefault.error?.data?.issues, [
+      "resolution differs from the founderDecision recommendedDefault",
+    ]);
+
+    const unknownId = eng.call(10, "decision/resolve", {
+      threadId,
+      decisionId: "dec_nonexistent",
+      decisionSeq,
+      decisionHash,
+      outcome: "decided",
+      resolution: "Some resolution",
+    });
+    assert.equal(unknownId.error?.code, ErrorCode.EvidenceInvalid);
+    assert.deepEqual(unknownId.error?.data?.issues, [
+      "decisionId has no founderDecision in this file",
+    ]);
+
+    // 8. Positive proof: between turns, the initialized lock-holding protocol caller resolves the
+    // decision via decision/resolve, appending founderDecision.resolved while preserving all prior lines.
+    const linesBeforeResolve = readFileSync(sessionPath, "utf8").trimEnd().split("\n");
+    const okResolve = eng.call(11, "decision/resolve", {
+      threadId,
+      decisionId: "dec_guard_1",
+      decisionSeq,
+      decisionHash,
+      outcome: "accepted-default",
+    });
+    assert.equal(okResolve.error, undefined);
+    assert.equal(okResolve.result?.outcome, "accepted-default");
+    assert.equal(okResolve.result?.resolution, "Default guard");
+    const linesAfterResolve = readFileSync(sessionPath, "utf8").trimEnd().split("\n");
+    assert.equal(linesAfterResolve.length, linesBeforeResolve.length + 1);
+    assert.deepEqual(linesAfterResolve.slice(0, linesBeforeResolve.length), linesBeforeResolve);
+
+    // 9. Duplicate resolution of the same decisionId -> -32010
+    const dupResolve = eng.call(12, "decision/resolve", {
+      threadId,
+      decisionId: "dec_guard_1",
+      decisionSeq,
+      decisionHash,
+      outcome: "decided",
+      resolution: "Second thoughts",
+    });
+    assert.equal(dupResolve.error?.code, ErrorCode.EvidenceInvalid);
+    assert.deepEqual(dupResolve.error?.data?.issues, [
+      "decisionId already has a founderDecision.resolved in this file",
+    ]);
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("M2-A6 doctor (inspectSessionV2) & listOpenDecisions: hand-crafted chains with resolution mismatches report decision-resolution-mismatch without echoing payload text, and corrupt files are skipped", () => {
+  const h = makeHome();
+  try {
+    const threadId = "thr_crafted_01";
+    const seatId = "madc-default";
+    const path = join(h.home, "sessions", `${threadId}.jsonl`);
+    const lock = acquireThreadLock(h.home, threadId);
+    assert.equal(lock.ok, true);
+    if (lock.ok) releaseThreadLock(lock.handle);
+
+    const lines: SessionEvent[] = [];
+    let prevHash = GENESIS_HASH;
+    const pushLine = (type: SessionEvent["type"], payload: Record<string, unknown>) => {
+      const seq = lines.length;
+      const ts = 1000 + seq;
+      const hash = sessionEventHash(prevHash, {
+        v: 1,
+        seq,
+        ts,
+        type,
+        threadId,
+        seatId,
+        payload: payload as unknown as SessionEvent["payload"],
+      });
+      const ev = {
+        v: 1 as const,
+        seq,
+        ts,
+        type,
+        threadId,
+        seatId,
+        prevHash,
+        hash,
+        payload,
+      } as unknown as SessionEvent;
+      lines.push(ev);
+      prevHash = hash;
+      return ev;
+    };
+
+    const openEv = pushLine("session.open", {
+      cwd: null,
+      backing: "kimi-code",
+      providerId: "kimi-code",
+      pinnedModel: "kimi-for-coding",
+      worktree: null,
+      handoff: null,
+    });
+    pushLine("turn.start", { turnId: "turn_1", inputText: "hi" });
+    const decEv = pushLine("founderDecision", {
+      decisionId: "dec_craft_1",
+      turnId: "turn_1",
+      question: "SENSITIVE_QUESTION_TEXT",
+      recommendedDefault: "SENSITIVE_DEFAULT_TEXT",
+      evidenceRefs: [
+        {
+          kind: "session",
+          path: `sessions/${threadId}.jsonl`,
+          seq: openEv.seq,
+          hash: openEv.hash,
+        },
+      ],
+    });
+    // 1. Resolution naming an unknown decisionId
+    pushLine("founderDecision.resolved", {
+      decisionId: "dec_ghost",
+      decisionSeq: 2,
+      decisionHash: decEv.hash,
+      outcome: "decided",
+      resolution: "SENSITIVE_RESOLUTION_TEXT",
+    });
+    // 2. Resolution of dec_craft_1 with wrong decisionSeq, wrong decisionHash, and mismatched accepted-default resolution
+    pushLine("founderDecision.resolved", {
+      decisionId: "dec_craft_1",
+      decisionSeq: 99,
+      decisionHash: "f".repeat(64),
+      outcome: "accepted-default",
+      resolution: "SENSITIVE_WRONG_DEFAULT",
+    });
+    // 3. Duplicate resolution of dec_craft_1
+    pushLine("founderDecision.resolved", {
+      decisionId: "dec_craft_1",
+      decisionSeq: decEv.seq,
+      decisionHash: decEv.hash,
+      outcome: "decided",
+      resolution: "SENSITIVE_DUPLICATE_TEXT",
+    });
+    pushLine("session.close", { reason: "shutdown", worktree: null });
+
+    writeFileSync(path, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`, "utf8");
+
+    const findings = inspectSessionV2(h.home, lines);
+    const codes = findings.map((f) => f.code);
+    assert.deepEqual(codes, [
+      "decision-resolution-mismatch",
+      "decision-resolution-mismatch",
+      "decision-resolution-mismatch",
+      "decision-resolution-mismatch",
+      "decision-resolution-mismatch",
+    ]);
+    const serialized = JSON.stringify(findings);
+    assert.equal(serialized.includes("SENSITIVE_"), false, "findings must never echo payload text");
+
+    // Because the first resolution of dec_craft_1 had mismatched seq/hash/default and the second
+    // resolution was a duplicate only after the mismatched one, openDecisionsInChain keeps
+    // dec_craft_1 open until a valid resolution matches seq + hash.
+    const openInCrafted = openDecisionsInChain(lines.slice(0, 5));
+    assert.equal(openInCrafted.length, 1);
+    assert.equal(openInCrafted[0]?.decisionId, "dec_craft_1");
+
+    // Also plant a corrupt session file and verify listOpenDecisions skips it via onSkipped.
+    const corruptPath = join(h.home, "sessions", "thr_corrupt_01.jsonl");
+    appendFileSync(corruptPath, '{"not":"valid session chain"}\n', "utf8");
+    const skipped: Array<[string, string]> = [];
+    listOpenDecisions(h.home, (tid, reason) => skipped.push([tid, reason]));
+    assert.deepEqual(skipped, [["thr_corrupt_01", "session failed verification"]]);
+  } finally {
+    h.cleanup();
+  }
+});

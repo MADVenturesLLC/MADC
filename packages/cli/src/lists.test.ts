@@ -20,9 +20,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { canServe, listCatalog, type ProviderEntry } from "@madc/engine/client";
+import { canServe, listCatalog, type ProviderEntry, spawnEngine } from "@madc/engine/client";
 import { laneRows, parseProviderList, renderLaneTable, staleDeniedIds } from "./lanes.ts";
-import { parseSeatList, renderSeatsTable } from "./lists.ts";
+import {
+  parseDecisionList,
+  parseSeatList,
+  renderDecisionsTable,
+  renderSeatsTable,
+} from "./lists.ts";
 import { callEngineOnce } from "./rpc-call.ts";
 
 const ENGINE_SRC = fileURLToPath(new URL("../../engine/src/", import.meta.url));
@@ -80,6 +85,27 @@ const SEAT_OK_KEYS = [
   "warnings",
 ];
 const SEAT_BROKEN_KEYS = ["id", "ok", "path", "code", "issues"];
+const DECISIONS_TOP_KEYS = [
+  "ok",
+  "exitCode",
+  "madcVersion",
+  "protocolVersion",
+  "home",
+  "decisions",
+  "error",
+];
+const DECISION_KEYS = [
+  "threadId",
+  "seatId",
+  "seq",
+  "hash",
+  "ts",
+  "decisionId",
+  "turnId",
+  "question",
+  "recommendedDefault",
+  "evidenceRefs",
+];
 
 type Sandbox = {
   root: string;
@@ -623,4 +649,184 @@ test("A8 parseSeatList is strict; renderSeatsTable strips control bytes from sea
   assert.ok(!text.includes(ESC), "no raw ESC reaches the terminal");
   assert.match(text, /warning: seat s1: w�\[2K/);
   assert.match(text, /error: s2 \(\/h\/seats\/s2\.json\): -32006 x�/);
+});
+
+// ------------------------------------------------------------------------ decisions ls (M2-A6)
+
+test("M2-A6 decisions ls [--json]: round-trips decision/list across threads, excludes resolved decisions", {
+  timeout: 60_000,
+}, async () => {
+  const sb = sandbox();
+  try {
+    // 1. Empty inbox before any sessions exist
+    const emptyJson = await runCli(sb, ["decisions", "ls", "--json"], { engine: ECHO });
+    assert.equal(emptyJson.code, 0, emptyJson.stdout + emptyJson.stderr);
+    const emptyOut = JSON.parse(emptyJson.stdout) as Record<string, unknown>;
+    assert.deepStrictEqual(Object.keys(emptyOut), DECISIONS_TOP_KEYS);
+    assert.equal(emptyOut.ok, true);
+    assert.equal(emptyOut.exitCode, 0);
+    assert.equal(emptyOut.home, sb.home);
+    assert.deepStrictEqual(emptyOut.decisions, []);
+    assert.equal(emptyOut.error, null);
+
+    const emptyText = await runCli(sb, ["decisions", "ls"], { engine: ECHO });
+    assert.equal(emptyText.code, 0, emptyText.stderr);
+    assert.match(
+      emptyText.stdout.trimEnd(),
+      /^DECISION +THREAD +SEAT +TURN +SEQ +REFS +DEFAULT +QUESTION$/,
+    );
+
+    // 2. Populate two decisions via the echo engine, resolving one and leaving one open
+    const client = spawnEngine({
+      entry: ECHO,
+      env: { ...sb.keychainEnv, MADC_HOME: sb.home },
+    });
+    let openDecisionId = "";
+    let threadId = "";
+    let turnId = "";
+    try {
+      await client.request("initialize", { clientInfo: { name: "test", version: "0.0.0" } });
+      client.notify("initialized", {});
+      const started = await client.request("thread/start", { seatId: "madc-default" });
+      threadId = started.thread.id;
+      const turnStarted = await client.request("turn/start", {
+        threadId,
+        input: [{ type: "text", text: "hi" }],
+      });
+      await client.waitFor(
+        (m) =>
+          m.method === "turn/completed" &&
+          (m.params as { turn?: { id?: string } } | undefined)?.turn?.id === turnStarted.turn.id,
+      );
+      turnId = turnStarted.turn.id;
+      const d1 = await client.request("decision/raise", {
+        threadId,
+        turnId,
+        question: "Should we use closed key sets on founderDecision?",
+        recommendedDefault: "Yes",
+        evidenceRefs: [{ kind: "git", sha: "a".repeat(40), remote: null }],
+      });
+      const d2 = await client.request("decision/raise", {
+        threadId,
+        turnId,
+        question: "Keep append-only resolution events?",
+        recommendedDefault: "Append-only",
+        evidenceRefs: [{ kind: "git", sha: "b".repeat(40), remote: null }],
+      });
+      openDecisionId = d2.decisionId;
+      await client.request("decision/resolve", {
+        threadId,
+        decisionId: d1.decisionId,
+        decisionSeq: d1.seq,
+        decisionHash: d1.hash,
+        outcome: "accepted-default",
+      });
+    } finally {
+      await client.close();
+    }
+
+    // Plant one corrupt session file to verify corrupt files are skipped cleanly without breaking decision/list
+    writeFileSync(join(sb.home, "sessions", "thr_corrupt00001.jsonl"), "{ not json\n", {
+      mode: 0o600,
+    });
+
+    const rJson = await runCli(sb, ["decisions", "ls", "--json"], { engine: ECHO });
+    assert.equal(rJson.code, 0, rJson.stdout + rJson.stderr);
+    const out = JSON.parse(rJson.stdout) as Record<string, unknown>;
+    assert.deepStrictEqual(Object.keys(out), DECISIONS_TOP_KEYS);
+    assert.equal(out.ok, true);
+    const decisions = out.decisions as Array<Record<string, unknown>>;
+    assert.equal(decisions.length, 1);
+    const dec = decisions[0] as Record<string, unknown>;
+    assert.deepStrictEqual(Object.keys(dec), DECISION_KEYS);
+    assert.equal(dec.decisionId, openDecisionId);
+    assert.equal(dec.threadId, threadId);
+    assert.equal(dec.seatId, "madc-default");
+    assert.equal(dec.turnId, turnId);
+    assert.equal(dec.question, "Keep append-only resolution events?");
+    assert.equal(dec.recommendedDefault, "Append-only");
+
+    const rText = await runCli(sb, ["decisions", "ls"], { engine: ECHO });
+    assert.equal(rText.code, 0, rText.stderr);
+    const lines = rText.stdout.trimEnd().split("\n");
+    assert.match(lines[0] ?? "", /^DECISION +THREAD +SEAT +TURN +SEQ +REFS +DEFAULT +QUESTION$/);
+    assert.ok(lines[1]?.startsWith(`${openDecisionId} `));
+    assert.match(lines[1] ?? "", /Keep append-only resolution events\?/);
+
+    // Invalid MADC_HOME exits 2 before spawning the engine
+    const bad = await runCli(sb, ["decisions", "ls", "--json"], {
+      engine: ECHO,
+      env: { MADC_HOME: "relative/home" },
+    });
+    assert.equal(bad.code, 2, bad.stdout);
+    const badOut = JSON.parse(bad.stdout) as Record<string, unknown>;
+    assert.deepStrictEqual(Object.keys(badOut), DECISIONS_TOP_KEYS);
+    assert.equal(badOut.decisions, null);
+    assert.equal((badOut.error as { class: string }).class, "usage");
+
+    // Engine exit is exit 3 with the locked failure JSON shape
+    const dead = await runCli(sb, ["decisions", "ls", "--json"], { engine: EXIT_ENGINE });
+    assert.equal(dead.code, 3, dead.stdout);
+    const deadOut = JSON.parse(dead.stdout) as Record<string, unknown>;
+    assert.deepStrictEqual(Object.keys(deadOut), DECISIONS_TOP_KEYS);
+    assert.equal(deadOut.ok, false);
+    assert.equal(deadOut.decisions, null);
+  } finally {
+    sb.cleanup();
+  }
+});
+
+test("M2-A6 parseDecisionList is strict; renderDecisionsTable strips control bytes", () => {
+  const validDecision = {
+    threadId: "thr_0001",
+    seatId: "daedalus",
+    seq: 2,
+    hash: "a".repeat(64),
+    ts: 1700000000000,
+    decisionId: "dec_0001",
+    turnId: "trn_0001",
+    question: `Choose option?${ESC}[31m`,
+    recommendedDefault: `A${ESC}[2K`,
+    evidenceRefs: [
+      { kind: "session", path: "sessions/thr_0001.jsonl", seq: 0, hash: "b".repeat(64) },
+    ],
+  };
+  const parsed = parseDecisionList({ data: [validDecision] });
+  assert.ok(parsed !== null);
+  assert.equal(parsed.length, 1);
+
+  for (const [why, bad] of [
+    ["not an object", null],
+    ["data not an array", { data: {} }],
+    ["invalid decisionId", { data: [{ ...validDecision, decisionId: "../bad" }] }],
+    ["invalid threadId", { data: [{ ...validDecision, threadId: "../bad" }] }],
+    ["empty question", { data: [{ ...validDecision, question: "   " }] }],
+    ["empty recommendedDefault", { data: [{ ...validDecision, recommendedDefault: "" }] }],
+    ["empty evidenceRefs", { data: [{ ...validDecision, evidenceRefs: [] }] }],
+    [
+      "extra key on evidenceRef",
+      {
+        data: [
+          {
+            ...validDecision,
+            evidenceRefs: [
+              {
+                kind: "session",
+                path: "sessions/thr_0001.jsonl",
+                seq: 0,
+                hash: "b".repeat(64),
+                extra: 1,
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  ] as const) {
+    assert.equal(parseDecisionList(bad), null, why);
+  }
+
+  const text = renderDecisionsTable(parsed).join("\n");
+  assert.ok(!text.includes(ESC), "no raw ESC reaches the terminal");
+  assert.match(text, /Choose option\?\uFFFD\[31m/);
 });

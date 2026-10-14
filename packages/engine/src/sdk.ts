@@ -83,3 +83,9 @@ export {
   type SessionVerifyResult,
   verifySessionFile,
 } from "./session-store.ts";
+export {
+  checkEvidenceRef,
+  type EvidenceRef,
+  FOUNDER_DECISION_OUTCOMES,
+  type FounderDecisionResolutionOutcome,
+} from "./session-v2.ts";

@@ -3,6 +3,7 @@
 *Surface Architect · 2026-09-27 · Venue: `MADVenturesLLC/MADC` · Status: **build pin** — gates Hephaestus Acts M1-A1 … M1-A9. Docs only.*
 
 *Amended by `PIN-madc-M2-brief-delivery.md` (2026-10-06, M2-A4, P-M2-3's brief-delivery slice): a handoff target's first `turn/start` serves the source's hash-pinned brief once as `input[0]`, under the recorded `turn.start.briefServed` marker; no method, param, result, notification, item kind or code changes; `protocolVersion` stays `madc-m1/1`; additive.*
+*Amended by `PIN-madc-M2-founder-decision-inbox.md` (2026-10-14, M2-A6, P-M2-3's decision-inbox slice): adds `decision/raise`, `decision/list`, `decision/resolve`, the append-only `founderDecision.resolved` session event, and closed key sets on `founderDecision` and `EvidenceRef` (D-439); `protocolVersion` stays `madc-m1/1`; additive.*
 
 *Supersedes `docs/plan/PIN-madc-M0-protocol-messages.md` **for M1 work**. The M0 pin stays frozen and is not edited (M1-A0; Founder, 2026-09-25). M0 Amendments 2 and 3 are separate frozen files, unedited and not superseded here; they remain binding as written, and their references to M0-pin sections read against the matching sections of this pin.*
 
