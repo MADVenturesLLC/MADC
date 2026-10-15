@@ -2507,11 +2507,13 @@ export class EngineConnection {
           Object.hasOwn(rawObj, "decisionId") && rawObj.decisionId !== undefined
             ? rawObj.decisionId
             : newId("dec");
-        // F3: preserve caller-owned keys (including own `"__proto__"`) with `Object.fromEntries`
-        // while binding `decisionId` and the active `turnId` from the engine.
-        const rawEntries = Object.entries(rawObj).filter(
-          ([k]) => k !== "decisionId" && k !== "turnId",
-        );
+        // F2/F3: preserve caller-owned keys (including own `"__proto__"`) with `Object.fromEntries`
+        // while binding `decisionId` and the active `turnId` from the engine. Any caller-supplied
+        // `turnId` is mapped to `"__caller_turnId__"` so `checkV2Payload` rejects it under D-439
+        // alongside any caller-supplied `threadId`.
+        const rawEntries = Object.entries(rawObj)
+          .filter(([k]) => k !== "decisionId")
+          .map(([k, v]): [string, unknown] => (k === "turnId" ? ["__caller_turnId__", v] : [k, v]));
         const candidate: Record<string, unknown> = Object.fromEntries([
           ...rawEntries,
           ["decisionId", decisionId],

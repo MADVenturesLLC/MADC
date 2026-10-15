@@ -25,7 +25,8 @@ import { appendFileSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
-import type { ProviderPort } from "@madc/adapters";
+import { createKimiCodePort, honestUserAgent, type ProviderPort } from "@madc/adapters";
+import { createFakeKimiTransport } from "@madc/adapters/testing";
 import { type Agent, echoAgent, type TurnSink } from "./agent.ts";
 import { listOpenDecisions, openDecisionsInChain } from "./decisions.ts";
 import { inspectSessionV2 } from "./handoff.ts";
@@ -35,7 +36,7 @@ import type { PresenceTerminal } from "./presence/terminal.ts";
 import { ErrorCode } from "./protocol/errors.ts";
 import { createProviderAgent } from "./provider-agent.ts";
 import { seedRosterSeats } from "./seats/roster.ts";
-import { EngineConnection, type EngineOptions } from "./server.ts";
+import { ENGINE_VERSION, EngineConnection, type EngineOptions } from "./server.ts";
 import {
   GENESIS_HASH,
   type SessionEvent,
@@ -1754,6 +1755,304 @@ test("F5 regression: refused cold resolution on a session with a dangling turn l
       eng.shutdown();
     }
   } finally {
+    h.cleanup();
+  }
+});
+
+test("F2 real direct-lane adapter (createKimiCodePort / createDirectKeyPort): native pi-ai founder_decision_raise tool discovery, valid and invalid model-originated raises, authority enforcement, and turn continuation", async () => {
+  const h = makeHome();
+  const fakeKimi = createFakeKimiTransport();
+  const realProviderAgent = createProviderAgent({
+    credential: { ok: true, apiKey: "sk-kimi-synthetic-f2-test" },
+    createPort: (apiKey) =>
+      createKimiCodePort({
+        apiKey,
+        userAgent: honestUserAgent(ENGINE_VERSION),
+        baseUrl: "https://kimi-fake.invalid/coding",
+        fetch: fakeKimi.fetch,
+      }),
+  });
+  const eng = createHarness(h.home, {
+    agent: realProviderAgent,
+    terminal: makeConfirmingTerminal(async () => true),
+  });
+  try {
+    eng.init();
+    const threadId = threadIdOf(eng.call(2, "thread/start", {}));
+    const openEv = readEvents(h.home, threadId)[0];
+    assert.ok(openEv !== undefined && openEv.type === "session.open");
+
+    // Queue synthetic native pi-ai model responses across a single active turn:
+    // 1. (C) Invalid model-originated raise: bad evidenceRefs (seq 999 / all-zero hash) -> -32010 tool_result (is_error: true).
+    fakeKimi.queueReply({
+      type: "tool-call",
+      id: "call_f2_invalid_ev",
+      name: "founder_decision_raise",
+      args: {
+        decisionId: "dec_real_invalid_ev",
+        question: "Should invalid evidence succeed?",
+        recommendedDefault: "Never",
+        evidenceRefs: [
+          {
+            kind: "session",
+            path: `sessions/${threadId}.jsonl`,
+            seq: 999,
+            hash: "0".repeat(64),
+          },
+        ],
+      },
+      model: "kimi-for-coding",
+    });
+
+    // 2. (E) Authority check: model attempts to override threadId and turnId -> -32010 tool_result (is_error: true).
+    fakeKimi.queueReply({
+      type: "tool-call",
+      id: "call_f2_forged_identity",
+      name: "founder_decision_raise",
+      args: {
+        decisionId: "dec_real_forged_identity",
+        threadId: "thr_other_spoofed",
+        turnId: "turn_other_spoofed",
+        question: "Can the model choose threadId or turnId?",
+        recommendedDefault: "Never",
+        evidenceRefs: [
+          {
+            kind: "session",
+            path: `sessions/${threadId}.jsonl`,
+            seq: openEv.seq,
+            hash: openEv.hash,
+          },
+        ],
+      },
+      model: "kimi-for-coding",
+    });
+
+    // 3. (E) Authority check: model attempts to invoke decision/resolve -> error tool_result (is_error: true).
+    fakeKimi.queueReply({
+      type: "tool-call",
+      id: "call_f2_resolve_forbidden",
+      name: "decision/resolve",
+      args: {
+        threadId,
+        decisionId: "dec_real_model_ok",
+        outcome: "accepted-default",
+      },
+      model: "kimi-for-coding",
+    });
+
+    // 4. (B) Valid model-originated raise: valid question, recommendedDefault, and evidenceRefs -> recorded mid-turn.
+    fakeKimi.queueReply({
+      type: "tool-call",
+      id: "call_f2_valid_raise",
+      name: "founder_decision_raise",
+      args: {
+        decisionId: "dec_real_model_ok",
+        question: "Proceed with native pi-ai founder_decision_raise tool?",
+        recommendedDefault: "Proceed with bounded single-tool capability",
+        evidenceRefs: [
+          {
+            kind: "session",
+            path: `sessions/${threadId}.jsonl`,
+            seq: openEv.seq,
+            hash: openEv.hash,
+          },
+        ],
+      },
+      model: "kimi-for-coding",
+    });
+
+    // 5. (D) Turn continuation: after receiving the structured tool results, the model streams its final output.
+    fakeKimi.queueReply({
+      type: "stream",
+      chunks: ["Decision ", "dec_real_model_ok ", "raised; turn complete."],
+      model: "kimi-for-coding",
+    });
+
+    const turnId = turnIdOf(
+      eng.call(3, "turn/start", {
+        threadId,
+        input: [{ type: "text", text: "Evaluate and raise a founder decision if needed." }],
+      }),
+    );
+    await waitTurnCompleted(eng.messages, turnId);
+    const completedMsg = eng.messages.find(
+      (m) =>
+        m.method === "turn/completed" &&
+        ((m.params as { turn?: { id?: string } })?.turn?.id ?? "") === turnId,
+    );
+    assert.ok(completedMsg !== undefined);
+    const completedTurn = (
+      completedMsg.params as {
+        turn: {
+          id: string;
+          status: string;
+          items: Array<{ kind: string; text?: string; code?: number }>;
+        };
+      }
+    ).turn;
+    assert.equal(completedTurn.status, "completed");
+
+    // A. TOOL DISCOVERY: verify the shipped adapter advertised founder_decision_raise in pi-ai's native Anthropic format.
+    const firstReqBody = JSON.parse(fakeKimi.requests[0]?.body ?? "{}") as {
+      tools?: Array<{
+        name: string;
+        description?: string;
+        input_schema?: {
+          type: string;
+          required?: string[];
+          properties?: Record<string, unknown>;
+        };
+      }>;
+    };
+    assert.ok(
+      Array.isArray(firstReqBody.tools),
+      `adapter must advertise native tools array (got tools=${String(firstReqBody.tools)}, requests=${fakeKimi.requests.length}, openDecisions=${listOpenDecisions(h.home).length})`,
+    );
+    assert.equal(
+      fakeKimi.requests.length,
+      5,
+      "expected 4 tool-call round-trips + 1 final completion request",
+    );
+    assert.equal(firstReqBody.tools.length, 1, "adapter must expose only founder_decision_raise");
+    const advertisedTool = firstReqBody.tools[0];
+    assert.ok(advertisedTool !== undefined);
+    assert.equal(advertisedTool.name, "founder_decision_raise");
+    assert.deepEqual([...(advertisedTool.input_schema?.required ?? [])].sort(), [
+      "evidenceRefs",
+      "question",
+      "recommendedDefault",
+    ]);
+    assert.ok(advertisedTool.input_schema?.properties !== undefined);
+    assert.equal("question" in advertisedTool.input_schema.properties, true);
+    assert.equal("recommendedDefault" in advertisedTool.input_schema.properties, true);
+    assert.equal("evidenceRefs" in advertisedTool.input_schema.properties, true);
+    assert.equal("decisionId" in advertisedTool.input_schema.properties, true);
+    assert.equal(
+      "threadId" in advertisedTool.input_schema.properties,
+      false,
+      "tool schema must not advertise threadId",
+    );
+    assert.equal(
+      "turnId" in advertisedTool.input_schema.properties,
+      false,
+      "tool schema must not advertise turnId",
+    );
+
+    // C. INVALID MODEL-ORIGINATED RAISE: verify second request carries -32010 tool_result error back to the model.
+    const secondReqBody = JSON.parse(fakeKimi.requests[1]?.body ?? "{}") as {
+      messages: Array<{
+        role: string;
+        content: unknown;
+      }>;
+    };
+    const secondReqSerialized = JSON.stringify(secondReqBody.messages);
+    assert.equal(secondReqSerialized.includes("call_f2_invalid_ev"), true);
+    assert.equal(secondReqSerialized.includes(String(ErrorCode.EvidenceInvalid)), true);
+    assert.equal(secondReqSerialized.includes("evidence-ref-invalid"), true);
+
+    // E. AUTHORITY: verify third request carries -32010 field-invalid refusal when model supplies threadId/turnId,
+    // and fourth request carries error tool_result when model attempts decision/resolve.
+    const thirdReqSerialized = fakeKimi.requests[2]?.body ?? "";
+    assert.equal(thirdReqSerialized.includes("call_f2_forged_identity"), true);
+    assert.equal(thirdReqSerialized.includes(String(ErrorCode.EvidenceInvalid)), true);
+    assert.equal(thirdReqSerialized.includes("field-invalid"), true);
+
+    const fourthReqSerialized = fakeKimi.requests[3]?.body ?? "";
+    assert.equal(fourthReqSerialized.includes("call_f2_resolve_forbidden"), true);
+    assert.equal(fourthReqSerialized.includes('"is_error":true'), true);
+
+    // B. VALID MODEL-ORIGINATED RAISE: verify fifth request carries structured success tool_result and decision is recorded.
+    const fifthReqSerialized = fakeKimi.requests[4]?.body ?? "";
+    assert.equal(fifthReqSerialized.includes("call_f2_valid_raise"), true);
+    assert.equal(fifthReqSerialized.includes("dec_real_model_ok"), true);
+
+    const openDecisions = listOpenDecisions(h.home);
+    assert.equal(openDecisions.length, 1);
+    assert.equal(openDecisions[0]?.decisionId, "dec_real_model_ok");
+    assert.equal(openDecisions[0]?.threadId, threadId);
+    assert.equal(openDecisions[0]?.turnId, turnId);
+    assert.equal(
+      openDecisions[0]?.question,
+      "Proceed with native pi-ai founder_decision_raise tool?",
+    );
+    assert.equal(
+      openDecisions[0]?.recommendedDefault,
+      "Proceed with bounded single-tool capability",
+    );
+
+    const rpcList = eng.call(4, "decision/list", {});
+    assert.equal(rpcList.error, undefined);
+    const rpcDecisions = rpcList.result?.data as Array<{ decisionId: string; turnId: string }>;
+    assert.equal(rpcDecisions.length, 1);
+    assert.equal(rpcDecisions[0]?.decisionId, "dec_real_model_ok");
+    assert.equal(rpcDecisions[0]?.turnId, turnId);
+
+    // D. TURN CONTINUATION & SESSION INTEGRITY: verify final assistant output, servedModel receipt, and verified chain.
+    const agentMessages = completedTurn.items.filter((i) => i.kind === "agentMessage");
+    assert.equal(agentMessages.length, 1);
+    assert.equal(agentMessages[0]?.text, "Decision dec_real_model_ok raised; turn complete.");
+
+    const sessionPath = join(h.home, "sessions", `${threadId}.jsonl`);
+    const verified = verifySessionFile(sessionPath);
+    assert.equal(verified.ok, true, "session chain must verify cleanly");
+    const events = readEvents(h.home, threadId);
+    const decisionEvents = events.filter((e) => e.type === "founderDecision");
+    assert.equal(decisionEvents.length, 1, "only the valid decision may be written");
+    assert.equal(
+      events.some((e) => e.type === "founderDecision.resolved"),
+      false,
+      "model must never write founderDecision.resolved",
+    );
+    assert.equal(
+      events.some((e) => e.type === "servedModel"),
+      true,
+      "servedModel receipt must still be recorded",
+    );
+
+    // Bounded tool-call loop & duplicate decision prevention: queue 8 consecutive duplicate tool-calls
+    // and verify the adapter executes at most MAX_DECISION_TOOL_ROUNDS (4) tool rounds (5 HTTP requests)
+    // and writes zero duplicate decisions.
+    const reqCountBeforeLoopTurn = fakeKimi.requests.length;
+    for (let i = 0; i < 8; i += 1) {
+      fakeKimi.queueReply({
+        type: "tool-call",
+        id: `call_f2_dup_${i}`,
+        name: "founder_decision_raise",
+        args: {
+          decisionId: "dec_real_model_ok",
+          question: "Duplicate raise in loop?",
+          recommendedDefault: "No",
+          evidenceRefs: [
+            {
+              kind: "session",
+              path: `sessions/${threadId}.jsonl`,
+              seq: openEv.seq,
+              hash: openEv.hash,
+            },
+          ],
+        },
+        model: "kimi-for-coding",
+      });
+    }
+    const loopTurnId = turnIdOf(
+      eng.call(5, "turn/start", {
+        threadId,
+        input: [{ type: "text", text: "Attempt unbounded tool loop." }],
+      }),
+    );
+    await waitTurnCompleted(eng.messages, loopTurnId);
+    assert.equal(
+      fakeKimi.requests.length - reqCountBeforeLoopTurn,
+      5,
+      "MAX_DECISION_TOOL_ROUNDS (4) must cap tool round-trips at 4 (5 HTTP requests total)",
+    );
+    assert.equal(
+      listOpenDecisions(h.home).length,
+      1,
+      "duplicate decisionId in bounded loop must not create a second decision",
+    );
+  } finally {
+    eng.shutdown();
     h.cleanup();
   }
 });

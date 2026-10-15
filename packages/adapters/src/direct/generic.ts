@@ -17,15 +17,113 @@ import {
   type Api,
   type AssistantMessage,
   createModels,
+  type Message,
   type Model,
   type Provider,
+  type Tool,
+  type ToolCall,
+  Type,
 } from "@earendil-works/pi-ai";
 import {
   ProviderCallError,
+  type ProviderDecisionRaiseInput,
   type ProviderPort,
   type ProviderTurnRequest,
   type ProviderTurnResult,
 } from "../provider-port.ts";
+
+/**
+ * M2-A6 (F2): single bounded model-callable tool exposed on direct lanes through pi-ai's native
+ * `Context.tools` contract. The engine owns `threadId` and `turnId`; the model supplies only the
+ * typed `founderDecision` fields (`question`, `recommendedDefault`, `evidenceRefs`, and optional
+ * `decisionId`). Never exposes `decision/resolve`.
+ */
+export const FOUNDER_DECISION_RAISE_TOOL_NAME = "founder_decision_raise";
+
+/** Maximum native decision-tool round-trips permitted within a single provider turn. */
+export const MAX_DECISION_TOOL_ROUNDS = 4;
+
+const EVIDENCE_REF_SCHEMA = Type.Object({
+  kind: Type.String({
+    description: 'Evidence reference kind ("session", "servedModel", or "git").',
+  }),
+  path: Type.Optional(
+    Type.String({ description: "Relative session path (sessions/<threadId>.jsonl)." }),
+  ),
+  seq: Type.Optional(Type.Integer({ minimum: 0, description: "Target event sequence number." })),
+  hash: Type.Optional(Type.String({ description: "64-hex SHA-256 event hash." })),
+  sha: Type.Optional(Type.String({ description: "40-hex git commit SHA." })),
+  remote: Type.Optional(
+    Type.Union([Type.String(), Type.Null()], {
+      description: "Git remote name or null for local-only commit.",
+    }),
+  ),
+});
+
+export const FOUNDER_DECISION_RAISE_TOOL: Tool = Object.freeze({
+  name: FOUNDER_DECISION_RAISE_TOOL_NAME,
+  description:
+    "Raise a typed Founder decision on the active thread and turn. Requires non-empty question, recommendedDefault, and verified evidenceRefs.",
+  parameters: Type.Object({
+    question: Type.String({
+      description: "The decision question requiring Founder resolution.",
+    }),
+    recommendedDefault: Type.String({
+      description: "The recommended default resolution if accepted as-is.",
+    }),
+    evidenceRefs: Type.Array(EVIDENCE_REF_SCHEMA, {
+      minItems: 1,
+      description: "Non-empty list of verified evidence references backing the decision.",
+    }),
+    decisionId: Type.Optional(
+      Type.String({
+        description: "Optional explicit decision id matching ^dec_[A-Za-z0-9_-]{1,64}$.",
+      }),
+    ),
+  }),
+});
+
+const DIRECT_LANE_TOOLS: readonly Tool[] = Object.freeze([FOUNDER_DECISION_RAISE_TOOL]);
+
+function executeDecisionToolCall(
+  call: ToolCall,
+  request: ProviderTurnRequest,
+): { readonly text: string; readonly isError: boolean } {
+  if (call.name !== FOUNDER_DECISION_RAISE_TOOL_NAME) {
+    return {
+      text: JSON.stringify({
+        ok: false,
+        error: {
+          code: -32601,
+          message: "Unsupported tool: only founder_decision_raise is permitted",
+        },
+      }),
+      isError: true,
+    };
+  }
+  if (request.raiseDecision === undefined) {
+    return {
+      text: JSON.stringify({
+        ok: false,
+        error: {
+          code: -32010,
+          message: "Evidence invalid: founder_decision_raise requires an active engine turn",
+        },
+      }),
+      isError: true,
+    };
+  }
+  const rawArgs = call.arguments;
+  const input =
+    typeof rawArgs === "object" && rawArgs !== null && !Array.isArray(rawArgs)
+      ? (Object.fromEntries(Object.entries(rawArgs)) as unknown as ProviderDecisionRaiseInput)
+      : (rawArgs as unknown as ProviderDecisionRaiseInput);
+  const outcome = request.raiseDecision(input);
+  return {
+    text: JSON.stringify(outcome),
+    isError: !outcome.ok,
+  };
+}
 
 /**
  * Wire apis a direct-key lane can speak through pi-ai (registry `wire` field drives the choice).
@@ -191,51 +289,86 @@ export function createDirectKeyPort(config: DirectKeyPortConfig): ProviderPort {
         }
       }
       const target = config.baseUrl === undefined ? model : { ...model, baseUrl: config.baseUrl };
-      let status: number | null = null;
       const timestamp = Date.now();
-      const stream = catalog.stream(
-        target,
-        {
-          ...(request.systemPrompt === undefined ? {} : { systemPrompt: request.systemPrompt }),
-          messages: request.messages.map((m) => ({ role: "user", content: m.text, timestamp })),
-        },
-        {
-          apiKey: config.apiKey,
-          ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
-          // Provider-scoped env: keeps pi-ai from consulting ambient process env for this request.
-          env: {},
-          signal: request.signal,
-          ...(config.userAgent === undefined
-            ? {}
-            : { headers: { "User-Agent": config.userAgent } }),
-          onResponse: (response) => {
-            status = response.status;
-          },
-        },
-      );
+      const conversationMessages: Message[] = request.messages.map((m) => ({
+        role: "user" as const,
+        content: m.text,
+        timestamp,
+      }));
 
+      let accumulatedText = "";
       let final: AssistantMessage | undefined;
-      try {
-        for await (const event of stream) {
-          if (event.type === "text_delta") request.onTextDelta(event.delta);
-        }
-        final = await stream.result();
-      } catch {
-        // Never surface the underlying error text: it can carry upstream bodies.
-        throw failure(config, request.signal, status);
-      }
-      if (final.stopReason === "error" || final.stopReason === "aborted") {
-        throw failure(
-          config,
-          request.signal,
-          status ?? providerErrorStatus(final.errorMessage),
-          final.stopReason === "aborted",
+      let toolRounds = 0;
+
+      while (true) {
+        let status: number | null = null;
+        const stream = catalog.stream(
+          target,
+          {
+            ...(request.systemPrompt === undefined ? {} : { systemPrompt: request.systemPrompt }),
+            messages: conversationMessages,
+            tools: [...DIRECT_LANE_TOOLS],
+          },
+          {
+            apiKey: config.apiKey,
+            ...(config.fetch === undefined ? {} : { fetch: config.fetch }),
+            // Provider-scoped env: keeps pi-ai from consulting ambient process env for this request.
+            env: {},
+            signal: request.signal,
+            ...(config.userAgent === undefined
+              ? {}
+              : { headers: { "User-Agent": config.userAgent } }),
+            onResponse: (response) => {
+              status = response.status;
+            },
+          },
         );
+
+        try {
+          for await (const event of stream) {
+            if (event.type === "text_delta") request.onTextDelta(event.delta);
+          }
+          final = await stream.result();
+        } catch {
+          // Never surface the underlying error text: it can carry upstream bodies.
+          throw failure(config, request.signal, status);
+        }
+        if (final.stopReason === "error" || final.stopReason === "aborted") {
+          throw failure(
+            config,
+            request.signal,
+            status ?? providerErrorStatus(final.errorMessage),
+            final.stopReason === "aborted",
+          );
+        }
+
+        accumulatedText += final.content
+          .filter((part) => part.type === "text")
+          .map((part) => part.text)
+          .join("");
+
+        const toolCalls = final.content.filter(
+          (part): part is ToolCall => part.type === "toolCall",
+        );
+        if (toolCalls.length === 0 || toolRounds >= MAX_DECISION_TOOL_ROUNDS) {
+          break;
+        }
+        toolRounds += 1;
+        conversationMessages.push(final);
+        const resultTimestamp = Date.now();
+        for (const call of toolCalls) {
+          const outcome = executeDecisionToolCall(call, request);
+          conversationMessages.push({
+            role: "toolResult",
+            toolCallId: call.id,
+            toolName: call.name,
+            content: [{ type: "text", text: outcome.text }],
+            isError: outcome.isError,
+            timestamp: resultTimestamp,
+          });
+        }
       }
-      const text = final.content
-        .filter((part) => part.type === "text")
-        .map((part) => part.text)
-        .join("");
+
       const servedModel = final.responseModel ?? model.id;
       // OpenAI-compat lanes: pi-ai fills responseModel from the first chunk's `model` — the vendor
       // reported an identity even when it equals the requested id. Anthropic lanes omit the key so
@@ -254,7 +387,7 @@ export function createDirectKeyPort(config: DirectKeyPortConfig): ProviderPort {
           ? { vendorReported: true as const }
           : {};
       return {
-        text,
+        text: accumulatedText,
         requestedModelId: model.id,
         servedModel,
         ...vendorReported,
