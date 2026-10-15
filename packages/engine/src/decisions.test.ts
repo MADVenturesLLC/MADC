@@ -2041,6 +2041,18 @@ test("F2 real direct-lane adapter (createKimiCodePort / createDirectKeyPort): na
       }),
     );
     await waitTurnCompleted(eng.messages, loopTurnId);
+    const loopCompletedMsg = eng.messages.find(
+      (m) =>
+        m.method === "turn/completed" &&
+        ((m.params as { turn?: { id?: string } })?.turn?.id ?? "") === loopTurnId,
+    );
+    assert.ok(loopCompletedMsg !== undefined);
+    const loopTurn = (loopCompletedMsg.params as { turn: { status: string } }).turn;
+    assert.equal(
+      loopTurn.status,
+      "failed",
+      "exhausting MAX_DECISION_TOOL_ROUNDS with another tool call must fail the turn",
+    );
     assert.equal(
       fakeKimi.requests.length - reqCountBeforeLoopTurn,
       5,
@@ -2051,6 +2063,204 @@ test("F2 real direct-lane adapter (createKimiCodePort / createDirectKeyPort): na
       1,
       "duplicate decisionId in bounded loop must not create a second decision",
     );
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("F2 tool-limit exhaustion regression: four distinct valid decision-tool rounds followed by a fifth tool-call response fails the provider turn while preserving the four recorded decisions, with no fifth callback, no servedModel receipt, and sanitized error", async () => {
+  const h = makeHome();
+  const fakeKimi = createFakeKimiTransport();
+  const syntheticSecretKey = "sk-kimi-synthetic-exhaust-secret-9911";
+  let raiseCallbackCount = 0;
+
+  const realProviderAgent = createProviderAgent({
+    credential: { ok: true, apiKey: syntheticSecretKey },
+    createPort: (apiKey) => {
+      const innerPort = createKimiCodePort({
+        apiKey,
+        userAgent: honestUserAgent(ENGINE_VERSION),
+        baseUrl: "https://kimi-fake.invalid/coding",
+        fetch: fakeKimi.fetch,
+      });
+      return {
+        providerId: innerPort.providerId,
+        streamTurn(req) {
+          const origRaise = req.raiseDecision;
+          return innerPort.streamTurn({
+            ...req,
+            ...(origRaise === undefined
+              ? {}
+              : {
+                  raiseDecision: (input) => {
+                    raiseCallbackCount += 1;
+                    return origRaise(input);
+                  },
+                }),
+          });
+        },
+      };
+    },
+  });
+
+  const eng = createHarness(h.home, {
+    agent: realProviderAgent,
+    terminal: makeConfirmingTerminal(async () => true),
+  });
+
+  try {
+    eng.init();
+    const threadId = threadIdOf(eng.call(2, "thread/start", {}));
+    const openEv = readEvents(h.home, threadId)[0];
+    assert.ok(openEv !== undefined && openEv.type === "session.open");
+
+    // Queue four permitted decision-tool rounds (four distinct valid decisions) plus a fifth response
+    // requesting another distinct valid decision after MAX_DECISION_TOOL_ROUNDS (4) is exhausted.
+    for (let i = 1; i <= 4; i += 1) {
+      fakeKimi.queueReply({
+        type: "tool-call",
+        id: `call_exhaust_${i}`,
+        name: "founder_decision_raise",
+        args: {
+          decisionId: `dec_exhaust_${i}`,
+          question: `Permitted decision question ${i}?`,
+          recommendedDefault: `Permitted default ${i}`,
+          evidenceRefs: [
+            {
+              kind: "session",
+              path: `sessions/${threadId}.jsonl`,
+              seq: openEv.seq,
+              hash: openEv.hash,
+            },
+          ],
+        },
+        model: "kimi-for-coding",
+      });
+    }
+    fakeKimi.queueReply({
+      type: "tool-call",
+      id: "call_exhaust_5",
+      name: "founder_decision_raise",
+      args: {
+        decisionId: "dec_exhaust_5",
+        question: "FifthQuestion_MUST_NOT_EXECUTE_OR_LEAK?",
+        recommendedDefault: "FifthDefault_MUST_NOT_EXECUTE_OR_LEAK",
+        evidenceRefs: [
+          {
+            kind: "session",
+            path: `sessions/${threadId}.jsonl`,
+            seq: openEv.seq,
+            hash: openEv.hash,
+          },
+        ],
+      },
+      model: "kimi-for-coding",
+    });
+
+    const turnId = turnIdOf(
+      eng.call(3, "turn/start", {
+        threadId,
+        input: [{ type: "text", text: "Raise five decisions in five rounds." }],
+      }),
+    );
+    await waitTurnCompleted(eng.messages, turnId);
+
+    const completedMsg = eng.messages.find(
+      (m) =>
+        m.method === "turn/completed" &&
+        ((m.params as { turn?: { id?: string } })?.turn?.id ?? "") === turnId,
+    );
+    assert.ok(completedMsg !== undefined);
+    const finishedTurn = (
+      completedMsg.params as {
+        turn: {
+          id: string;
+          status: string;
+          error: { code: number; message: string } | null;
+          items: Array<{ kind: string; status: string; message?: string; code?: number }>;
+        };
+      }
+    ).turn;
+
+    // 1. Four prior decisions remain recorded; fifth decision is not recorded.
+    const openDecisionIds = listOpenDecisions(h.home).map((d) => d.decisionId);
+    assert.deepEqual(
+      openDecisionIds,
+      ["dec_exhaust_1", "dec_exhaust_2", "dec_exhaust_3", "dec_exhaust_4"],
+      "four prior decisions must remain recorded and fifth decision must not be recorded",
+    );
+
+    // 2. No fifth decision callback is executed and no 6th HTTP request is made.
+    assert.equal(
+      raiseCallbackCount,
+      4,
+      "no fifth decision callback may be executed after MAX_DECISION_TOOL_ROUNDS (4)",
+    );
+    assert.equal(
+      fakeKimi.requests.length,
+      5,
+      "exactly 5 HTTP requests (4 tool rounds + 5th reply)",
+    );
+
+    // 3. Turn status is FAILED, not COMPLETED.
+    assert.equal(
+      finishedTurn.status,
+      "failed",
+      `turn status must be failed when 5th response requests another tool call (got status=${finishedTurn.status}, openDecisionIds=${JSON.stringify(openDecisionIds)}, raiseCallbackCount=${raiseCallbackCount})`,
+    );
+    assert.deepEqual(finishedTurn.error, {
+      code: ErrorCode.InternalError,
+      message: "kimi-code request failed",
+    });
+
+    // 4. No successful served-model receipt for the failed turn.
+    assert.equal(
+      finishedTurn.items.some((i) => i.kind === "servedModel"),
+      false,
+      "failed turn must not contain a servedModel item",
+    );
+
+    // 5. Session chain still verifies, records 4 founderDecision events, 0 servedModel events, and turn.end failed.
+    const sessionPath = join(h.home, "sessions", `${threadId}.jsonl`);
+    const verified = verifySessionFile(sessionPath);
+    assert.equal(verified.ok, true, "session chain must verify cleanly after failed turn");
+    const events = readEvents(h.home, threadId);
+    assert.deepEqual(
+      events
+        .filter((e) => e.type === "founderDecision")
+        .map((e) => (e.payload as SessionEvent<"founderDecision">["payload"]).decisionId),
+      ["dec_exhaust_1", "dec_exhaust_2", "dec_exhaust_3", "dec_exhaust_4"],
+    );
+    assert.equal(
+      events.some((e) => e.type === "servedModel"),
+      false,
+      "session JSONL must not record a servedModel receipt for the failed turn",
+    );
+    const turnEndEv = events.find((e) => e.type === "turn.end");
+    assert.ok(turnEndEv !== undefined);
+    const turnEndPayload = turnEndEv.payload as SessionEvent<"turn.end">["payload"];
+    assert.equal(turnEndPayload.status, "failed");
+    assert.deepEqual(turnEndPayload.error, {
+      code: ErrorCode.InternalError,
+      message: "kimi-code request failed",
+    });
+
+    // 6. Error is sanitized: no model text, tool arguments, 5th decision payload, or credentials leak.
+    const errorSurface = `${JSON.stringify(finishedTurn.error)}\n${JSON.stringify(turnEndPayload.error)}\n${eng.logs.join("\n")}`;
+    for (const forbiddenMarker of [
+      syntheticSecretKey,
+      "dec_exhaust_5",
+      "FifthQuestion_MUST_NOT_EXECUTE_OR_LEAK",
+      "FifthDefault_MUST_NOT_EXECUTE_OR_LEAK",
+      "call_exhaust_5",
+    ]) {
+      assert.equal(
+        errorSurface.includes(forbiddenMarker),
+        false,
+        `sanitized error surface must not leak ${forbiddenMarker}`,
+      );
+    }
   } finally {
     eng.shutdown();
     h.cleanup();

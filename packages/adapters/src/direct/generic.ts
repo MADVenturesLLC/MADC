@@ -350,8 +350,11 @@ export function createDirectKeyPort(config: DirectKeyPortConfig): ProviderPort {
         const toolCalls = final.content.filter(
           (part): part is ToolCall => part.type === "toolCall",
         );
-        if (toolCalls.length === 0 || toolRounds >= MAX_DECISION_TOOL_ROUNDS) {
+        if (toolCalls.length === 0) {
           break;
+        }
+        if (toolRounds >= MAX_DECISION_TOOL_ROUNDS) {
+          throw failure(config, request.signal, null);
         }
         toolRounds += 1;
         conversationMessages.push(final);
