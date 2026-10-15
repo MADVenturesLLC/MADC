@@ -20,15 +20,20 @@
  *    `decision-resolution-mismatch` findings without echoing payload text.
  */
 import assert from "node:assert/strict";
-import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { appendFileSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
+import type { ProviderPort } from "@madc/adapters";
 import { type Agent, echoAgent, type TurnSink } from "./agent.ts";
 import { listOpenDecisions, openDecisionsInChain } from "./decisions.ts";
 import { inspectSessionV2 } from "./handoff.ts";
 import { acquireThreadLock, releaseThreadLock } from "./lock.ts";
+import type { TerminalFacts } from "./presence/policy.ts";
+import type { PresenceTerminal } from "./presence/terminal.ts";
 import { ErrorCode } from "./protocol/errors.ts";
+import { createProviderAgent } from "./provider-agent.ts";
 import { seedRosterSeats } from "./seats/roster.ts";
 import { EngineConnection, type EngineOptions } from "./server.ts";
 import {
@@ -44,6 +49,26 @@ type WireResponse = {
   result?: Record<string, unknown>;
   error?: { code: number; message: string; data?: Record<string, unknown> };
 };
+
+const TEST_TERMINAL_FACTS: TerminalFacts = {
+  device: "16/18",
+  session: null,
+};
+
+function makeConfirmingTerminal(
+  behavior: (prompt: string, signal: AbortSignal) => Promise<boolean> = async () => true,
+  facts: TerminalFacts | null = TEST_TERMINAL_FACTS,
+): PresenceTerminal & { readonly prompts: string[] } {
+  const prompts: string[] = [];
+  return {
+    prompts,
+    probe: () => facts,
+    confirm: (prompt, signal) => {
+      prompts.push(prompt);
+      return behavior(prompt, signal);
+    },
+  };
+}
 
 function createHarness(home: string, opts: Partial<EngineOptions> = {}) {
   seedRosterSeats(home);
@@ -80,12 +105,32 @@ function createHarness(home: string, opts: Partial<EngineOptions> = {}) {
     assert.ok(reply !== undefined, `expected synchronous reply for ${method} (id=${id})`);
     return reply;
   };
+  const callAsync = (id: number, method: string, params?: unknown): Promise<WireResponse> => {
+    const before = messages.length;
+    conn.handleLine(JSON.stringify({ id, method, ...(params === undefined ? {} : { params }) }));
+    return new Promise<WireResponse>((resolve, reject) => {
+      const deadline = Date.now() + 5_000;
+      const tick = () => {
+        const reply = messages.slice(before).find((m) => m.id === id) as WireResponse | undefined;
+        if (reply !== undefined) {
+          resolve(reply);
+          return;
+        }
+        if (Date.now() > deadline) {
+          reject(new Error(`timed out waiting for reply to ${method} (id=${id})`));
+          return;
+        }
+        setTimeout(tick, 5);
+      };
+      tick();
+    });
+  };
   const init = () => {
     const r = call(1, "initialize", { clientInfo: { name: "test", version: "0.0.0" } });
     assert.equal(r.error, undefined);
     conn.handleLine(JSON.stringify({ method: "initialized", params: {} }));
   };
-  return { conn, call, init, messages, logs, shutdown: () => conn.shutdown() };
+  return { conn, call, callAsync, init, messages, logs, shutdown: () => conn.shutdown() };
 }
 
 function readEvents(home: string, threadId: string): readonly SessionEvent[] {
@@ -332,7 +377,7 @@ test("M2-A6 D-439 closed key sets: extra keys on founderDecision, EvidenceRef, a
 
 test("M2-A6 capability 3 & 6: open decisions across threads, deterministic ordering, and append-only resolution (warm and cold threads)", async () => {
   const h = makeHome();
-  const eng1 = createHarness(h.home);
+  const eng1 = createHarness(h.home, { terminal: makeConfirmingTerminal(async () => true) });
   let threadA = "";
   let threadB = "";
   let decA1 = { decisionId: "dec_a1", seq: 0, hash: "" };
@@ -402,7 +447,7 @@ test("M2-A6 capability 3 & 6: open decisions across threads, deterministic order
     const rawLineBefore = readFileSync(join(h.home, "sessions", `${threadA}.jsonl`), "utf8")
       .trimEnd()
       .split("\n")[decA1.seq];
-    const resA1 = eng1.call(9, "decision/resolve", {
+    const resA1 = await eng1.callAsync(9, "decision/resolve", {
       threadId: threadA,
       decisionId: "dec_a1",
       decisionSeq: decA1.seq,
@@ -432,10 +477,10 @@ test("M2-A6 capability 3 & 6: open decisions across threads, deterministic order
   }
 
   // Cold resolution in a fresh engine process (threadB is not loaded yet when decision/resolve arrives).
-  const eng2 = createHarness(h.home);
+  const eng2 = createHarness(h.home, { terminal: makeConfirmingTerminal(async () => true) });
   try {
     eng2.init();
-    const resB1 = eng2.call(2, "decision/resolve", {
+    const resB1 = await eng2.callAsync(2, "decision/resolve", {
       threadId: threadB,
       decisionId: "dec_b1",
       decisionSeq: decB1.seq,
@@ -503,7 +548,10 @@ test("M2-A6 capability 7: authorization boundary & decisionId grammar (positive 
       await gate2;
     },
   };
-  const eng = createHarness(h.home, { agent: probingAgent });
+  const eng = createHarness(h.home, {
+    agent: probingAgent,
+    terminal: makeConfirmingTerminal(async () => true),
+  });
   try {
     // 1. Negative proof: uninitialized protocol caller cannot invoke decision/resolve, decision/raise, or decision/list (-32000 NotInitialized).
     const uninitResolve = eng.call(90, "decision/resolve", {
@@ -529,13 +577,14 @@ test("M2-A6 capability 7: authorization boundary & decisionId grammar (positive 
     releaseTurn1();
     await waitTurnCompleted(eng.messages, turn1);
 
-    // 2. Negative proof: TurnSink passed to Agent.run exposes only item/receipt callbacks and
+    // 2. Negative proof: TurnSink passed to Agent.run exposes only item/receipt/raiseDecision callbacks and
     // never exposes EngineConnection, SessionWriter, or any decision/resolve capability.
     assert.deepEqual([...sinkKeys].sort(), [
       "completeItem",
       "delta",
       "fallbackRejected",
       "newItemId",
+      "raiseDecision",
       "repoDecision",
       "signal",
       "startItem",
@@ -716,10 +765,11 @@ test("M2-A6 capability 7: authorization boundary & decisionId grammar (positive 
       "decisionId has no founderDecision in this file",
     ]);
 
-    // 8. Positive proof: between turns, the initialized lock-holding protocol caller resolves the
-    // decision via decision/resolve, appending founderDecision.resolved while preserving all prior lines.
+    // 8. Positive proof: between turns, the initialized lock-holding protocol caller with confirmed
+    // engine-owned operator terminal presence resolves the decision via decision/resolve, appending
+    // founderDecision.resolved while preserving all prior lines.
     const linesBeforeResolve = readFileSync(sessionPath, "utf8").trimEnd().split("\n");
-    const okResolve = eng.call(11, "decision/resolve", {
+    const okResolve = await eng.callAsync(11, "decision/resolve", {
       threadId,
       decisionId: "dec_guard_1",
       decisionSeq,
@@ -868,6 +918,841 @@ test("M2-A6 doctor (inspectSessionV2) & listOpenDecisions: hand-crafted chains w
     const skipped: Array<[string, string]> = [];
     listOpenDecisions(h.home, (tid, reason) => skipped.push([tid, reason]));
     assert.deepEqual(skipped, [["thr_corrupt_01", "session failed verification"]]);
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("F1 regression: decision/resolve requires fresh engine-owned operator confirmation bound to thread, decisionId, outcome, and resolution; refuses when unavailable, declined, or cancelled without mutating session", async () => {
+  const h = makeHome();
+  const eng1 = createHarness(h.home, { terminal: makeConfirmingTerminal(async () => true) });
+  try {
+    eng1.init();
+    const threadId = threadIdOf(eng1.call(2, "thread/start", {}));
+    const turnId = turnIdOf(
+      eng1.call(3, "turn/start", { threadId, input: [{ type: "text", text: "raise two" }] }),
+    );
+    await waitTurnCompleted(eng1.messages, turnId);
+
+    const turnStart = readEvents(h.home, threadId).find((e) => e.type === "turn.start");
+    assert.ok(turnStart !== undefined);
+
+    const raise1 = eng1.call(4, "decision/raise", {
+      threadId,
+      turnId,
+      decisionId: "dec_f1_alpha",
+      question: "Switch primary store?",
+      recommendedDefault: "Keep existing store",
+      evidenceRefs: [
+        {
+          kind: "session",
+          path: `sessions/${threadId}.jsonl`,
+          seq: turnStart.seq,
+          hash: turnStart.hash,
+        },
+      ],
+    });
+    assert.equal(raise1.error, undefined);
+    const dec1Seq = raise1.result?.seq as number;
+    const dec1Hash = raise1.result?.hash as string;
+
+    const raise2 = eng1.call(5, "decision/raise", {
+      threadId,
+      turnId,
+      decisionId: "dec_f1_beta",
+      question: "Enable strict audit mode?",
+      recommendedDefault: "Enable strict mode",
+      evidenceRefs: [
+        {
+          kind: "session",
+          path: `sessions/${threadId}.jsonl`,
+          seq: turnStart.seq,
+          hash: turnStart.hash,
+        },
+      ],
+    });
+    assert.equal(raise2.error, undefined);
+    const dec2Seq = raise2.result?.seq as number;
+    const dec2Hash = raise2.result?.hash as string;
+
+    // Shut down eng1 so the thread is cold and its lock on disk is free.
+    eng1.shutdown();
+
+    const sessionPath = join(h.home, "sessions", `${threadId}.jsonl`);
+    const coldSnapshot = readFileSync(sessionPath);
+    const coldSha256 = createHash("sha256").update(coldSnapshot).digest("hex");
+
+    // 1. Independent caller, free cold lock, no operator confirmation (default non-stdin harness and explicit null probe): REFUSED.
+    // Also pass founder-sounding clientInfo/role/presence claims to verify they are ignored.
+    const engNoTty = createHarness(h.home, {
+      terminal: {
+        probe: () => null,
+        confirm: async () => true,
+        unsupported: "no controlling terminal",
+      },
+    });
+    try {
+      const initRes = engNoTty.call(1, "initialize", {
+        clientInfo: { name: "founder", version: "1.0.0" },
+      });
+      assert.equal(initRes.error, undefined);
+      engNoTty.conn.handleLine(JSON.stringify({ method: "initialized", params: {} }));
+
+      const resNoTty = await engNoTty.callAsync(2, "decision/resolve", {
+        threadId,
+        decisionId: "dec_f1_alpha",
+        decisionSeq: dec1Seq,
+        decisionHash: dec1Hash,
+        outcome: "accepted-default",
+      });
+      assert.equal(resNoTty.error?.code, ErrorCode.EvidenceInvalid);
+      assert.equal(resNoTty.error?.data?.reason, "field-invalid");
+      assert.equal(
+        createHash("sha256").update(readFileSync(sessionPath)).digest("hex"),
+        coldSha256,
+        "no unauthorized writes when confirmation is unavailable",
+      );
+    } finally {
+      engNoTty.shutdown();
+    }
+
+    // 2. Confirmation declined: REFUSED and zero writes.
+    const declinedTerm = makeConfirmingTerminal(async () => false);
+    const engDecline = createHarness(h.home, { terminal: declinedTerm });
+    try {
+      engDecline.init();
+      const resDeclined = await engDecline.callAsync(2, "decision/resolve", {
+        threadId,
+        decisionId: "dec_f1_alpha",
+        decisionSeq: dec1Seq,
+        decisionHash: dec1Hash,
+        outcome: "decided",
+        resolution: "Migrate next quarter",
+      });
+      assert.equal(resDeclined.error?.code, ErrorCode.EvidenceInvalid);
+      assert.equal(resDeclined.error?.data?.reason, "field-invalid");
+      assert.deepEqual(resDeclined.error?.data?.issues, [
+        "Founder resolution confirmation declined",
+      ]);
+      assert.equal(declinedTerm.prompts.length, 1);
+      assert.ok(declinedTerm.prompts[0]?.includes(threadId));
+      assert.ok(declinedTerm.prompts[0]?.includes("dec_f1_alpha"));
+      assert.ok(declinedTerm.prompts[0]?.includes("decided"));
+      assert.ok(declinedTerm.prompts[0]?.includes("Migrate next quarter"));
+      assert.equal(
+        createHash("sha256").update(readFileSync(sessionPath)).digest("hex"),
+        coldSha256,
+        "no unauthorized writes when confirmation is declined",
+      );
+    } finally {
+      engDecline.shutdown();
+    }
+
+    // 3a. Confirmation interrupted / cancelled at the terminal while connection is live: REFUSED (-32010) and zero writes.
+    const interruptedTerm = makeConfirmingTerminal(async () => {
+      throw new Error("terminal read interrupted");
+    });
+    const engInterrupt = createHarness(h.home, { terminal: interruptedTerm });
+    try {
+      engInterrupt.init();
+      const resInterrupted = await engInterrupt.callAsync(2, "decision/resolve", {
+        threadId,
+        decisionId: "dec_f1_alpha",
+        decisionSeq: dec1Seq,
+        decisionHash: dec1Hash,
+        outcome: "accepted-default",
+      });
+      assert.equal(resInterrupted.error?.code, ErrorCode.EvidenceInvalid);
+      assert.deepEqual(resInterrupted.error?.data?.issues, [
+        "Founder resolution confirmation cancelled",
+      ]);
+      assert.equal(
+        createHash("sha256").update(readFileSync(sessionPath)).digest("hex"),
+        coldSha256,
+        "no unauthorized writes when confirmation is interrupted",
+      );
+    } finally {
+      engInterrupt.shutdown();
+    }
+
+    // 3b. Confirmation cancelled by engine shutdown / EOF while waiting for keypress: signal aborted, lock released, and zero writes.
+    let notifyPrompted!: () => void;
+    const promptedReady = new Promise<void>((resolve) => {
+      notifyPrompted = resolve;
+    });
+    let abortObserved = false;
+    const cancelTerm = makeConfirmingTerminal((_prompt, signal) => {
+      notifyPrompted();
+      return new Promise<boolean>((resolve) => {
+        if (signal.aborted) {
+          abortObserved = true;
+          resolve(false);
+          return;
+        }
+        signal.addEventListener(
+          "abort",
+          () => {
+            abortObserved = true;
+            resolve(false);
+          },
+          { once: true },
+        );
+      });
+    });
+    const engCancel = createHarness(h.home, { terminal: cancelTerm });
+    try {
+      engCancel.init();
+      engCancel.conn.handleLine(
+        JSON.stringify({
+          id: 2,
+          method: "decision/resolve",
+          params: {
+            threadId,
+            decisionId: "dec_f1_alpha",
+            decisionSeq: dec1Seq,
+            decisionHash: dec1Hash,
+            outcome: "accepted-default",
+          },
+        }),
+      );
+      await promptedReady;
+      assert.equal(cancelTerm.prompts.length, 1);
+      assert.ok(cancelTerm.prompts[0]?.includes(threadId));
+      assert.ok(cancelTerm.prompts[0]?.includes("dec_f1_alpha"));
+      assert.ok(cancelTerm.prompts[0]?.includes("accepted-default"));
+      assert.ok(cancelTerm.prompts[0]?.includes("Keep existing store"));
+      // Concurrent call on the same thread while confirmation is pending is refused -32004.
+      const concurrentDuringConfirm = engCancel.call(3, "decision/raise", {
+        threadId,
+        turnId,
+        question: "Concurrent?",
+        recommendedDefault: "No",
+        evidenceRefs: [
+          {
+            kind: "session",
+            path: `sessions/${threadId}.jsonl`,
+            seq: turnStart.seq,
+            hash: turnStart.hash,
+          },
+        ],
+      });
+      assert.equal(concurrentDuringConfirm.error?.code, ErrorCode.TurnAlreadyActive);
+      engCancel.shutdown();
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(abortObserved, true, "shutdown must abort pending decision confirmation");
+      assert.equal(
+        engCancel.messages.find((m) => m.id === 2),
+        undefined,
+        "cancelled decision/resolve on shutdown is never answered as resolved",
+      );
+      assert.equal(
+        createHash("sha256").update(readFileSync(sessionPath)).digest("hex"),
+        coldSha256,
+        "no unauthorized writes when confirmation is cancelled on shutdown",
+      );
+    } finally {
+      engCancel.shutdown();
+    }
+
+    // 4. Valid operator confirmation: SUCCESS, and a subsequent resolution on the same thread
+    // requires a fresh confirmation bound to the second decision (never reusing the first confirmation).
+    let confirmCallCount = 0;
+    const selectiveTerm = makeConfirmingTerminal(async () => {
+      confirmCallCount += 1;
+      return confirmCallCount === 1;
+    });
+    const engConfirm = createHarness(h.home, { terminal: selectiveTerm });
+    try {
+      engConfirm.init();
+      const resOk = await engConfirm.callAsync(2, "decision/resolve", {
+        threadId,
+        decisionId: "dec_f1_alpha",
+        decisionSeq: dec1Seq,
+        decisionHash: dec1Hash,
+        outcome: "accepted-default",
+      });
+      assert.equal(resOk.error, undefined);
+      assert.equal(resOk.result?.decisionId, "dec_f1_alpha");
+      assert.equal(resOk.result?.outcome, "accepted-default");
+      assert.equal(resOk.result?.resolution, "Keep existing store");
+      assert.equal(selectiveTerm.prompts.length, 1);
+      assert.ok(selectiveTerm.prompts[0]?.includes("dec_f1_alpha"));
+
+      // Second resolution on the same warm thread must prompt again (and fails when declined).
+      const snapshotAfterFirst = readFileSync(sessionPath, "utf8");
+      const resSecond = await engConfirm.callAsync(3, "decision/resolve", {
+        threadId,
+        decisionId: "dec_f1_beta",
+        decisionSeq: dec2Seq,
+        decisionHash: dec2Hash,
+        outcome: "decided",
+        resolution: "Defer strict mode",
+      });
+      assert.equal(resSecond.error?.code, ErrorCode.EvidenceInvalid);
+      assert.deepEqual(resSecond.error?.data?.issues, ["Founder resolution confirmation declined"]);
+      assert.equal(selectiveTerm.prompts.length, 2);
+      assert.ok(selectiveTerm.prompts[1]?.includes("dec_f1_beta"));
+      assert.ok(selectiveTerm.prompts[1]?.includes("Defer strict mode"));
+      assert.equal(readFileSync(sessionPath, "utf8"), snapshotAfterFirst);
+    } finally {
+      engConfirm.shutdown();
+    }
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("F2 regression: executing agent raises typed decisions mid-turn via TurnSink.raiseDecision and ProviderTurnRequest.raiseDecision; invalid raise refuses -32010 while turn continues; agent cannot resolve", async () => {
+  const h = makeHome();
+  const sinkKeyList: string[] = [];
+  let typeofRaiseDecision = "undefined";
+  let invalidRaiseOutcome: unknown = null;
+  let validRaiseOutcome: unknown = null;
+  let midTurnResolveRpc: WireResponse | null = null;
+  let engRef!: ReturnType<typeof createHarness>;
+
+  const midTurnAgent: Agent = {
+    name: "mid-turn",
+    async run(ctx, sink: TurnSink) {
+      sinkKeyList.push(...Object.keys(sink));
+      const raiseFn = sink.raiseDecision;
+      typeofRaiseDecision = typeof raiseFn;
+      assert.equal(typeof raiseFn, "function", "TurnSink must expose raiseDecision during a turn");
+      if (typeof raiseFn !== "function") return;
+      assert.equal("resolveDecision" in sink, false, "TurnSink must never expose resolveDecision");
+
+      sink.startItem({
+        id: "item_before",
+        kind: "agentMessage",
+        status: "inProgress",
+        text: "starting analysis",
+      });
+      sink.completeItem({
+        id: "item_before",
+        kind: "agentMessage",
+        status: "completed",
+        text: "starting analysis",
+      });
+
+      // 1. Invalid mid-turn raise (bad evidenceRef seq/hash) -> refuses -32010 and turn continues.
+      invalidRaiseOutcome = raiseFn({
+        decisionId: "dec_mid_bad",
+        question: "Bad raise?",
+        recommendedDefault: "No",
+        evidenceRefs: [
+          {
+            kind: "session",
+            path: `sessions/${ctx.threadId}.jsonl`,
+            seq: 999,
+            hash: "0".repeat(64),
+          },
+        ],
+      });
+
+      // 2. Valid mid-turn raise referencing the active turn's turn.start event.
+      const eventsNow = readEvents(h.home, ctx.threadId);
+      const turnStart = eventsNow.find(
+        (e): e is SessionEvent<"turn.start"> =>
+          e.type === "turn.start" &&
+          (e.payload as SessionEvent<"turn.start">["payload"]).turnId === ctx.turnId,
+      );
+      assert.ok(turnStart !== undefined);
+
+      validRaiseOutcome = raiseFn({
+        decisionId: "dec_mid_ok",
+        question: "Adopt mid-turn schema check?",
+        recommendedDefault: "Adopt immediately",
+        evidenceRefs: [
+          {
+            kind: "session",
+            path: `sessions/${ctx.threadId}.jsonl`,
+            seq: turnStart.seq,
+            hash: turnStart.hash,
+          },
+        ],
+      });
+
+      // 3. Agent attempts to resolve its own decision mid-turn over RPC -> refused -32004.
+      const okDecision = (
+        validRaiseOutcome as {
+          ok: boolean;
+          decision?: { seq: number; hash: string };
+        }
+      ).decision;
+      if (okDecision) {
+        midTurnResolveRpc = await engRef.callAsync(99, "decision/resolve", {
+          threadId: ctx.threadId,
+          decisionId: "dec_mid_ok",
+          decisionSeq: okDecision.seq,
+          decisionHash: okDecision.hash,
+          outcome: "accepted-default",
+        });
+      }
+
+      // 4. Turn continues after both the refused raise and the valid raise.
+      sink.startItem({
+        id: "item_after",
+        kind: "agentMessage",
+        status: "inProgress",
+        text: "continuing turn after decision raise",
+      });
+      sink.completeItem({
+        id: "item_after",
+        kind: "agentMessage",
+        status: "completed",
+        text: "continuing turn after decision raise",
+      });
+    },
+  };
+
+  const eng = createHarness(h.home, {
+    agent: midTurnAgent,
+    terminal: makeConfirmingTerminal(async () => true),
+  });
+  engRef = eng;
+  try {
+    eng.init();
+    const threadId = threadIdOf(eng.call(2, "thread/start", {}));
+    const turnId = turnIdOf(
+      eng.call(3, "turn/start", { threadId, input: [{ type: "text", text: "go" }] }),
+    );
+    await waitTurnCompleted(eng.messages, turnId);
+    assert.equal(typeofRaiseDecision, "function", "TurnSink.raiseDecision must be a function");
+
+    const badOut = invalidRaiseOutcome as {
+      ok: boolean;
+      error?: { code: number; data?: Record<string, unknown> };
+    };
+    assert.equal(badOut?.ok, false);
+    assert.equal(badOut?.error?.code, ErrorCode.EvidenceInvalid);
+    assert.equal(badOut?.error?.data?.reason, "evidence-ref-invalid");
+
+    const goodOut = validRaiseOutcome as {
+      ok: boolean;
+      decision?: {
+        threadId: string;
+        turnId: string;
+        decisionId: string;
+        seq: number;
+        hash: string;
+      };
+    };
+    assert.equal(goodOut?.ok, true);
+    assert.equal(goodOut?.decision?.threadId, threadId);
+    assert.equal(goodOut?.decision?.turnId, turnId);
+    assert.equal(goodOut?.decision?.decisionId, "dec_mid_ok");
+
+    // Agent could not resolve its own decision during the turn.
+    assert.equal(
+      (midTurnResolveRpc as WireResponse | null)?.error?.code,
+      ErrorCode.TurnAlreadyActive,
+    );
+
+    // Decision is appended and appears in the inbox; the invalid one is not.
+    const inbox = listOpenDecisions(h.home);
+    assert.deepEqual(
+      inbox.map((d) => d.decisionId),
+      ["dec_mid_ok"],
+    );
+    const listRpc = eng.call(4, "decision/list", {});
+    assert.equal((listRpc.result?.data as unknown[])?.length, 1);
+
+    // Verify the session chain recorded item_before, the -32010 error item, founderDecision, item_after, and turn.end completed.
+    const events = readEvents(h.home, threadId);
+    const errorItem = events.find((e) => {
+      if (e.type !== "item") return false;
+      const item = (e.payload as SessionEvent<"item">["payload"]).item;
+      return item.kind === "error" && item.code === ErrorCode.EvidenceInvalid;
+    });
+    assert.ok(errorItem !== undefined, "expected -32010 error item recorded on invalid raise");
+    const afterItem = events.find((e) => {
+      if (e.type !== "item") return false;
+      const item = (e.payload as SessionEvent<"item">["payload"]).item;
+      return item.kind === "agentMessage" && item.id === "item_after";
+    });
+    assert.ok(afterItem !== undefined, "expected turn to continue after validation refusal");
+
+    // Also verify the real createProviderAgent -> ProviderPort.streamTurn(req) path.
+    let activeProviderThreadId = "";
+    let activeProviderTurnId = "";
+    const providerPort: ProviderPort = {
+      providerId: "kimi-code",
+      async streamTurn(req) {
+        assert.equal(
+          typeof req.raiseDecision,
+          "function",
+          "ProviderTurnRequest must receive raiseDecision from createProviderAgent",
+        );
+        assert.ok(req.raiseDecision !== undefined);
+        const turnStartEv = readEvents(h.home, activeProviderThreadId).find(
+          (e): e is SessionEvent<"turn.start"> =>
+            e.type === "turn.start" &&
+            (e.payload as SessionEvent<"turn.start">["payload"]).turnId === activeProviderTurnId,
+        );
+        assert.ok(turnStartEv !== undefined);
+        const providerRaise = req.raiseDecision({
+          decisionId: "dec_provider_mid_1",
+          question: "Approve provider-raised decision?",
+          recommendedDefault: "Approve provider default",
+          evidenceRefs: [
+            {
+              kind: "session",
+              path: `sessions/${activeProviderThreadId}.jsonl`,
+              seq: turnStartEv.seq,
+              hash: turnStartEv.hash,
+            },
+          ],
+        });
+        assert.equal(providerRaise.ok, true);
+        req.onTextDelta("provider done");
+        return {
+          text: "provider done",
+          requestedModelId: req.modelId,
+          servedModel: req.modelId,
+          vendorReported: true,
+        };
+      },
+    };
+
+    const engProvider = createHarness(h.home, {
+      agent: createProviderAgent({
+        directLanes: [
+          {
+            providerId: "kimi-code",
+            credential: "sk-kimi-synthetic-test",
+            createPort: () => providerPort,
+            resolvePinnedModel: (m) => ({ ok: true, modelId: m }),
+          },
+        ],
+      }),
+      terminal: makeConfirmingTerminal(async () => true),
+    });
+    try {
+      engProvider.init();
+      const pThreadId = threadIdOf(engProvider.call(2, "thread/start", {}));
+      activeProviderThreadId = pThreadId;
+      const pTurnId = turnIdOf(
+        engProvider.call(3, "turn/start", {
+          threadId: pThreadId,
+          input: [{ type: "text", text: "provider turn" }],
+        }),
+      );
+      activeProviderTurnId = pTurnId;
+      await waitTurnCompleted(engProvider.messages, pTurnId);
+      assert.deepEqual(
+        listOpenDecisions(h.home)
+          .map((d) => d.decisionId)
+          .sort(),
+        ["dec_mid_ok", "dec_provider_mid_1"],
+      );
+    } finally {
+      engProvider.shutdown();
+    }
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("F3 regression: own __proto__ property from JSON.parse is rejected with -32010 on both decision/raise and decision/resolve without mutating the session", async () => {
+  const h = makeHome();
+  const eng = createHarness(h.home, { terminal: makeConfirmingTerminal(async () => true) });
+  try {
+    eng.init();
+    const threadId = threadIdOf(eng.call(2, "thread/start", {}));
+    const turnId = turnIdOf(
+      eng.call(3, "turn/start", { threadId, input: [{ type: "text", text: "proto test" }] }),
+    );
+    await waitTurnCompleted(eng.messages, turnId);
+
+    const turnStart = readEvents(h.home, threadId).find((e) => e.type === "turn.start");
+    assert.ok(turnStart !== undefined);
+    const sessionPath = join(h.home, "sessions", `${threadId}.jsonl`);
+    const snapshotBeforeRaise = readFileSync(sessionPath, "utf8");
+
+    // 1. decision/raise with an own "__proto__" key constructed via JSON.parse.
+    const raiseParamsWithProto = JSON.parse(
+      `{"threadId":${JSON.stringify(threadId)},"turnId":${JSON.stringify(turnId)},"decisionId":"dec_proto_1","question":"Q?","recommendedDefault":"D","evidenceRefs":[{"kind":"session","path":${JSON.stringify(`sessions/${threadId}.jsonl`)},"seq":${turnStart.seq},"hash":${JSON.stringify(turnStart.hash)}}],"__proto__":"bypass"}`,
+    );
+    assert.equal(Object.hasOwn(raiseParamsWithProto, "__proto__"), true);
+    const protoRaiseRes = await eng.callAsync(4, "decision/raise", raiseParamsWithProto);
+    assert.equal(protoRaiseRes.error?.code, ErrorCode.EvidenceInvalid);
+    assert.equal(protoRaiseRes.error?.data?.reason, "field-invalid");
+    assert.deepEqual(protoRaiseRes.error?.data?.issues, [
+      "founderDecision has a key outside decisionId, turnId, question, recommendedDefault and evidenceRefs",
+    ]);
+    assert.equal(
+      readFileSync(sessionPath, "utf8"),
+      snapshotBeforeRaise,
+      "no session mutation when decision/raise rejects own __proto__",
+    );
+
+    // Raise a valid decision so we can test decision/resolve with an own "__proto__" key.
+    const validRaise = eng.call(5, "decision/raise", {
+      threadId,
+      turnId,
+      decisionId: "dec_proto_valid",
+      question: "Q?",
+      recommendedDefault: "D",
+      evidenceRefs: [
+        {
+          kind: "session",
+          path: `sessions/${threadId}.jsonl`,
+          seq: turnStart.seq,
+          hash: turnStart.hash,
+        },
+      ],
+    });
+    assert.equal(validRaise.error, undefined);
+    const decisionSeq = validRaise.result?.seq as number;
+    const decisionHash = validRaise.result?.hash as string;
+    const snapshotAfterValidRaise = readFileSync(sessionPath, "utf8");
+
+    // 2. decision/resolve with an own "__proto__" key constructed via JSON.parse.
+    const resolveParamsWithProto = JSON.parse(
+      `{"threadId":${JSON.stringify(threadId)},"decisionId":"dec_proto_valid","decisionSeq":${decisionSeq},"decisionHash":${JSON.stringify(decisionHash)},"outcome":"accepted-default","__proto__":"bypass"}`,
+    );
+    assert.equal(Object.hasOwn(resolveParamsWithProto, "__proto__"), true);
+    const protoResolveRes = await eng.callAsync(6, "decision/resolve", resolveParamsWithProto);
+    assert.equal(protoResolveRes.error?.code, ErrorCode.EvidenceInvalid);
+    assert.equal(protoResolveRes.error?.data?.reason, "field-invalid");
+    assert.deepEqual(protoResolveRes.error?.data?.issues, [
+      "founderDecision.resolved has a key outside decisionId, decisionSeq, decisionHash, outcome and resolution",
+    ]);
+    assert.equal(
+      readFileSync(sessionPath, "utf8"),
+      snapshotAfterValidRaise,
+      "no session mutation when decision/resolve rejects own __proto__",
+    );
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("F4 regression: decision/list returns fixed sanitized error message and never leaks caller keys, values, or secret-shaped strings", () => {
+  const h = makeHome();
+  const eng = createHarness(h.home);
+  try {
+    eng.init();
+    const secretPayload = JSON.parse(
+      '{"SECRET_KEY_MARKER_ALPHA":"SECRET_VALUE_MARKER_OMEGA","sk_live_synthetic_998877":"Bearer eyJ_synthetic_private_marker","__proto__":{"SECRET_PROTO_MARKER":"proto_val"}}',
+    );
+    const res = eng.call(2, "decision/list", secretPayload);
+    assert.equal(res.error?.code, ErrorCode.InvalidParams);
+    assert.equal(res.error?.message, "Invalid params");
+    assert.deepEqual(res.error?.data?.issues, ["decision/list takes no params"]);
+
+    const observable = `${JSON.stringify(res)}\n${eng.logs.join("\n")}`;
+    for (const marker of [
+      "SECRET_KEY_MARKER_ALPHA",
+      "SECRET_VALUE_MARKER_OMEGA",
+      "sk_live_synthetic_998877",
+      "eyJ_synthetic_private_marker",
+      "SECRET_PROTO_MARKER",
+      "proto_val",
+    ]) {
+      assert.equal(
+        observable.includes(marker),
+        false,
+        `observable response/logs must not leak marker ${marker}`,
+      );
+    }
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("F5 regression: refused cold resolution on a session with a dangling turn leaves the file byte-for-byte unchanged, while valid cold resolution recovers and resolves", async () => {
+  const h = makeHome();
+  try {
+    seedRosterSeats(h.home);
+    const threadId = "thr_cold_dangling_01";
+    const seatId = "madc-default";
+    const sessionPath = join(h.home, "sessions", `${threadId}.jsonl`);
+
+    // Ensure sessions/ directory exists via lock acquire + release.
+    const lock = acquireThreadLock(h.home, threadId);
+    assert.equal(lock.ok, true);
+    if (lock.ok) releaseThreadLock(lock.handle);
+
+    // Construct a verified session ending in a dangling turn (turn.start with no turn.end) and an open founderDecision.
+    const lines: SessionEvent[] = [];
+    let prevHash = GENESIS_HASH;
+    const pushLine = (type: SessionEvent["type"], payload: Record<string, unknown>) => {
+      const seq = lines.length;
+      const ts = 2000 + seq;
+      const hash = sessionEventHash(prevHash, {
+        v: 1,
+        seq,
+        ts,
+        type,
+        threadId,
+        seatId,
+        payload: payload as unknown as SessionEvent["payload"],
+      });
+      const ev = {
+        v: 1 as const,
+        seq,
+        ts,
+        type,
+        threadId,
+        seatId,
+        prevHash,
+        hash,
+        payload,
+      } as unknown as SessionEvent;
+      lines.push(ev);
+      prevHash = hash;
+      return ev;
+    };
+
+    const openEv = pushLine("session.open", {
+      cwd: null,
+      backing: "kimi-code",
+      providerId: "kimi-code",
+      pinnedModel: "kimi-for-coding",
+      worktree: null,
+      handoff: null,
+    });
+    pushLine("turn.start", { turnId: "turn_dangling_1", inputText: "unclosed turn" });
+    const decEv = pushLine("founderDecision", {
+      decisionId: "dec_cold_dangling",
+      turnId: "turn_dangling_1",
+      question: "Resolve after crash?",
+      recommendedDefault: "Keep safe baseline",
+      evidenceRefs: [
+        {
+          kind: "session",
+          path: `sessions/${threadId}.jsonl`,
+          seq: openEv.seq,
+          hash: openEv.hash,
+        },
+      ],
+    });
+
+    writeFileSync(sessionPath, `${lines.map((l) => JSON.stringify(l)).join("\n")}\n`, "utf8");
+
+    const origBytes = readFileSync(sessionPath);
+    const origSha256 = createHash("sha256").update(origBytes).digest("hex");
+    const origSize = statSync(sessionPath).size;
+    const origEvents = readEvents(h.home, threadId);
+    const origNextSeq = origEvents.length;
+    assert.equal(origNextSeq, 3);
+
+    const assertFileUntouched = (label: string) => {
+      const nowBytes = readFileSync(sessionPath);
+      const nowSha256 = createHash("sha256").update(nowBytes).digest("hex");
+      const nowSize = statSync(sessionPath).size;
+      const nowEvents = readEvents(h.home, threadId);
+      assert.equal(nowSize, origSize, `${label}: file size must be unchanged`);
+      assert.equal(nowSha256, origSha256, `${label}: SHA-256 must be unchanged`);
+      assert.equal(
+        Buffer.compare(nowBytes, origBytes),
+        0,
+        `${label}: exact bytes must be unchanged`,
+      );
+      assert.equal(nowEvents.length, origNextSeq, `${label}: nextSeq must be unchanged`);
+    };
+
+    const eng = createHarness(h.home, { terminal: makeConfirmingTerminal(async () => true) });
+    try {
+      eng.init();
+
+      // 1. Invalid decisionSeq on cold thread with dangling turn -> -32010 and zero bytes written.
+      const badSeqRes = await eng.callAsync(2, "decision/resolve", {
+        threadId,
+        decisionId: "dec_cold_dangling",
+        decisionSeq: 99,
+        decisionHash: decEv.hash,
+        outcome: "accepted-default",
+      });
+      assert.equal(badSeqRes.error?.code, ErrorCode.EvidenceInvalid);
+      assert.deepEqual(badSeqRes.error?.data?.issues, [
+        "decisionSeq differs from the founderDecision line",
+      ]);
+      assertFileUntouched("invalid decisionSeq");
+
+      // 2. Invalid decisionHash on cold thread with dangling turn -> -32010 and zero bytes written.
+      const badHashRes = await eng.callAsync(3, "decision/resolve", {
+        threadId,
+        decisionId: "dec_cold_dangling",
+        decisionSeq: decEv.seq,
+        decisionHash: "0".repeat(64),
+        outcome: "accepted-default",
+      });
+      assert.equal(badHashRes.error?.code, ErrorCode.EvidenceInvalid);
+      assert.deepEqual(badHashRes.error?.data?.issues, [
+        "decisionHash differs from the founderDecision line",
+      ]);
+      assertFileUntouched("invalid decisionHash");
+
+      // 3. Mismatched accepted-default resolution on cold thread -> -32010 and zero bytes written.
+      const badDefaultRes = await eng.callAsync(4, "decision/resolve", {
+        threadId,
+        decisionId: "dec_cold_dangling",
+        decisionSeq: decEv.seq,
+        decisionHash: decEv.hash,
+        outcome: "accepted-default",
+        resolution: "Not the recommended default",
+      });
+      assert.equal(badDefaultRes.error?.code, ErrorCode.EvidenceInvalid);
+      assert.deepEqual(badDefaultRes.error?.data?.issues, [
+        "resolution differs from the founderDecision recommendedDefault",
+      ]);
+      assertFileUntouched("mismatched accepted-default");
+
+      // 4. Unknown decisionId on cold thread -> -32010 and zero bytes written.
+      const unknownIdRes = await eng.callAsync(5, "decision/resolve", {
+        threadId,
+        decisionId: "dec_unknown_cold",
+        decisionSeq: decEv.seq,
+        decisionHash: decEv.hash,
+        outcome: "decided",
+        resolution: "Custom",
+      });
+      assert.equal(unknownIdRes.error?.code, ErrorCode.EvidenceInvalid);
+      assert.deepEqual(unknownIdRes.error?.data?.issues, [
+        "decisionId has no founderDecision in this file",
+      ]);
+      assertFileUntouched("unknown decisionId");
+
+      // 5. Valid cold resolution with confirmed operator terminal -> recovers dangling turn AND appends founderDecision.resolved, leaving writer usable.
+      const okRes = await eng.callAsync(6, "decision/resolve", {
+        threadId,
+        decisionId: "dec_cold_dangling",
+        decisionSeq: decEv.seq,
+        decisionHash: decEv.hash,
+        outcome: "accepted-default",
+      });
+      assert.equal(okRes.error, undefined);
+      assert.equal(okRes.result?.decisionId, "dec_cold_dangling");
+      assert.equal(okRes.result?.outcome, "accepted-default");
+      assert.equal(okRes.result?.resolution, "Keep safe baseline");
+
+      const eventsAfter = readEvents(h.home, threadId);
+      assert.equal(eventsAfter.length, 5);
+      assert.equal(eventsAfter[3]?.type, "turn.end");
+      const recoveredEnd = eventsAfter[3]?.payload as SessionEvent<"turn.end">["payload"];
+      assert.equal(recoveredEnd.turnId, "turn_dangling_1");
+      assert.equal(recoveredEnd.status, "interrupted");
+      assert.equal(recoveredEnd.error, null);
+      assert.equal(eventsAfter[4]?.type, "founderDecision.resolved");
+      const resolvedEv = eventsAfter[4]
+        ?.payload as SessionEvent<"founderDecision.resolved">["payload"];
+      assert.equal(resolvedEv.decisionId, "dec_cold_dangling");
+
+      // Verify the writer on the now-warm thread remains usable for a subsequent turn.
+      const nextTurnId = turnIdOf(
+        eng.call(7, "turn/start", { threadId, input: [{ type: "text", text: "after recovery" }] }),
+      );
+      await waitTurnCompleted(eng.messages, nextTurnId);
+      const finalEvents = readEvents(h.home, threadId);
+      assert.ok(finalEvents.length > 5);
+    } finally {
+      eng.shutdown();
+    }
   } finally {
     h.cleanup();
   }

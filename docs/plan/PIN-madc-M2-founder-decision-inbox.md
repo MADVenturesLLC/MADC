@@ -61,11 +61,11 @@ export type FounderDecisionResolvedPayload = {
 - **Redaction.** `decisionId`, `decisionSeq`, `decisionHash` and `outcome` are structural (rewriting any of them refuses `-32010 field-invalid` before the append). `resolution` is free text and is redacted before hashing.
 - **Doctor (`inspectSessionV2`).** Gains `decision-resolution-mismatch` (`level: "fail"`): reported when a `founderDecision.resolved` in a verified chain names a `decisionId` with no prior `founderDecision`, re-resolves an already-resolved `decisionId`, or carries a `decisionSeq` or `decisionHash` that differs from the `founderDecision` line, or when `outcome === "accepted-default"` and `resolution` differs from that line's `recommendedDefault`.
 
-## 4. Protocol methods (`protocolVersion` stays `madc-m1/1`, D-M2-7)
+## 4. Protocol methods & executing-seat raise capability (`protocolVersion` stays `madc-m1/1`, D-M2-7)
 
-### 4.1 `decision/raise`
+### 4.1 `decision/raise` and mid-turn `TurnSink.raiseDecision` / `ProviderTurnRequest.raiseDecision`
 
-- **Params (`DecisionRaiseParams`):**
+- **Client RPC params (`DecisionRaiseParams`):**
   ```ts
   {
     threadId: string;
@@ -76,17 +76,22 @@ export type FounderDecisionResolvedPayload = {
     evidenceRefs: EvidenceRef[];
   }
   ```
-- **Checks:**
+- **Mid-turn executing-seat capability (`TurnSink.raiseDecision` & `ProviderTurnRequest.raiseDecision`, F2):**
+  - During an active turn, the engine exposes `sink.raiseDecision(input)` on `TurnSink` and forwards it onto `ProviderTurnRequest.raiseDecision` in `createProviderAgent`.
+  - The capability is strictly **raise-only** (never grants `decision/resolve`), binds the active `threadId` and `turnId` from the engine (ignoring any caller-supplied `turnId`), and preserves every caller-owned key via `Object.fromEntries` (F3) before validating through `checkV2Payload("founderDecision", candidate)` and `record.session.append("founderDecision", payload)`.
+  - On a `-32010` validation refusal, the engine records a durable `error` item (`code: -32010`) on the turn, returns `{ ok: false, error }`, and permits the turn to continue. On success, it appends `"founderDecision"` and returns `{ ok: true, decision: { threadId, turnId, decisionId, seq, hash } }`.
+  - **Vendor-agent ACP v1 boundary:** ACP v1 `session/update` notifications (`agent_message_chunk`, `agent_thought_chunk`, `tool_call`, `tool_call_update`, `plan`, `usage_update`, etc., `docs/plan/PIN-madc-M1-acp-vendor-harness.md` §3.4) define no typed `founderDecision` update kind, and M4 engine-provided tools are deferred until M4 (`PLAN-madc-M2-build-plan.md` §3). Vendor-agent seats therefore remain governed by the existing ACP v1 contract without inventing an unsupported ACP method or deriving decisions from free-text prose.
+- **Checks (`decision/raise`):**
   1. `params` must be an object with a valid `threadId` (`-32602` otherwise).
-  2. Candidate `founderDecision` payload (all keys of `params` except `threadId`, with `decisionId` minted when omitted) is validated by `checkV2Payload("founderDecision", candidate)` before any lock or thread lookup. Any fault refuses `-32010` (`turnId: null` at this stage, D-399).
-  3. The thread must be loaded in this connection, not poisoned/broken, holding its thread lock, and passing `#handoffGate`.
+  2. Candidate `founderDecision` payload (constructed via `Object.fromEntries` so own `"__proto__"` keys are preserved and rejected by D-439 closed-key validation, F3) is validated by `checkV2Payload("founderDecision", candidate)` before any lock or thread lookup. Any fault refuses `-32010` (`turnId: null` at this stage, D-399).
+  3. The thread must be loaded in this connection, not poisoned/broken, holding its thread lock, have no pending cold confirmation, and pass `#handoffGate`.
   4. Appends `"founderDecision"` through the thread's `SessionWriter`, which enforces `decisionId` uniqueness in the file, `turnId` naming a `turn.start` in the file, same-file `EvidenceRef` resolution against `SessionChainIndex`, and structural redaction safety.
 - **Result (`DecisionRaiseResult`):**
   `{ threadId: string, decisionId: string, seq: number, hash: string }`.
 
 ### 4.2 `decision/list`
 
-- **Params:** `{}` (any unexpected key refuses `-32602`).
+- **Params:** `{}` (any unexpected key, including an own `"__proto__"` property, refuses `-32602` with the fixed sanitized issue `"decision/list takes no params"`, never echoing caller key names or values, F4).
 - **Behavior:** Read-only scan (`listOpenDecisions(home)` in `packages/engine/src/decisions.ts`) over `$MADC_HOME/sessions/<threadId>.jsonl`. Only regular files under the confined `sessions/` directory that pass both `verifySessionFile` and `rebuildSession` are read; unverified files are skipped (and logged to stderr) and never contribute a decision. Within each verified chain, a `founderDecision` is open iff no valid `founderDecision.resolved` in that chain cites `{ decisionId, decisionSeq: seq, decisionHash: hash }`.
 - **Result (`DecisionListResult`):**
   `{ data: OpenDecisionSummary[] }`, sorted deterministically by `(ts, threadId, seq)`, where each `OpenDecisionSummary` carries only:
@@ -107,9 +112,11 @@ export type FounderDecisionResolvedPayload = {
   ```
 - **Checks:**
   1. `params` must be an object with a valid `threadId` (`-32602` otherwise).
-  2. Candidate `founderDecision.resolved` payload is shape-checked before any lock or disk write (`-32010` on any missing/invalid field or extra key).
-  3. If `threadId` is loaded on this connection, verifies lock ownership, no active/confirming turn (`-32004`), writer usability (`-32009`), and `#handoffGate`. If `threadId` is not yet loaded on this connection, acquires the thread lock (`-32004` if held by another live process) and loads the thread through `#loadColdThread` (`-32002` if missing).
-  4. When `outcome === "accepted-default"` and `resolution` was omitted, fills `resolution` from the indexed `founderDecision`'s `recommendedDefault`. Appends `"founderDecision.resolved"` through the thread's `SessionWriter` (`-32010` if `decisionId` is unknown, already resolved, `decisionSeq` / `decisionHash` mismatches, or `resolution` mismatches `recommendedDefault`).
+  2. Candidate `founderDecision.resolved` payload (constructed via `Object.fromEntries` to preserve own `"__proto__"` properties, F3) is shape-checked before any lock or disk write (`-32010` on any missing/invalid field or extra key).
+  3. If `threadId` is loaded on this connection, verifies lock ownership, no active/confirming turn (`-32004`), writer usability (`-32009`), and `#handoffGate`. If `threadId` is not yet loaded on this connection, acquires the thread lock (`-32004` if held by another live process) and opens/verifies the cold thread via `#openColdThread` (`-32002` if missing) **without** writing dangling-turn recovery records yet (F5).
+  4. When `outcome === "accepted-default"` and `resolution` was omitted, fills `resolution` from the indexed `founderDecision`'s `recommendedDefault`. Validates the candidate resolution against the verified chain index and redactor via `SessionWriter.validateCandidate("founderDecision.resolved", resolvedPayload)` **before** any cold recovery write or terminal prompt (`-32010` if `decisionId` is unknown, already resolved, `decisionSeq` / `decisionHash` mismatches, or `resolution` mismatches `recommendedDefault`, leaving a cold session file byte-for-byte untouched on refusal, F5).
+  5. **Fresh engine-owned operator terminal confirmation (F1):** Requires a fresh confirmation on the engine's own controlling terminal (`PresenceTerminal.probe()` + `confirm()`), serialized engine-wide and bound to `threadId`, `decisionId`, `outcome`, and `resolution`. Embedded engines without an explicit `terminal` and with `input !== process.stdin` default to `ABSENT_TERMINAL` (fail-closed). Refuses `-32010` with zero disk writes if the controlling terminal is unavailable, changed during the prompt, declined, or cancelled/interrupted.
+  6. Only after confirmation succeeds and post-confirmation revalidation passes does a cold thread append any dangling-turn recovery records (`#recoverDanglingTurns`) and register in `#threads`, followed by appending `"founderDecision.resolved"` through the thread's `SessionWriter`.
 - **Result (`DecisionResolveResult`):**
   `{ threadId: string, decisionId: string, seq: number, hash: string, outcome: FounderDecisionResolutionOutcome, resolution: string }`.
 

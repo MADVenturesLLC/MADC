@@ -63,6 +63,9 @@ export {
 export {
   ProviderCallError,
   type ProviderCallErrorReason,
+  type ProviderDecisionRaiseInput,
+  type ProviderDecisionRaiseOutcome,
+  type ProviderEvidenceRef,
   type ProviderMessage,
   type ProviderPort,
   type ProviderToolEvent,

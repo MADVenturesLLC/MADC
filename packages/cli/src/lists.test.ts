@@ -679,7 +679,7 @@ test("M2-A6 decisions ls [--json]: round-trips decision/list across threads, exc
     // 2. Populate two decisions via the echo engine, resolving one and leaving one open
     const client = spawnEngine({
       entry: ECHO,
-      env: { ...sb.keychainEnv, MADC_HOME: sb.home },
+      env: { ...sb.keychainEnv, MADC_HOME: sb.home, MADC_TEST_CONFIRM_TERMINAL: "1" },
     });
     let openDecisionId = "";
     let threadId = "";

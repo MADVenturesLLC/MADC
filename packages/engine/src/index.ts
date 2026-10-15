@@ -10,6 +10,8 @@ export {
   type Agent,
   type AgentTurnContext,
   echoAgent,
+  type TurnDecisionInput,
+  type TurnDecisionOutcome,
   type TurnPreflightContext,
   type TurnSink,
 } from "./agent.ts";

@@ -846,6 +846,39 @@ export class SessionWriter {
   }
 
   /**
+   * M2-A6 (F5 / F1): validate one candidate event against this writer's chain index and redactor
+   * without opening the file, writing any bytes, or advancing `seq`. Throws `-32010`
+   * (`EvidenceInvalid`) on any write-side or structural-redaction fault.
+   */
+  validateCandidate<T extends SessionEventType>(type: T, payload: SessionPayloads[T]): void {
+    const refusal = validateForWrite(type, payload, {
+      threadId: this.threadId,
+      seatId: this.seatId,
+      index: this.#index,
+    });
+    if (refusal !== null) {
+      throw evidenceInvalid({
+        threadId: this.threadId,
+        turnId: this.#echoableTurnId(payload),
+        type,
+        reason: refusal.reason,
+        issues: refusal.issues,
+      });
+    }
+    const redact = createRedactor(this.#secrets());
+    const structural = redactionRefusal(type, payload, redact(payload));
+    if (structural !== null) {
+      throw evidenceInvalid({
+        threadId: this.threadId,
+        turnId: this.#echoableTurnId(payload),
+        type,
+        reason: structural.reason,
+        issues: structural.issues,
+      });
+    }
+  }
+
+  /**
    * The `turnId` a -32010 `data` may echo (Argus G1; the D-350/D-375 class): the payload's
    * well-formed id only when redaction leaves it unchanged, else null. A refused payload never
    * reaches the redactor, so a configured secret or a token-shaped id would otherwise leave the
