@@ -210,9 +210,9 @@ test("M2 §10.8 reserved stays reserved: memory.write and tool.call refuse -3201
     );
   }
   assert.deepEqual(
-    [...SESSION_EVENT_TYPES].slice(-4),
+    [...SESSION_EVENT_TYPES].slice(-V2_EVENT_TYPES.length),
     [...V2_EVENT_TYPES],
-    "the four §2 types are the only additions to the writable set",
+    "the v2 types (including M2-A6 founderDecision.resolved) are the only additions to the writable set",
   );
   const f = fixture();
   try {

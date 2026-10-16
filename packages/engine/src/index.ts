@@ -10,6 +10,8 @@ export {
   type Agent,
   type AgentTurnContext,
   echoAgent,
+  type TurnDecisionInput,
+  type TurnDecisionOutcome,
   type TurnPreflightContext,
   type TurnSink,
 } from "./agent.ts";
@@ -36,6 +38,7 @@ export {
   type RunCommandResult,
   type RunCommandSpec,
 } from "./credentials/store.ts";
+export { listOpenDecisions, openDecisionsInChain } from "./decisions.ts";
 export {
   checkHandoffTarget,
   type HandoffTargetCheck,
@@ -175,10 +178,14 @@ export {
 export { ENGINE_VERSION, EngineConnection, type EngineOptions, runEngine } from "./server.ts";
 export {
   createRedactor,
+  type DecisionChainEntry,
   type EvidenceRef,
   type FallbackLane,
   type FallbackRejectedPayload,
+  FOUNDER_DECISION_OUTCOMES,
   type FounderDecisionPayload,
+  type FounderDecisionResolutionOutcome,
+  type FounderDecisionResolvedPayload,
   GENESIS_HASH,
   type HandoffAbortedPayload,
   type HandoffAbortReason,
@@ -215,6 +222,7 @@ export {
 } from "./session-store.ts";
 export {
   checkEvidenceRef,
+  checkFounderDecisionResolved,
   checkHandoffLink,
   checkV2Payload,
   checkWorktreeIdentity,

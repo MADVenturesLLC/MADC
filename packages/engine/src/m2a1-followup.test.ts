@@ -40,6 +40,7 @@ import { defaultGitRunner, type GitRunner } from "./policy/identity.ts";
 import { ErrorCode, EVIDENCE_REFUSALS, RpcError } from "./protocol/errors.ts";
 import { CLOSE_REREAD_BUDGET_MS, EngineConnection, type EngineOptions } from "./server.ts";
 import {
+  createRedactor,
   GENESIS_HASH,
   rebuildSession,
   SessionChainIndex,
@@ -52,7 +53,7 @@ import {
   verifySessionFile,
   verifySessionText,
 } from "./session-store.ts";
-import { checkV2Payload, type WorktreeIdentity } from "./session-v2.ts";
+import { checkV2Payload, redactionRefusal, type WorktreeIdentity } from "./session-v2.ts";
 import { makeHome } from "./testing/harness.ts";
 import { rereadWorktreeIdentity, resolveWorktreeIdentity } from "./worktree.ts";
 
@@ -890,6 +891,7 @@ test("M2-A1 FU F1 (Argus pre-check, completes P21): a payload KEY that is a conf
     f.writer.append("turn.start", { turnId: "turn_1", inputText: "x" });
     const open = readLines(f.path)[0] as Line;
     const ref = { kind: "session", path: "sessions/thr_src.jsonl", seq: 0, hash: open.hash };
+    const redact = createRedactor([SECRET]);
     for (const key of [SECRET, GHP]) {
       for (const value of ["plain", key]) {
         const decision = {
@@ -901,9 +903,13 @@ test("M2-A1 FU F1 (Argus pre-check, completes P21): a payload KEY that is a conf
           [key]: value,
         };
         const d = expectRefusal(f, "founderDecision", decision, "field-invalid", "turn_1");
-        assert.deepEqual(d.issues, ["redaction would rewrite structural field <extra key>"]);
+        assert.deepEqual(d.issues, [
+          "founderDecision has a key outside decisionId, turnId, question, recommendedDefault and evidenceRefs",
+        ]);
         assert.equal(leaks(d.issues, key), false, `founderDecision ${key.slice(0, 4)}`);
         assert.equal(JSON.stringify(d.data).includes(key), false);
+        const rr = redactionRefusal("founderDecision", decision, redact(decision));
+        assert.deepEqual(rr?.issues, ["redaction would rewrite structural field <extra key>"]);
         const out = {
           handoffId: "hof_f1",
           turnId: null,
@@ -916,24 +922,30 @@ test("M2-A1 FU F1 (Argus pre-check, completes P21): a payload KEY that is a conf
         assert.equal(leaks(h.issues, key), false, `handoff.out ${key.slice(0, 4)}`);
         assert.equal(JSON.stringify(h.data).includes(key), false);
       }
-      // Nested: an extra key on an EvidenceRef keeps the pinned path, never the key.
+      // Nested: an extra key on an EvidenceRef is refused by D-439's closed key set before
+      // redaction and keeps the pinned path, never the key; redactionRefusal also masks it.
+      const nestedPayload = {
+        decisionId: "dec_f1",
+        turnId: "turn_1",
+        question: "q",
+        recommendedDefault: "d",
+        evidenceRefs: [{ ...ref, [key]: "v" }],
+      };
       const nested = expectRefusal(
         f,
         "founderDecision",
-        {
-          decisionId: "dec_f1",
-          turnId: "turn_1",
-          question: "q",
-          recommendedDefault: "d",
-          evidenceRefs: [{ ...ref, [key]: "v" }],
-        },
-        "field-invalid",
+        nestedPayload,
+        "evidence-ref-invalid",
         "turn_1",
       );
       assert.deepEqual(nested.issues, [
-        "redaction would rewrite structural field evidenceRefs[0].<extra key>",
+        "evidenceRefs[0] has a key outside kind, path, seq and hash",
       ]);
       assert.equal(leaks(nested.issues, key), false);
+      const nestedRr = redactionRefusal("founderDecision", nestedPayload, redact(nestedPayload));
+      assert.deepEqual(nestedRr?.issues, [
+        "redaction would rewrite structural field evidenceRefs[0].<extra key>",
+      ]);
     }
     // Pinned names are still named (unchanged behavior): a secret-valued handoffId.
     const named = expectRefusal(
@@ -1735,6 +1747,7 @@ test("M2-A1 FU a.6 P11: SessionWriter.resume refuses a missing, empty, forged or
       note: (e: Parameters<SessionChainIndex["note"]>[0]) => real.note(e),
       handoffState: (id: string) => real.handoffState(id),
       hasDecision: (id: string) => real.hasDecision(id),
+      decisionAt: (id: string) => real.decisionAt(id),
       hasTurn: (id: string) => real.hasTurn(id),
     };
     assert.throws(() => resume(lookAlike), TypeError, "a delegating look-alike");

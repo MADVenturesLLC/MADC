@@ -182,10 +182,10 @@ test("A2 §3.5/P4 there is no auth/set over JSONL: -32601, the secret is never e
 });
 
 test("A2 schema test: no JSONL method accepts a secret value (pin §8.3)", () => {
-  // The complete M1 method list, as pinned (protocol pin §3): M0's six, the two presence methods
-  // (M1-A2), `seat/list` (M1-A7) and `provider/list` (M1-A8); plus `thread/handoff`, the one
-  // method the M2 handoff procedure pin authorizes (M2-A2). No `auth/set`, and nothing whose name
-  // suggests a secret-carrying request.
+  // The complete M1/M2 method list, as pinned (protocol pin §3): M0's six, the two presence methods
+  // (M1-A2), `seat/list` (M1-A7) and `provider/list` (M1-A8); plus `thread/handoff` (M2-A2) and
+  // `decision/raise`, `decision/list`, `decision/resolve` (M2-A6). No `auth/set`, and nothing whose
+  // name suggests a secret-carrying request.
   assert.deepStrictEqual(
     [...CLIENT_REQUEST_METHODS],
     [
@@ -200,6 +200,9 @@ test("A2 schema test: no JSONL method accepts a secret value (pin §8.3)", () =>
       "auth/status",
       "auth/remove",
       "thread/handoff",
+      "decision/raise",
+      "decision/list",
+      "decision/resolve",
     ],
   );
   assert.ok(!CLIENT_REQUEST_METHODS.some((m) => /set|secret|credential|token/i.test(m)));
@@ -224,12 +227,22 @@ test("A2 schema test: no JSONL method accepts a secret value (pin §8.3)", () =>
     // it is hashed and written (evidence pin rule 1.4) and never echoed in an error's `data`.
     "targetSeatId",
     "brief",
+    // M2-A6 (`decision/raise`, `decision/resolve`): decision ids, chain citations, outcome enum,
+    // and decision question / default / resolution text (redacted and never echoed in error `data`).
+    "decisionId",
+    "question",
+    "recommendedDefault",
+    "evidenceRefs",
+    "decisionSeq",
+    "decisionHash",
+    "outcome",
+    "resolution",
   ]);
   for (const [method, fields] of Object.entries(CLIENT_REQUEST_PARAM_FIELDS)) {
-    // `seat/list` and `provider/list` are the two methods protocol pin §3.5 gives empty params
+    // `seat/list`, `provider/list` and `decision/list` are the three methods with empty params
     // (`{}`): they declare no field, which is the strongest possible no-secret shape. Every other
     // method declares some.
-    if (method === "seat/list" || method === "provider/list") {
+    if (method === "seat/list" || method === "provider/list" || method === "decision/list") {
       assert.deepStrictEqual([...fields], [], `${method} takes no params`);
       continue;
     }

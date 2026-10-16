@@ -28,6 +28,52 @@ export type ProviderToolEvent =
       readonly isError: boolean;
     };
 
+export type ProviderEvidenceRef =
+  | {
+      readonly kind: "session";
+      readonly path: string;
+      readonly seq: number;
+      readonly hash: string;
+    }
+  | {
+      readonly kind: "servedModel";
+      readonly path: string;
+      readonly seq: number;
+      readonly hash: string;
+    }
+  | {
+      readonly kind: "git";
+      readonly sha: string;
+      readonly remote: string | null;
+    };
+
+export type ProviderDecisionRaiseInput = {
+  readonly decisionId?: string;
+  readonly question: string;
+  readonly recommendedDefault: string;
+  readonly evidenceRefs: readonly ProviderEvidenceRef[];
+};
+
+export type ProviderDecisionRaiseOutcome =
+  | {
+      readonly ok: true;
+      readonly decision: {
+        readonly threadId: string;
+        readonly turnId: string;
+        readonly decisionId: string;
+        readonly seq: number;
+        readonly hash: string;
+      };
+    }
+  | {
+      readonly ok: false;
+      readonly error: {
+        readonly code: number;
+        readonly message: string;
+        readonly data?: Record<string, unknown>;
+      };
+    };
+
 export type ProviderTurnRequest = {
   /** Bare catalog model id for the backing's pi-ai provider, e.g. `kimi-for-coding`. */
   readonly modelId: string;
@@ -41,6 +87,12 @@ export type ProviderTurnRequest = {
    * client). Optional: direct lanes and the M0 vendor adapters never call it.
    */
   onToolEvent?(event: ProviderToolEvent): void;
+  /**
+   * M2-A6: engine-controlled capability for an executing seat to raise a typed `founderDecision`
+   * during the active turn. Validates through the thread's `SessionWriter` and never grants
+   * `decision/resolve`.
+   */
+  raiseDecision?(input: ProviderDecisionRaiseInput): ProviderDecisionRaiseOutcome;
 };
 
 export type ProviderTurnResult = {

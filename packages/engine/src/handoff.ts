@@ -44,6 +44,7 @@ export type SessionFindingCode =
   | "handoff-mismatch"
   | "handoff-terminal-conflict"
   | "evidence-ref-mismatch"
+  | "decision-resolution-mismatch"
   | "duplicate-id"
   | "handoff-incomplete"
   | "handoff-unverifiable"
@@ -442,7 +443,7 @@ export function inspectSessionV2(
   // --- founderDecision: unique ids, evidence refs resolved (§3)
   const runGit = deps.runGit ?? defaultGitRunner;
   const selfPath = sessionRefPath(threadId);
-  const decisions = new Set<string>();
+  const decisionOrigins = new Map<string, SessionEvent>();
   const chains = new Map<string, Chain>();
   const chainOf = (id: string): Chain => {
     let c = chains.get(id);
@@ -456,9 +457,11 @@ export function inspectSessionV2(
     if (e.type !== "founderDecision") continue;
     const p = payloadOf(e);
     const id = String(p.decisionId);
-    if (decisions.has(id))
+    if (decisionOrigins.has(id)) {
       fail("duplicate-id", `founderDecision at seq ${e.seq} reuses decisionId ${id}`);
-    decisions.add(id);
+    } else {
+      decisionOrigins.set(id, e);
+    }
     const refs = Array.isArray(p.evidenceRefs) ? (p.evidenceRefs as EvidenceRef[]) : [];
     refs.forEach((ref, i) => {
       const where = `founderDecision ${id} evidenceRefs[${i}]`;
@@ -520,6 +523,49 @@ export function inspectSessionV2(
         );
       }
     });
+  }
+
+  // --- founderDecision.resolved: links to prior founderDecision, unique per decisionId (M2-A6 pin §5)
+  const resolvedBy = new Map<string, number>();
+  for (const e of events) {
+    if (e.type !== "founderDecision.resolved") continue;
+    const p = payloadOf(e);
+    const id = String(p.decisionId);
+    const origin = decisionOrigins.get(id);
+    if (origin === undefined || origin.seq >= e.seq) {
+      fail(
+        "decision-resolution-mismatch",
+        `founderDecision.resolved at seq ${e.seq} names decision ${id}, which has no prior founderDecision`,
+      );
+      continue;
+    }
+    const firstSeq = resolvedBy.get(id);
+    if (firstSeq !== undefined) {
+      fail(
+        "decision-resolution-mismatch",
+        `founderDecision.resolved at seq ${e.seq} is a duplicate resolution for decision ${id} (first at seq ${firstSeq})`,
+      );
+      continue;
+    }
+    resolvedBy.set(id, e.seq);
+    if (p.decisionSeq !== origin.seq) {
+      fail(
+        "decision-resolution-mismatch",
+        `founderDecision.resolved at seq ${e.seq} decisionSeq ${String(p.decisionSeq)} differs from founderDecision ${id} seq ${origin.seq}`,
+      );
+    }
+    if (p.decisionHash !== origin.hash) {
+      fail(
+        "decision-resolution-mismatch",
+        `founderDecision.resolved at seq ${e.seq} decisionHash differs from founderDecision ${id} hash at seq ${origin.seq}`,
+      );
+    }
+    if (p.outcome === "accepted-default" && p.resolution !== payloadOf(origin).recommendedDefault) {
+      fail(
+        "decision-resolution-mismatch",
+        `founderDecision.resolved at seq ${e.seq} resolution differs from founderDecision ${id} recommendedDefault`,
+      );
+    }
   }
 
   // --- reserved tool.call receipts (pin §4.2; Argus P22 option (a), Copilot r4168208974): `call`
