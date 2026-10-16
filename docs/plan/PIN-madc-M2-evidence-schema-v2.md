@@ -2,6 +2,8 @@
 
 *Hephaestus (builder-drafted under the Founder's M2-A0 commission) · 2026-10-01 · Venue: `MADVenturesLLC/MADC` · Status: **proposed, not a build authorization until the Founder merges it.** Docs only. Additive to the M1 session chain.*
 
+*Amended by `PIN-madc-M2-founder-decision-inbox.md` (2026-10-16): closed key sets on `founderDecision`, `EvidenceRef` and `founderDecision.resolved` (D-439, extra key `-32010`); new append-only `founderDecision.resolved` record; the §2.3 seat-facing raise commissioned to M2-A6 (`decision/raise`, direct-lane `founder_decision_raise`); additive, envelope `v: 1` and hash formula unchanged.*
+
 *Base: `main` @ `c4f97fc668c4b55d701b0be4875aa0c4180cdd15` (the M1 I1–I3 squash, PR #45); its parent is M1-A9 `148a2793620d045e2a0470b8f6add630af26cbc8` (PR #44). Every file and line cited below was read at that commit. This pin was not written by Surface Architect and claims none of Surface's authority; it is a builder's proposal for Argus review and the Founder's merge. Nothing in it is implemented: no code in `packages/` writes, reads, links or refuses any event named here, and this act adds none.*
 
 *Revision 2026-10-01 (same-PR correction on PR #46, one commit on head `f4ac048e27be7b67c813cc7474a9d9b22329e193`): the Founder ruled **D-M2-A0-1 … D-M2-A0-6** as this pin's recommended defaults on 2026-10-01; §9 records the rulings. Argus reviewed that head **PASS-WITH-ADVISORIES** ([PR #46, comment 5941986958](https://github.com/MADVenturesLLC/MADC/pull/46#issuecomment-5941986958)). The status line is unchanged: proposed until this PR merges. No code was added.*
