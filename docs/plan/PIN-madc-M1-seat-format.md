@@ -6,7 +6,7 @@
 
 *Carried forward unchanged: **M0 Amendment 1** (merged PR #8). The frozen M0 pin's record line: `*Amendment 1 (2026-09-24): lock token, fixes A2 Copilot W1 (PR #7), Founder-authorized.*` Its normative home is the M1 protocol pin §3.3 and §8; it is reproduced verbatim in §6 below because the lock file lives under `$MADC_HOME/sessions/`.*
 
-*Amended by `PIN-madc-M2-founder-decision-inbox.md` (2026-10-16): `founder_decision_raise` is an engine capability, exempt from §2 `tools.deny` matching and from the headless unknown-tool denial until a tool-policy matcher is pinned; it is never offered on a headless turn (D-M1-3/4 untouched); additive.*
+*Amended by `PIN-madc-M2-founder-decision-inbox.md` (2026-10-16): `founder_decision_raise` is an engine capability, exempt from §2 `tools.deny` matching and from the headless unknown-tool denial until a tool-policy matcher is pinned, so it is offered on headless direct-lane turns of seats that permit headless; a turn refused as headless-not-permitted (D-M1-3/4, untouched) never starts and is never offered it; additive.*
 
 **Authority:**
 
