@@ -7,9 +7,9 @@
  * `verifySessionFile` or `rebuildSession` is skipped (reported to `onSkipped`) and never
  * contributes a decision.
  */
-import { readdirSync, realpathSync } from "node:fs";
+import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { confinedPath, isStrictlyUnder } from "./home.ts";
+import { isStrictlyUnder } from "./home.ts";
 import { isValidId } from "./protocol/ids.ts";
 import type { OpenDecisionSummary } from "./protocol/types.ts";
 import {
@@ -84,10 +84,16 @@ export function listOpenDecisions(
   onSkipped?: (threadId: string, reason: string) => void,
 ): OpenDecisionSummary[] {
   const dir = join(home, "sessions");
+  let realHome: string;
+  let realDir: string;
   let names: string[];
   try {
-    if (!isStrictlyUnder(realpathSync(dir), realpathSync(home))) return [];
-    names = readdirSync(dir).sort();
+    const st = lstatSync(dir);
+    if (st.isSymbolicLink() || !st.isDirectory()) return [];
+    realHome = realpathSync(home);
+    realDir = realpathSync(dir);
+    if (!isStrictlyUnder(realDir, realHome)) return [];
+    names = readdirSync(realDir).sort();
   } catch {
     return [];
   }
@@ -96,12 +102,8 @@ export function listOpenDecisions(
     if (!name.endsWith(".jsonl")) continue;
     const threadId = name.slice(0, -".jsonl".length);
     if (!isValidId(threadId)) continue;
-    let path: string;
-    try {
-      path = confinedPath(home, "sessions", threadId, ".jsonl");
-    } catch {
-      continue;
-    }
+    const path = join(realDir, `${threadId}.jsonl`);
+    if (!isStrictlyUnder(path, realHome)) continue;
     const verified = verifySessionFile(path, threadId, {}, home);
     if (!verified.ok) {
       onSkipped?.(threadId, "session failed verification");

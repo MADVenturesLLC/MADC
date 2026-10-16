@@ -77,7 +77,8 @@ export const FOUNDER_DECISION_RAISE_TOOL: Tool = Object.freeze({
     }),
     decisionId: Type.Optional(
       Type.String({
-        description: "Optional explicit decision id matching ^dec_[A-Za-z0-9_-]{1,64}$.",
+        description:
+          "Optional explicit decision id matching ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$; the engine generates one when omitted.",
       }),
     ),
   }),

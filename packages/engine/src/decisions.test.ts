@@ -21,11 +21,26 @@
  */
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { appendFileSync, readFileSync, statSync, writeFileSync } from "node:fs";
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
 import { test } from "node:test";
-import { createKimiCodePort, honestUserAgent, type ProviderPort } from "@madc/adapters";
+import {
+  createKimiCodePort,
+  FOUNDER_DECISION_RAISE_TOOL,
+  honestUserAgent,
+  type ProviderPort,
+} from "@madc/adapters";
 import { createFakeKimiTransport } from "@madc/adapters/testing";
 import { type Agent, echoAgent, type TurnSink } from "./agent.ts";
 import { listOpenDecisions, openDecisionsInChain } from "./decisions.ts";
@@ -2261,6 +2276,427 @@ test("F2 tool-limit exhaustion regression: four distinct valid decision-tool rou
         `sanitized error surface must not leak ${forbiddenMarker}`,
       );
     }
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("Copilot Finding 1 regression: decision/resolve terminal confirmation prompt strips all 32 C1 controls (U+0080..U+009F including U+009B) alongside C0/DEL while preserving ordinary Unicode and leaving session bytes unchanged on decline", async () => {
+  const h = makeHome();
+  const declinedTerm = makeConfirmingTerminal(async () => false);
+  const eng = createHarness(h.home, { terminal: declinedTerm });
+  try {
+    eng.init();
+    const threadId = threadIdOf(eng.call(2, "thread/start", {}));
+    const turnId = turnIdOf(
+      eng.call(3, "turn/start", { threadId, input: [{ type: "text", text: "c1 prompt test" }] }),
+    );
+    await waitTurnCompleted(eng.messages, turnId);
+
+    const turnStart = readEvents(h.home, threadId).find((e) => e.type === "turn.start");
+    assert.ok(turnStart !== undefined);
+
+    const raiseRes = eng.call(4, "decision/raise", {
+      threadId,
+      turnId,
+      decisionId: "dec_c1_prompt_01",
+      question: "Confirm C1 sanitization?",
+      recommendedDefault: "Safe baseline",
+      evidenceRefs: [
+        {
+          kind: "session",
+          path: `sessions/${threadId}.jsonl`,
+          seq: turnStart.seq,
+          hash: turnStart.hash,
+        },
+      ],
+    });
+    assert.equal(raiseRes.error, undefined);
+    const decisionSeq = raiseRes.result?.seq as number;
+    const decisionHash = raiseRes.result?.hash as string;
+
+    const sessionPath = join(h.home, "sessions", `${threadId}.jsonl`);
+    const beforeBytes = readFileSync(sessionPath);
+    const beforeSha256 = createHash("sha256").update(beforeBytes).digest("hex");
+
+    const allC1Chars = Array.from({ length: 32 }, (_, i) => String.fromCharCode(0x80 + i)).join("");
+    const unicodeText = "Approve café — 決策 α→ω";
+    const maliciousResolution = `${unicodeText} ${allC1Chars}\u009b31mCSI_SPOOF\u009b0m\u0007\u001b[2J\u007f`;
+
+    const resolveRes = await eng.callAsync(5, "decision/resolve", {
+      threadId,
+      decisionId: "dec_c1_prompt_01",
+      decisionSeq,
+      decisionHash,
+      outcome: "decided",
+      resolution: maliciousResolution,
+    });
+    assert.equal(resolveRes.error?.code, ErrorCode.EvidenceInvalid);
+    assert.deepEqual(resolveRes.error?.data?.issues, ["Founder resolution confirmation declined"]);
+
+    assert.equal(declinedTerm.prompts.length, 1);
+    const prompt = declinedTerm.prompts[0] ?? "";
+    assert.equal(
+      prompt.includes(unicodeText),
+      true,
+      "ordinary Unicode text must remain readable in the confirmation prompt",
+    );
+    for (let cp = 0x80; cp <= 0x9f; cp += 1) {
+      const hex = cp.toString(16).toUpperCase().padStart(4, "0");
+      assert.equal(
+        prompt.includes(String.fromCharCode(cp)),
+        false,
+        `confirmation prompt must not contain C1 control U+${hex}`,
+      );
+    }
+    for (const c0OrDel of [0x00, 0x07, 0x08, 0x1b, 0x7f]) {
+      const hex = c0OrDel.toString(16).toUpperCase().padStart(4, "0");
+      assert.equal(
+        prompt.includes(String.fromCharCode(c0OrDel)),
+        false,
+        `confirmation prompt must not contain C0/DEL control U+${hex}`,
+      );
+    }
+
+    const afterBytes = readFileSync(sessionPath);
+    const afterSha256 = createHash("sha256").update(afterBytes).digest("hex");
+    assert.equal(
+      afterSha256,
+      beforeSha256,
+      "declined confirmation must not change session SHA-256",
+    );
+    assert.equal(
+      Buffer.compare(afterBytes, beforeBytes),
+      0,
+      "declined confirmation must leave session bytes unchanged",
+    );
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("Copilot Finding 3 regression: listOpenDecisions and decision/list are strictly read-only, preserve 0755 directory permissions and session bytes, do not create missing directories, and preserve symlink/confinement and sanitized skip protections", async () => {
+  const h = makeHome();
+  const hExternal = makeHome();
+  try {
+    // 1. Seed a valid open decision in h.home.
+    const engSeed = createHarness(h.home);
+    let threadId = "";
+    try {
+      engSeed.init();
+      threadId = threadIdOf(engSeed.call(2, "thread/start", {}));
+      const turnId = turnIdOf(
+        engSeed.call(3, "turn/start", {
+          threadId,
+          input: [{ type: "text", text: "seed open decision" }],
+        }),
+      );
+      await waitTurnCompleted(engSeed.messages, turnId);
+      const openEv = readEvents(h.home, threadId)[0] as SessionEvent;
+      const raiseRes = engSeed.call(4, "decision/raise", {
+        threadId,
+        turnId,
+        decisionId: "dec_readonly_01",
+        question: "Keep listing read-only?",
+        recommendedDefault: "Yes, never mkdir or chmod on list",
+        evidenceRefs: [
+          {
+            kind: "session",
+            path: `sessions/${threadId}.jsonl`,
+            seq: openEv.seq,
+            hash: openEv.hash,
+          },
+        ],
+      });
+      assert.equal(raiseRes.error, undefined);
+    } finally {
+      engSeed.shutdown();
+    }
+
+    const sessionsDir = join(h.home, "sessions");
+    const sessionPath = join(sessionsDir, `${threadId}.jsonl`);
+    const origBytes = readFileSync(sessionPath);
+    const origSha256 = createHash("sha256").update(origBytes).digest("hex");
+
+    const engList = createHarness(h.home);
+    try {
+      engList.init();
+
+      // Set fixture home and sessions directories to 0755.
+      chmodSync(h.home, 0o755);
+      chmodSync(sessionsDir, 0o755);
+      if (process.platform !== "win32") {
+        assert.equal(statSync(h.home).mode & 0o777, 0o755);
+        assert.equal(statSync(sessionsDir).mode & 0o777, 0o755);
+      }
+
+      // Listing returns the open decision without changing permissions or session bytes.
+      const listed = listOpenDecisions(h.home);
+      assert.deepEqual(
+        listed.map((d) => d.decisionId),
+        ["dec_readonly_01"],
+      );
+      const rpcList = engList.call(2, "decision/list", {});
+      assert.equal(rpcList.error, undefined);
+      const rpcData = (rpcList.result as { data: Array<{ decisionId: string }> }).data;
+      assert.deepEqual(
+        rpcData.map((d) => d.decisionId),
+        ["dec_readonly_01"],
+      );
+    } finally {
+      engList.shutdown();
+    }
+    if (process.platform !== "win32") {
+      assert.equal(
+        statSync(h.home).mode & 0o777,
+        0o755,
+        "listOpenDecisions / decision/list must not tighten home directory permissions from 0755",
+      );
+      assert.equal(
+        statSync(sessionsDir).mode & 0o777,
+        0o755,
+        "listOpenDecisions / decision/list must not tighten sessions directory permissions from 0755",
+      );
+    }
+    const afterBytes = readFileSync(sessionPath);
+    assert.equal(createHash("sha256").update(afterBytes).digest("hex"), origSha256);
+    assert.equal(Buffer.compare(afterBytes, origBytes), 0);
+
+    // Preserve allowance for an operator-chosen symlinked home.
+    mkdirSync(hExternal.home, { recursive: true, mode: 0o700 });
+    const symlinkHome = join(hExternal.home, "operator-symlink-home");
+    symlinkSync(h.home, symlinkHome, "dir");
+    const viaSymlinkHome = listOpenDecisions(symlinkHome);
+    assert.deepEqual(
+      viaSymlinkHome.map((d) => d.decisionId),
+      ["dec_readonly_01"],
+      "operator-chosen symlinked home must continue to list open decisions",
+    );
+    if (process.platform !== "win32") {
+      assert.equal(statSync(h.home).mode & 0o777, 0o755);
+      assert.equal(statSync(sessionsDir).mode & 0o777, 0o755);
+    }
+
+    // 2. Missing directories remain absent and untouched.
+    const missingHome = join(hExternal.home, "absent-madc-home");
+    assert.equal(existsSync(missingHome), false);
+    assert.deepEqual(listOpenDecisions(missingHome), []);
+    assert.equal(existsSync(missingHome), false, "missing home must not be created");
+
+    const homeWithoutSessions = join(hExternal.home, "home-without-sessions");
+    mkdirSync(homeWithoutSessions, { mode: 0o755 });
+    chmodSync(homeWithoutSessions, 0o755);
+    const missingSessionsDir = join(homeWithoutSessions, "sessions");
+    assert.equal(existsSync(missingSessionsDir), false);
+    assert.deepEqual(listOpenDecisions(homeWithoutSessions), []);
+    assert.equal(existsSync(missingSessionsDir), false, "missing sessions/ must not be created");
+    if (process.platform !== "win32") {
+      assert.equal(statSync(homeWithoutSessions).mode & 0o777, 0o755);
+    }
+
+    // 3. Reject symlinked sessions/ components (both external and in-home targets).
+    const symSessionsHome = join(hExternal.home, "home-with-symlink-sessions");
+    mkdirSync(symSessionsHome, { mode: 0o700 });
+    symlinkSync(sessionsDir, join(symSessionsHome, "sessions"), "dir");
+    assert.deepEqual(
+      listOpenDecisions(symSessionsHome),
+      [],
+      "symlinked sessions/ pointing outside home must be rejected",
+    );
+
+    rmSync(join(symSessionsHome, "sessions"), { recursive: true, force: true });
+    const internalTargetDir = join(symSessionsHome, "real-sessions-target");
+    mkdirSync(internalTargetDir, { mode: 0o700 });
+    writeFileSync(join(internalTargetDir, `${threadId}.jsonl`), origBytes);
+    symlinkSync(internalTargetDir, join(symSessionsHome, "sessions"), "dir");
+    assert.deepEqual(
+      listOpenDecisions(symSessionsHome),
+      [],
+      "symlinked sessions/ component must be rejected even when target is inside home",
+    );
+
+    // 4. Reject symlinked session files and corrupt files while keeping skip diagnostics sanitized.
+    const symlinkSessionPath = join(sessionsDir, "thr_symlink_file.jsonl");
+    const corruptSessionPath = join(sessionsDir, "thr_corrupt_secret.jsonl");
+    symlinkSync(sessionPath, symlinkSessionPath);
+    writeFileSync(
+      corruptSessionPath,
+      '{"secret":"SECRET_CORRUPT_LINE_DO_NOT_LEAK_9911"}\n',
+      "utf8",
+    );
+    try {
+      const skipped: Array<[string, string]> = [];
+      const afterSkipList = listOpenDecisions(h.home, (tid, reason) => skipped.push([tid, reason]));
+      assert.deepEqual(
+        afterSkipList.map((d) => d.decisionId),
+        ["dec_readonly_01"],
+      );
+      assert.deepEqual(skipped, [
+        ["thr_corrupt_secret", "session failed verification"],
+        ["thr_symlink_file", "session failed verification"],
+      ]);
+      assert.equal(
+        JSON.stringify(skipped).includes("SECRET_CORRUPT_LINE_DO_NOT_LEAK_9911"),
+        false,
+        "skip diagnostics must stay sanitized",
+      );
+    } finally {
+      rmSync(symlinkSessionPath, { force: true });
+      rmSync(corruptSessionPath, { force: true });
+    }
+  } finally {
+    hExternal.cleanup();
+    h.cleanup();
+  }
+});
+
+test("Copilot Finding 2 regression: FOUNDER_DECISION_RAISE_TOOL advertises the full decisionId grammar ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$ and accepts non-dec_ and 128-char IDs while rejecting 129-char IDs", async () => {
+  // 1. Verify advertised tool schema description on FOUNDER_DECISION_RAISE_TOOL.
+  const paramsSchema = FOUNDER_DECISION_RAISE_TOOL.parameters as {
+    properties?: {
+      decisionId?: { description?: string };
+    };
+  };
+  const decisionIdDesc = paramsSchema.properties?.decisionId?.description ?? "";
+  assert.equal(
+    decisionIdDesc.includes("^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"),
+    true,
+    `expected FOUNDER_DECISION_RAISE_TOOL decisionId description to include ^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$ (got ${JSON.stringify(decisionIdDesc)})`,
+  );
+  assert.equal(
+    decisionIdDesc.includes("^dec_"),
+    false,
+    `FOUNDER_DECISION_RAISE_TOOL decisionId description must not narrow grammar to ^dec_ (got ${JSON.stringify(decisionIdDesc)})`,
+  );
+  assert.equal(
+    /optional/i.test(decisionIdDesc) && /generat|omit/i.test(decisionIdDesc),
+    true,
+    `FOUNDER_DECISION_RAISE_TOOL decisionId description must explain that explicit ID is optional and engine-generated when omitted (got ${JSON.stringify(decisionIdDesc)})`,
+  );
+
+  // 2. Verify runtime behavior across non-dec_ ID, 128-character ID, omitted ID, and 129-character ID via real direct-lane tool execution.
+  const h = makeHome();
+  const fakeKimi = createFakeKimiTransport();
+  const realProviderAgent = createProviderAgent({
+    credential: { ok: true, apiKey: "sk-kimi-synthetic-f2-id-grammar" },
+    createPort: (apiKey) =>
+      createKimiCodePort({
+        apiKey,
+        userAgent: honestUserAgent(ENGINE_VERSION),
+        baseUrl: "https://kimi-fake.invalid/coding",
+        fetch: fakeKimi.fetch,
+      }),
+  });
+  const eng = createHarness(h.home, {
+    agent: realProviderAgent,
+    terminal: makeConfirmingTerminal(async () => true),
+  });
+  try {
+    eng.init();
+    const threadId = threadIdOf(eng.call(2, "thread/start", {}));
+    const openEv = readEvents(h.home, threadId)[0] as SessionEvent;
+    const validRef = {
+      kind: "session" as const,
+      path: `sessions/${threadId}.jsonl`,
+      seq: openEv.seq,
+      hash: openEv.hash,
+    };
+
+    const nonDecId = "custom-decision-id_01";
+    const id128 = `A${"b".repeat(126)}9`;
+    const id129 = `A${"b".repeat(127)}9`;
+    assert.equal(id128.length, 128);
+    assert.equal(id129.length, 129);
+
+    // Round 1: non-dec_ ID (positive)
+    fakeKimi.queueReply({
+      type: "tool-call",
+      id: "call_id_non_dec",
+      name: "founder_decision_raise",
+      args: {
+        decisionId: nonDecId,
+        question: "Accept non-dec_ explicit decisionId?",
+        recommendedDefault: "Accept any valid protocol id",
+        evidenceRefs: [validRef],
+      },
+      model: "kimi-for-coding",
+    });
+    // Round 2: 128-character ID (positive boundary)
+    fakeKimi.queueReply({
+      type: "tool-call",
+      id: "call_id_128",
+      name: "founder_decision_raise",
+      args: {
+        decisionId: id128,
+        question: "Accept 128-char decisionId?",
+        recommendedDefault: "Accept max length id",
+        evidenceRefs: [validRef],
+      },
+      model: "kimi-for-coding",
+    });
+    // Round 3: 129-character ID (negative boundary -> -32010)
+    fakeKimi.queueReply({
+      type: "tool-call",
+      id: "call_id_129",
+      name: "founder_decision_raise",
+      args: {
+        decisionId: id129,
+        question: "Reject 129-char decisionId?",
+        recommendedDefault: "Reject over-length id",
+        evidenceRefs: [validRef],
+      },
+      model: "kimi-for-coding",
+    });
+    // Round 4: omitted decisionId (positive -> engine mints dec_<32 hex>)
+    fakeKimi.queueReply({
+      type: "tool-call",
+      id: "call_id_omitted",
+      name: "founder_decision_raise",
+      args: {
+        question: "Mint decisionId when omitted?",
+        recommendedDefault: "Engine mints dec_<32 hex>",
+        evidenceRefs: [validRef],
+      },
+      model: "kimi-for-coding",
+    });
+    fakeKimi.queueReply({
+      type: "stream",
+      chunks: ["ID grammar checks complete."],
+      model: "kimi-for-coding",
+    });
+
+    const turnId = turnIdOf(
+      eng.call(3, "turn/start", {
+        threadId,
+        input: [{ type: "text", text: "Test ID grammar boundaries." }],
+      }),
+    );
+    await waitTurnCompleted(eng.messages, turnId);
+
+    // Check advertised wire schema in the first HTTP request.
+    const firstReq = JSON.parse(fakeKimi.requests[0]?.body ?? "{}") as {
+      tools?: Array<{
+        input_schema?: { properties?: { decisionId?: { description?: string } } };
+      }>;
+    };
+    const wireDesc = firstReq.tools?.[0]?.input_schema?.properties?.decisionId?.description ?? "";
+    assert.equal(wireDesc.includes("^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$"), true);
+    assert.equal(wireDesc.includes("^dec_"), false);
+
+    // Check that the 129-character ID tool call returned an error tool_result (-32010).
+    const fourthReqBody = fakeKimi.requests[3]?.body ?? "";
+    assert.equal(fourthReqBody.includes("call_id_129"), true);
+    assert.equal(fourthReqBody.includes('"is_error":true'), true);
+    assert.equal(fourthReqBody.includes("decisionId must match the id grammar"), true);
+
+    // Check open decisions: nonDecId, id128, and the engine-minted dec_<32 hex> are persisted; id129 is not.
+    const open = listOpenDecisions(h.home);
+    assert.equal(open.length, 3);
+    assert.equal(open[0]?.decisionId, nonDecId);
+    assert.equal(open[1]?.decisionId, id128);
+    assert.match(open[2]?.decisionId ?? "", /^dec_[0-9a-f]{32}$/);
   } finally {
     eng.shutdown();
     h.cleanup();

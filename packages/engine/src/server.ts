@@ -261,14 +261,14 @@ function presencePrompt(seatId: string, providerId: string): string {
 }
 
 /**
- * Strip ASCII control characters and ANSI escapes before displaying decision text on the
- * controlling terminal during Founder decision resolution confirmation.
+ * Strip C0, DEL, and C1 (U+0080..U+009F) control characters and ANSI escapes before displaying
+ * decision text on the controlling terminal during Founder decision resolution confirmation.
  */
 function sanitizeTerminalText(text: string): string {
   let out = "";
   for (let i = 0; i < text.length; i += 1) {
     const code = text.charCodeAt(i);
-    if (code === 0x1b || code < 0x20 || code === 0x7f) {
+    if (code === 0x1b || code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
       out += " ";
     } else {
       out += text[i];
