@@ -2702,3 +2702,300 @@ test("Copilot Finding 2 regression: FOUNDER_DECISION_RAISE_TOOL advertises the f
     h.cleanup();
   }
 });
+
+// --- PR #63 round-5 review guards (Argus pr63-review-048c5f1.md: L3, N-L1, N2-L T1) ------------
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+async function waitFor(cond: () => boolean, what: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (!cond()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, 5));
+  }
+}
+
+/** A thread with one finished turn and one raised decision; returns ids and the turn.start ref. */
+async function threadWithDecision(eng: ReturnType<typeof createHarness>, home: string) {
+  const threadId = threadIdOf(eng.call(2, "thread/start", {}));
+  const turnId = turnIdOf(
+    eng.call(3, "turn/start", { threadId, input: [{ type: "text", text: "go" }] }),
+  );
+  await waitTurnCompleted(eng.messages, turnId);
+  const ts = readEvents(home, threadId).find((e) => e.type === "turn.start");
+  assert.ok(ts !== undefined);
+  const ref = { kind: "session", path: `sessions/${threadId}.jsonl`, seq: ts.seq, hash: ts.hash };
+  const r = eng.call(4, "decision/raise", {
+    threadId,
+    turnId,
+    decisionId: "dec_guard",
+    question: "Q?",
+    recommendedDefault: "D",
+    evidenceRefs: [ref],
+  });
+  assert.equal(r.error, undefined);
+  return {
+    threadId,
+    turnId,
+    ref,
+    decisionSeq: r.result?.seq as number,
+    decisionHash: r.result?.hash as string,
+  };
+}
+
+const sessionSha = (home: string, threadId: string) =>
+  createHash("sha256")
+    .update(readFileSync(join(home, "sessions", `${threadId}.jsonl`)))
+    .digest("hex");
+
+test("L3 S2/S4: while a warm resolution waits for confirmation, a second resolve and a raise are refused -32004 and nothing is appended", async () => {
+  const h = makeHome();
+  const gate = deferred<boolean>();
+  const term = makeConfirmingTerminal(() => gate.promise);
+  const eng = createHarness(h.home, { terminal: term });
+  try {
+    eng.init();
+    const t = await threadWithDecision(eng, h.home);
+    const pending = eng.callAsync(10, "decision/resolve", {
+      threadId: t.threadId,
+      decisionId: "dec_guard",
+      decisionSeq: t.decisionSeq,
+      decisionHash: t.decisionHash,
+      outcome: "accepted-default",
+    });
+    await waitFor(() => term.prompts.length === 1, "confirmation prompt");
+    const before = sessionSha(h.home, t.threadId);
+
+    const second = eng.call(11, "decision/resolve", {
+      threadId: t.threadId,
+      decisionId: "dec_guard",
+      decisionSeq: t.decisionSeq,
+      decisionHash: t.decisionHash,
+      outcome: "decided",
+      resolution: "other",
+    });
+    assert.equal(second.error?.code, ErrorCode.TurnAlreadyActive);
+    const raise = eng.call(12, "decision/raise", {
+      threadId: t.threadId,
+      turnId: t.turnId,
+      decisionId: "dec_guard_2",
+      question: "Q2?",
+      recommendedDefault: "D2",
+      evidenceRefs: [t.ref],
+    });
+    assert.equal(raise.error?.code, ErrorCode.TurnAlreadyActive);
+    assert.equal(sessionSha(h.home, t.threadId), before, "no append while confirming");
+    assert.equal(term.prompts.length, 1, "the refused resolve never prompted");
+
+    gate.resolve(true);
+    const done = await pending;
+    assert.equal(done.error, undefined);
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("N-L1 N9/N10/N12: while a cold resolution waits for confirmation, raise, a second resolve and thread/resume are refused -32004 and nothing is appended", async () => {
+  const h = makeHome();
+  const eng1 = createHarness(h.home);
+  eng1.init();
+  const t = await threadWithDecision(eng1, h.home);
+  eng1.shutdown();
+
+  const gate = deferred<boolean>();
+  const term = makeConfirmingTerminal(() => gate.promise);
+  const eng = createHarness(h.home, { terminal: term });
+  try {
+    eng.init();
+    const before = sessionSha(h.home, t.threadId);
+    const pending = eng.callAsync(10, "decision/resolve", {
+      threadId: t.threadId,
+      decisionId: "dec_guard",
+      decisionSeq: t.decisionSeq,
+      decisionHash: t.decisionHash,
+      outcome: "accepted-default",
+    });
+    await waitFor(() => term.prompts.length === 1, "confirmation prompt");
+
+    const raise = eng.call(11, "decision/raise", {
+      threadId: t.threadId,
+      turnId: t.turnId,
+      decisionId: "dec_guard_2",
+      question: "Q2?",
+      recommendedDefault: "D2",
+      evidenceRefs: [t.ref],
+    });
+    assert.equal(raise.error?.code, ErrorCode.TurnAlreadyActive, "raise (N9)");
+    const second = await eng.callAsync(12, "decision/resolve", {
+      threadId: t.threadId,
+      decisionId: "dec_guard",
+      decisionSeq: t.decisionSeq,
+      decisionHash: t.decisionHash,
+      outcome: "decided",
+      resolution: "other",
+    });
+    assert.equal(second.error?.code, ErrorCode.TurnAlreadyActive, "second resolve (N10)");
+    const resume = await eng.callAsync(13, "thread/resume", { threadId: t.threadId });
+    assert.equal(resume.error?.code, ErrorCode.TurnAlreadyActive, "resume (N12)");
+    assert.equal(term.prompts.length, 1, "refused calls never prompted");
+    assert.equal(sessionSha(h.home, t.threadId), before, "no append while confirming");
+
+    gate.resolve(true);
+    assert.equal((await pending).error, undefined);
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("N-L1 N1/N3: resolve with no controlling terminal reports 'confirmation unavailable'; a terminal that changes during the prompt is refused; neither writes", async () => {
+  const h = makeHome();
+  const eng1 = createHarness(h.home, { terminal: makeConfirmingTerminal() });
+  try {
+    eng1.init();
+    const t = await threadWithDecision(eng1, h.home);
+    const resolveParams = {
+      threadId: t.threadId,
+      decisionId: "dec_guard",
+      decisionSeq: t.decisionSeq,
+      decisionHash: t.decisionHash,
+      outcome: "accepted-default",
+    };
+    eng1.shutdown();
+    const before = sessionSha(h.home, t.threadId);
+
+    const engNone = createHarness(h.home, {
+      terminal: {
+        probe: () => null,
+        confirm: async () => true,
+        unsupported: "no controlling terminal",
+      },
+    });
+    try {
+      engNone.init();
+      const r = await engNone.callAsync(2, "decision/resolve", resolveParams);
+      assert.equal(r.error?.code, ErrorCode.EvidenceInvalid);
+      assert.deepEqual(r.error?.data?.issues, [
+        "Founder resolution confirmation unavailable (no controlling terminal)",
+      ]);
+    } finally {
+      engNone.shutdown();
+    }
+    assert.equal(sessionSha(h.home, t.threadId), before);
+
+    let probes = 0;
+    const swapping: PresenceTerminal & { prompts: string[] } = {
+      prompts: [],
+      probe: () => (probes++ === 0 ? TEST_TERMINAL_FACTS : { device: "16/99", session: null }),
+      confirm: async (prompt) => {
+        swapping.prompts.push(prompt);
+        return true;
+      },
+    };
+    const engSwap = createHarness(h.home, { terminal: swapping });
+    try {
+      engSwap.init();
+      const r = await engSwap.callAsync(2, "decision/resolve", resolveParams);
+      assert.equal(r.error?.code, ErrorCode.EvidenceInvalid);
+      assert.deepEqual(r.error?.data?.issues, [
+        "Founder resolution confirmation failed (controlling terminal changed)",
+      ]);
+      assert.equal(swapping.prompts.length, 1);
+    } finally {
+      engSwap.shutdown();
+    }
+    assert.equal(sessionSha(h.home, t.threadId), before, "no write on a changed terminal");
+  } finally {
+    h.cleanup();
+  }
+});
+
+test("L3 S6/S8: a malformed payload on an unknown thread is refused -32010 (shape first, turnId null), not -32002", () => {
+  const h = makeHome();
+  const eng = createHarness(h.home);
+  try {
+    eng.init();
+    const raise = eng.call(2, "decision/raise", {
+      threadId: "thr_never_existed",
+      question: "",
+      recommendedDefault: "D",
+      evidenceRefs: [],
+    });
+    assert.equal(raise.error?.code, ErrorCode.EvidenceInvalid, "raise shape check before lookup");
+    assert.equal(raise.error?.data?.turnId, null);
+    const resolve = eng.call(3, "decision/resolve", {
+      threadId: "thr_never_existed",
+      decisionId: "dec_x",
+      decisionSeq: -1,
+      decisionHash: "nothex",
+      outcome: "maybe",
+    });
+    assert.equal(
+      resolve.error?.code,
+      ErrorCode.EvidenceInvalid,
+      "resolve shape check before lookup",
+    );
+    assert.equal(resolve.error?.data?.turnId, null);
+    assert.equal(existsSync(join(h.home, "sessions", "thr_never_existed.jsonl")), false);
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("N-L1 N16/N17, N2-L T1: TurnSink.raiseDecision refuses a caller turnId, a null-prototype input, and any call after the turn ended; none appends a decision", async () => {
+  const h = makeHome();
+  let sinkRef: TurnSink | undefined;
+  const outcomes: Record<string, unknown> = {};
+  const agent: Agent = {
+    name: "guard-agent",
+    async run(ctx, sink) {
+      sinkRef = sink;
+      const ts = readEvents(h.home, ctx.threadId).find((e) => e.type === "turn.start");
+      assert.ok(ts !== undefined);
+      const valid = {
+        question: "Q?",
+        recommendedDefault: "D",
+        evidenceRefs: [
+          { kind: "session", path: `sessions/${ctx.threadId}.jsonl`, seq: ts.seq, hash: ts.hash },
+        ],
+      };
+      outcomes.callerTurnId = sink.raiseDecision?.({ ...valid, turnId: ctx.turnId } as never);
+      outcomes.nullProto = sink.raiseDecision?.(Object.assign(Object.create(null), valid));
+      outcomes.validInput = valid;
+    },
+  };
+  const eng = createHarness(h.home, { agent });
+  try {
+    eng.init();
+    const threadId = threadIdOf(eng.call(2, "thread/start", {}));
+    const turnId = turnIdOf(
+      eng.call(3, "turn/start", { threadId, input: [{ type: "text", text: "go" }] }),
+    );
+    await waitTurnCompleted(eng.messages, turnId);
+    const code = (o: unknown) => (o as { ok: boolean; error?: { code: number } }).error?.code;
+    assert.equal((outcomes.callerTurnId as { ok: boolean }).ok, false, "T1");
+    assert.equal(code(outcomes.callerTurnId), ErrorCode.EvidenceInvalid, "T1");
+    assert.equal((outcomes.nullProto as { ok: boolean }).ok, false, "N17");
+    assert.equal(code(outcomes.nullProto), ErrorCode.EvidenceInvalid, "N17");
+
+    const late = sinkRef?.raiseDecision?.(outcomes.validInput as never);
+    assert.equal((late as { ok: boolean }).ok, false, "N16");
+    assert.equal(code(late), ErrorCode.TurnNotFound, "N16");
+    assert.equal(
+      readEvents(h.home, threadId).filter((e) => e.type === "founderDecision").length,
+      0,
+      "no decision appended by any refused raise",
+    );
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
