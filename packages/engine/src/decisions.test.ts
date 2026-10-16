@@ -2226,7 +2226,7 @@ test("F2 tool-limit exhaustion regression: four distinct valid decision-tool rou
     );
     assert.deepEqual(finishedTurn.error, {
       code: ErrorCode.InternalError,
-      message: "kimi-code request failed",
+      message: "kimi-code decision tool limit reached",
     });
 
     // 4. No successful served-model receipt for the failed turn.
@@ -2258,7 +2258,7 @@ test("F2 tool-limit exhaustion regression: four distinct valid decision-tool rou
     assert.equal(turnEndPayload.status, "failed");
     assert.deepEqual(turnEndPayload.error, {
       code: ErrorCode.InternalError,
-      message: "kimi-code request failed",
+      message: "kimi-code decision tool limit reached",
     });
 
     // 6. Error is sanitized: no model text, tool arguments, 5th decision payload, or credentials leak.

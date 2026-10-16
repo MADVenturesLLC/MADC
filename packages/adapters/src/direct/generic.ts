@@ -308,7 +308,9 @@ export function createDirectKeyPort(config: DirectKeyPortConfig): ProviderPort {
           {
             ...(request.systemPrompt === undefined ? {} : { systemPrompt: request.systemPrompt }),
             messages: conversationMessages,
-            tools: [...DIRECT_LANE_TOOLS],
+            // Argus N2-M (part): advertise the decision tool only when the engine handed this turn
+            // a raise capability; otherwise the request body is the M1 shape with no `tools`.
+            ...(request.raiseDecision === undefined ? {} : { tools: [...DIRECT_LANE_TOOLS] }),
           },
           {
             apiKey: config.apiKey,
@@ -355,7 +357,14 @@ export function createDirectKeyPort(config: DirectKeyPortConfig): ProviderPort {
           break;
         }
         if (toolRounds >= MAX_DECISION_TOOL_ROUNDS) {
-          throw failure(config, request.signal, null);
+          // Argus N4-L: a fixed, payload-free message of its own, so exhaustion never reads as a
+          // dropped connection. Still a plain failure (no quota reason); earlier decisions stay.
+          if (request.signal.aborted) throw failure(config, request.signal, null);
+          throw new ProviderCallError(
+            "failed",
+            null,
+            `${config.providerId} decision tool limit reached`,
+          );
         }
         toolRounds += 1;
         conversationMessages.push(final);
