@@ -212,3 +212,41 @@ test("N4-L: tool-round exhaustion fails with its own fixed message, not the netw
     },
   );
 });
+
+test("N4-L abort priority: a signal aborted while the over-limit response arrives fails as aborted, not as the tool limit", async () => {
+  const transport = createFakeKimiTransport();
+  const controller = new AbortController();
+  let calls = 0;
+  const fetchAbortingOnLast: typeof globalThis.fetch = async (input, init) => {
+    calls += 1;
+    const res = await transport.fetch(input, init);
+    if (calls <= MAX_DECISION_TOOL_ROUNDS) return res;
+    const bytes = await res.arrayBuffer();
+    controller.abort();
+    return new Response(bytes, { status: res.status, headers: res.headers });
+  };
+  const port = createKimiCodePort({
+    apiKey: KEY,
+    userAgent: honestUserAgent("0.0.0"),
+    baseUrl: "https://kimi-fake.invalid/coding",
+    fetch: fetchAbortingOnLast,
+  });
+  for (let i = 0; i <= MAX_DECISION_TOOL_ROUNDS; i++) {
+    transport.queueReply({
+      type: "tool-call",
+      id: `call_${i}`,
+      name: FOUNDER_DECISION_RAISE_TOOL_NAME,
+      args: { question: `q${i}` },
+      model: MODEL,
+    });
+  }
+  await assert.rejects(
+    port.streamTurn(turnRequest({ signal: controller.signal, raiseDecision: () => ok })),
+    (err: Error & { kind?: string }) => {
+      assert.equal(err.kind, "aborted");
+      assert.equal(err.message, "kimi-code request aborted");
+      return true;
+    },
+  );
+  assert.equal(calls, MAX_DECISION_TOOL_ROUNDS + 1);
+});

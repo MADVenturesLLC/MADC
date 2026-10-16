@@ -2999,3 +2999,105 @@ test("N-L1 N16/N17, N2-L T1: TurnSink.raiseDecision refuses a caller turnId, a n
     h.cleanup();
   }
 });
+
+// --- N-M1: thread/handoff step 1 rows 4a and 6a (inbox pin §4.4, Surface ruling 2026-10-16) ------
+
+const handoffParams = (threadId: string) => ({
+  threadId,
+  turnId: null,
+  targetSeatId: "surface-architect",
+  brief: "hand this on",
+});
+
+test("N-M1 row 4a: thread/handoff on a source held for a pending cold decision/resolve confirmation is refused -32004 { threadId, activeTurnId: null } and appends nothing", async () => {
+  const h = makeHome();
+  const eng1 = createHarness(h.home);
+  eng1.init();
+  const t = await threadWithDecision(eng1, h.home);
+  eng1.shutdown();
+  const gate = deferred<boolean>();
+  const term = makeConfirmingTerminal(() => gate.promise);
+  const eng = createHarness(h.home, { terminal: term });
+  try {
+    eng.init();
+    const before = sessionSha(h.home, t.threadId);
+    const pending = eng.callAsync(10, "decision/resolve", {
+      threadId: t.threadId,
+      decisionId: "dec_guard",
+      decisionSeq: t.decisionSeq,
+      decisionHash: t.decisionHash,
+      outcome: "accepted-default",
+    });
+    await waitFor(() => term.prompts.length === 1, "confirmation prompt");
+    const r = eng.call(11, "thread/handoff", handoffParams(t.threadId));
+    assert.equal(r.error?.code, ErrorCode.TurnAlreadyActive);
+    assert.deepEqual(r.error?.data, { threadId: t.threadId, activeTurnId: null });
+    assert.equal(sessionSha(h.home, t.threadId), before, "row 4a appends nothing");
+    gate.resolve(false);
+    await pending;
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("N-M1 row 6a (confirming): thread/handoff while a warm decision/resolve confirmation is pending is refused -32004 { threadId, activeTurnId: null } and appends nothing", async () => {
+  const h = makeHome();
+  const gate = deferred<boolean>();
+  const term = makeConfirmingTerminal(() => gate.promise);
+  const eng = createHarness(h.home, { terminal: term });
+  try {
+    eng.init();
+    const t = await threadWithDecision(eng, h.home);
+    const pending = eng.callAsync(10, "decision/resolve", {
+      threadId: t.threadId,
+      decisionId: "dec_guard",
+      decisionSeq: t.decisionSeq,
+      decisionHash: t.decisionHash,
+      outcome: "accepted-default",
+    });
+    await waitFor(() => term.prompts.length === 1, "confirmation prompt");
+    const before = sessionSha(h.home, t.threadId);
+    const r = eng.call(11, "thread/handoff", handoffParams(t.threadId));
+    assert.equal(r.error?.code, ErrorCode.TurnAlreadyActive);
+    assert.deepEqual(r.error?.data, { threadId: t.threadId, activeTurnId: null });
+    assert.equal(sessionSha(h.home, t.threadId), before, "row 6a appends nothing");
+    gate.resolve(false);
+    await pending;
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
+
+test("N-M1 row 6a (active turn): thread/handoff while a turn is running is refused -32004 { threadId, activeTurnId: <turn> } and appends nothing", async () => {
+  const h = makeHome();
+  const hold = deferred<void>();
+  let started = false;
+  const agent: Agent = {
+    name: "blocking",
+    async run() {
+      started = true;
+      await hold.promise;
+    },
+  };
+  const eng = createHarness(h.home, { agent });
+  try {
+    eng.init();
+    const threadId = threadIdOf(eng.call(2, "thread/start", {}));
+    const turnId = turnIdOf(
+      eng.call(3, "turn/start", { threadId, input: [{ type: "text", text: "go" }] }),
+    );
+    await waitFor(() => started, "turn running");
+    const before = sessionSha(h.home, threadId);
+    const r = eng.call(4, "thread/handoff", handoffParams(threadId));
+    assert.equal(r.error?.code, ErrorCode.TurnAlreadyActive);
+    assert.deepEqual(r.error?.data, { threadId, activeTurnId: turnId });
+    assert.equal(sessionSha(h.home, threadId), before, "row 6a appends nothing");
+    hold.resolve();
+    await waitTurnCompleted(eng.messages, turnId);
+  } finally {
+    eng.shutdown();
+    h.cleanup();
+  }
+});
