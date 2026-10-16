@@ -2833,6 +2833,11 @@ test("N-L1 N9/N10/N12: while a cold resolution waits for confirmation, raise, a 
       evidenceRefs: [t.ref],
     });
     assert.equal(raise.error?.code, ErrorCode.TurnAlreadyActive, "raise (N9)");
+    assert.deepEqual(
+      raise.error?.data,
+      { threadId: t.threadId, activeTurnId: null },
+      "raise (N9) data",
+    );
     const second = await eng.callAsync(12, "decision/resolve", {
       threadId: t.threadId,
       decisionId: "dec_guard",
@@ -2842,8 +2847,18 @@ test("N-L1 N9/N10/N12: while a cold resolution waits for confirmation, raise, a 
       resolution: "other",
     });
     assert.equal(second.error?.code, ErrorCode.TurnAlreadyActive, "second resolve (N10)");
+    assert.deepEqual(
+      second.error?.data,
+      { threadId: t.threadId, activeTurnId: null },
+      "second resolve (N10) data",
+    );
     const resume = await eng.callAsync(13, "thread/resume", { threadId: t.threadId });
     assert.equal(resume.error?.code, ErrorCode.TurnAlreadyActive, "resume (N12)");
+    assert.deepEqual(
+      resume.error?.data,
+      { threadId: t.threadId, activeTurnId: null },
+      "resume (N12) data",
+    );
     assert.equal(term.prompts.length, 1, "refused calls never prompted");
     assert.equal(sessionSha(h.home, t.threadId), before, "no append while confirming");
 
