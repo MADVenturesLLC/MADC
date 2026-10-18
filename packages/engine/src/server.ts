@@ -10,8 +10,9 @@ import {
   RegistryDeniedError,
   type RunMode,
 } from "@madc/registry";
-import type { Agent, AgentTurnContext, TurnSink } from "./agent.ts";
+import type { Agent, AgentTurnContext, TurnDecisionOutcome, TurnSink } from "./agent.ts";
 import { type CredentialStore, createCredentialStore } from "./credentials/store.ts";
+import { listOpenDecisions } from "./decisions.ts";
 import { checkHandoffTarget, type HandoffTargetCheck, readHandoffBrief } from "./handoff.ts";
 import { confinedPath, sessionsOwnerReadUnsupported } from "./home.ts";
 import {
@@ -53,6 +54,9 @@ import {
   type AuthStatusResult,
   DEFAULT_SEAT_ID,
   DEFAULT_TURN_MODE,
+  type DecisionListResult,
+  type DecisionRaiseResult,
+  type DecisionResolveResult,
   type InitializeResult,
   type Item,
   PROTOCOL_VERSION,
@@ -81,6 +85,8 @@ import { listSeatSummaries } from "./seats/list.ts";
 import { ensureSeatMemoryFile } from "./seats/memory.ts";
 import { seedRosterSeats } from "./seats/roster.ts";
 import {
+  type FounderDecisionPayload,
+  type FounderDecisionResolvedPayload,
   type HandoffAbortReason,
   type HandoffOutPayload,
   type RebuiltSession,
@@ -254,6 +260,48 @@ function presencePrompt(seatId: string, providerId: string): string {
   );
 }
 
+/**
+ * Strip C0, DEL, and C1 (U+0080..U+009F) control characters and ANSI escapes before displaying
+ * decision text on the controlling terminal during Founder decision resolution confirmation.
+ */
+function sanitizeTerminalText(text: string): string {
+  let out = "";
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    if (code === 0x1b || code < 0x20 || (code >= 0x7f && code <= 0x9f)) {
+      out += " ";
+    } else {
+      out += text[i];
+    }
+  }
+  return out;
+}
+
+/**
+ * M2-A6 (F1): the prompt the engine writes to its own controlling terminal before recording a
+ * `founderDecision.resolved` event. Bound to the specific thread, decision ID, proposed outcome,
+ * and resolution being recorded.
+ */
+function decisionResolutionPrompt(
+  threadId: string,
+  decisionId: string,
+  outcome: string,
+  resolution: string,
+): string {
+  const safeResolution = sanitizeTerminalText(resolution);
+  return (
+    `\r\nmadc: confirm Founder decision resolution on thread ${threadId}` +
+    `\r\nmadc: decision ${decisionId} | outcome: ${outcome} | resolution: ${safeResolution}` +
+    "\r\nmadc: press Enter to confirm this resolution (type n then Enter to refuse): "
+  );
+}
+
+/** Fail-closed terminal for in-process connections without `process.stdin` or an explicit `terminal`. */
+const ABSENT_TERMINAL: PresenceTerminal = Object.freeze({
+  probe: () => null,
+  confirm: () => Promise.resolve(false),
+});
+
 /** One dispatched request's response value plus an optional post-response hook. */
 type DispatchResult = { value: unknown; after?: () => void };
 
@@ -329,6 +377,8 @@ export class EngineConnection {
   #shutDown = false;
   #rl: Interface | null = null;
   readonly #threads = new Map<string, ThreadRecord>();
+  /** Locks held for cold threads while a `decision/resolve` operator confirmation is pending. */
+  readonly #coldConfirmingLocks = new Map<string, LockHandle>();
   /** Locks this process still holds without a thread record (probe locks whose release failed). */
   readonly #strayLocks: LockHandle[] = [];
   /**
@@ -605,7 +655,11 @@ export class EngineConnection {
   }
 
   releaseLocks(): void {
-    const handles = [...[...this.#threads.values()].map((r) => r.lock), ...this.#strayLocks];
+    const handles = [
+      ...[...this.#threads.values()].map((r) => r.lock),
+      ...this.#coldConfirmingLocks.values(),
+      ...this.#strayLocks,
+    ];
     for (const handle of handles) {
       try {
         releaseThreadLock(handle);
@@ -690,9 +744,374 @@ export class EngineConnection {
         return this.#authStatus(params);
       case "auth/remove":
         return this.#authRemove(params);
+      case "decision/raise":
+        return this.#decisionRaise(params);
+      case "decision/list":
+        return { value: this.#decisionList(params) };
+      case "decision/resolve":
+        return this.#decisionResolve(params);
       default:
         throw methodNotFound(method);
     }
+  }
+
+  // ---------------------------------------------------------------- decisions
+
+  /**
+   * M2-A6 (`docs/plan/PIN-madc-M2-founder-decision-inbox.md` §4.1): typed `founderDecision` raise
+   * on a loaded thread. Validates the candidate payload (including closed key sets on
+   * `founderDecision` and `EvidenceRef`, D-439, preserving own `"__proto__"` keys, F3) before any
+   * lock or thread lookup, then appends through the thread's `SessionWriter`.
+   */
+  #decisionRaise(params: unknown): { value: DecisionRaiseResult } {
+    const p = paramsObject(params);
+    const issues: string[] = [];
+    const threadId = requireId(p, "threadId", issues);
+    throwIfIssues(issues);
+
+    const entries = Object.entries(p).filter(([k]) => k !== "threadId");
+    const hasDecisionId = entries.some(([k, v]) => k === "decisionId" && v !== undefined);
+    const candidate: Record<string, unknown> = Object.fromEntries([
+      ...entries.filter(([k, v]) => !(k === "decisionId" && v === undefined)),
+      ...(hasDecisionId ? [] : [["decisionId", newId("dec")]]),
+    ]);
+    const faults = checkV2Payload("founderDecision", candidate);
+    const firstFault = faults[0];
+    if (firstFault !== undefined) {
+      throw evidenceInvalid({
+        threadId,
+        turnId: null,
+        type: "founderDecision",
+        reason: firstFault.reason,
+        issues: faults.map((f) => f.issue),
+      });
+    }
+
+    const poisoned = this.#poisoned.get(threadId);
+    if (poisoned !== undefined) throw sessionWriteFailed(threadId, poisoned.path, poisoned.seq);
+    if (this.#coldConfirmingLocks.has(threadId)) throw turnAlreadyActive(threadId, null);
+    const record = this.#threads.get(threadId);
+    if (record === undefined) {
+      const holder = this.#liveLockHolder(threadId);
+      if (holder !== null) throw turnAlreadyActive(threadId, null, holder);
+      throw threadNotFound(threadId);
+    }
+    if (record.confirming) throw turnAlreadyActive(threadId, null);
+    if (!holdsThreadLock(record.lock)) {
+      throw turnAlreadyActive(threadId, null, this.#liveLockHolder(threadId) ?? undefined);
+    }
+    if (record.session.broken) {
+      throw sessionWriteFailed(threadId, record.session.path, record.session.nextSeq);
+    }
+    this.#handoffGate(record);
+
+    let line: SessionEvent<"founderDecision">;
+    try {
+      line = record.session.append("founderDecision", candidate as FounderDecisionPayload);
+    } catch (err) {
+      this.#notePoisoned(threadId, record.session);
+      throw err;
+    }
+    record.thread.updatedAt = Math.max(record.thread.updatedAt, line.ts);
+    return {
+      value: {
+        threadId,
+        decisionId: line.payload.decisionId,
+        seq: line.seq,
+        hash: line.hash,
+      },
+    };
+  }
+
+  /**
+   * M2-A6 (`docs/plan/PIN-madc-M2-founder-decision-inbox.md` §4.2, F4): `{ data: OpenDecisionSummary[] }`
+   * across all verified session chains in `$MADC_HOME/sessions`. Read-only; takes no params and
+   * returns a fixed sanitized error message when unexpected params are supplied.
+   */
+  #decisionList(params: unknown): DecisionListResult {
+    const p = paramsObject(params);
+    if (Object.keys(p).length > 0) {
+      throw invalidParams(["decision/list takes no params"]);
+    }
+    return {
+      data: listOpenDecisions(this.#opts.home, (threadId, reason) =>
+        this.#log(`decision/list: skipping ${threadId} (${reason})`),
+      ),
+    };
+  }
+
+  /**
+   * M2-A6 (`docs/plan/PIN-madc-M2-founder-decision-inbox.md` §4.3, F1 / F3 / F5): append-only
+   * Founder resolution of an open `founderDecision` under the thread lock.
+   *
+   * - Preserves all caller-owned keys (including `"__proto__"`) during candidate construction (F3).
+   * - Validates the proposed resolution against the verified existing chain BEFORE any cold-thread
+   *   dangling-turn recovery write, so a refused resolution leaves the session file byte-for-byte
+   *   unchanged (F5).
+   * - Requires a fresh, engine-owned operator confirmation on the controlling terminal bound to
+   *   the specific thread, decision ID, proposed outcome, and resolution being recorded before any
+   *   mutation, failing closed when confirmation is unavailable, declined, cancelled, or
+   *   interrupted (F1).
+   */
+  #decisionResolve(
+    params: unknown,
+  ): { value: DecisionResolveResult } | Promise<{ value: DecisionResolveResult }> {
+    const p = paramsObject(params);
+    const issues: string[] = [];
+    const threadId = requireId(p, "threadId", issues);
+    throwIfIssues(issues);
+
+    const candidateEntries = Object.entries(p).filter(([k]) => k !== "threadId");
+    const candidate: Record<string, unknown> = Object.fromEntries(candidateEntries);
+    const resolutionOmittedForDefault =
+      candidate.outcome === "accepted-default" &&
+      (!Object.hasOwn(candidate, "resolution") || candidate.resolution === undefined);
+    const precheck: Record<string, unknown> = resolutionOmittedForDefault
+      ? Object.fromEntries([
+          ...candidateEntries.filter(([k]) => k !== "resolution"),
+          ["resolution", "__default__"],
+        ])
+      : candidate;
+    const faults = checkV2Payload("founderDecision.resolved", precheck);
+    const firstFault = faults[0];
+    if (firstFault !== undefined) {
+      throw evidenceInvalid({
+        threadId,
+        turnId: null,
+        type: "founderDecision.resolved",
+        reason: firstFault.reason,
+        issues: faults.map((f) => f.issue),
+      });
+    }
+
+    const poisoned = this.#poisoned.get(threadId);
+    if (poisoned !== undefined) throw sessionWriteFailed(threadId, poisoned.path, poisoned.seq);
+    if (this.#coldConfirmingLocks.has(threadId)) throw turnAlreadyActive(threadId, null);
+
+    let targetRecord: ThreadRecord;
+    let coldHandle: LockHandle | null = null;
+    let coldDanglingTurnIds: readonly string[] = [];
+    let resolvedPayload: FounderDecisionResolvedPayload;
+
+    const existing = this.#threads.get(threadId);
+    if (existing !== undefined) {
+      if (existing.activeTurnId !== null) throw turnAlreadyActive(threadId, existing.activeTurnId);
+      if (existing.confirming) throw turnAlreadyActive(threadId, null);
+      if (!holdsThreadLock(existing.lock)) {
+        throw turnAlreadyActive(threadId, null, this.#liveLockHolder(threadId) ?? undefined);
+      }
+      if (existing.session.broken) {
+        throw sessionWriteFailed(threadId, existing.session.path, existing.session.nextSeq);
+      }
+      this.#handoffGate(existing);
+      const origin = resolutionOmittedForDefault
+        ? existing.session.decisionAt(String(candidate.decisionId))
+        : undefined;
+      resolvedPayload = (
+        resolutionOmittedForDefault
+          ? Object.fromEntries([
+              ...candidateEntries.filter(([k]) => k !== "resolution"),
+              ["resolution", origin?.recommendedDefault ?? "__default__"],
+            ])
+          : candidate
+      ) as FounderDecisionResolvedPayload;
+      existing.session.validateCandidate("founderDecision.resolved", resolvedPayload);
+      targetRecord = existing;
+    } else {
+      const lock = acquireThreadLock(this.#opts.home, threadId);
+      if (!lock.ok) throw turnAlreadyActive(threadId, null, lock.holderPid ?? undefined);
+      const handle = lock.handle;
+      try {
+        const opened = this.#openColdThread(threadId, handle);
+        const origin = resolutionOmittedForDefault
+          ? opened.record.session.decisionAt(String(candidate.decisionId))
+          : undefined;
+        resolvedPayload = (
+          resolutionOmittedForDefault
+            ? Object.fromEntries([
+                ...candidateEntries.filter(([k]) => k !== "resolution"),
+                ["resolution", origin?.recommendedDefault ?? "__default__"],
+              ])
+            : candidate
+        ) as FounderDecisionResolvedPayload;
+        opened.record.session.validateCandidate("founderDecision.resolved", resolvedPayload);
+        targetRecord = opened.record;
+        coldHandle = handle;
+        coldDanglingTurnIds = opened.danglingTurnIds;
+      } catch (err) {
+        this.#releaseOrKeep(handle);
+        throw err;
+      }
+    }
+
+    const terminal = this.#terminalAccess();
+    const facts = terminal.probe();
+    if (facts === null) {
+      if (coldHandle !== null) this.#releaseOrKeep(coldHandle);
+      const why = terminal.unsupported ?? "no controlling terminal";
+      this.#log(`decision/resolve ${threadId}: confirmation unavailable (${why}); refused`);
+      throw evidenceInvalid({
+        threadId,
+        turnId: null,
+        type: "founderDecision.resolved",
+        reason: "field-invalid",
+        issues: [`Founder resolution confirmation unavailable (${why})`],
+      });
+    }
+
+    return this.#awaitDecisionConfirmation(
+      threadId,
+      targetRecord,
+      coldHandle,
+      coldDanglingTurnIds,
+      resolvedPayload,
+      facts,
+    );
+  }
+
+  /**
+   * M2-A6 (F1 / F5): queues a fresh operator confirmation prompt on the engine's controlling
+   * terminal bound to `threadId`, `decisionId`, `outcome`, and `resolution`. Never reuses an
+   * earlier turn or decision confirmation. Only after the operator confirms on the same live
+   * terminal does a cold thread recover its dangling turns and append `founderDecision.resolved`.
+   */
+  async #awaitDecisionConfirmation(
+    threadId: string,
+    targetRecord: ThreadRecord,
+    coldHandle: LockHandle | null,
+    coldDanglingTurnIds: readonly string[],
+    resolvedPayload: FounderDecisionResolvedPayload,
+    facts: TerminalFacts,
+  ): Promise<{ value: DecisionResolveResult }> {
+    const controller = new AbortController();
+    if (coldHandle !== null) {
+      this.#coldConfirmingLocks.set(threadId, coldHandle);
+    } else {
+      targetRecord.confirming = true;
+    }
+    this.#pendingConfirmations.add(controller);
+    const previous = this.#confirmationTail;
+    let release = (): void => {};
+    this.#confirmationTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const prompt = decisionResolutionPrompt(
+      threadId,
+      resolvedPayload.decisionId,
+      resolvedPayload.outcome,
+      resolvedPayload.resolution,
+    );
+    let confirmed = false;
+    let wasAborted = false;
+    try {
+      await previous;
+      if (controller.signal.aborted || this.#shutDown) {
+        wasAborted = true;
+      } else {
+        confirmed = await this.#terminalAccess().confirm(prompt, controller.signal);
+        if (controller.signal.aborted || this.#shutDown) {
+          wasAborted = true;
+        }
+      }
+    } catch {
+      wasAborted = true;
+      confirmed = false;
+    } finally {
+      release();
+      if (coldHandle !== null) {
+        this.#coldConfirmingLocks.delete(threadId);
+      } else {
+        targetRecord.confirming = false;
+      }
+      this.#pendingConfirmations.delete(controller);
+    }
+
+    const cleanupCold = (): void => {
+      if (coldHandle !== null) this.#releaseOrKeep(coldHandle);
+    };
+
+    if (wasAborted || this.#shutDown) {
+      cleanupCold();
+      throw evidenceInvalid({
+        threadId,
+        turnId: null,
+        type: "founderDecision.resolved",
+        reason: "field-invalid",
+        issues: ["Founder resolution confirmation cancelled"],
+      });
+    }
+
+    if (coldHandle !== null) {
+      if (!holdsThreadLock(coldHandle)) {
+        cleanupCold();
+        throw turnAlreadyActive(threadId, null, this.#liveLockHolder(threadId) ?? undefined);
+      }
+    } else if (
+      this.#threads.get(threadId) !== targetRecord ||
+      !holdsThreadLock(targetRecord.lock)
+    ) {
+      throw turnAlreadyActive(threadId, null, this.#liveLockHolder(threadId) ?? undefined);
+    }
+
+    if (!confirmed) {
+      cleanupCold();
+      throw evidenceInvalid({
+        threadId,
+        turnId: null,
+        type: "founderDecision.resolved",
+        reason: "field-invalid",
+        issues: ["Founder resolution confirmation declined"],
+      });
+    }
+
+    const after = this.#terminalAccess().probe();
+    if (after === null || !sameTerminal(after, facts)) {
+      cleanupCold();
+      throw evidenceInvalid({
+        threadId,
+        turnId: null,
+        type: "founderDecision.resolved",
+        reason: "field-invalid",
+        issues: ["Founder resolution confirmation failed (controlling terminal changed)"],
+      });
+    }
+
+    try {
+      targetRecord.session.validateCandidate("founderDecision.resolved", resolvedPayload);
+    } catch (err) {
+      cleanupCold();
+      throw err;
+    }
+
+    if (coldHandle !== null) {
+      try {
+        this.#recoverDanglingTurns(targetRecord, coldDanglingTurnIds);
+      } catch (err) {
+        if (this.#poisoned.has(threadId)) this.#strayLocks.push(coldHandle);
+        else this.#releaseOrKeep(coldHandle);
+        throw err;
+      }
+      this.#threads.set(threadId, targetRecord);
+    }
+
+    let line: SessionEvent<"founderDecision.resolved">;
+    try {
+      line = targetRecord.session.append("founderDecision.resolved", resolvedPayload);
+    } catch (err) {
+      this.#notePoisoned(threadId, targetRecord.session);
+      throw err;
+    }
+    targetRecord.thread.updatedAt = Math.max(targetRecord.thread.updatedAt, line.ts);
+    return {
+      value: {
+        threadId,
+        decisionId: line.payload.decisionId,
+        seq: line.seq,
+        hash: line.hash,
+        outcome: line.payload.outcome,
+        resolution: line.payload.resolution,
+      },
+    };
   }
 
   // -------------------------------------------------------------------- seats
@@ -985,6 +1404,7 @@ export class EngineConnection {
     // lost lock is refused (-32004), never re-taken: the procedure appends to the source.
     const poisoned = this.#poisoned.get(threadId);
     if (poisoned !== undefined) throw sessionWriteFailed(threadId, poisoned.path, poisoned.seq);
+    if (this.#coldConfirmingLocks.has(threadId)) throw turnAlreadyActive(threadId, null);
     const record = this.#threads.get(threadId);
     if (record === undefined) {
       const holder = this.#liveLockHolder(threadId);
@@ -994,6 +1414,8 @@ export class EngineConnection {
     if (!holdsThreadLock(record.lock)) {
       throw turnAlreadyActive(threadId, null, this.#liveLockHolder(threadId) ?? undefined);
     }
+    if (record.activeTurnId !== null) throw turnAlreadyActive(threadId, record.activeTurnId);
+    if (record.confirming) throw turnAlreadyActive(threadId, null);
     if (record.session.broken) {
       throw sessionWriteFailed(threadId, record.session.path, record.session.nextSeq);
     }
@@ -1235,6 +1657,7 @@ export class EngineConnection {
     // or reloading (the poisoned check runs before any lock step).
     const poisoned = this.#poisoned.get(threadId);
     if (poisoned !== undefined) throw sessionWriteFailed(threadId, poisoned.path, poisoned.seq);
+    if (this.#coldConfirmingLocks.has(threadId)) throw turnAlreadyActive(threadId, null);
 
     const known = this.#threads.get(threadId);
     if (known !== undefined) {
@@ -1299,6 +1722,20 @@ export class EngineConnection {
    * `interrupted` by appending a `turn.end` event.
    */
   #loadColdThread(threadId: string, handle: LockHandle): ThreadRecord {
+    const { record, danglingTurnIds } = this.#openColdThread(threadId, handle);
+    this.#recoverDanglingTurns(record, danglingTurnIds);
+    return record;
+  }
+
+  /**
+   * Verify and rebuild a cold thread under its lock WITHOUT appending dangling-turn recovery yet.
+   * Used by `#decisionResolve` so integrity validation and operator confirmation happen before any
+   * byte is written to disk (F5).
+   */
+  #openColdThread(
+    threadId: string,
+    handle: LockHandle,
+  ): { record: ThreadRecord; danglingTurnIds: readonly string[] } {
     const path = confinedPath(this.#opts.home, "sessions", threadId, ".jsonl");
     // lstat, not existsSync: a dangling symlink is not "not found"; verification refuses it (-32603).
     try {
@@ -1367,41 +1804,13 @@ export class EngineConnection {
       // Amendment 2 §2: bound to this acquisition and to the verified byte size.
       { holdsLock: () => holdsThreadLock(handle), expectedSize: verifiedSize },
       {
-        // Amendment 3 rule 4: a close that fails after a durable batch is logged, not fatal.
+        // Amendment 3 rule 4: a close that fails after a durable append is logged, not fatal.
         onCloseFailed: (code) =>
           this.#log(`session ${threadId}: close failed after a durable append (${code})`),
       },
       // M2 (D-M2-A0-4): the writer holds the verified file as an index.
       SessionChainIndex.fromEvents(verified.events),
     );
-    if (rebuilt.danglingTurnIds.length > 0) {
-      // All dangling turns close in ONE append batch (Copilot r4107434889): either every
-      // `turn.end` is durable or none is (rolled back), so a failed reload / resume never leaves a
-      // partially recovered file. rebuildSession gives every dangling turn the same completedAt;
-      // that is the batch ts, and the thread's updatedAt covers the close.
-      const closedAt =
-        rebuilt.turns.find((t) => t.id === rebuilt.danglingTurnIds[0])?.completedAt ?? Date.now();
-      let events: SessionEvent[];
-      try {
-        events = session.appendAll(
-          rebuilt.danglingTurnIds.map((turnId) => ({
-            type: "turn.end" as const,
-            payload: { turnId, status: "interrupted" as const, error: null },
-          })),
-          closedAt,
-        );
-      } catch (err) {
-        // Amendment 3 item 1 "Poisoned inside a reload": if the rollback of this close batch
-        // failed, C2 adds the thread to #poisoned and rule 3's line is logged once. The request
-        // then answers the append's own -32009; the caller keeps the lock until exit (rule 3)
-        // instead of releasing it, and no record is kept.
-        this.#notePoisoned(threadId, session);
-        throw err;
-      }
-      for (const event of events) {
-        rebuilt.thread.updatedAt = Math.max(rebuilt.thread.updatedAt, event.ts);
-      }
-    }
     const turns = new Map<string, TurnRecord>();
     for (const turn of rebuilt.turns) {
       turns.set(turn.id, {
@@ -1412,19 +1821,59 @@ export class EngineConnection {
       });
     }
     return {
-      thread: rebuilt.thread,
-      lock: handle,
-      turns,
-      activeTurnId: null,
-      seat,
-      session,
-      // M1-A5: a presence confirmation never survives a reload; the next gated turn asks again.
-      confirmedTerminal: null,
-      confirming: false,
-      open,
-      // The link was checked above for this load; the first turn/start checks it again (§2.1).
-      handoffVerified: false,
+      record: {
+        thread: rebuilt.thread,
+        lock: handle,
+        turns,
+        activeTurnId: null,
+        seat,
+        session,
+        // M1-A5: a presence confirmation never survives a reload; the next gated turn asks again.
+        confirmedTerminal: null,
+        confirming: false,
+        open,
+        // The link was checked above for this load; the first turn/start checks it again (§2.1).
+        handoffVerified: false,
+      },
+      danglingTurnIds: rebuilt.danglingTurnIds,
     };
+  }
+
+  /**
+   * Append synthetic `turn.end` recovery records for any dangling turns found when opening a cold
+   * thread.
+   */
+  #recoverDanglingTurns(record: ThreadRecord, danglingTurnIds: readonly string[]): void {
+    if (danglingTurnIds.length === 0) return;
+    const threadId = record.thread.id;
+    // All dangling turns close in ONE append batch (Copilot r4107434889): either every
+    // `turn.end` is durable or none is (rolled back), so a failed reload / resume never leaves a
+    // partially recovered file. rebuildSession gives every dangling turn the same completedAt;
+    // that is the batch ts, and the thread's updatedAt covers the close.
+    const firstTurnId = danglingTurnIds[0];
+    const closedAt =
+      (firstTurnId !== undefined ? record.turns.get(firstTurnId)?.turn.completedAt : null) ??
+      Date.now();
+    let events: SessionEvent[];
+    try {
+      events = record.session.appendAll(
+        danglingTurnIds.map((turnId) => ({
+          type: "turn.end" as const,
+          payload: { turnId, status: "interrupted" as const, error: null },
+        })),
+        closedAt,
+      );
+    } catch (err) {
+      // Amendment 3 item 1 "Poisoned inside a reload": if the rollback of this close batch
+      // failed, C2 adds the thread to #poisoned and rule 3's line is logged once. The request
+      // then answers the append's own -32009; the caller keeps the lock until exit (rule 3)
+      // instead of releasing it, and no record is kept.
+      this.#notePoisoned(threadId, record.session);
+      throw err;
+    }
+    for (const event of events) {
+      record.thread.updatedAt = Math.max(record.thread.updatedAt, event.ts);
+    }
   }
 
   #threadList(params: unknown): ThreadListResult {
@@ -1700,9 +2149,16 @@ export class EngineConnection {
 
   // ----------------------------------------------------------------- presence
 
-  /** Lazily created so an engine that never gates a turn on presence never opens `/dev/tty`. */
+  /**
+   * Lazily created so an engine that never gates a turn or decision resolution on presence never
+   * opens `/dev/tty`. Only the live stdio server (`input === process.stdin`) falls back to the OS
+   * controlling terminal when `opts.terminal` is omitted; embedded / in-process engines without an
+   * explicit `terminal` fail closed rather than inheriting an ambient `/dev/tty` (F1).
+   */
   #terminalAccess(): PresenceTerminal {
-    this.#terminal ??= this.#opts.terminal ?? createSystemTerminal();
+    this.#terminal ??=
+      this.#opts.terminal ??
+      (this.#opts.input === process.stdin ? createSystemTerminal() : ABSENT_TERMINAL);
     return this.#terminal;
   }
 
@@ -1993,6 +2449,118 @@ export class EngineConnection {
           this.#notePoisoned(record.thread.id, record.session);
           this.#finishTurn(record, tr, "failed", err.toBody());
           return false;
+        }
+      },
+      raiseDecision: (decisionInput): TurnDecisionOutcome => {
+        // M2-A6 (F2): raise-only capability bound to the active thread/turn identity. Never grants
+        // `decision/resolve` or derives decisions from free text. Validation refusals (-32010)
+        // record a durable `error` item on the turn and return `{ ok: false, error }` without
+        // aborting the turn; write failures (-32009) poison and fail the turn just like `#persistItem`.
+        const recordRefusalItem = (err: RpcError): TurnDecisionOutcome => {
+          const errItem: Item = {
+            id: newId("item"),
+            kind: "error",
+            status: "completed",
+            message: err.message,
+            code: err.code,
+          };
+          sink.startItem(errItem);
+          sink.completeItem(errItem);
+          return {
+            ok: false,
+            error: {
+              code: err.code,
+              message: err.message,
+              ...(err.data === undefined ? {} : { data: err.data }),
+            },
+          };
+        };
+        if (!live()) {
+          const err = turnNotFound(turn.threadId, turn.id);
+          return {
+            ok: false,
+            error: {
+              code: err.code,
+              message: err.message,
+              ...(err.data === undefined ? {} : { data: err.data }),
+            },
+          };
+        }
+        if (
+          typeof decisionInput !== "object" ||
+          decisionInput === null ||
+          Array.isArray(decisionInput) ||
+          Object.getPrototypeOf(decisionInput) !== Object.prototype
+        ) {
+          return recordRefusalItem(
+            evidenceInvalid({
+              threadId: turn.threadId,
+              turnId: turn.id,
+              type: "founderDecision",
+              reason: "field-invalid",
+              issues: ["founderDecision input must be a JSON object"],
+            }),
+          );
+        }
+        const rawObj = decisionInput as Record<string, unknown>;
+        const decisionId =
+          Object.hasOwn(rawObj, "decisionId") && rawObj.decisionId !== undefined
+            ? rawObj.decisionId
+            : newId("dec");
+        // F2/F3: preserve caller-owned keys (including own `"__proto__"`) with `Object.fromEntries`
+        // while binding `decisionId` and the active `turnId` from the engine. Any caller-supplied
+        // `turnId` is mapped to `"__caller_turnId__"` so `checkV2Payload` rejects it under D-439
+        // alongside any caller-supplied `threadId`.
+        const rawEntries = Object.entries(rawObj)
+          .filter(([k]) => k !== "decisionId")
+          .map(([k, v]): [string, unknown] => (k === "turnId" ? ["__caller_turnId__", v] : [k, v]));
+        const candidate: Record<string, unknown> = Object.fromEntries([
+          ...rawEntries,
+          ["decisionId", decisionId],
+          ["turnId", turn.id],
+        ]);
+        const faults = checkV2Payload("founderDecision", candidate);
+        const firstFault = faults[0];
+        if (firstFault !== undefined) {
+          return recordRefusalItem(
+            evidenceInvalid({
+              threadId: turn.threadId,
+              turnId: turn.id,
+              type: "founderDecision",
+              reason: firstFault.reason,
+              issues: faults.map((f) => f.issue),
+            }),
+          );
+        }
+        try {
+          const payload = candidate as FounderDecisionPayload;
+          const line = record.session.append("founderDecision", payload);
+          record.thread.updatedAt = Math.max(record.thread.updatedAt, line.ts);
+          return {
+            ok: true,
+            decision: {
+              threadId: turn.threadId,
+              turnId: turn.id,
+              decisionId: payload.decisionId,
+              seq: line.seq,
+              hash: line.hash,
+            },
+          };
+        } catch (err) {
+          if (!(err instanceof RpcError)) throw err;
+          if (err.code === ErrorCode.EvidenceInvalid) {
+            return recordRefusalItem(err);
+          }
+          this.#notePoisoned(record.thread.id, record.session);
+          this.#finishTurn(record, tr, "failed", err.toBody());
+          return {
+            ok: false,
+            error: {
+              code: err.code,
+              message: err.message,
+              ...(err.data === undefined ? {} : { data: err.data }),
+            },
+          };
         }
       },
     };

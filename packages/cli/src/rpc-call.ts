@@ -37,7 +37,7 @@ export type EngineCallOptions = {
   /** Merged over `process.env` for the child (`undefined` removes a variable). */
   readonly env: Record<string, string | undefined>;
   readonly clientName: string;
-  readonly method: "provider/list" | "seat/list";
+  readonly method: "provider/list" | "seat/list" | "decision/list";
   /** Hard deadline for the whole exchange (initialize + request + cleanup). */
   readonly budgetMs: number;
   readonly sig?: EngineCallSignal;

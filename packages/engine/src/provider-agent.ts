@@ -619,6 +619,7 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
             signal: sink.signal,
             onTextDelta: (delta) => sink.delta(id, delta),
             onToolEvent: toolItems.onToolEvent,
+            ...(sink.raiseDecision === undefined ? {} : { raiseDecision: sink.raiseDecision }),
           });
         } catch (err) {
           if (sink.signal.aborted) return;

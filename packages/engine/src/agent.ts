@@ -1,7 +1,7 @@
 import type { Presence } from "./presence/policy.ts";
 import type { Item, TurnMode, UserInput } from "./protocol/types.ts";
 import type { EngineSeat } from "./seat.ts";
-import type { FallbackRejectedPayload, RepoDecisionPayload } from "./session-store.ts";
+import type { EvidenceRef, FallbackRejectedPayload, RepoDecisionPayload } from "./session-store.ts";
 
 /** What `preflight` sees: the turn has not been created yet. */
 export type TurnPreflightContext = {
@@ -35,6 +35,43 @@ export type TurnPreflightContext = {
 export type AgentTurnContext = TurnPreflightContext & {
   readonly turnId: string;
 };
+
+/**
+ * M2-A6 (`docs/plan/PIN-madc-M2-founder-decision-inbox.md` §4.1): typed input for an executing
+ * seat to raise a `founderDecision` during an active turn. The engine binds the active `threadId`
+ * and `turnId` and mints `dec_<32 lowercase hex>` when `decisionId` is omitted.
+ */
+export type TurnDecisionInput = {
+  readonly decisionId?: string;
+  readonly question: string;
+  readonly recommendedDefault: string;
+  readonly evidenceRefs: readonly EvidenceRef[];
+};
+
+/**
+ * M2-A6: synchronous outcome of `TurnSink.raiseDecision`. On `-32010` (`EvidenceInvalid`),
+ * nothing is appended to `founderDecision`, an `error` item (`code: -32010`) is recorded on the
+ * active turn, and the turn continues.
+ */
+export type TurnDecisionOutcome =
+  | {
+      readonly ok: true;
+      readonly decision: {
+        readonly threadId: string;
+        readonly turnId: string;
+        readonly decisionId: string;
+        readonly seq: number;
+        readonly hash: string;
+      };
+    }
+  | {
+      readonly ok: false;
+      readonly error: {
+        readonly code: number;
+        readonly message: string;
+        readonly data?: Record<string, unknown>;
+      };
+    };
 
 /**
  * Item stream for one turn. The engine owns ids, ordering, and notifications; after the turn ends
@@ -71,6 +108,14 @@ export type TurnSink = {
    * pre-M1-A4 fake sinks stay valid; a sink without the method is treated as "recorded".
    */
   repoDecision?(payload: RepoDecisionPayload): boolean;
+  /**
+   * M2-A6 (`docs/plan/PIN-madc-M2-founder-decision-inbox.md` §4.1): engine-controlled capability
+   * for an executing seat to raise a typed `founderDecision` during the active turn. Uses the
+   * active thread and turn identity, validates through the thread's `SessionWriter`, emits a
+   * `-32010` `error` item and permits the turn to continue on validation refusal, and never grants
+   * `decision/resolve`.
+   */
+  raiseDecision?(input: TurnDecisionInput): TurnDecisionOutcome;
 };
 
 /**

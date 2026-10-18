@@ -4,6 +4,7 @@
  * parsers accept it either way.
  */
 import type { ProviderStatus } from "@madc/registry";
+import type { EvidenceRef, FounderDecisionResolutionOutcome } from "../session-v2.ts";
 
 /** P1: the M1-only methods of §3.5 exist only under `madc-m1/1`; all M0 methods and codes are unchanged. */
 export const PROTOCOL_VERSION = "madc-m1/1" as const;
@@ -192,6 +193,59 @@ export type ThreadHandoffResult = {
   targetGenesisHash: string;
 };
 
+/**
+ * M2 Founder Decision Inbox pin §4 (`docs/plan/PIN-madc-M2-founder-decision-inbox.md`): typed
+ * `founderDecision` raise on a loaded thread, read-only open-decision scan across verified session
+ * files in `$MADC_HOME/sessions`, and append-only Founder resolution under the thread lock.
+ */
+export type DecisionRaiseParams = {
+  threadId: string;
+  turnId: string;
+  decisionId?: string;
+  question: string;
+  recommendedDefault: string;
+  evidenceRefs: EvidenceRef[];
+};
+export type DecisionRaiseResult = {
+  threadId: string;
+  decisionId: string;
+  seq: number;
+  hash: string;
+};
+
+export type OpenDecisionSummary = {
+  readonly threadId: string;
+  readonly seatId: string;
+  readonly seq: number;
+  readonly hash: string;
+  readonly ts: number;
+  readonly decisionId: string;
+  readonly turnId: string;
+  readonly question: string;
+  readonly recommendedDefault: string;
+  readonly evidenceRefs: readonly EvidenceRef[];
+};
+
+export type DecisionListParams = Record<string, never>;
+export type DecisionListResult = { data: OpenDecisionSummary[] };
+
+export type DecisionResolveParams = {
+  threadId: string;
+  decisionId: string;
+  decisionSeq: number;
+  decisionHash: string;
+  outcome: FounderDecisionResolutionOutcome;
+  resolution?: string;
+};
+export type DecisionResolveResult = {
+  threadId: string;
+  decisionId: string;
+  seq: number;
+  hash: string;
+  outcome: FounderDecisionResolutionOutcome;
+  resolution: string;
+};
+
 /** P3: `mode` is optional; absent means `headless` (fail-closed). */
 export type TurnStartParams = { threadId: string; input: UserInput[]; mode?: TurnMode };
 export type TurnStartResult = { turn: Turn };
@@ -301,7 +355,8 @@ export type ProviderListResult = { data: ProviderSummary[] };
 /**
  * Client → server requests (complete M0 list plus the M1 §3.5 methods: `seat/list`,
  * `provider/list`, `auth/status`, `auth/remove`; plus `thread/handoff`, the one method the M2
- * handoff procedure pin authorizes — `protocolVersion` is unchanged, see that pin §2).
+ * handoff procedure pin authorizes, and `decision/raise`, `decision/list`, `decision/resolve` from
+ * the M2 Founder Decision Inbox pin — `protocolVersion` is unchanged, D-M2-7).
  */
 export type ClientRequests = {
   initialize: { params: InitializeParams; result: InitializeResult };
@@ -316,6 +371,10 @@ export type ClientRequests = {
   "auth/remove": { params: AuthRemoveParams; result: AuthRemoveResult };
   /** M2 handoff procedure pin: the one method that pin authorizes. */
   "thread/handoff": { params: ThreadHandoffParams; result: ThreadHandoffResult };
+  /** M2 Founder Decision Inbox pin: raise, list, and resolve Founder decisions. */
+  "decision/raise": { params: DecisionRaiseParams; result: DecisionRaiseResult };
+  "decision/list": { params: DecisionListParams; result: DecisionListResult };
+  "decision/resolve": { params: DecisionResolveParams; result: DecisionResolveResult };
 };
 
 export type ClientRequestMethod = keyof ClientRequests;
@@ -358,14 +417,17 @@ export const CLIENT_REQUEST_METHODS: readonly ClientRequestMethod[] = Object.fre
   "auth/status",
   "auth/remove",
   "thread/handoff",
+  "decision/raise",
+  "decision/list",
+  "decision/resolve",
 ]);
 
 /**
  * Declared top-level params fields per request method (M1-A2 schema test, protocol pin §3.5: "No
  * `auth/set` over JSONL … No JSONL method accepts a secret value"). Keys are exactly
- * `CLIENT_REQUEST_METHODS`; no field may carry a secret. `seat/list` and `provider/list` are the two
- * methods the pin gives empty params (`{}`), so they declare no field — an empty list there is the
- * pinned shape, not a missing declaration.
+ * `CLIENT_REQUEST_METHODS`; no field may carry a secret. `seat/list`, `provider/list` and
+ * `decision/list` are the methods the pins give empty params (`{}`), so they declare no field — an
+ * empty list there is the pinned shape, not a missing declaration.
  */
 export const CLIENT_REQUEST_PARAM_FIELDS: Readonly<Record<ClientRequestMethod, readonly string[]>> =
   Object.freeze({
@@ -380,6 +442,23 @@ export const CLIENT_REQUEST_PARAM_FIELDS: Readonly<Record<ClientRequestMethod, r
     "auth/status": ["providerId"],
     "auth/remove": ["providerId"],
     "thread/handoff": ["threadId", "targetSeatId", "brief", "turnId"],
+    "decision/raise": [
+      "threadId",
+      "turnId",
+      "decisionId",
+      "question",
+      "recommendedDefault",
+      "evidenceRefs",
+    ],
+    "decision/list": [],
+    "decision/resolve": [
+      "threadId",
+      "decisionId",
+      "decisionSeq",
+      "decisionHash",
+      "outcome",
+      "resolution",
+    ],
   });
 
 // ---------------------------------------------------------------------------

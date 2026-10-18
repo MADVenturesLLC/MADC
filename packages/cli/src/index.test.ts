@@ -94,25 +94,42 @@ test("A7 §1 usage errors: bare text is reserved for M1 chat; unknown flag, -s w
   assert.equal(parseArgs(["doctor", "-s", "x"]).kind, "usage");
 });
 
-test("M1-A8 grammar: providers ls / seats ls [--json]; nothing else is accepted around them", () => {
+test("M1-A8 / M2-A6 grammar: providers ls / seats ls / decisions ls [--json]; nothing else is accepted around them", () => {
   assert.deepEqual(parseArgs(["providers", "ls"]), { kind: "providers-ls", json: false });
   assert.deepEqual(parseArgs(["--json", "providers", "ls"]), { kind: "providers-ls", json: true });
   assert.deepEqual(parseArgs(["seats", "ls", "--json"]), { kind: "seats-ls", json: true });
+  assert.deepEqual(parseArgs(["decisions", "ls"]), { kind: "decisions-ls", json: false });
+  assert.deepEqual(parseArgs(["decisions", "ls", "--json"]), { kind: "decisions-ls", json: true });
+  assert.deepEqual(parseArgs(["--json", "decisions", "ls"]), { kind: "decisions-ls", json: true });
   assert.deepEqual(parseArgs(["providers"]), {
     kind: "usage",
     message: "providers needs a subcommand: ls",
+  });
+  assert.deepEqual(parseArgs(["decisions"]), {
+    kind: "usage",
+    message: "decisions needs a subcommand: ls",
   });
   // An unknown subcommand is never echoed (it could be anything pasted on the command line).
   assert.deepEqual(parseArgs(["seats", "sk-not-a-subcommand"]), {
     kind: "usage",
     message: "unknown seats subcommand (expected ls)",
   });
+  assert.deepEqual(parseArgs(["decisions", "sk-not-a-subcommand"]), {
+    kind: "usage",
+    message: "unknown decisions subcommand (expected ls)",
+  });
   assert.deepEqual(parseArgs(["providers", "ls", "extra"]), {
     kind: "usage",
     message: "unexpected argument extra",
   });
+  assert.deepEqual(parseArgs(["decisions", "ls", "extra"]), {
+    kind: "usage",
+    message: "unexpected argument extra",
+  });
   assert.equal(parseArgs(["providers", "ls", "-s", "x"]).kind, "usage");
+  assert.equal(parseArgs(["decisions", "ls", "-s", "x"]).kind, "usage");
   assert.equal(parseArgs(["seats", "ls", "--init"]).kind, "usage");
+  assert.equal(parseArgs(["decisions", "ls", "--init"]).kind, "usage");
   // `-p` keeps the one-shot's own rule for stray positionals (M0 bytes unchanged).
   assert.deepEqual(parseArgs(["-p", "hi", "providers", "ls"]), {
     kind: "usage",

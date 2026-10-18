@@ -104,6 +104,23 @@ export type FounderDecisionPayload = {
   evidenceRefs: EvidenceRef[];
 };
 
+export type FounderDecisionResolutionOutcome = "accepted-default" | "decided";
+export const FOUNDER_DECISION_OUTCOMES: readonly FounderDecisionResolutionOutcome[] = Object.freeze(
+  ["accepted-default", "decided"],
+);
+
+/** M2 Founder-decision-inbox pin §3: append-only resolution of an earlier `founderDecision`. */
+export type FounderDecisionResolvedPayload = {
+  decisionId: string;
+  /** seq of the `founderDecision` line in this file. */
+  decisionSeq: number;
+  /** hash of that `founderDecision` line, 64 lowercase hex. */
+  decisionHash: string;
+  outcome: FounderDecisionResolutionOutcome;
+  /** The Founder's resolution text, verbatim; non-empty after trim. */
+  resolution: string;
+};
+
 // ------------------------------------------------------------- §4 reserved (M4)
 
 /** §4.1: defined here, not stored — no engine writes it before the M4 pin. */
@@ -132,13 +149,19 @@ export type ToolCallReceiptPayload = {
   reason: string | null;
 };
 
-/** The four §2 event types this act's writer can append. */
-export type V2EventType = "handoff.out" | "handoff.link" | "handoff.aborted" | "founderDecision";
+/** The §2 event types (plus M2-A6's `founderDecision.resolved`) the v2 writer can append. */
+export type V2EventType =
+  | "handoff.out"
+  | "handoff.link"
+  | "handoff.aborted"
+  | "founderDecision"
+  | "founderDecision.resolved";
 export const V2_EVENT_TYPES: readonly V2EventType[] = Object.freeze([
   "handoff.out",
   "handoff.link",
   "handoff.aborted",
   "founderDecision",
+  "founderDecision.resolved",
 ]);
 
 /**
@@ -211,6 +234,9 @@ function field(
   else if (!ok(p[name])) out.push(invalid(label, why));
 }
 
+const SESSION_REF_KEYS: readonly string[] = ["kind", "path", "seq", "hash"];
+const GIT_REF_KEYS: readonly string[] = ["kind", "sha", "remote"];
+
 /** §3 well-formedness of one `EvidenceRef` (every fault is `evidence-ref-invalid`). */
 export function checkEvidenceRef(ref: unknown, where: string): ShapeIssue[] {
   const bad = (why: string): ShapeIssue => ({
@@ -226,6 +252,10 @@ export function checkEvidenceRef(ref: unknown, where: string): ShapeIssue[] {
     }
     if (!isSeq(ref.seq)) out.push(bad("seq must be a non-negative integer"));
     if (!isHex64(ref.hash)) out.push(bad("hash must be 64 lowercase hex"));
+    // D-439 (M2-A6 pin §2): closed key set; never echo the caller key (Argus F1).
+    if (Object.keys(ref).some((k) => ref[k] !== undefined && !SESSION_REF_KEYS.includes(k))) {
+      out.push(bad("has a key outside kind, path, seq and hash"));
+    }
     return out;
   }
   if (kind === "git") {
@@ -233,6 +263,9 @@ export function checkEvidenceRef(ref: unknown, where: string): ShapeIssue[] {
     if (!present(ref, "remote")) out.push(bad("remote is required (null allowed)"));
     else if (ref.remote !== null && !isNormalizedRemote(ref.remote)) {
       out.push(bad("remote must be a normalized remote or null"));
+    }
+    if (Object.keys(ref).some((k) => ref[k] !== undefined && !GIT_REF_KEYS.includes(k))) {
+      out.push(bad("has a key outside kind, sha and remote"));
     }
     return out;
   }
@@ -360,6 +393,14 @@ function checkHandoffAborted(p: Record<string, unknown>): ShapeIssue[] {
   return out;
 }
 
+const FOUNDER_DECISION_KEYS: readonly string[] = [
+  "decisionId",
+  "turnId",
+  "question",
+  "recommendedDefault",
+  "evidenceRefs",
+];
+
 function checkFounderDecision(p: Record<string, unknown>): ShapeIssue[] {
   const out: ShapeIssue[] = [];
   // Evidence first (§2.3 "Evidence or nothing"): absent or empty is its own pinned reason.
@@ -375,6 +416,49 @@ function checkFounderDecision(p: Record<string, unknown>): ShapeIssue[] {
   field(p, "turnId", isValidId, "must match the id grammar", out);
   field(p, "question", isNonEmpty, "must be a non-empty string", out);
   field(p, "recommendedDefault", isNonEmpty, "must be a non-empty string", out);
+  // D-439 (M2-A6 pin §2): closed key set; never echo the caller key (Argus F1).
+  if (Object.keys(p).some((k) => p[k] !== undefined && !FOUNDER_DECISION_KEYS.includes(k))) {
+    out.push(
+      invalid(
+        "founderDecision",
+        "has a key outside decisionId, turnId, question, recommendedDefault and evidenceRefs",
+      ),
+    );
+  }
+  return out;
+}
+
+const FOUNDER_DECISION_RESOLVED_KEYS: readonly string[] = [
+  "decisionId",
+  "decisionSeq",
+  "decisionHash",
+  "outcome",
+  "resolution",
+];
+
+export function checkFounderDecisionResolved(p: Record<string, unknown>): ShapeIssue[] {
+  const out: ShapeIssue[] = [];
+  field(p, "decisionId", isValidId, "must match the id grammar", out);
+  field(p, "decisionSeq", isSeq, "must be a non-negative integer", out);
+  field(p, "decisionHash", isHex64, "must be 64 lowercase hex", out);
+  field(
+    p,
+    "outcome",
+    (v) => (FOUNDER_DECISION_OUTCOMES as readonly unknown[]).includes(v),
+    `must be one of ${FOUNDER_DECISION_OUTCOMES.join(", ")}`,
+    out,
+  );
+  field(p, "resolution", isNonEmpty, "must be a non-empty string", out);
+  if (
+    Object.keys(p).some((k) => p[k] !== undefined && !FOUNDER_DECISION_RESOLVED_KEYS.includes(k))
+  ) {
+    out.push(
+      invalid(
+        "founderDecision.resolved",
+        "has a key outside decisionId, decisionSeq, decisionHash, outcome and resolution",
+      ),
+    );
+  }
   return out;
 }
 
@@ -474,6 +558,8 @@ export function checkV2Payload(
       return checkHandoffAborted(p);
     case "founderDecision":
       return checkFounderDecision(p);
+    case "founderDecision.resolved":
+      return checkFounderDecisionResolved(p);
     case "memory.write":
       return checkMemoryWrite(p, ctx);
     case "tool.call":
@@ -488,6 +574,12 @@ export function checkV2Payload(
 /** What the index keeps per chained line: enough to resolve a same-file `EvidenceRef`. */
 export type ChainLine = { readonly hash: string; readonly type: string };
 export type HandoffState = "open" | "linked" | "aborted";
+export type DecisionChainEntry = {
+  readonly seq: number;
+  readonly hash: string;
+  readonly recommendedDefault: string;
+  readonly resolved: boolean;
+};
 
 /**
  * D-M2-A0-4: the writer holds the verified file, so it can resolve a same-file ref, refuse a
@@ -498,7 +590,7 @@ export type HandoffState = "open" | "linked" | "aborted";
 export class SessionChainIndex {
   readonly #lines: ChainLine[] = [];
   readonly #handoffs = new Map<string, HandoffState>();
-  readonly #decisions = new Set<string>();
+  readonly #decisions = new Map<string, DecisionChainEntry>();
   /** Every `turnId` a `turn.start` in this file named (a `founderDecision` must name one, P9). */
   readonly #turns = new Set<string>();
   /** `undefined` while no `session.open` was noted, or the open is a v1 line (no `worktree` key). */
@@ -525,7 +617,7 @@ export class SessionChainIndex {
     const copy = new SessionChainIndex();
     copy.#lines.push(...this.#lines);
     for (const [id, state] of this.#handoffs) copy.#handoffs.set(id, state);
-    for (const id of this.#decisions) copy.#decisions.add(id);
+    for (const [id, entry] of this.#decisions) copy.#decisions.set(id, entry);
     for (const id of this.#turns) copy.#turns.add(id);
     // Argus G2: the copy gets its own frozen worktree, never the caller's or this index's object.
     const w = this.#openWorktree;
@@ -551,6 +643,10 @@ export class SessionChainIndex {
 
   hasDecision(decisionId: string): boolean {
     return this.#decisions.has(decisionId);
+  }
+
+  decisionAt(decisionId: string): DecisionChainEntry | undefined {
+    return this.#decisions.get(decisionId);
   }
 
   /** Whether a `turn.start` in this file named `turnId` (pin §2.3 "the turn that raised it"). */
@@ -582,6 +678,7 @@ export class SessionChainIndex {
    * that mutated it could otherwise make a forged hash resolve at write time.
    */
   note(e: { readonly type: string; readonly hash: string; readonly payload: unknown }): void {
+    const seq = this.#lines.length;
     this.#lines.push(Object.freeze({ hash: e.hash, type: e.type }));
     const p = isPlainRecord(e.payload) ? e.payload : {};
     switch (e.type) {
@@ -613,7 +710,30 @@ export class SessionChainIndex {
         if (isStr(p.handoffId)) this.#handoffs.set(p.handoffId, "aborted");
         break;
       case "founderDecision":
-        if (isStr(p.decisionId)) this.#decisions.add(p.decisionId);
+        if (isStr(p.decisionId) && !this.#decisions.has(p.decisionId)) {
+          this.#decisions.set(
+            p.decisionId,
+            Object.freeze({
+              seq,
+              hash: e.hash,
+              recommendedDefault: isStr(p.recommendedDefault) ? p.recommendedDefault : "",
+              resolved: false,
+            }),
+          );
+        }
+        break;
+      case "founderDecision.resolved":
+        if (isStr(p.decisionId)) {
+          const prev = this.#decisions.get(p.decisionId);
+          if (
+            prev !== undefined &&
+            !prev.resolved &&
+            p.decisionSeq === prev.seq &&
+            p.decisionHash === prev.hash
+          ) {
+            this.#decisions.set(p.decisionId, Object.freeze({ ...prev, resolved: true }));
+          }
+        }
         break;
       case "turn.start":
         this.#turnStarts++;
@@ -754,7 +874,7 @@ export function validateForWrite(
         issues.push(invalid("decisionId", "is already used in this file"));
       }
       // Argus P9 (turnId part; pin §2.3 `:178` "the turn that raised it"): the decision must name
-      // a turn this file started. The key-set part of P9 waits on a pin row (follow-up §(b)).
+      // a turn this file started.
       if (!index.hasTurn(p.turnId as string)) {
         issues.push(invalid("turnId", "names no turn.start in this file"));
       }
@@ -765,6 +885,30 @@ export function validateForWrite(
           index,
         ),
       );
+      break;
+    }
+    case "founderDecision.resolved": {
+      const id = p.decisionId as string;
+      const d = index.decisionAt(id);
+      if (d === undefined) {
+        issues.push(invalid("decisionId", "has no founderDecision in this file"));
+      } else if (d.resolved) {
+        issues.push(invalid("decisionId", "already has a founderDecision.resolved in this file"));
+      } else {
+        if (p.decisionSeq !== d.seq) {
+          issues.push(invalid("decisionSeq", "differs from the founderDecision line"));
+        }
+        if (p.decisionHash !== d.hash) {
+          issues.push(invalid("decisionHash", "differs from the founderDecision line"));
+        }
+        if (
+          p.outcome === "accepted-default" &&
+          d.recommendedDefault !== "" &&
+          p.resolution !== d.recommendedDefault
+        ) {
+          issues.push(invalid("resolution", "differs from the founderDecision recommendedDefault"));
+        }
+      }
       break;
     }
     case "session.close": {
@@ -823,6 +967,10 @@ export function structuralView(type: string, payload: unknown): unknown {
       const { question: _q, recommendedDefault: _r, ...rest } = p;
       return rest;
     }
+    case "founderDecision.resolved": {
+      const { resolution: _r, ...rest } = p;
+      return rest;
+    }
     case "handoff.link":
       return p;
     default:
@@ -865,6 +1013,13 @@ const PINNED_STRUCTURAL_KEYS: Readonly<Record<string, ReadonlySet<string>>> = {
     "hash",
     "sha",
     "remote",
+  ]),
+  "founderDecision.resolved": new Set([
+    "decisionId",
+    "decisionSeq",
+    "decisionHash",
+    "outcome",
+    "resolution",
   ]),
 };
 const EXTRA_KEY = "<extra key>";

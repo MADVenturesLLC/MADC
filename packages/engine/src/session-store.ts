@@ -32,7 +32,9 @@ import { isValidId } from "./protocol/ids.ts";
 import type { Item, RpcErrorBody, Thread, Turn, TurnMode, TurnStatus } from "./protocol/types.ts";
 import {
   checkV2Payload,
+  type DecisionChainEntry,
   type FounderDecisionPayload,
+  type FounderDecisionResolvedPayload,
   type HandoffAbortedPayload,
   type HandoffLinkPayload,
   type HandoffOutPayload,
@@ -141,8 +143,11 @@ export type RepoDecisionPayload = {
 export type SessionClosePayload = { reason: string; worktree?: WorktreeIdentity | null };
 
 export type {
+  DecisionChainEntry,
   EvidenceRef,
   FounderDecisionPayload,
+  FounderDecisionResolutionOutcome,
+  FounderDecisionResolvedPayload,
   HandoffAbortedPayload,
   HandoffAbortReason,
   HandoffLinkPayload,
@@ -153,7 +158,11 @@ export type {
   ToolCallReceiptPayload,
   WorktreeIdentity,
 } from "./session-v2.ts";
-export { RESERVED_EVENT_TYPES, SessionChainIndex } from "./session-v2.ts";
+export {
+  FOUNDER_DECISION_OUTCOMES,
+  RESERVED_EVENT_TYPES,
+  SessionChainIndex,
+} from "./session-v2.ts";
 
 export type SessionPayloads = {
   "session.open": SessionOpenPayload;
@@ -170,6 +179,7 @@ export type SessionPayloads = {
   "handoff.link": HandoffLinkPayload;
   "handoff.aborted": HandoffAbortedPayload;
   founderDecision: FounderDecisionPayload;
+  "founderDecision.resolved": FounderDecisionResolvedPayload;
 };
 export type SessionEventType = keyof SessionPayloads;
 /** The WRITABLE set. A reserved M4 name entering it before the M4 pin fails the §10 item 8 guard. */
@@ -186,6 +196,7 @@ export const SESSION_EVENT_TYPES: readonly SessionEventType[] = Object.freeze([
   "handoff.link",
   "handoff.aborted",
   "founderDecision",
+  "founderDecision.resolved",
 ]);
 
 export type SessionEvent<T extends SessionEventType = SessionEventType> = {
@@ -803,6 +814,11 @@ export class SessionWriter {
     return this.#index.lineAt(seq);
   }
 
+  /** Indexed `founderDecision` facts for `decisionId` in this file, or `undefined` (M2-A6). */
+  decisionAt(decisionId: string): DecisionChainEntry | undefined {
+    return this.#index.decisionAt(decisionId);
+  }
+
   get broken(): boolean {
     return this.#broken;
   }
@@ -827,6 +843,39 @@ export class SessionWriter {
     ts: number = Date.now(),
   ): SessionEvent<T> {
     return this.appendAll([{ type, payload }], ts)[0] as SessionEvent<T>;
+  }
+
+  /**
+   * M2-A6 (F5 / F1): validate one candidate event against this writer's chain index and redactor
+   * without opening the file, writing any bytes, or advancing `seq`. Throws `-32010`
+   * (`EvidenceInvalid`) on any write-side or structural-redaction fault.
+   */
+  validateCandidate<T extends SessionEventType>(type: T, payload: SessionPayloads[T]): void {
+    const refusal = validateForWrite(type, payload, {
+      threadId: this.threadId,
+      seatId: this.seatId,
+      index: this.#index,
+    });
+    if (refusal !== null) {
+      throw evidenceInvalid({
+        threadId: this.threadId,
+        turnId: this.#echoableTurnId(payload),
+        type,
+        reason: refusal.reason,
+        issues: refusal.issues,
+      });
+    }
+    const redact = createRedactor(this.#secrets());
+    const structural = redactionRefusal(type, payload, redact(payload));
+    if (structural !== null) {
+      throw evidenceInvalid({
+        threadId: this.threadId,
+        turnId: this.#echoableTurnId(payload),
+        type,
+        reason: structural.reason,
+        issues: structural.issues,
+      });
+    }
   }
 
   /**
@@ -1232,6 +1281,7 @@ export function v2LineIssue(
     case "handoff.link":
     case "handoff.aborted":
     case "founderDecision":
+    case "founderDecision.resolved":
     case "memory.write":
     case "tool.call":
       return checkV2Payload(type, payload, { seatId: ctx.seatId }).length === 0
@@ -1411,6 +1461,7 @@ function checkPayload(
     case "handoff.link":
     case "handoff.aborted":
     case "founderDecision":
+    case "founderDecision.resolved":
     case "memory.write":
     case "tool.call":
       return v2LineIssue(type, p, ctx);
