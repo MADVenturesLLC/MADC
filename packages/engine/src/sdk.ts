@@ -50,6 +50,9 @@ export { resolveMadcHome, sessionsOwnerReadUnsupported } from "./home.ts";
 export {
   type HomeReport,
   inspectMadcHome,
+  inspectRoom,
+  type RoomReport,
+  type RoomThreadRow,
   type SeatReport,
   type SessionFinding,
   type SessionFindingCode,

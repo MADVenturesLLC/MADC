@@ -20,9 +20,12 @@ import { MADC_VERSION } from "@madc/core";
 import {
   checkEvidenceRef,
   type EvidenceRef,
+  inspectRoom,
   isValidId,
   type OpenDecisionSummary,
   PROTOCOL_VERSION,
+  type RoomReport,
+  type RoomThreadRow,
   resolveMadcHome,
   type SeatSummary,
 } from "@madc/engine/client";
@@ -60,7 +63,7 @@ function installSignals(): { sig: ListSignal; remove: () => void } {
   };
 }
 
-type ListKind = "providers" | "seats" | "decisions";
+type ListKind = "providers" | "seats" | "decisions" | "room";
 
 /** The one `--json` object for a failed listing: the same keys as success, the list `null`. */
 function failureJson(
@@ -488,4 +491,72 @@ export async function runDecisionsLs(io: CliIO, json: boolean): Promise<number> 
   } finally {
     remove();
   }
+}
+
+function handoffLabel(row: RoomThreadRow): string {
+  const inPart = row.handoff.inbound === null ? "-" : `in:${row.handoff.inbound.sourceSeatId}`;
+  const outPart = row.handoff.outboundCount > 0 ? `out:${row.handoff.outboundCount}` : "-";
+  const oneWay = row.handoff.oneWay ? " (one-way)" : "";
+  return `${inPart}/${outPart}${oneWay}`;
+}
+
+function worktreeLabel(row: RoomThreadRow): string {
+  if (row.worktree.open === null) return "-";
+  const head = row.worktree.close?.head ?? row.worktree.open.head;
+  const sha = head === null ? "unborn" : head.slice(0, 7);
+  return row.worktree.missing ? `${sha} (missing)` : sha;
+}
+
+export function renderRoomTable(room: RoomReport): string[] {
+  if (room.threads.length === 0) return ["no threads in room"];
+  const lines: string[] = [];
+  for (const row of room.threads) {
+    const level = row.level.toUpperCase().padEnd(4);
+    const seat = stripControls(row.seatId ?? "-");
+    const chain = row.chain.ok ? "ok" : `broken(line ${row.chain.line})`;
+    const ho = stripControls(handoffLabel(row));
+    const wt = stripControls(worktreeLabel(row));
+    const dec = `${row.openDecisions.length} dec`;
+    const codes =
+      row.findings.length === 0 ? "" : `  [${row.findings.map((f) => f.code).join(", ")}]`;
+    lines.push(
+      `${level}  ${row.threadId}  seat:${seat}  chain:${chain}  ho:${ho}  wt:${wt}  ${dec}${codes}`,
+    );
+  }
+  return lines;
+}
+
+export async function runRoom(io: CliIO, json: boolean): Promise<number> {
+  const early = takeEarlySignal();
+  if (early !== null) return interrupted(io, json, "room", early);
+  let home: string;
+  try {
+    home = resolveMadcHome(io.env as NodeJS.ProcessEnv);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    return fail(io, json, "room", EXIT.usage, { code: null, message, class: "usage" });
+  }
+  const state = classifyHomePath(home);
+  if (state.kind === "not-directory" || state.kind === "invalid") {
+    const message =
+      state.kind === "invalid" ? state.message : `MADC_HOME ${home} exists but is not a directory`;
+    return fail(io, json, "room", EXIT.usage, { code: null, message, class: "usage" }, home);
+  }
+  const room = inspectRoom(home);
+  if (json) {
+    io.stdout.write(
+      `${JSON.stringify({
+        ok: true,
+        exitCode: EXIT.ok,
+        madcVersion: MADC_VERSION,
+        protocolVersion: PROTOCOL_VERSION,
+        home,
+        room,
+        error: null,
+      })}\n`,
+    );
+    return EXIT.ok;
+  }
+  for (const line of renderRoomTable(room)) io.stdout.write(`${line}\n`);
+  return EXIT.ok;
 }

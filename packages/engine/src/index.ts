@@ -58,6 +58,9 @@ export {
 export {
   type HomeReport,
   inspectMadcHome,
+  inspectRoom,
+  type RoomReport,
+  type RoomThreadRow,
   type SeatReport,
   type SessionReport,
 } from "./inspect.ts";

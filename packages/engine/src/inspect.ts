@@ -4,13 +4,15 @@
  */
 import { lstatSync, readdirSync, realpathSync } from "node:fs";
 import { join } from "node:path";
-import { inspectSessionV2, type SessionFinding } from "./handoff.ts";
+import { openDecisionsInChain } from "./decisions.ts";
+import { inspectSessionV2, type SessionFinding, type SessionFindingLevel } from "./handoff.ts";
 import { isStrictlyUnder } from "./home.ts";
 import { RpcError } from "./protocol/errors.ts";
 import { isValidId } from "./protocol/ids.ts";
-import { DEFAULT_SEAT_ID } from "./protocol/types.ts";
+import { DEFAULT_SEAT_ID, type OpenDecisionSummary } from "./protocol/types.ts";
 import { loadSeat, seatFilePath } from "./seat-store.ts";
 import { type SessionFailureKind, verifySessionFile } from "./session-store.ts";
+import type { SessionOpenHandoffLink, WorktreeIdentity } from "./session-v2.ts";
 
 export type { SessionFinding, SessionFindingCode, SessionFindingLevel } from "./handoff.ts";
 
@@ -129,4 +131,178 @@ export function inspectMadcHome(home: string, seatId: string = DEFAULT_SEAT_ID):
         };
   }
   return { home, seat: seatReport(home, seatId), lastSession };
+}
+
+export type RoomThreadRow = {
+  readonly threadId: string;
+  readonly path: string;
+  readonly seatId: string | null;
+  readonly level: "pass" | SessionFindingLevel;
+  readonly chain: SessionReport["chain"];
+  readonly handoff: {
+    readonly inbound: SessionOpenHandoffLink | null;
+    readonly outboundCount: number;
+    readonly oneWay: boolean;
+  };
+  readonly worktree: {
+    readonly open: WorktreeIdentity | null;
+    readonly close: WorktreeIdentity | null;
+    readonly missing: boolean;
+  };
+  readonly openDecisions: readonly OpenDecisionSummary[];
+  readonly findings: readonly SessionFinding[];
+};
+
+export type RoomReport = {
+  readonly home: string;
+  readonly threads: readonly RoomThreadRow[];
+  readonly counts: {
+    readonly threads: number;
+    readonly pass: number;
+    readonly warn: number;
+    readonly fail: number;
+    readonly openDecisions: number;
+  };
+};
+
+function allSessionPaths(home: string): Array<{ threadId: string; path: string }> {
+  const dir = join(home, "sessions");
+  let names: string[];
+  try {
+    if (!isStrictlyUnder(realpathSync(dir), realpathSync(home))) return [];
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: Array<{ threadId: string; path: string }> = [];
+  for (const name of names) {
+    if (!name.endsWith(".jsonl")) continue;
+    const threadId = name.slice(0, -".jsonl".length);
+    if (!isValidId(threadId)) continue;
+    const path = join(dir, name);
+    try {
+      if (!lstatSync(path).isFile()) continue;
+    } catch {
+      continue;
+    }
+    out.push({ threadId, path });
+  }
+  out.sort((a, b) => (a.threadId < b.threadId ? -1 : a.threadId > b.threadId ? 1 : 0));
+  return out;
+}
+
+/**
+ * M2-A8: read-only room aggregation across all valid session files in `$MADC_HOME/sessions`.
+ * Never writes, locks, seeds, or prints payload text.
+ */
+export function inspectRoom(home: string): RoomReport {
+  const files = allSessionPaths(home);
+  const threads: RoomThreadRow[] = [];
+  let pass = 0;
+  let warn = 0;
+  let fail = 0;
+  let openDecisions = 0;
+
+  for (const { threadId, path } of files) {
+    const verified = verifySessionFile(path, threadId, {}, home);
+    if (!verified.ok) {
+      fail += 1;
+      threads.push({
+        threadId,
+        path,
+        seatId: null,
+        level: "fail",
+        chain: {
+          ok: false,
+          line: verified.line,
+          reason: verified.reason,
+          kind: verified.kind,
+        },
+        handoff: { inbound: null, outboundCount: 0, oneWay: false },
+        worktree: { open: null, close: null, missing: false },
+        openDecisions: [],
+        findings: [
+          {
+            level: "fail",
+            code: "integrity",
+            detail: `line ${verified.line}: ${verified.reason}`,
+          },
+        ],
+      });
+      continue;
+    }
+
+    const events = verified.events;
+    const findings = inspectSessionV2(home, events);
+    const open = events[0]?.type === "session.open" ? events[0] : undefined;
+    const openPayload =
+      open !== undefined && open.payload !== null && typeof open.payload === "object"
+        ? (open.payload as Record<string, unknown>)
+        : null;
+    const inbound =
+      openPayload !== null && openPayload.handoff !== undefined && openPayload.handoff !== null
+        ? (openPayload.handoff as SessionOpenHandoffLink)
+        : null;
+    const openWorktree =
+      openPayload !== null && openPayload.worktree !== undefined && openPayload.worktree !== null
+        ? (openPayload.worktree as WorktreeIdentity)
+        : null;
+    let closeWorktree: WorktreeIdentity | null = null;
+    let outboundCount = 0;
+    for (const ev of events) {
+      if (ev.type === "handoff.out") outboundCount += 1;
+      if (
+        ev.type === "session.close" &&
+        ev.payload !== null &&
+        typeof ev.payload === "object" &&
+        "worktree" in ev.payload
+      ) {
+        closeWorktree = (ev.payload as { worktree: WorktreeIdentity | null }).worktree ?? null;
+      }
+    }
+
+    const decisions = openDecisionsInChain(events);
+    openDecisions += decisions.length;
+
+    const hasFail = findings.some((f) => f.level === "fail");
+    const hasWarn = findings.some((f) => f.level === "warn");
+    const level: RoomThreadRow["level"] = hasFail ? "fail" : hasWarn ? "warn" : "pass";
+    if (level === "fail") fail += 1;
+    else if (level === "warn") warn += 1;
+    else pass += 1;
+
+    threads.push({
+      threadId,
+      path,
+      seatId: open?.seatId ?? null,
+      level,
+      chain: { ok: true },
+      handoff: {
+        inbound,
+        outboundCount,
+        oneWay: findings.some(
+          (f) => f.code === "handoff-mismatch" || f.code === "handoff-unverifiable",
+        ),
+      },
+      worktree: {
+        open: openWorktree,
+        close: closeWorktree,
+        missing: findings.some((f) => f.code === "worktree-head-unreadable"),
+      },
+      openDecisions: decisions,
+      findings,
+    });
+  }
+
+  return {
+    home,
+    threads,
+    counts: {
+      threads: threads.length,
+      pass,
+      warn,
+      fail,
+      openDecisions,
+    },
+  };
 }

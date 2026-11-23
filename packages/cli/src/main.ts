@@ -15,7 +15,7 @@ import { classifyHomePath, runDoctor } from "./doctor.ts";
 import { takeEarlySignal } from "./early-signal.ts";
 import { EXIT } from "./exit-codes.ts";
 import type { CliIO } from "./io.ts";
-import { runDecisionsLs, runProvidersLs, runSeatsLs } from "./lists.ts";
+import { runDecisionsLs, runProvidersLs, runRoom, runSeatsLs } from "./lists.ts";
 import { PROMPT_CAP_BYTES, readPromptFromStdin, runOneShot } from "./oneshot.ts";
 
 const DEFAULT_SEAT = "madc-default";
@@ -59,6 +59,8 @@ export async function main(argv: readonly string[], io: CliIO): Promise<number> 
       return runSeatsLs(io, parsed.json);
     case "decisions-ls":
       return runDecisionsLs(io, parsed.json);
+    case "room":
+      return runRoom(io, parsed.json);
     case "oneshot":
       return oneShot(io, parsed.prompt, parsed.seatId, parsed.json);
   }

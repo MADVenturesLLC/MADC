@@ -34,6 +34,7 @@ import {
   EngineProtocolError,
   EngineRpcError,
   inspectMadcHome,
+  inspectRoom,
   isPidAlive,
   isValidId,
   listCatalog,
@@ -42,6 +43,7 @@ import {
   PROTOCOL_VERSION,
   REPO_GATED_PROVIDER_IDS,
   type RepoPolicyLoad,
+  type RoomReport,
   readLock,
   resolveMadcHome,
   type SeatSummary,
@@ -63,6 +65,7 @@ import {
   staleDeniedIds,
   staleDeniedLine,
 } from "./lanes.ts";
+import { renderRoomTable } from "./lists.ts";
 
 export type CheckStatus = "pass" | "warn" | "fail" | "skip" | "init";
 
@@ -485,6 +488,24 @@ function inspectDirect(home: string): Inspection {
  * later, after `bin.codex`, so the M0 row order is unchanged). Synchronous; the parent only ever
  * runs this inside the bounded child.
  */
+function checkRoom(home: HomeState): Check {
+  if (home.kind !== "present") return skip("room", "no sessions yet");
+  const room = inspectRoom(home.path);
+  const { threads, fail, warn, openDecisions } = room.counts;
+  if (threads === 0) return skip("room", "no sessions yet");
+  const summary = `${threads} thread(s): ${fail} fail, ${warn} warn, ${openDecisions} open decision(s)`;
+  const status: CheckStatus = fail > 0 ? "fail" : warn > 0 ? "warn" : "pass";
+  return {
+    id: "room",
+    status,
+    summary,
+    evidence: {
+      counts: room.counts,
+      threads: room.threads,
+    },
+  };
+}
+
 export function localRows(home: HomeState): Check[] {
   const insp = home.kind === "present" ? inspectDirect(home.path) : null;
   return [
@@ -494,11 +515,12 @@ export function localRows(home: HomeState): Check[] {
     home.kind === "present"
       ? checkSeats(home, listSeatSummaries(home.path), straySeatFiles(home.path) ?? [])
       : checkSeats(home, null),
+    checkRoom(home),
   ];
 }
 
 /** The ids of the rows `localRows` returns, in order. */
-const LOCAL_ROW_IDS = ["seat", "session", "locks", "seats"] as const;
+const LOCAL_ROW_IDS = ["seat", "session", "locks", "seats", "room"] as const;
 
 /** Seat sha256 for `--init`'s before/after comparison (runs inside the bounded child). */
 export function initSeatSha(home: string): string | null {
@@ -1362,9 +1384,11 @@ export async function collectDoctor(
     // M1-A8: the `seats` row is computed in the same bounded child as `seat` / `session` /
     // `locks`, and emitted after `bin.codex` so the M0 row order is unchanged.
     let seatsRow: Check | null = null;
+    let roomRow: Check | null = null;
     if (start("seat")) {
       for (const row of localRowsBounded(home)) {
         if (row.id === "seats") seatsRow = row;
+        else if (row.id === "room") roomRow = row;
         else emit(row);
       }
       // The local rows ran under a blocking spawnSync child: let a signal delivered meanwhile
@@ -1381,6 +1405,7 @@ export async function collectDoctor(
       emit(await (lanes ?? checkLanes(io, home, sig)));
       lanesEmitted = true;
     }
+    if (roomRow !== null && start("room")) emit(roomRow);
   } finally {
     // A run that ended before the `lanes` row (a signal, or a throw) kills its probe and still
     // waits for it, so the probe's temp home is removed before doctor returns (§3e E7).
@@ -1445,6 +1470,16 @@ export function laneTableLines(c: Check): string[] {
   return renderLaneTable(c.evidence.lanes as LaneRow[]).map((line) => `      ${line}`);
 }
 
+export function roomTableLines(c: Check): string[] {
+  if (c.id !== "room" || !Array.isArray(c.evidence.threads)) return [];
+  const report = {
+    home: "",
+    threads: c.evidence.threads,
+    counts: c.evidence.counts,
+  } as RoomReport;
+  return renderRoomTable(report).map((line) => `      ${line}`);
+}
+
 export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number> {
   const color = !opts.json && colorEnabled(io);
   if (!opts.json) {
@@ -1462,6 +1497,7 @@ export async function runDoctor(io: CliIO, opts: DoctorOptions): Promise<number>
           io.stdout.write(renderRow(c, color));
           // M1-A8: the lanes table prints under its row, indented so it never reads as a row.
           for (const line of laneTableLines(c)) io.stdout.write(`${line}\n`);
+          for (const line of roomTableLines(c)) io.stdout.write(`${line}\n`);
         },
       };
   const run = await collectDoctor(io, opts, hooks);

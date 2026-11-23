@@ -27,6 +27,8 @@ export type ParsedArgs =
   | { readonly kind: "seats-ls"; readonly json: boolean }
   /** M2-A6: `madc decisions ls [--json]` (engine `decision/list`). */
   | { readonly kind: "decisions-ls"; readonly json: boolean }
+  /** M2-A8: `madc room [--json]` (read-only room overview across threads). */
+  | { readonly kind: "room"; readonly json: boolean }
   | {
       readonly kind: "oneshot";
       /** The prompt text, or "-" to read it from stdin. */
@@ -51,6 +53,7 @@ export const USAGE = `usage:
   madc providers ls [--json]                   every registry lane: wired, presence, terms freshness
   madc seats ls [--json]                       every seat in MADC_HOME (broken seats are listed)
   madc decisions ls [--json]                   open Founder decisions across threads
+  madc room [--json]                           room overview across threads (chain, handoffs, worktrees, decisions)
   madc -p <prompt|-> [-s <seatId>] [--json]    headless one-shot turn ("-" reads stdin)
   madc [-s <seatId>] ["<text>"]                interactive chat on a terminal (-s picks the seat)
 `;
@@ -173,6 +176,12 @@ export function parseArgs(argv: readonly string[]): ParsedArgs {
     if (rest.length > 0) return usage(`unexpected argument ${rest[0] ?? ""}`);
     if (seatId !== undefined) return usage(SEAT_FLAG_ONLY);
     return { kind: "doctor", json, init };
+  }
+  if (first === "room" && prompt === undefined) {
+    if (seatId !== undefined) return usage(SEAT_FLAG_ONLY);
+    if (init) return usage("--init is only valid with doctor");
+    if (rest.length > 0) return usage(`unexpected argument ${rest[0] ?? ""}`);
+    return { kind: "room", json };
   }
   if (
     (first === "providers" || first === "seats" || first === "decisions") &&
