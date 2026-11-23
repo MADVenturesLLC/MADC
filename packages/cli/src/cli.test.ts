@@ -219,7 +219,8 @@ test("A7 §7.1 doctor exits 0 on an engine-seeded home with no KIMI_API_KEY and 
     // registry denies as stale (D-M1-6). WARN never fails doctor.
     assert.equal(check(report, "seats").status, "warn");
     assert.equal(check(report, "lanes").status, "warn");
-    assert.deepEqual(report.counts, { pass: 8, warn: 2, fail: 0, skip: 3 });
+    assert.equal(check(report, "room").status, "pass");
+    assert.deepEqual(report.counts, { pass: 9, warn: 2, fail: 0, skip: 3 });
     const text = await runCli(sb, ["doctor"]);
     assert.equal(text.code, 0);
     const rows = text.stdout.trim().split("\n");
@@ -426,7 +427,9 @@ test("M1-A8 doctor lanes: exit 0 with a WARN naming every stale (denied) allow e
     for (const [i, lane] of lanes.entries()) {
       assert.ok(lines[at + 2 + i]?.startsWith(`      ${lane.id} `), `${lane.id} table line`);
     }
-    assert.match(lines[at + 2 + lanes.length] ?? "", /^RESULT /);
+    assert.match(lines[at + 2 + lanes.length] ?? "", /^PASS {2}room /);
+    assert.match(lines[at + 3 + lanes.length] ?? "", /^ {6}PASS /);
+    assert.match(lines[at + 4 + lanes.length] ?? "", /^RESULT /);
   } finally {
     sb.cleanup();
   }
