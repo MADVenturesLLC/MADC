@@ -6,7 +6,14 @@ MAD's local-first agent platform: one engine, named seats, any subscription.
 > The M0 acts are on main ([docs/runbook/M0.md](docs/runbook/M0.md)). M1, "every lane lit +
 > named roster" ([PLAN-madc-M1-build-plan.md](docs/plan/PLAN-madc-M1-build-plan.md)), has
 > eleven wired lanes and five seeded seats on main; its operator guide is
-> [docs/runbook/M1.md](docs/runbook/M1.md). Merges are Founder-only and name the exact head SHA.
+> [docs/runbook/M1.md](docs/runbook/M1.md). The M2 build plan, "the room" (multi-seat work
+> and evidence schema v2), was **accepted and made commissionable by the Founder on
+> 2026-10-05** ([PLAN-madc-M2-build-plan.md](docs/plan/PLAN-madc-M2-build-plan.md)); on main
+> today are M2-A0 (schema pin, PR #46), M2-A1 (first v2 writer, PR #47, follow-up PR #48),
+> M2-A2 (`thread/handoff`, PR #49), M2-A3 (seat handoff allowlist, PR #60), M2-A4 (the
+> target serves the brief, PR #61) and M2-A6 (Founder Decision Inbox, PR #63). M2-A5
+> (parallel seats in engine-created worktrees) and M2-A7 through M2-A9 are **not** on main.
+> Merges are Founder-only and name the exact head SHA.
 
 ## The idea
 
