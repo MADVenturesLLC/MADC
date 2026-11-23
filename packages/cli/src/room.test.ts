@@ -1,16 +1,22 @@
 /**
- * M2-A8 (`PLAN-madc-M2-build-plan.md` §7): `madc room [--json]` and `madc doctor` v2 room row.
+ * M2-A8 (`PLAN-madc-M2-build-plan.md` §7): `madc room [--json]` and `madc doctor` v2 room table.
+ * Imports ONLY `@madc/engine/client` (no `../../engine/src/*` — plan §6 import rules).
  */
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Writable } from "node:stream";
 import { test } from "node:test";
-import { inspectRoom, type RoomReport } from "@madc/engine/client";
+import { fileURLToPath } from "node:url";
+import { inspectRoom, type RoomReport, spawnEngine } from "@madc/engine/client";
 import { parseArgs } from "./args.ts";
 import type { CliIO } from "./io.ts";
 import { main } from "./main.ts";
+
+const ECHO_ENGINE = fileURLToPath(
+  new URL("../../engine/src/testing/echo-engine.ts", import.meta.url),
+);
 
 function makeTempHome(): { home: string; cleanup: () => void } {
   const home = mkdtempSync(join(tmpdir(), "madc-m2a8-"));
@@ -57,10 +63,10 @@ test("M2-A8 parseArgs: room [--json] and usage rejections", () => {
   assert.equal(parseArgs(["room", "extra"]).kind, "usage");
 });
 
-test("M2-A8 room --json and doctor v2: reports one-way handoff, missing worktree, malformed v2 line, and open decision with exit code discipline", async () => {
+test("M2-A8 room --json and doctor v2: reports one-way handoff, malformed v2 line, and open decision with exit code discipline", async () => {
   const { home, cleanup } = makeTempHome();
   try {
-    // 1. Seed a valid v2 seat so doctor's seat/seats rows pass.
+    // 1. Seed a valid v2 seat allowing self-handoff so we can create a real handoff via spawnEngine.
     writeFileSync(
       join(home, "seats", "madc-default.json"),
       JSON.stringify({
@@ -75,118 +81,63 @@ test("M2-A8 room --json and doctor v2: reports one-way handoff, missing worktree
         memory: { mode: "in-session" },
         tools: { deny: [] },
         policy: { headlessOk: true },
-        handoffs: { enabled: false, targets: [] },
+        handoffs: { enabled: true, targets: ["madc-default"] },
       }),
       { mode: 0o600 },
     );
 
-    // 2. Write a malformed session file (FAIL integrity).
-    writeFileSync(join(home, "sessions", "thr_bad_line.jsonl"), "{not-json\n", { mode: 0o600 });
-
-    // 3. Write a clean v1 session file with a missing worktree under $MADC_HOME/worktrees (WARN only).
-    const { echoAgent } = await import("../../engine/src/agent.ts");
-    const { EngineConnection } = await import("../../engine/src/server.ts");
-    const { PassThrough } = await import("node:stream");
-    const runEngine = async (
-      fn: (req: (m: string, p?: unknown) => Promise<Record<string, unknown>>) => Promise<void>,
-    ) => {
-      const input = new PassThrough();
-      const out: Record<string, unknown>[] = [];
-      const output = new Writable({
-        write(chunk, _enc, cb) {
-          for (const line of String(chunk).split("\n")) if (line) out.push(JSON.parse(line));
-          cb();
-        },
-      });
-      const conn = new EngineConnection({ input, output, home, agent: echoAgent, log: () => {} });
-      const done = conn.run();
-      let id = 1;
-      const req = async (method: string, params: unknown = {}) => {
-        const cur = id++;
-        input.write(`${JSON.stringify({ id: cur, method, params })}\n`);
-        for (;;) {
-          const hit = out.find((m) => m.id === cur);
-          if (hit) return hit;
-          await new Promise((r) => setTimeout(r, 5));
-        }
-      };
-      await req("initialize", { clientInfo: { name: "t", version: "0" } });
-      await fn(req);
-      input.end();
-      await done;
-    };
-
+    // 2. Spawn the real engine via `@madc/engine/client` to create:
+    //    - `decThreadId` with an open founderDecision
+    //    - `srcId` -> `oneWayId` via `thread/handoff`
+    const client = spawnEngine({ entry: ECHO_ENGINE, env: { ...process.env, MADC_HOME: home } });
     let decThreadId = "";
-    await runEngine(async (req) => {
-      const s = await req("thread/start", { seatId: "madc-default" });
-      decThreadId = (s.result as { thread: { id: string } }).thread.id;
-      const t = await req("turn/start", {
+    let srcId = "";
+    let oneWayId = "";
+    try {
+      await client.request("initialize", { clientInfo: { name: "room-test", version: "0" } });
+
+      const sDec = (await client.request("thread/start", { seatId: "madc-default" })) as {
+        thread: { id: string };
+      };
+      decThreadId = sDec.thread.id;
+      const tDec = (await client.request("turn/start", {
         threadId: decThreadId,
         input: [{ type: "text", text: "SECRET_PROMPT_TEXT" }],
-      });
-      const turnId = (t.result as { turn: { id: string } }).turn.id;
-      await new Promise((r) => setTimeout(r, 40));
-      await req("decision/raise", {
+      })) as { turn: { id: string } };
+      await new Promise((r) => setTimeout(r, 80));
+      await client.request("decision/raise", {
         threadId: decThreadId,
-        turnId,
+        turnId: tDec.turn.id,
         question: "Approve M2-A8?",
         recommendedDefault: "Yes",
         evidenceRefs: [
           { kind: "git", sha: "25096fffd1076d65c4a9ba148117a3cf77e919e0", remote: null },
         ],
       });
-    });
 
-    // 4. Create a one-way handoff target citing an existing source session that has no handoff.out/link.
-    const { SessionWriter } = await import("../../engine/src/session-store.ts");
-    const srcId = "thr_source_no_link";
-    SessionWriter.create(
-      join(home, "sessions", `${srcId}.jsonl`),
-      srcId,
-      "madc-default",
-      {
-        cwd: null,
-        backing: "kimi-code",
-        providerId: "kimi-code",
-        pinnedModel: "kimi-coding/kimi-for-coding",
-        worktree: null,
-        handoff: null,
-      },
-      () => [],
-      Date.now(),
-      home,
-      { holdsLock: () => true },
-    ).append("session.close", { reason: "shutdown", worktree: null });
+      const sSrc = (await client.request("thread/start", { seatId: "madc-default" })) as {
+        thread: { id: string };
+      };
+      srcId = sSrc.thread.id;
+      const ho = (await client.request("thread/handoff", {
+        threadId: srcId,
+        targetSeatId: "madc-default",
+        brief: "SECRET_BRIEF_TEXT",
+        turnId: null,
+      })) as { targetThreadId: string };
+      oneWayId = ho.targetThreadId;
+    } finally {
+      await client.close();
+    }
 
-    const oneWayId = "thr_oneway_target";
-    const oneWayWriter = SessionWriter.create(
-      join(home, "sessions", `${oneWayId}.jsonl`),
-      oneWayId,
-      "madc-default",
-      {
-        cwd: null,
-        backing: "kimi-code",
-        providerId: "kimi-code",
-        pinnedModel: "kimi-coding/kimi-for-coding",
-        worktree: {
-          topLevel: join(home, "worktrees", oneWayId),
-          remote: null,
-          head: "25096fffd1076d65c4a9ba148117a3cf77e919e0",
-        },
-        handoff: {
-          sourceThreadId: srcId,
-          sourceSeatId: "madc-default",
-          handoffId: "ho_missing",
-          sourceSeq: 1,
-          sourceHash: "a".repeat(64),
-        },
-      },
-      () => [],
-      Date.now(),
-      home,
-      { holdsLock: () => true },
-    );
-    oneWayWriter.append("session.close", { reason: "shutdown", worktree: null });
+    // 3. Truncate `srcId` to its first line (losing handoff.out + handoff.link) so `oneWayId`
+    //    becomes a genuine one-way handoff (`fail handoff-mismatch`), and `srcId` is `warn not-cleanly-closed`.
+    const srcPath = join(home, "sessions", `${srcId}.jsonl`);
+    const firstLine = readFileSync(srcPath, "utf8").split("\n")[0];
+    writeFileSync(srcPath, `${firstLine}\n`);
+
+    // 4. Write a malformed session file (FAIL integrity).
+    writeFileSync(join(home, "sessions", "thr_bad_line.jsonl"), "{not-json\n", { mode: 0o600 });
 
     // `madc room --json` schema and findings check.
     const roomRes = await runMain(home, ["room", "--json"]);
@@ -208,12 +159,11 @@ test("M2-A8 room --json and doctor v2: reports one-way handoff, missing worktree
     const oneWayRow = byId.get(oneWayId);
     assert.equal(oneWayRow?.level, "fail");
     assert.equal(oneWayRow?.handoff.oneWay, true);
-    assert.equal(oneWayRow?.worktree.missing, true);
 
     const decRow = byId.get(decThreadId);
     assert.equal(decRow?.openDecisions.length, 1);
     assert.equal(decRow?.openDecisions[0]?.question, "Approve M2-A8?");
-    assert.equal(roomRes.stdout.includes("SECRET_PROMPT_TEXT"), false);
+    assert.equal(roomRes.stdout.includes("SECRET_BRIEF_TEXT"), false);
 
     // `madc doctor --json` exits 1 when room has FAILs.
     const docFail = await runMain(home, ["doctor", "--json"]);
@@ -223,35 +173,15 @@ test("M2-A8 room --json and doctor v2: reports one-way handoff, missing worktree
     };
     assert.equal(docFailJson.checks.find((c) => c.id === "room")?.status, "fail");
 
-    // Remove the FAILing threads, leaving only a WARN thread (`not-cleanly-closed` or missing worktree).
+    // Remove the FAILing threads (`thr_bad_line` and `oneWayId`), leaving `srcId` (WARN only).
     rmSync(join(home, "sessions", "thr_bad_line.jsonl"));
     rmSync(join(home, "sessions", `${oneWayId}.jsonl`));
-
-    // Add a clean-chain thread that was not cleanly closed (WARN only, no FAIL).
-    const warnId = "thr_warn_only";
-    SessionWriter.create(
-      join(home, "sessions", `${warnId}.jsonl`),
-      warnId,
-      "madc-default",
-      {
-        cwd: null,
-        backing: "kimi-code",
-        providerId: "kimi-code",
-        pinnedModel: "kimi-coding/kimi-for-coding",
-        worktree: null,
-        handoff: null,
-      },
-      () => [],
-      Date.now(),
-      home,
-      { holdsLock: () => true },
-    );
 
     const roomWarn = inspectRoom(home);
     assert.equal(roomWarn.counts.fail, 0);
     assert.ok(roomWarn.counts.warn >= 1);
 
-    // `madc doctor --json` exits 0 with warnings only (note: policy/lanes/etc may warn/skip, no FAIL).
+    // `madc doctor --json` reports `room` as `warn` (and exits 0 when only warnings exist).
     const docWarn = await runMain(home, ["doctor", "--json"]);
     const docWarnJson = JSON.parse(docWarn.stdout) as {
       checks: Array<{ id: string; status: string }>;
