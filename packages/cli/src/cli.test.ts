@@ -49,6 +49,8 @@ const DOCTOR_IDS = [
   // M1-A8: appended after the M0 rows (whose ids and order are unchanged).
   "seats",
   "lanes",
+  // M2-A8: room overview row appended last.
+  "room",
 ];
 const ANSI = new RegExp(`${String.fromCharCode(27)}\\[`);
 const SECRET_ENV_NAME = /KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|AUTH/i;
