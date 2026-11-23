@@ -139,7 +139,9 @@ function streamClaudeTurn(
     try {
       // The child inherits the environment (spawn default): that is how the unmodified tool finds
       // its own auth. MAD never adds, removes, or rewrites a variable.
-      child = spawnFn(binaryPath, args, { stdio: ["ignore", "pipe", "pipe"] });
+      const cwdOpt =
+        typeof request.cwd === "string" && request.cwd !== "" ? { cwd: request.cwd } : {};
+      child = spawnFn(binaryPath, args, { stdio: ["ignore", "pipe", "pipe"], ...cwdOpt });
     } catch {
       reject(new ProviderCallError("failed", null, "claude-code child failed to start"));
       return;

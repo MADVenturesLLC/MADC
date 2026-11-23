@@ -79,6 +79,8 @@ export type ProviderTurnRequest = {
   readonly modelId: string;
   readonly systemPrompt?: string;
   readonly messages: readonly ProviderMessage[];
+  /** M2-A5: working directory placement for vendor-agent backings (not a write sandbox). */
+  readonly cwd?: string | null;
   readonly signal: AbortSignal;
   /** Called for every streamed assistant text chunk, in order. */
   onTextDelta(delta: string): void;

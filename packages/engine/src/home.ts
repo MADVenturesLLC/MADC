@@ -30,7 +30,7 @@ export function resolveMadcHome(env: NodeJS.ProcessEnv = process.env): string {
   return join(homedir(), ".madc");
 }
 
-export type HomeSubdir = "sessions" | "seats" | "memory";
+export type HomeSubdir = "sessions" | "seats" | "memory" | "worktrees";
 
 /** `child` is strictly inside `parent` (both already resolved). */
 export function isStrictlyUnder(child: string, parent: string): boolean {

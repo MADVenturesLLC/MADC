@@ -6,6 +6,8 @@
 
 *Amended by `PIN-madc-M2-founder-decision-inbox.md` (2026-10-16): §3 step 1 gains rows 4a (pending cold `decision/resolve` confirmation) and 6a (active turn or pending warm confirmation), both `-32004 TurnAlreadyActive`, nothing appended; additive.*
 
+*Amended by `PIN-madc-M2-handoff-procedure-amendment-2.md` (2026-11-23): §4 step 3 opens a `worktree: true` target seat in its own engine-created worktree (`$MADC_HOME/worktrees/<targetThreadId>`) off the source's repo rather than `record.thread.cwd`.*
+
 *Base: `main` @ `ce10ca010ddd72c29513a117ba872168707b9046` (the M2-A1 squash, PR #47). Every file cited below was read at that commit. This pin opens no decision table: the evidence pin's rulings D-M2-A0-1 … D-M2-A0-6 bind as recorded there, and every rule below either restates a binding source or is fixed by the commission.*
 
 **What this pin does.** It names the one protocol request that performs the M2 evidence pin §2.1 order inside one engine process: the source appends `handoff.out`, a new target thread opens citing it, the source appends `handoff.link` citing the target's genesis, or `handoff.aborted` when the target did not open. It fixes the params, the result, the refusals and their order, and what is on disk after each outcome.

@@ -143,12 +143,16 @@ function streamAcpTurn(
   const label = spec.providerId;
   const prompt = request.messages.map((m) => m.text).join("\n");
   return new Promise<ProviderTurnResult>((resolve, reject) => {
+    const cwd = typeof request.cwd === "string" && request.cwd !== "" ? request.cwd : process.cwd();
+    const cwdOpt = typeof request.cwd === "string" && request.cwd !== "" ? { cwd } : {};
     let child: ChildProcess;
     try {
-      // The child inherits the environment (spawn default) and the engine's cwd: that is how the
-      // unmodified agent finds its own auth and workspace. MAD adds, removes or rewrites nothing.
+      // The child inherits the environment (spawn default) and the requested cwd (or the engine's
+      // cwd when absent): that is how the unmodified agent finds its own auth and workspace. MAD
+      // adds, removes or rewrites nothing.
       child = spawnFn(binaryPath, [...spec.args(request.modelId)], {
         stdio: ["pipe", "pipe", "pipe"],
+        ...cwdOpt,
       });
     } catch {
       // A synchronous spawn throw is never a missing binary (node reports not-found
@@ -156,7 +160,6 @@ function streamAcpTurn(
       reject(new ProviderCallError("failed", null, `${label} agent child failed to start`));
       return;
     }
-    const cwd = process.cwd();
     let stdoutBuf = "";
     let settled = false;
     let spawnError: NodeJS.ErrnoException | null = null;

@@ -147,7 +147,9 @@ function streamCodexTurn(
     try {
       // The child inherits the environment (spawn default): that is how the unmodified tool finds
       // its own auth. MAD never adds, removes, or rewrites a variable.
-      child = spawnFn(binaryPath, ["app-server"], { stdio: ["pipe", "pipe", "pipe"] });
+      const cwdOpt =
+        typeof request.cwd === "string" && request.cwd !== "" ? { cwd: request.cwd } : {};
+      child = spawnFn(binaryPath, ["app-server"], { stdio: ["pipe", "pipe", "pipe"], ...cwdOpt });
     } catch {
       // A synchronous spawn throw is never a missing binary (node reports not-found
       // asynchronously via the 'error' event), so no pinned `binary-missing` reason here.
