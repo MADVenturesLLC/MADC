@@ -67,6 +67,8 @@ export type EngineSeat = {
   readonly tools: SeatToolsPolicy;
   readonly policy: { readonly headlessOk: boolean };
   readonly handoffs: SeatHandoffsStub;
+  /** M2-A5 (`PIN-madc-M2-seat-worktree.md`): opt-in worktree isolation on v2 seats. */
+  readonly worktree?: boolean;
 };
 
 /** Seat pin §3, key order included (the seed writer serializes this object). */
@@ -122,8 +124,8 @@ const SEAT_KEYS = [
   "handoffs",
 ] as const;
 
-/** The v2 file schema (S2) is the closed M0 key set plus `displayName` and `fallbacks`. */
-const SEAT_KEYS_V2 = [...SEAT_KEYS, "displayName", "fallbacks"] as const;
+/** The v2 file schema (S2 + M2-A5) is the closed M0 key set plus `displayName`, `fallbacks`, and optional `worktree`. */
+const SEAT_KEYS_V2 = [...SEAT_KEYS, "displayName", "fallbacks", "worktree"] as const;
 
 /**
  * `memory.path` (seat pin §2): relative, normalized, under `memory/`, ends `.md`, no `..`, not
@@ -290,6 +292,10 @@ export function validateSeat(raw: unknown, expectedId: string): SeatValidation {
     }
   }
 
+  if (version === 2 && Object.hasOwn(raw, "worktree") && typeof raw.worktree !== "boolean") {
+    issues.push("worktree must be a boolean");
+  }
+
   if (issues.length > 0) return { ok: false, issues };
   const m = memory as Record<string, unknown>;
   const t = tools as Record<string, unknown>;
@@ -321,6 +327,7 @@ export function validateSeat(raw: unknown, expectedId: string): SeatValidation {
       enabled: allowlist.length > 0,
       targets: Object.freeze([...allowlist]),
     }),
+    ...(version === 2 && typeof raw.worktree === "boolean" ? { worktree: raw.worktree } : {}),
   });
   return { ok: true, seat };
 }

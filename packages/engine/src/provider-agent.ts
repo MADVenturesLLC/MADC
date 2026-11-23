@@ -616,6 +616,7 @@ export function createProviderAgent(options: ProviderAgentOptions): Agent {
             modelId: current.modelId,
             systemPrompt: seat.standingInstructions,
             messages: [{ role: "user", text: ctx.input.map((part) => part.text).join("\n") }],
+            ...(ctx.cwd === null ? {} : { cwd: ctx.cwd }),
             signal: sink.signal,
             onTextDelta: (delta) => sink.delta(id, delta),
             onToolEvent: toolItems.onToolEvent,

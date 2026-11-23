@@ -11,7 +11,9 @@
  * `handoff-unverifiable` and may NOT serve (the engine refuses `-32010 handoff-one-way`); a source
  * whose target cannot be read serves as today and doctor WARNs. Nothing here writes.
  */
+import { existsSync, realpathSync } from "node:fs";
 import { join } from "node:path";
+import { isStrictlyUnder } from "./home.ts";
 import { isPidAlive, readLock } from "./lock.ts";
 import { defaultGitRunner, type GitRunner } from "./policy/identity.ts";
 import { isValidId } from "./protocol/ids.ts";
@@ -30,6 +32,7 @@ import {
   sessionRefPath,
   type WorktreeIdentity,
 } from "./session-v2.ts";
+import { rereadWorktreeIdentity } from "./worktree.ts";
 
 export type SessionFindingLevel = "warn" | "fail";
 /**
@@ -610,12 +613,33 @@ export function inspectSessionV2(
   }
 
   // --- worktree at close (§2.2) and the clean-close rule (D-M2-A0-5), v2 files only
+  let closeWarnedWorktree = false;
   for (const e of events) {
     if (e.type !== "session.close") continue;
     if (openWorktree !== null && payloadOf(e).worktree === null) {
+      closeWarnedWorktree = true;
       warn(
         "worktree-head-unreadable",
         `session.close at seq ${e.seq} could not re-read HEAD at ${openWorktree.topLevel}`,
+      );
+    }
+  }
+  if (!closeWarnedWorktree && openWorktree !== null) {
+    let underWorktrees = false;
+    try {
+      const worktreesDir = realpathSync(join(home, "worktrees"));
+      underWorktrees = isStrictlyUnder(openWorktree.topLevel, worktreesDir);
+    } catch {
+      // If `$MADC_HOME/worktrees` does not exist yet, check lexical prefix.
+      underWorktrees = isStrictlyUnder(openWorktree.topLevel, join(home, "worktrees"));
+    }
+    if (
+      underWorktrees &&
+      (!existsSync(openWorktree.topLevel) || rereadWorktreeIdentity(openWorktree, deps) === null)
+    ) {
+      warn(
+        "worktree-head-unreadable",
+        `recorded seat worktree no longer exists or has moved: ${openWorktree.topLevel}`,
       );
     }
   }

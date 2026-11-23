@@ -105,7 +105,7 @@ import {
   type WorktreeIdentity,
 } from "./session-store.ts";
 import { type BriefServedMarker, checkV2Payload } from "./session-v2.ts";
-import { rereadWorktreeIdentity, resolveWorktreeIdentity } from "./worktree.ts";
+import { createSeatWorktree, rereadWorktreeIdentity, resolveWorktreeIdentity } from "./worktree.ts";
 
 export const ENGINE_VERSION = "0.0.0";
 
@@ -1303,9 +1303,20 @@ export class EngineConnection {
     const handle = lock.handle;
 
     const now = Date.now();
+    // M2-A5 (`PIN-madc-M2-seat-worktree.md`): opt-in worktree creation when `seat.worktree === true`.
+    // Refuses before any session file or event is written.
+    let effectiveCwd = cwd;
+    if (seat.seat.worktree === true) {
+      const created = createSeatWorktree(this.#opts.home, id, cwd, this.#opts.worktreeDeps ?? {});
+      if (!created.ok) {
+        this.#releaseOrKeep(handle);
+        throw invalidParams(created.issues);
+      }
+      effectiveCwd = created.path;
+    }
     // M2 pin §2.2: engine-owned worktree identity (realpath'd top-level, normalized origin, HEAD),
-    // resolved from `cwd` the way the repo gate resolves repo identity; null outside a work tree.
-    const worktree = resolveWorktreeIdentity(cwd, this.#opts.worktreeDeps ?? {});
+    // resolved from `effectiveCwd` the way the repo gate resolves repo identity; null outside a work tree.
+    const worktree = resolveWorktreeIdentity(effectiveCwd, this.#opts.worktreeDeps ?? {});
     let session: SessionWriter;
     try {
       session = SessionWriter.create(
@@ -1313,7 +1324,7 @@ export class EngineConnection {
         id,
         seatId,
         {
-          cwd,
+          cwd: effectiveCwd,
           backing: seat.seat.preferredBacking,
           providerId: seat.seat.preferredBacking,
           pinnedModel: seat.seat.pinnedModel,
@@ -1338,7 +1349,7 @@ export class EngineConnection {
     const thread: Thread = {
       id,
       seatId,
-      cwd,
+      cwd: effectiveCwd,
       createdAt: now,
       updatedAt: now,
       status: "idle",

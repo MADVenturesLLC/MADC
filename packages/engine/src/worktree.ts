@@ -9,7 +9,9 @@
  * No worktree is created or managed here (pin §6): recording identity is the whole scope.
  * Synchronous on purpose, like the repo gate: it runs inside `thread/start` and at shutdown.
  */
-import { realpathSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
+import { dirname } from "node:path";
+import { confinedPath, isStrictlyUnder } from "./home.ts";
 import {
   defaultGitRunner,
   type GitRunner,
@@ -148,4 +150,123 @@ export function rereadWorktreeIdentity(
   const identity = identityAt(topLevel, runGit);
   if (bounded?.expired() === true) return null;
   return identity;
+}
+
+export type CreateWorktreeResult =
+  | { readonly ok: true; readonly path: string }
+  | { readonly ok: false; readonly issues: string[] };
+
+/**
+ * M2-A5 (`PIN-madc-M2-seat-worktree.md`): create an engine-managed detached worktree at
+ * `$MADC_HOME/worktrees/<threadId>` from the git repository containing `sourceCwd`. Refuses
+ * non-git `sourceCwd`, occupied target paths, paths outside `$MADC_HOME/worktrees`, and any
+ * attempt to reuse the repo's primary working tree.
+ */
+export function createSeatWorktree(
+  home: string,
+  threadId: string,
+  sourceCwd: string | null,
+  deps: RepoIdentityDeps = {},
+): CreateWorktreeResult {
+  if (sourceCwd === null || sourceCwd.trim() === "") {
+    return { ok: false, issues: ["worktree mode requires a non-empty git cwd"] };
+  }
+  const runGit = deps.runGit ?? defaultGitRunner;
+  const realpath = deps.realpath ?? ((path: string) => realpathSync(path));
+  const sourceTop = topLevelOf(sourceCwd, runGit, realpath);
+  if (sourceTop === null) {
+    return { ok: false, issues: ["worktree mode requires a git repository cwd"] };
+  }
+  let targetPath: string;
+  try {
+    targetPath = confinedPath(home, "worktrees", threadId, "");
+  } catch (err) {
+    return {
+      ok: false,
+      issues: [err instanceof Error ? err.message : "worktree path escaped confined root"],
+    };
+  }
+  const worktreesRoot = realpath(dirname(confinedPath(home, "worktrees", "probe", "")));
+  if (!isStrictlyUnder(targetPath, worktreesRoot) || targetPath === sourceTop) {
+    return { ok: false, issues: ["worktree path must be strictly under $MADC_HOME/worktrees"] };
+  }
+  if (existsSync(targetPath)) {
+    return { ok: false, issues: [`worktree path already occupied: ${targetPath}`] };
+  }
+  const added = runGit(["worktree", "add", "--detach", targetPath, "HEAD"], sourceTop);
+  if (added.code !== 0) {
+    return { ok: false, issues: ["git worktree add failed for seat worktree"] };
+  }
+  const createdTop = topLevelOf(targetPath, runGit, realpath);
+  if (
+    createdTop === null ||
+    createdTop === sourceTop ||
+    !isStrictlyUnder(createdTop, worktreesRoot)
+  ) {
+    return { ok: false, issues: ["created worktree failed confinement verification"] };
+  }
+  return { ok: true, path: createdTop };
+}
+
+export type RemoveWorktreeResult =
+  | { readonly ok: true }
+  | {
+      readonly ok: false;
+      readonly reason: "dirty-worktree" | "outside-root" | "remove-failed";
+      readonly message: string;
+    };
+
+/**
+ * M2-A5 (`D-M2-4` cleanup posture): a dirty worktree is NEVER removed, and the refusal names it.
+ */
+export function removeSeatWorktree(
+  home: string,
+  worktreePath: string,
+  deps: RepoIdentityDeps = {},
+): RemoveWorktreeResult {
+  const runGit = deps.runGit ?? defaultGitRunner;
+  const realpath = deps.realpath ?? ((path: string) => realpathSync(path));
+  const worktreesRoot = realpath(dirname(confinedPath(home, "worktrees", "probe", "")));
+  let resolved: string;
+  try {
+    resolved = realpath(worktreePath);
+  } catch {
+    return {
+      ok: false,
+      reason: "outside-root",
+      message: `worktree path cannot be resolved: ${worktreePath}`,
+    };
+  }
+  if (!isStrictlyUnder(resolved, worktreesRoot)) {
+    return {
+      ok: false,
+      reason: "outside-root",
+      message: `refusing to remove worktree outside $MADC_HOME/worktrees: ${resolved}`,
+    };
+  }
+  const status = runGit(["status", "--porcelain"], resolved);
+  if (status.code !== 0 || status.stdout.trim() !== "") {
+    return {
+      ok: false,
+      reason: "dirty-worktree",
+      message: `refusing to remove dirty worktree: ${resolved}`,
+    };
+  }
+  const top = topLevelOf(resolved, runGit, realpath);
+  if (top === null) {
+    return {
+      ok: false,
+      reason: "remove-failed",
+      message: `refusing to remove unreadable worktree: ${resolved}`,
+    };
+  }
+  const removed = runGit(["worktree", "remove", resolved], resolved);
+  if (removed.code !== 0) {
+    return {
+      ok: false,
+      reason: "remove-failed",
+      message: `git worktree remove failed for ${resolved}`,
+    };
+  }
+  return { ok: true };
 }
