@@ -490,7 +490,10 @@ for (const providerId of WIRED) {
     assert.ok(entry);
     const { options, cleanup } = lane.wire();
     try {
-      const agent = createProviderAgent(options);
+      const agent = createProviderAgent({
+        ...options,
+        assertAllowedNow: Date.parse(entry.verifiedAt),
+      });
       const sink = captureSink();
       await agent.run(ctxFor(providerId, lane), sink);
       const { items, deltas } = sink.captured;
