@@ -1,6 +1,6 @@
 # madc M3 build plan — Desktop v1 on the same engine
 
-*2026-11-23 · Venue: `MADVenturesLLC/MADC` only · Status: **draft — pending Founder acceptance (`D-M3-1`) and stack ruling (`D-R6`)**. Not a build authorization until accepted; each act still needs its own Founder commission and Founder merge at an exact head SHA.*
+*2026-11-23 · Venue: `MADVenturesLLC/MADC` only · Status: **accepted for M3-A0** (Founder, 2026-11-23: `"Yes, start M3-A0"`). Each act still needs its own Founder merge at an exact head SHA.*
 
 *Base: `main` @ `39148d0` (M2-A9 merge commit, PR #69). Roadmap: [`ROADMAP-madc-post-M0.md`](ROADMAP-madc-post-M0.md) (§0 M3 row, §1 M3, §6 D-R6).*
 
