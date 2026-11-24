@@ -45,8 +45,8 @@ These close the pin half of Clio's D-627 (stale text after #71). The plan, READM
 Before spawning, the launcher probes `engine.sock` (path from `engineSocketPath(home)`, `socket.ts:22-28` @ `6e20176`, with the §4 Windows hash change):
 
 - If a listener accepts the connection **and** answers `initialize` with `protocolVersion: "madc-m1/1"` within **1 s** (connect plus reply), the launcher uses that connection and does not spawn.
-- Otherwise it spawns `serve`, which takes `engine.lock` and runs its §4 checks, refusing with exit 10 or 11 if the home is owned or the path unsafe.
-- **On child exit 10** (a live `engine.lock` holder, a live listener, or `EADDRINUSE`), the launcher **re-runs the §2 probe once** and, if a listener answers, connects to it. That is not a respawn. If the re-probe fails, it reports the failure (§5).
+- Otherwise it spawns `serve`, which takes `engine.lock` and runs its §4 checks, refusing with exit 20 or 21 if the home is owned or the path unsafe.
+- **On child exit 20** (a live `engine.lock` holder, a live listener, or `EADDRINUSE`), the launcher **re-runs the §2 probe once** and, if a listener answers, connects to it. That is not a respawn. If the re-probe fails, it reports the failure (§5).
 
 A launcher that reuses another launcher's listener does not own it: that `serve` ends when **its** launcher ends (§3).
 
@@ -56,8 +56,8 @@ A launcher that reuses another launcher's listener does not own it: that `serve`
 
 - **Body and token:** exactly `{ pid, startedAt, token }`, `token` 128 random bits as 32 lowercase hex, fresh on every acquisition, kept in memory, never logged, never on the wire (M1 pin lines 98 and 103 (d); `lock.ts:16-23`, `:54-56`).
 - **Create:** exclusive create through a private temp file hard-linked into place (`createExclusive`, `lock.ts:181-195`), up to five attempts (`lock.ts:259`).
-- **Live holder:** a holder whose pid is alive, whatever its token, means the home is owned (M1 pin line 102 (c); `lock.ts:263-269`, `isPidAlive` `:166-174`). **`serve` exits 10.** So does running out of attempts (`lock.ts:275`).
-- **Stale holder and reclaim:** a dead pid or a corrupt body is reclaimed by rename-aside, re-read, and delete only if byte-for-byte unchanged, else restored (M1 pin line 101 (b); `reclaimIfUnchanged`, `lock.ts:219-245`). A symlink at the path is corrupt and never followed (`lock.ts:156`); any other non-regular file is refused (`LockPathNotAFileError`, `lock.ts:153-163`): **exit 11**, as is any other I/O error taking the lock.
+- **Live holder:** a holder whose pid is alive, whatever its token, means the home is owned (M1 pin line 102 (c); `lock.ts:263-269`, `isPidAlive` `:166-174`). **`serve` exits 20.** So does running out of attempts (`lock.ts:275`).
+- **Stale holder and reclaim:** a dead pid or a corrupt body is reclaimed by rename-aside, re-read, and delete only if byte-for-byte unchanged, else restored (M1 pin line 101 (b); `reclaimIfUnchanged`, `lock.ts:219-245`). A symlink at the path is corrupt and never followed (`lock.ts:156`); any other non-regular file is refused (`LockPathNotAFileError`, `lock.ts:153-163`): **exit 21**, as is any other I/O error taking the lock.
 - **Release:** only if the on-disk token is this holder's, and only if the path still names the file whose body was checked (M1 pin line 100 (a); `releaseThreadLock`, `lock.ts:323-338`).
 - **Envelope and residuals unchanged:** cross-namespace reclaim and the three-engine reclaim race (M0 Amendment 2 §1, §6 lines 78-91) apply to `engine.lock` as they do to thread locks.
 
@@ -71,8 +71,8 @@ A launcher that reuses another launcher's listener does not own it: that `serve`
 
 - **(a) EOF on its stdin.** Because the launcher holds the stdin pipe open, the engine ends when its launcher exits or crashes and does not orphan. A `serve` started with stdin already at EOF (for example `</dev/null`) shuts down at once.
 - **(b) SIGTERM or SIGINT.**
-- **(c) A fatal listener error** after listening started (the server emits `error`): exit 12.
-- **(d) An unexpected internal fault:** `serve` installs `uncaughtException` and `unhandledRejection` handlers that write one reason line, attempt this shutdown, and exit 14. `serve` never exits with the runtime's default 1.
+- **(c) A fatal listener error** after listening started (the server emits `error`): exit 22.
+- **(d) An unexpected internal fault:** `serve` installs `uncaughtException` and `unhandledRejection` handlers that write one reason line, attempt this shutdown, and exit 24. `serve` never exits with the runtime's default 1.
 
 **Shutdown sequence** (the same for every trigger):
 
@@ -83,9 +83,9 @@ A launcher that reuses another launcher's listener does not own it: that `serve`
 5. `engine.sock` is unlinked **only if** `lstat` still shows a socket with the same `dev`+`ino` this process bound. Because `engine.lock` is still held, no successor `serve` (inside the envelope) can have bound there.
 6. Release `engine.lock` (§2a).
 
-**Locks on every exit path.** As the stdio engine does (`process.once("exit", () => conn.releaseLocks())`, `main.ts:253` @ `bd037b4`), `serve` registers a process-exit handler that releases every thread lock still held and `engine.lock`. It runs on every exit, including 13 and 14. Only SIGKILL skips it; the next start then reclaims the dead holder's locks under §2a.
+**Locks on every exit path.** As the stdio engine does (`process.once("exit", () => conn.releaseLocks())`, `main.ts:253` @ `bd037b4`), `serve` registers a process-exit handler that releases every thread lock still held and `engine.lock`. It runs on every exit, including 23 and 24. Only SIGKILL skips it; the next start then reclaims the dead holder's locks under §2a.
 
-**A failing shutdown step** writes one stderr log line and the sequence continues with the next step. The exit keeps the trigger's code, or 13 if the deadline passes (§6).
+**A failing shutdown step** writes one stderr log line and the sequence continues with the next step. The exit keeps the trigger's code, or 23 if the deadline passes (§6).
 
 **Deadline.** Shutdown has a **5 s** deadline from the first trigger. When it expires, `serve` writes its final reason line and exits anyway (§6). A second trigger during shutdown changes nothing.
 
@@ -96,31 +96,31 @@ A connected client that is not the launcher does **not** keep `serve` alive, and
 With `engine.lock` held (§2a), in this order:
 
 1. **`lstat($MADC_HOME/engine.sock)`.**
-2. **`ENOENT`:** go to `listen`. **Any other `lstat` error** (`EACCES`, `ENOTDIR`, `ELOOP`, `EIO`, …): **refuse.** Exit 11.
-3. **Present and not a socket** (a symlink, regular file, directory, FIFO, device, or anything for which `isSocket()` is false): **refuse, do not unlink.** Exit 11.
+2. **`ENOENT`:** go to `listen`. **Any other `lstat` error** (`EACCES`, `ENOTDIR`, `ELOOP`, `EIO`, …): **refuse.** Exit 21.
+3. **Present and not a socket** (a symlink, regular file, directory, FIFO, device, or anything for which `isSocket()` is false): **refuse, do not unlink.** Exit 21.
 4. **A socket:** probe `connect()` with a **1 s** timeout.
-   - The probe connects (a listener answers): **refuse, do not unlink.** Exit 10.
-   - The probe times out: **refuse, do not unlink.** Exit 11.
-   - The probe fails with `ECONNREFUSED`, **or** with `ENOENT` on the path step 1 verified as a socket: **stale.** Re-`lstat`; if it is still a socket with the same `dev`+`ino`, unlink it and go to `listen`; if it is gone (`ENOENT`), go to `listen`; if it changed or the re-`lstat` fails otherwise, refuse without unlinking (exit 11). The `ENOENT` case exists because Bun 1.3.11 reports a stale Unix socket as `ENOENT`, not `ECONNREFUSED` (Argus review of #73 at `6e20176`, line 129: "Bun 1.3.11 gave `ENOENT`; Bun 1.4.2 and Node gave `ECONNREFUSED`"). CI runs Bun 1.3.11.
-   - Any other probe error: refuse, do not unlink. Exit 11.
+   - The probe connects (a listener answers): **refuse, do not unlink.** Exit 20.
+   - The probe times out: **refuse, do not unlink.** Exit 21.
+   - The probe fails with `ECONNREFUSED`, **or** with `ENOENT` on the path step 1 verified as a socket: **stale.** Re-`lstat`; if it is still a socket with the same `dev`+`ino`, unlink it and go to `listen`; if it is gone (`ENOENT`), go to `listen`; if it changed or the re-`lstat` fails otherwise, refuse without unlinking (exit 21). The `ENOENT` case exists because Bun 1.3.11 reports a stale Unix socket as `ENOENT`, not `ECONNREFUSED` (Argus review of #73 at `6e20176`, line 129: "Bun 1.3.11 gave `ENOENT`; Bun 1.4.2 and Node gave `ECONNREFUSED`"). CI runs Bun 1.3.11.
+   - Any other probe error: refuse, do not unlink. Exit 21.
 
-**Listen (between steps 4 and 5), under umask `0o177`.** On POSIX, `serve` sets `process.umask(0o177)` immediately before `listen()` and restores the previous umask straight after the bind, in `listen`'s callback or its `error` handler, before anything else is created. A `listen` that fails with `EADDRINUSE` is exit 10; any other `listen` failure is exit 12.
+**Listen (between steps 4 and 5), under umask `0o177`.** On POSIX, `serve` sets `process.umask(0o177)` immediately before `listen()` and restores the previous umask straight after the bind, in `listen`'s callback or its `error` handler, before anything else is created. A `listen` that fails with `EADDRINUSE` is exit 20; any other `listen` failure is exit 22.
 
-5. **After `listen`:** `chmod` the socket to `0600`, then `lstat` it: it must be a socket, mode `0600`, owned by the process uid. If the `chmod` or that check fails: **close the server, unlink the socket this process bound, and refuse.** Exit 11 (fail closed; Argus L5). The umask keeps the socket from ever existing at a wider mode; the `chmod` plus `lstat` check stays as the verification.
+5. **After `listen`:** `chmod` the socket to `0600`, then `lstat` it: it must be a socket, mode `0600`, owned by the process uid. If the `chmod` or that check fails: **close the server, unlink the socket this process bound, and refuse.** Exit 21 (fail closed; Argus L5). The umask keeps the socket from ever existing at a wider mode; the `chmod` plus `lstat` check stays as the verification.
 
-**Windows (named pipe).** Steps 1-5's `lstat`, unlink and `chmod`, and the listen rule's umask, do not apply. The pipe name is `\\.\pipe\madc-<sha256(realpath(MADC_HOME)).slice(0,16)>`, hashing the **real path** so two spellings of one home name one pipe (`socket.ts:23-26` @ `6e20176` hashes the raw string; Argus I1, review line 192). `engine.lock` (§2a) applies. `EADDRINUSE` on the pipe is exit 10. Windows termination is a hard kill: no shutdown sequence runs and 143 is not observable, so on Windows the launcher always closes `serve`'s stdin first (EOF, exit 0) before any kill (§5). The owner-only pipe ACL is not pinned (§9). Nothing on Windows runs in CI: the Windows branch is **unverified**.
+**Windows (named pipe).** Steps 1-5's `lstat`, unlink and `chmod`, and the listen rule's umask, do not apply. The pipe name is `\\.\pipe\madc-<sha256(realpath(MADC_HOME)).slice(0,16)>`, hashing the **real path** so two spellings of one home name one pipe (`socket.ts:23-26` @ `6e20176` hashes the raw string; Argus I1, review line 192). `engine.lock` (§2a) applies. `EADDRINUSE` on the pipe is exit 20. Windows termination is a hard kill: no shutdown sequence runs and 143 is not observable, so on Windows the launcher always closes `serve`'s stdin first (EOF, exit 0) before any kill (§5). The owner-only pipe ACL is not pinned (§9). Nothing on Windows runs in CI: the Windows branch is **unverified**.
 
 ## 5. Launcher waits
 
 - **Start.** After spawning, the launcher waits up to **5 s** for `initialize` to succeed over the socket (it may retry `connect()` until then).
-- **Child exited 10 before `initialize`:** re-probe once per §2 and connect if a listener answers; otherwise report the failure as below.
+- **Child exited 20 before `initialize`:** re-probe once per §2 and connect if a listener answers; otherwise report the failure as below.
 - **Deadline passed, child still running and never completed `initialize`:** SIGTERM, then SIGKILL **2 s** later if still running.
 - **Stopping a child that did complete `initialize`:** close its stdin (EOF). If the launcher must signal it, SIGTERM, then wait **7 s** (the 5 s shutdown deadline plus a 2 s margin) before SIGKILL. On Windows, the stdin close always comes first, before any kill (§4).
 - **Any failure:** show it with the child's stderr (drained per §1.3) and its exit code when it exited. **No automatic retry or respawn.**
 
 ## 6. Exit codes for `madc-engine serve`
 
-**Existing codes, reused.** The engine process already uses `2` for a bad `$MADC_HOME` (`main.ts:222-227` @ `bd037b4`, and the CLI pin's "non-absolute `MADC_HOME` (also engine exit 2)", `PIN-madc-M0-cli.md:194`) and for `auth-set` usage errors (`auth-set.ts:112-117`, `:120`); `130` for SIGINT and `143` for SIGTERM (`main.ts:254-259`, pairs at `:255` and `:256`; `auth-set.ts:154` uses 130 for an interrupt); `1` and `4` for `auth-set` store and lane failures (`auth-set.ts:175-178`; `:134`, `:137-141`). The CLI's own table is 0-5 plus 130/143 (`PIN-madc-M0-cli.md:188-198`; `packages/cli/src/exit-codes.ts:6-15`). The new codes 10-14 appear nowhere in the engine or CLI source at `bd037b4`, and `serve` does not use 1, 3, 4 or 5, so a `serve` exit is never mistaken for an `auth-set` or CLI class.
+**Existing codes, reused.** The engine process already uses `2` for a bad `$MADC_HOME` (`main.ts:222-227` @ `bd037b4`, and the CLI pin's "non-absolute `MADC_HOME` (also engine exit 2)", `PIN-madc-M0-cli.md:194`) and for `auth-set` usage errors (`auth-set.ts:112-117`, `:120`); `130` for SIGINT and `143` for SIGTERM (`main.ts:254-259`, pairs at `:255` and `:256`; `auth-set.ts:154` uses 130 for an interrupt); `1` and `4` for `auth-set` store and lane failures (`auth-set.ts:175-178`; `:134`, `:137-141`). The CLI's own table is 0-5 plus 130/143 (`PIN-madc-M0-cli.md:188-198`; `packages/cli/src/exit-codes.ts:6-15`). The new codes 20-24 appear nowhere in the engine or CLI source at `bd037b4`, and `serve` does not use 1, 3, 4 or 5, so a `serve` exit is never mistaken for an `auth-set` or CLI class. **Runtime-reserved codes.** Node.js reserves `1`, `3`-`7`, `9`, `10`, `12`, `13`, `14`, `124` and `>128` for its own runtime failures ([Node.js `doc/api/process.md`, "Exit codes"](https://github.com/nodejs/node/blob/main/doc/api/process.md#exit-codes), read 2026-11-24). `serve`'s new codes therefore sit at 20-24, outside that list; `130` and `143` are Node's own signal exits (128 + signal number) and match. A `serve` exit with any code not in the table below (including a runtime-reserved one, for example `13` from an unsettled top-level `await` in `bin.ts`) is not one of `serve`'s pinned meanings: the launcher treats it as `24`, an unexpected fault.
 
 | Code | Meaning | When |
 | --- | --- | --- |
@@ -128,24 +128,24 @@ With `engine.lock` held (§2a), in this order:
 | 130 | Clean shutdown, SIGINT | §3 (b), finished within 5 s (reuses `main.ts:255`) |
 | 143 | Clean shutdown, SIGTERM | §3 (b), finished within 5 s (reuses `main.ts:256`); POSIX only (§4 Windows) |
 | 2 | Usage or home | Any argument after `serve`; `MADC_HOME` set but not absolute; `$MADC_HOME` cannot be created `0700` or made private (`socket.ts:49-50` @ `6e20176`) |
-| 10 | The home is already owned | Live `engine.lock` holder or acquire attempts exhausted (§2a); §4 step 4 probe connected; `listen` `EADDRINUSE` (POSIX socket or Windows pipe) |
-| 11 | Unsafe path | `engine.lock` path not a regular file or other I/O error taking it (§2a); §4 step 2 `lstat` error other than `ENOENT`; step 3 non-socket; step 4 probe timeout, other probe error, or socket changed before unlink; step 5 `chmod`/mode/owner failure |
-| 12 | Unexpected bind or listen error | `listen` fails other than `EADDRINUSE` (`EACCES`, a path over the 104/108-byte socket limit, Argus I4, review line 195, or anything else); or a fatal server `error` after listening (§3 c) |
-| 13 | Shutdown deadline exceeded | A clean trigger (EOF, SIGINT, SIGTERM) whose shutdown did not finish within 5 s |
-| 14 | Unexpected internal fault | An `uncaughtException` or `unhandledRejection` outside a shutdown already under way (§3 d) |
+| 20 | The home is already owned | Live `engine.lock` holder or acquire attempts exhausted (§2a); §4 step 4 probe connected; `listen` `EADDRINUSE` (POSIX socket or Windows pipe) |
+| 21 | Unsafe path | `engine.lock` path not a regular file or other I/O error taking it (§2a); §4 step 2 `lstat` error other than `ENOENT`; step 3 non-socket; step 4 probe timeout, other probe error, or socket changed before unlink; step 5 `chmod`/mode/owner failure |
+| 22 | Unexpected bind or listen error | `listen` fails other than `EADDRINUSE` (`EACCES`, a path over the 104/108-byte socket limit, Argus I4, review line 195, or anything else); or a fatal server `error` after listening (§3 c) |
+| 23 | Shutdown deadline exceeded | A clean trigger (EOF, SIGINT, SIGTERM) whose shutdown did not finish within 5 s |
+| 24 | Unexpected internal fault | An `uncaughtException` or `unhandledRejection` outside a shutdown already under way (§3 d) |
 
 **Precedence (every combination):**
 
 | Situation | Exit |
 | --- | --- |
-| Startup check fails, in the order args → home → `engine.lock` → §4 steps 1-4 → `listen` → step 5 | The **first** failing check's code (2, 10, 11 or 12) |
-| Unexpected fault during startup, not one of those checks | 14 |
+| Startup check fails, in the order args → home → `engine.lock` → §4 steps 1-4 → `listen` → step 5 | The **first** failing check's code (2, 20, 21 or 22) |
+| Unexpected fault during startup, not one of those checks | 24 |
 | EOF or signal during startup, before any check has failed | Startup is aborted, anything bound is closed and unlinked (§3 step 5 rule), locks released; 0 / 130 / 143 |
 | Running; first trigger EOF / SIGINT / SIGTERM; shutdown finishes within 5 s (with or without a failing shutdown step) | 0 / 130 / 143 |
-| Running; first trigger EOF / SIGINT / SIGTERM; deadline passes | 13 |
-| Running; first trigger a fatal listener error | 12, whether or not the deadline passes |
-| Running; first trigger an unexpected fault | 14, whether or not the deadline passes |
-| Fault, listener error or step failure **during** a shutdown already under way | Treated as a failing shutdown step: the trigger's code, or 13 if a clean trigger's deadline passes |
+| Running; first trigger EOF / SIGINT / SIGTERM; deadline passes | 23 |
+| Running; first trigger a fatal listener error | 22, whether or not the deadline passes |
+| Running; first trigger an unexpected fault | 24, whether or not the deadline passes |
+| Fault, listener error or step failure **during** a shutdown already under way | Treated as a failing shutdown step: the trigger's code, or 23 if a clean trigger's deadline passes |
 | Second EOF or signal during shutdown | No change |
 | SIGKILL | No code from `serve` (killed by signal 9); its locks are reclaimed at the next start (§2a) |
 
@@ -173,8 +173,8 @@ Kept unchanged:
 Narrowed:
 
 - **Stale rule** (base line 16, "Only if `connect()` fails with `ECONNREFUSED` … may it unlink"). Now: unlink only an `lstat`-verified socket whose bounded probe failed with `ECONNREFUSED` or `ENOENT`, re-checked by `dev`+`ino` before unlink, with `engine.lock` held. **Why:** `socket.ts:30-42,66-72` @ `6e20176` treats any probe error as stale and has no timeout, so it deletes a regular file and throws a raw `EISDIR` on a directory (Argus L2, review lines 123-129); the `ENOENT` case keeps stale recovery working on CI's Bun 1.3.11; the lock stops two `serve`s racing the unlink (pre-check M2).
-- **`lstat` errors** (`socket.ts:56-62` @ `6e20176` treats every error as "absent" and binds). Now only `ENOENT` means absent; any other error is exit 11. **Why:** pre-check L2.
-- **`chmod` failure** (`socket.ts:104-110` @ `6e20176` swallows it). Now fatal: close, unlink, exit 11; and `listen` runs under umask `0o177`. **Why:** Argus L5 (review lines 169-173) and pre-check L7; a socket at umask mode breaks base line 13's `0600`.
+- **`lstat` errors** (`socket.ts:56-62` @ `6e20176` treats every error as "absent" and binds). Now only `ENOENT` means absent; any other error is exit 21. **Why:** pre-check L2.
+- **`chmod` failure** (`socket.ts:104-110` @ `6e20176` swallows it). Now fatal: close, unlink, exit 21; and `listen` runs under umask `0o177`. **Why:** Argus L5 (review lines 169-173) and pre-check L7; a socket at umask mode breaks base line 13's `0600`.
 - **Shutdown unlink** (`socket.ts:125-131` @ `6e20176` unlinks anything not a symlink). Now only the socket this process bound (`dev`+`ino`), before `engine.lock` is released. **Why:** do not remove a successor listener's socket.
 - **Socket teardown** (`socket.ts:118-121` @ `6e20176` destroys without `end()`). Now `end()`, then `destroy()` on `finish` or after a 2 s per-socket grace. **Why:** queued `turn/completed` frames are flushed (pre-check M1, COPILOT-PATTERNS #10), and `server.close()` still cannot hang.
 - **Windows pipe name** (base line 14, `socket.ts:23-26` @ `6e20176`, hash of the raw `MADC_HOME`). Now the hash of `realpath(MADC_HOME)`. **Why:** two spellings of one home must not give two listeners (Argus I1).
@@ -184,6 +184,7 @@ Narrowed:
 - §3 `room/updated` stays exactly as written. Argus H1 on #73 is a build gap against it, not a pin change.
 - §4 is unchanged. It still cites no Iris design spec (the evidence-bound rule is D-626; the Iris citation gap is D-618). Out of scope here.
 - **Windows owner-only pipe ACL: an M3 gap, carried and unverified.** The pipe gets no owner-only ACL today (Argus I1, review line 192), and this amendment does not pin an API for one. It must be pinned before Windows is claimed as supported.
+- **Bun's runtime-reserved exit codes: unverified.** No Bun source listing reserved process exit codes was found; if Bun reserves any of 20-24, the launcher's "not in the table means 24" rule (§6) still holds, but the code's meaning would be ambiguous under Bun. Carried; check before M3-A2 ships.
 - **Doctor does not see `engine.lock` residue.** `madc doctor`'s lock check lists `sessions/` only (`packages/cli/src/doctor.ts:748-751` @ `bd037b4`), so an orphaned `engine.lock.reclaim-*` or `engine.lock.tmp-*` in `$MADC_HOME` (M0 Amendment 2 §6 residuals) is not reported. Carried; a CLI-pin change, not made here.
 - Who reconnects after a reused listener's launcher exits, and the desktop's reconnect UX, are M3-A2 build questions; this pin requires only that the launcher does not auto-retry or respawn (§5).
 - Whether `serve` is built in PR #73 (M3-A1) or as the first step of M3-A2 is the Founder's call; this pin does not decide it.
