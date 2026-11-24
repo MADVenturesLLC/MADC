@@ -254,7 +254,10 @@ export {
   type WriteRefusal,
 } from "./session-v2.ts";
 export {
+  enginePipeName,
   engineSocketPath,
+  SOCKET_CLOSE_GRACE_MS,
+  SOCKET_PATH_MAX_BYTES,
   SOCKET_PROBE_TIMEOUT_MS,
   type SocketServerDeps,
   type SocketServerHandle,

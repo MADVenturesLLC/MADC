@@ -335,6 +335,9 @@ function requireId(p: Record<string, unknown>, key: string, issues: string[]): s
   return value;
 }
 
+/** `session/search` params (M3 pin §2); any other key is refused (amendment 1 §10.7). */
+const SESSION_SEARCH_KEYS: ReadonlySet<string> = new Set(["query", "limit", "seatId"]);
+
 function throwIfIssues(issues: string[]): void {
   if (issues.length > 0) throw invalidParams(issues);
 }
@@ -879,6 +882,10 @@ export class EngineConnection {
    */
   notifyRoomUpdated(reason: RoomUpdateReason, threadId: string): void {
     if (!this.#initialized || !this.#subscribedRoom || this.#shutDown) return;
+    // Amendment 1 §10.3 (rev 6): an output that has already called `end()`, or is being
+    // destroyed, receives no `room/updated` (its socket is closing; a write would fail or be lost).
+    const out = this.#opts.output;
+    if (out.writableEnded || out.destroyed) return;
     this.#send({ method: "room/updated", params: { reason, threadId } });
   }
 
@@ -900,6 +907,11 @@ export class EngineConnection {
 
   #sessionSearch(params: unknown): SessionSearchResult {
     const p = paramsObject(params);
+    // Amendment 1 §10.7: a key outside base pin §2's params is -32602 with a fixed message that
+    // never echoes the key, the same way `room/inspect` refuses (base pin line 22).
+    if (Object.keys(p).some((key) => !SESSION_SEARCH_KEYS.has(key))) {
+      throw invalidParams(["session/search takes only query, limit and seatId"]);
+    }
     // Pin §2: wire values go to `searchSessions` unchanged, which refuses a blank or non-string
     // `query`, a `limit` that is not a positive integer and a `seatId` outside the id grammar with
     // -32602 (Argus #73 L1: a wrong type is refused, never dropped).
@@ -912,6 +924,10 @@ export class EngineConnection {
 
   #sessionRead(params: unknown): SessionReadResult {
     const p = paramsObject(params);
+    // Amendment 1 §10.7: as `session/search` above — unknown keys are -32602, never echoed.
+    if (Object.keys(p).some((key) => key !== "threadId")) {
+      throw invalidParams(["session/read takes only threadId"]);
+    }
     const issues: string[] = [];
     const threadId = requireId(p, "threadId", issues);
     throwIfIssues(issues);
@@ -1590,10 +1606,11 @@ export class EngineConnection {
       throw err;
     }
     record.thread.updatedAt = Math.max(record.thread.updatedAt, outLine.ts);
-    // M3-A1 pin §3 ("a handoff links/aborts"): from here on `handoff.out` is durable, so every
-    // failure below (a `handoff.aborted` record, a link that does not verify, a failed append) has
-    // changed the source session and is announced on the SOURCE thread after the error answer.
-    // Success announces on the target thread instead (below), so this hook is dropped on success.
+    // M3-A1 pin §3 ("a handoff links/aborts"), amendment 1 §10.1-2: from here on `handoff.out` is
+    // durable, so the request announces exactly one `handoff` on the SOURCE thread whatever the
+    // outcome. Every failure below (a `handoff.aborted` record, a link that does not verify, a
+    // failed append) fires this hook after the error answer; success fires its own `after` (same
+    // source thread) and this hook is dropped.
     this.#afterError.push(() => this.#emitRoomUpdated("handoff", threadId));
     const link: SessionOpenHandoffLink = {
       sourceThreadId: threadId,
@@ -1674,7 +1691,9 @@ export class EngineConnection {
     }
     return {
       value: { handoffId, targetThreadId, targetGenesisHash: genesis.hash },
-      after: () => this.#emitRoomUpdated("handoff", targetThreadId),
+      // Amendment 1 §10.2: `threadId` is always the source, where `handoff.link` was appended;
+      // a client finds the target from that record (`session/read`, `room/inspect`).
+      after: () => this.#emitRoomUpdated("handoff", threadId),
     };
   }
 

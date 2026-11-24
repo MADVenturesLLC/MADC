@@ -7,21 +7,25 @@
  */
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   readlinkSync,
+  renameSync,
   statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { createConnection, Socket } from "node:net";
-import { join } from "node:path";
+import { createConnection, createServer, type Server, Socket } from "node:net";
+import { dirname, join } from "node:path";
 import { createInterface, type Interface } from "node:readline";
-import { PassThrough } from "node:stream";
+import { PassThrough, type Writable } from "node:stream";
 import { afterEach, test } from "node:test";
 import { type Agent, echoAgent } from "./agent.ts";
 import type { RoomReport } from "./inspect.ts";
@@ -30,7 +34,9 @@ import type { SessionReadResult, SessionSearchResult } from "./search.ts";
 import { EngineConnection } from "./server.ts";
 import { unguardedSessionWriterForTests } from "./session-store.ts";
 import {
+  enginePipeName,
   engineSocketPath,
+  SOCKET_PATH_MAX_BYTES,
   type SocketServerHandle,
   type SocketServerOptions,
   SocketStartError,
@@ -77,9 +83,16 @@ function waitFor(cond: () => boolean, ms: number, what: string): Promise<void> {
 
 class RpcFailure extends Error {
   readonly code: number | undefined;
-  constructor(code: number | undefined, message: string | undefined) {
+  readonly rpcMessage: string | undefined;
+  readonly data: unknown;
+  /** The whole response line as it came off the socket (for "never echoed" checks). */
+  readonly raw: string;
+  constructor(code: number | undefined, message: string | undefined, data: unknown, raw: string) {
     super(`RPC ${code}: ${message}`);
     this.code = code;
+    this.rpcMessage = message;
+    this.data = data;
+    this.raw = raw;
   }
 }
 
@@ -124,8 +137,8 @@ class SocketRpcClient {
         if (!p) return;
         this.#pending.delete(msg.id);
         if (msg.error !== undefined) {
-          const err = msg.error as { code?: number; message?: string };
-          p.reject(new RpcFailure(err.code, err.message));
+          const err = msg.error as { code?: number; message?: string; data?: unknown };
+          p.reject(new RpcFailure(err.code, err.message, err.data, line));
         } else {
           p.resolve(msg.result);
         }
@@ -279,6 +292,80 @@ async function makeStaleSocket(sockPath: string): Promise<void> {
   assert.ok(lstatSync(sockPath).isSocket(), "a stale socket file is left at the path");
 }
 
+/** A bare in-process Unix-socket listener at `sockPath` (impostors and runtime probes). */
+async function listenOn(sockPath: string): Promise<Server> {
+  const server = createServer();
+  await new Promise<void>((resolve) => server.listen(sockPath, () => resolve()));
+  return server;
+}
+
+/** `assert.rejects` matcher for a `SocketStartError` of one kind carrying exactly errno `code`. */
+function refusalWithCode(
+  kind: SocketStartRefusal,
+  code: string | undefined,
+): (err: unknown) => boolean {
+  return (err) => {
+    refusal(kind)(err);
+    assert.equal((err as SocketStartError).code, code, (err as Error).message);
+    return true;
+  };
+}
+
+/**
+ * Child-process subscriber that stops reading (so the engine's writes to it pile up), asks for
+ * `requests` large `session/read` answers, prints `ready`, resumes reading on `go` from stdin, and
+ * prints one JSON summary when the engine ends the connection. A separate process, because an
+ * in-process client paused and resumed after the peer ends gets 0 bytes on Bun 1.3.11
+ * (amendment 1 §3 step 3 test note).
+ */
+const SLOW_SUBSCRIBER = `
+const net = require("node:net");
+const sock = net.createConnection(process.env.MADC_TEST_SOCK);
+const requests = Number(process.env.MADC_TEST_REQUESTS);
+let buf = "";
+let bytes = 0;
+let responses = 0;
+const updates = [];
+sock.setEncoding("utf8");
+sock.on("connect", () => {
+  sock.write(JSON.stringify({ id: 1, method: "initialize", params: { clientInfo: { name: "slow", version: "0" }, capabilities: { subscribeRoom: true } } }) + "\\n");
+});
+function onLine(msg) {
+  if (msg.id === 1) {
+    for (let i = 0; i < requests; i++) {
+      sock.write(JSON.stringify({ id: 10 + i, method: "session/read", params: { threadId: "thr_big" } }) + "\\n");
+    }
+    sock.pause();
+    setTimeout(() => process.stdout.write("ready\\n"), 600);
+  } else if (typeof msg.id === "number" && msg.result !== undefined) {
+    responses++;
+  } else if (msg.method === "room/updated") {
+    updates.push(msg.params);
+  }
+}
+sock.on("data", (chunk) => {
+  bytes += Buffer.byteLength(chunk);
+  buf += chunk;
+  let i;
+  while ((i = buf.indexOf("\\n")) >= 0) {
+    const line = buf.slice(0, i);
+    buf = buf.slice(i + 1);
+    if (line.trim()) onLine(JSON.parse(line));
+  }
+});
+process.stdin.on("data", () => sock.resume());
+let printed = false;
+const report = () => {
+  if (printed) return;
+  printed = true;
+  process.stdout.write(JSON.stringify({ bytes, responses, updates }) + "\\n");
+  process.exit(0);
+};
+sock.on("end", report);
+sock.on("close", report);
+sock.on("error", report);
+`;
+
 /** A fake `connect` for the probe: a socket that emits one error with `code`, or never settles. */
 function fakeConnect(code: string | null): (path: string) => Socket {
   return () => {
@@ -415,10 +502,10 @@ test("M3-A1 socket: a stale-looking socket is unlinked only on ECONNREFUSED / EN
   assert.ok(Date.now() - t0 < 2000, "the probe timeout bounds startup");
   assert.equal(lstatSync(sockPath).ino, before, "timeout: not unlinked");
 
-  // An error that does not prove the socket stale.
+  // An error that does not prove the socket stale; its errno is on the refusal (Argus P4).
   await assert.rejects(
     () => start(home, { socketDeps: { connect: fakeConnect("EACCES") } }),
-    refusal("probe-failed"),
+    refusalWithCode("probe-failed", "EACCES"),
   );
   assert.equal(lstatSync(sockPath).ino, before, "EACCES: not unlinked");
 
@@ -439,6 +526,140 @@ test("M3-A1 socket: a stale-looking socket is unlinked only on ECONNREFUSED / EN
   assert.equal(readFileSync(sockPath, "utf8"), "swapped in");
 });
 
+test("M3-A1 socket: a non-stale probe error refuses even when the path vanished during the probe (amendment 1 §4 step 4)", {
+  skip: !POSIX,
+}, async () => {
+  const home = freshHome();
+  const sockPath = engineSocketPath(home);
+  await makeStaleSocket(sockPath);
+  await assert.rejects(
+    () =>
+      start(home, {
+        socketDeps: {
+          connect: (p) => {
+            unlinkSync(p); // gone before the re-lstat
+            return fakeConnect("EACCES")(p);
+          },
+        },
+      }),
+    refusal("probe-failed"),
+  );
+  assert.equal(existsSync(sockPath), false, "nothing was bound after the refusal");
+});
+
+test("M3-A1 socket: a stale socket whose unlink fails (not ENOENT) refuses and stays put; ENOENT proceeds", {
+  skip: !POSIX,
+}, async () => {
+  const home = freshHome();
+  const sockPath = engineSocketPath(home);
+  await makeStaleSocket(sockPath);
+  const before = lstatSync(sockPath).ino;
+  await assert.rejects(
+    () =>
+      start(home, {
+        socketDeps: {
+          unlink: () => {
+            throw Object.assign(new Error("EACCES: unlink refused"), { code: "EACCES" });
+          },
+        },
+      }),
+    (err: unknown) => {
+      refusalWithCode("stat-failed", "EACCES")(err);
+      assert.match((err as Error).message, /unlink failed \(EACCES\)/);
+      return true;
+    },
+  );
+  assert.equal(lstatSync(sockPath).ino, before, "the stale socket is left in place");
+
+  // Someone else removed it between the re-lstat and our unlink: free to bind.
+  const server = await start(home, {
+    socketDeps: {
+      unlink: (p) => {
+        unlinkSync(p);
+        throw Object.assign(new Error("ENOENT: already gone"), { code: "ENOENT" });
+      },
+    },
+  });
+  const c = await connect(server.socketPath);
+  await c.init("after-unlink-enoent");
+});
+
+test("M3-A1 socket: a socket path over the sun_path limit is refused before anything is bound (listen-failed)", {
+  skip: !POSIX,
+}, async () => {
+  // sun_path is 108 bytes on Linux and 104 on macOS/BSD, one of them the terminating NUL.
+  assert.equal(SOCKET_PATH_MAX_BYTES, process.platform === "linux" ? 107 : 103);
+  /** A home whose engine.sock path is exactly `bytes` long. */
+  const homeWithSocketPathOf = (bytes: number): string => {
+    const base = freshHome();
+    const pad = bytes - Buffer.byteLength(join(base, "x", "engine.sock")) + 1;
+    assert.ok(pad > 0 && pad < 200, `padding ${pad}`);
+    const home = join(base, "h".repeat(pad));
+    mkdirSync(home, { mode: 0o700 });
+    assert.equal(Buffer.byteLength(engineSocketPath(home)), bytes);
+    return home;
+  };
+  for (const over of [SOCKET_PATH_MAX_BYTES + 1, SOCKET_PATH_MAX_BYTES + 12]) {
+    const home = homeWithSocketPathOf(over);
+    await assert.rejects(
+      () => start(home),
+      (err: unknown) => {
+        refusalWithCode("listen-failed", undefined)(err);
+        assert.match(
+          (err as Error).message,
+          new RegExp(`socket path too long \\(${over} bytes, limit ${SOCKET_PATH_MAX_BYTES}\\)`),
+        );
+        return true;
+      },
+    );
+    assert.deepEqual(
+      readdirSync(home).filter((f) => f.startsWith("engine")),
+      [],
+      "no socket (or truncated socket name) was bound",
+    );
+  }
+  // Exactly at the limit still binds and serves.
+  const server = await start(homeWithSocketPathOf(SOCKET_PATH_MAX_BYTES));
+  const c = await connect(server.socketPath);
+  await c.init("at-limit");
+});
+
+test("M3-A1 socket: a bound socket not owned by this process's uid fails closed (amendment 1 §4 step 5)", {
+  skip: !POSIX,
+}, async () => {
+  const home = freshHome();
+  const sockPath = engineSocketPath(home);
+  const uid = process.getuid?.() ?? 0;
+  await assert.rejects(
+    () => start(home, { socketDeps: { getuid: () => uid + 1 } }),
+    (err: unknown) => {
+      refusal("chmod-failed")(err);
+      assert.match((err as Error).message, new RegExp(`owner uid is ${uid}, not ${uid + 1}`));
+      return true;
+    },
+  );
+  assert.equal(existsSync(sockPath), false, "the bound socket is removed");
+  // The real uid passes.
+  const server = await start(home);
+  assert.equal(lstatSync(server.socketPath).uid, uid);
+});
+
+test("M3-A1 socket: the Windows pipe name hashes the home's real path (amendment 1 §4 Windows)", () => {
+  const home = freshHome();
+  const alias = join(dirname(home), "alias");
+  symlinkSync(home, alias);
+  const real = enginePipeName(home);
+  assert.match(real, /^\\\\\.\\pipe\\madc-[0-9a-f]{16}$/);
+  assert.equal(enginePipeName(alias), real, "two spellings of one home name one pipe");
+  const rawAliasHash = createHash("sha256").update(alias).digest("hex").slice(0, 16);
+  assert.notEqual(enginePipeName(alias), `\\\\.\\pipe\\madc-${rawAliasHash}`);
+  // An absent home has no listener: the name cannot be computed (ENOENT), never guessed.
+  assert.throws(
+    () => enginePipeName(join(dirname(home), "absent")),
+    (err: unknown) => (err as { code?: string }).code === "ENOENT",
+  );
+});
+
 test("M3-A1 socket: a failed chmod 0600 fails closed (listener closed, socket removed)", {
   skip: !POSIX,
 }, async () => {
@@ -446,7 +667,9 @@ test("M3-A1 socket: a failed chmod 0600 fails closed (listener closed, socket re
     () => {
       throw Object.assign(new Error("EPERM: chmod refused"), { code: "EPERM" });
     },
-    () => {}, // silently does nothing: the post-chmod mode check still refuses
+    // "Succeeds" but leaves the wrong mode (a no-op is no longer enough: the socket is born 0600
+    // under umask 0o177): the post-chmod mode check still refuses.
+    (path: string) => chmodSync(path, 0o644),
   ]) {
     const home = freshHome();
     const sockPath = engineSocketPath(home);
@@ -459,6 +682,221 @@ test("M3-A1 socket: a failed chmod 0600 fails closed (listener closed, socket re
     // Nothing was left listening: a normal start now succeeds.
     await start(home);
   }
+});
+
+test("M3-A1 socket: close() flushes a slow subscriber's MiB-scale backlog, ending with the thread-close room/updated (amendment 1 §3 step 3)", {
+  skip: !POSIX,
+  timeout: 30000,
+}, async () => {
+  const home = freshHome();
+  writeSeat(home, "seat-a");
+  const dir = join(home, "sessions");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const big = unguardedSessionWriterForTests.create(
+    join(dir, "thr_big.jsonl"),
+    "thr_big",
+    "seat-a",
+    { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" },
+    () => [],
+  );
+  big.append("turn.start", { turnId: "turn_1", inputText: "start" });
+  for (let i = 0; i < 4; i++) {
+    big.append("item", {
+      turnId: "turn_1",
+      item: {
+        id: `item_${i}`,
+        kind: "agentMessage",
+        status: "completed",
+        text: "x".repeat(256 * 1024),
+      },
+    });
+  }
+  const server = await start(home);
+  // The driver connects first, so its shutdown (thread close) is broadcast while the slow
+  // subscriber is still open.
+  const driver = await connect(server.socketPath);
+  await driver.init("driver");
+  const s = (await driver.request("thread/start", { seatId: "seat-a" })) as {
+    thread: { id: string };
+  };
+  const requests = 6;
+  const child = spawn(process.execPath, ["-e", SLOW_SUBSCRIBER], {
+    env: {
+      ...process.env,
+      MADC_TEST_SOCK: server.socketPath,
+      MADC_TEST_REQUESTS: String(requests),
+    },
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  let out = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    out += chunk;
+  });
+  const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+  try {
+    await waitFor(() => out.includes("ready\n"), 10000, "slow subscriber ready");
+    const closing = server.close();
+    child.stdin.write("go\n");
+    await withTimeout(closing, 10000, "close() with a slow subscriber");
+    await withTimeout(exited, 10000, "slow subscriber exit");
+  } finally {
+    if (child.exitCode === null) child.kill("SIGKILL");
+  }
+  const summary = JSON.parse(
+    out
+      .split("\n")
+      .filter((l) => l.startsWith("{"))
+      .at(-1) ?? "{}",
+  ) as {
+    bytes: number;
+    responses: number;
+    updates: RoomUpdate[];
+  };
+  assert.equal(summary.responses, requests, "every queued session/read answer arrived");
+  assert.ok(summary.bytes > 4 * 1024 * 1024, `MiB-scale backlog (${summary.bytes} bytes)`);
+  assert.deepEqual(summary.updates.at(-1), { reason: "thread", threadId: s.thread.id });
+});
+
+test("M3-A1 socket: close() with a subscriber that never reads still finishes, bounded by the per-socket grace", {
+  skip: !POSIX,
+  timeout: 30000,
+}, async () => {
+  const home = freshHome();
+  writeSeat(home, "seat-a");
+  const dir = join(home, "sessions");
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const big = unguardedSessionWriterForTests.create(
+    join(dir, "thr_big.jsonl"),
+    "thr_big",
+    "seat-a",
+    { cwd: null, backing: "kimi-code", providerId: "kimi-code", pinnedModel: "m" },
+    () => [],
+  );
+  big.append("turn.start", { turnId: "turn_1", inputText: "start" });
+  for (let i = 0; i < 4; i++) {
+    big.append("item", {
+      turnId: "turn_1",
+      item: {
+        id: `item_${i}`,
+        kind: "agentMessage",
+        status: "completed",
+        text: "x".repeat(256 * 1024),
+      },
+    });
+  }
+  const graceMs = 200;
+  const server = await start(home, { socketDeps: { closeGraceMs: graceMs } });
+  const child = spawn(process.execPath, ["-e", SLOW_SUBSCRIBER], {
+    env: { ...process.env, MADC_TEST_SOCK: server.socketPath, MADC_TEST_REQUESTS: "6" },
+    stdio: ["pipe", "pipe", "inherit"],
+  });
+  let out = "";
+  child.stdout.setEncoding("utf8");
+  child.stdout.on("data", (chunk: string) => {
+    out += chunk;
+  });
+  try {
+    await waitFor(() => out.includes("ready\n"), 10000, "never-reading subscriber ready");
+    // No "go": the subscriber never reads its MiB-scale backlog, so `finish` never fires.
+    const t0 = Date.now();
+    await withTimeout(server.close(), 5000, "close() with a never-reading subscriber");
+    const took = Date.now() - t0;
+    assert.ok(took >= graceMs - 20, `close() waited out the grace (${took} ms)`);
+    assert.ok(took < graceMs + 2000, `close() bounded by the grace (${took} ms)`);
+  } finally {
+    child.kill("SIGKILL");
+  }
+});
+
+test("M3-A1 socket: listen runs under umask 0o177 and the previous umask is restored, on success and on a listen failure", {
+  skip: !POSIX,
+}, async () => {
+  const previous = process.umask(0o022);
+  try {
+    const home = freshHome();
+    let modeAtBind = -1;
+    await start(home, {
+      socketDeps: {
+        chmod: (path, mode) => {
+          modeAtBind = lstatSync(path).mode & 0o777;
+          chmodSync(path, mode);
+        },
+      },
+    });
+    assert.equal(modeAtBind.toString(8), "600", "the socket was born 0600, before any chmod");
+    assert.equal(process.umask(), 0o022, "umask restored after the bind");
+
+    // A listen that fails (a directory appears at the path after the stale unlink): EADDRINUSE on
+    // every runtime, with the errno on the refusal (Argus P4), and the umask restored.
+    const failHome = freshHome();
+    const sockPath = engineSocketPath(failHome);
+    await makeStaleSocket(sockPath);
+    await assert.rejects(
+      () =>
+        start(failHome, {
+          socketDeps: {
+            unlink: (p) => {
+              unlinkSync(p);
+              mkdirSync(p, { mode: 0o700 });
+            },
+          },
+        }),
+      refusalWithCode("listen-failed", "EADDRINUSE"),
+    );
+    assert.equal(process.umask(), 0o022, "umask restored after a failed listen");
+  } finally {
+    process.umask(previous);
+  }
+});
+
+test("M3-A1 socket: close() and the fail-closed path unlink only the socket this engine bound (dev + ino)", {
+  skip: !POSIX,
+}, async () => {
+  // Does this runtime's own server.close() unlink the path (Node 22, Bun 1.4.x) or not (Bun
+  // 1.3.11)? Where it does, an impostor at the path is removed by the runtime, not by us.
+  const probeHome = freshHome();
+  const probePath = join(probeHome, "probe.sock");
+  const probe = await listenOn(probePath);
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  const runtimeUnlinks = !existsSync(probePath);
+
+  /** Replace whatever is at `p` with a different socket (bound by a live in-process server). */
+  const plantImpostor = async (p: string): Promise<Server> => {
+    unlinkSync(p);
+    return listenOn(p);
+  };
+
+  // close(): the socket at the path is no longer ours.
+  const home = freshHome();
+  const server = await start(home);
+  const impostor = await plantImpostor(server.socketPath);
+  const ino = lstatSync(server.socketPath).ino;
+  await server.close();
+  if (!runtimeUnlinks) {
+    assert.equal(lstatSync(server.socketPath).ino, ino, "close(): the impostor is left in place");
+  }
+  await new Promise<void>((resolve) => impostor.close(() => resolve()));
+
+  // Fail-closed: inside chmod, another socket is renamed over ours, so the check refuses
+  // ("replaced") and the fail-closed unlink must leave the other socket alone.
+  const fcHome = freshHome();
+  const fcPath = engineSocketPath(fcHome);
+  const otherPath = join(fcHome, "other.sock");
+  const other = await listenOn(otherPath);
+  const otherIno = lstatSync(otherPath).ino;
+  await assert.rejects(
+    () => start(fcHome, { socketDeps: { chmod: (path) => renameSync(otherPath, path) } }),
+    (err: unknown) => {
+      refusal("chmod-failed")(err);
+      assert.match((err as Error).message, /replaced before the mode check/);
+      return true;
+    },
+  );
+  if (!runtimeUnlinks) {
+    assert.equal(lstatSync(fcPath).ino, otherIno, "fail-closed: the other socket is left in place");
+  }
+  await new Promise<void>((resolve) => other.close(() => resolve()));
 });
 
 // ------------------------------------------------------------- initialize
@@ -524,7 +962,7 @@ test("M3-A1 room/updated: a subscriber gets every pin §3 trigger; unsubscribed 
   });
   await waitFor(() => sub.roomUpdates.length === 5, 2000, "decision resolved update");
 
-  // 4. A handoff links (announced on the target thread).
+  // 4. A handoff links (announced on the SOURCE thread, amendment 1 §10.2).
   const h = (await driver.request("thread/handoff", {
     threadId: src,
     targetSeatId: "seat-a",
@@ -575,8 +1013,8 @@ test("M3-A1 room/updated: a subscriber gets every pin §3 trigger; unsubscribed 
     { reason: "turn", threadId: src },
     { reason: "decision", threadId: src },
     { reason: "decision", threadId: src },
-    { reason: "handoff", threadId: "thr_target" },
-    { reason: "handoff", threadId: src },
+    { reason: "handoff", threadId: src }, // the link: source, not "thr_target" (§10.2)
+    { reason: "handoff", threadId: src }, // the abort: source
     { reason: "thread", threadId: src },
   ]);
   const closeLine = readFileSync(join(home, "sessions", `${src}.jsonl`), "utf8")
@@ -622,7 +1060,7 @@ test("M3-A1 room/updated: a turn interrupted by its client's disconnect announce
   ]);
 });
 
-test("M3-A1 room/updated over stdio: only a subscribed connection receives its own updates", () => {
+test("M3-A1 room/updated over stdio: only a subscribed connection receives its own updates, each turn update after its turn notification", async () => {
   const home = freshHome();
   writeSeat(home, "seat-a");
   for (const subscribe of [true, false]) {
@@ -647,9 +1085,100 @@ test("M3-A1 room/updated over stdio: only a subscribed connection receives its o
     conn.handleLine(
       JSON.stringify({ id: 2, method: "thread/start", params: { seatId: "seat-a" } }),
     );
+    const started = lines.find((m) => m.id === 2) as { result: { thread: { id: string } } };
+    const threadId = started.result.thread.id;
+    conn.handleLine(
+      JSON.stringify({
+        id: 3,
+        method: "turn/start",
+        params: { threadId, input: [{ type: "text", text: "hi" }] },
+      }),
+    );
+    await waitFor(
+      () => lines.some((m) => m.method === "turn/completed"),
+      3000,
+      `turn/completed (subscribeRoom: ${subscribe})`,
+    );
+    // Let anything queued after turn/completed land before reading the order.
+    await new Promise((r) => setImmediate(r));
     const updates = lines.filter((m) => m.method === "room/updated");
-    assert.equal(updates.length, subscribe ? 1 : 0, `subscribeRoom: ${subscribe}`);
+    if (!subscribe) {
+      assert.equal(updates.length, 0, "subscribeRoom:false receives nothing");
+    } else {
+      assert.deepEqual(
+        updates.map((m) => m.params),
+        [
+          { reason: "thread", threadId },
+          { reason: "turn", threadId },
+          { reason: "turn", threadId },
+        ],
+      );
+      // Pin §3 / Argus P2: each turn's room/updated follows its own turn notification.
+      const at = (pred: (m: Record<string, unknown>) => boolean): number => lines.findIndex(pred);
+      const turnStarted = at((m) => m.method === "turn/started");
+      const turnCompleted = at((m) => m.method === "turn/completed");
+      const turnUpdates = lines
+        .map((m, i) => ({ m, i }))
+        .filter(
+          ({ m }) => m.method === "room/updated" && (m.params as RoomUpdate).reason === "turn",
+        )
+        .map(({ i }) => i);
+      assert.equal(turnUpdates.length, 2);
+      const [startUpdate = -1, completionUpdate = -1] = turnUpdates;
+      assert.ok(turnStarted >= 0 && turnCompleted > turnStarted);
+      assert.ok(turnStarted < startUpdate, "turn/started precedes the start room/updated");
+      assert.ok(startUpdate < turnCompleted, "the start room/updated precedes turn/completed");
+      assert.ok(
+        turnCompleted < completionUpdate,
+        "turn/completed precedes the completion room/updated",
+      );
+    }
     conn.shutdown();
+  }
+});
+
+test("M3-A1 room/updated: a subscriber whose output is ending or destroyed receives none (amendment 1 §10.3)", () => {
+  const home = freshHome();
+  for (const state of ["open", "ending", "destroyed"] as const) {
+    const writes: string[] = [];
+    // A stub output: records every write attempt and reports the stream state under test.
+    const output = {
+      write: (chunk: string) => {
+        writes.push(chunk);
+        return true;
+      },
+      on: () => output,
+      once: () => output,
+      writableEnded: state === "ending",
+      destroyed: state === "destroyed",
+    } as unknown as Writable;
+    const conn = new EngineConnection({
+      input: new PassThrough(),
+      output,
+      home,
+      agent: echoAgent,
+      log: () => {},
+    });
+    const init = {
+      id: 1,
+      method: "initialize",
+      params: { clientInfo: { name: "s", version: "0" }, capabilities: { subscribeRoom: true } },
+    };
+    // Initialize while the stub reports open, then switch it to the state under test.
+    Object.assign(output, { writableEnded: false, destroyed: false });
+    conn.handleLine(JSON.stringify(init));
+    Object.assign(output, { writableEnded: state === "ending", destroyed: state === "destroyed" });
+    writes.length = 0;
+    conn.notifyRoomUpdated("thread", "thr_x");
+    if (state === "open") {
+      assert.equal(writes.length, 1);
+      assert.deepEqual(JSON.parse(writes[0] ?? "{}"), {
+        method: "room/updated",
+        params: { reason: "thread", threadId: "thr_x" },
+      });
+    } else {
+      assert.deepEqual(writes, [], `${state}: no room/updated is written`);
+    }
   }
 });
 
@@ -782,9 +1311,62 @@ test("M3-A1 session/read: verified events, chainOk:false for a broken chain, -32
   await assert.rejects(() => c.request("session/read", {}), rpcCode(-32602));
 });
 
+/**
+ * Amendment 1 §10.7: a key outside the method's params is `-32602` with one fixed issue that
+ * never echoes the key (or its value), the same way `room/inspect` refuses (base pin line 22).
+ */
+function unknownKeyRefusal(issue: string): (err: unknown) => boolean {
+  return (err) => {
+    assert.ok(err instanceof RpcFailure, `expected an RPC error, got ${String(err)}`);
+    assert.equal(err.code, -32602, err.message);
+    assert.equal(err.rpcMessage, "Invalid params");
+    assert.deepEqual(err.data, { issues: [issue] });
+    for (const marker of ["SECRET_KEY_MARKER", "SECRET_VALUE_MARKER"]) {
+      assert.ok(!err.raw.includes(marker), `the refusal echoed ${marker}: ${err.raw}`);
+    }
+    return true;
+  };
+}
+
+test("M3-A1 session/search and session/read: unknown keys are -32602 and the key is never echoed (amendment 1 §10.7)", async () => {
+  const c = await readClient();
+  const searchIssue = "session/search takes only query, limit and seatId";
+  for (const params of [
+    { query: NEEDLE, SECRET_KEY_MARKER: "SECRET_VALUE_MARKER" },
+    { query: NEEDLE, limit: 3, seatId: "seat-a", SECRET_KEY_MARKER_2: 1 },
+    { SECRET_KEY_MARKER: "SECRET_VALUE_MARKER" }, // refused as unknown before query is checked
+    JSON.parse(`{"query":"${NEEDLE}","__proto__":{"SECRET_KEY_MARKER":"SECRET_VALUE_MARKER"}}`),
+    { query: NEEDLE, threadId: "thr_other" }, // session/read's key is not session/search's
+  ]) {
+    await assert.rejects(() => c.request("session/search", params), unknownKeyRefusal(searchIssue));
+  }
+  const readIssue = "session/read takes only threadId";
+  for (const params of [
+    { threadId: "thr_other", SECRET_KEY_MARKER: "SECRET_VALUE_MARKER" },
+    { SECRET_KEY_MARKER: "SECRET_VALUE_MARKER" },
+    JSON.parse(`{"threadId":"thr_other","__proto__":{"SECRET_KEY_MARKER":1}}`),
+    { threadId: "thr_other", query: NEEDLE }, // session/search's key is not session/read's
+  ]) {
+    await assert.rejects(() => c.request("session/read", params), unknownKeyRefusal(readIssue));
+  }
+  // Known keys alone still answer (the guard narrows nothing the pin allows).
+  const ok = (await c.request("session/search", {
+    query: NEEDLE,
+    limit: 2,
+    seatId: "seat-a",
+  })) as SessionSearchResult;
+  assert.ok(ok.matches.length > 0);
+  const read = (await c.request("session/read", { threadId: "thr_other" })) as SessionReadResult;
+  assert.equal(read.chainOk, true);
+});
+
 test("M3-A1 room/inspect: {} returns the room report; unknown keys are -32602", async () => {
   const c = await readClient();
   const res = (await c.request("room/inspect", {})) as { room: RoomReport };
   assert.equal(typeof res.room.counts.threads, "number");
   await assert.rejects(() => c.request("room/inspect", { x: 1 }), rpcCode(-32602));
+  await assert.rejects(
+    () => c.request("room/inspect", { SECRET_KEY_MARKER: "SECRET_VALUE_MARKER" }),
+    unknownKeyRefusal("room/inspect takes no params"),
+  );
 });
