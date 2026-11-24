@@ -26,17 +26,32 @@ function makeTempDir(prefix: string): string {
   return dir;
 }
 
+function cleanGitEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const k of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+  ]) {
+    delete env[k];
+  }
+  return {
+    ...env,
+    GIT_AUTHOR_NAME: "MADC Conformance",
+    GIT_AUTHOR_EMAIL: "conformance@madc.invalid",
+    GIT_COMMITTER_NAME: "MADC Conformance",
+    GIT_COMMITTER_EMAIL: "conformance@madc.invalid",
+  };
+}
+
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, {
     cwd,
     encoding: "utf8",
-    env: {
-      ...process.env,
-      GIT_AUTHOR_NAME: "MADC Conformance",
-      GIT_AUTHOR_EMAIL: "conformance@madc.invalid",
-      GIT_COMMITTER_NAME: "MADC Conformance",
-      GIT_COMMITTER_EMAIL: "conformance@madc.invalid",
-    },
+    env: cleanGitEnv(),
   }).trim();
 }
 

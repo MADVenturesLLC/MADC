@@ -44,17 +44,32 @@ function makeHome(): { home: string; cleanup: () => void } {
   return { home, cleanup: () => rmSync(home, { recursive: true, force: true }) };
 }
 
+function cleanGitEnv(): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+  for (const k of [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_COMMON_DIR",
+  ]) {
+    delete env[k];
+  }
+  return {
+    ...env,
+    GIT_AUTHOR_NAME: "MADC Test",
+    GIT_AUTHOR_EMAIL: "test@madc.invalid",
+    GIT_COMMITTER_NAME: "MADC Test",
+    GIT_COMMITTER_EMAIL: "test@madc.invalid",
+  };
+}
+
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, {
     cwd,
     encoding: "utf8",
-    env: {
-      ...process.env,
-      GIT_AUTHOR_NAME: "MADC Test",
-      GIT_AUTHOR_EMAIL: "test@madc.invalid",
-      GIT_COMMITTER_NAME: "MADC Test",
-      GIT_COMMITTER_EMAIL: "test@madc.invalid",
-    },
+    env: cleanGitEnv(),
   }).trim();
 }
 
