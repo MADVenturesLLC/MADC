@@ -2,6 +2,8 @@
 
 *Builder-drafted under M3-A0 · 2026-11-23 · Venue: `MADVenturesLLC/MADC` · Status: **proposed until the Founder merges this PR**. Amends `PIN-madc-M1-protocol-messages.md` additively; `protocolVersion` stays `madc-m1/1`.*
 
+*Amended by `PIN-madc-M3-desktop-protocol-amendment-1.md` (2026-11-24, Argus M1 on #73): `madc-engine serve` starts the socket listener, launched only by the desktop app; lifetime (stdin EOF or signal, 5 s shutdown deadline); one listener per `$MADC_HOME`; §1 stale-socket rule narrowed (`lstat`-verified socket, 1 s probe, `ECONNREFUSED` or Bun `ENOENT`; never unlink a non-socket; `chmod 0600` failure fails closed); `serve` exit codes; supersedes lines 3 and 5's stale status, `D-M3-2` (D-620) and `D-R6` (D-633) wording; additive.*
+
 **What this pin does.** Defines the proposed local-socket JSONL transport (`$MADC_HOME/engine.sock`, pending `D-M3-2`) alongside stdio so `packages/desktop` (stack per `D-R6`, still open) connects to the same `@madc/engine` without embedding any agent loop, tools, or credentials. Adds read-only `room/inspect`, `session/search`, `session/read`, and opt-in `room/updated` notifications.
 
 **What it does not do.** It does not weaken single-writer locking, does not expose credentials over the socket, does not add remote/TCP access, and does not alter M0/M1/M2 methods.
