@@ -2,7 +2,7 @@
 
 *Builder-drafted under M3-A0 · 2026-11-23 · Venue: `MADVenturesLLC/MADC` · Status: **proposed until the Founder merges this PR**. Amends `PIN-madc-M1-protocol-messages.md` additively; `protocolVersion` stays `madc-m1/1`.*
 
-**What this pin does.** Defines the local-socket JSONL transport (`$MADC_HOME/engine.sock`) alongside stdio so `packages/desktop` (Tauri v2) connects to the same `@madc/engine` without embedding any agent loop, tools, or credentials. Adds read-only `room/inspect`, `session/search`, `session/read`, and opt-in `room/updated` notifications.
+**What this pin does.** Defines the proposed local-socket JSONL transport (`$MADC_HOME/engine.sock`, pending `D-M3-2`) alongside stdio so `packages/desktop` (stack per `D-R6`, still open) connects to the same `@madc/engine` without embedding any agent loop, tools, or credentials. Adds read-only `room/inspect`, `session/search`, `session/read`, and opt-in `room/updated` notifications.
 
 **What it does not do.** It does not weaken single-writer locking, does not expose credentials over the socket, does not add remote/TCP access, and does not alter M0/M1/M2 methods.
 

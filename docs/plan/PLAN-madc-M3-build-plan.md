@@ -1,6 +1,6 @@
 # madc M3 build plan — Desktop v1 on the same engine
 
-*2026-11-23 · Venue: `MADVenturesLLC/MADC` only · Status: **accepted for M3-A0** (Founder, 2026-11-23: `"Yes, start M3-A0"`). Each act still needs its own Founder merge at an exact head SHA.*
+*2026-11-23 · Venue: `MADVenturesLLC/MADC` only · Status: **accepted for M3-A0** (Founder, 2026-11-23: `"Yes, start M3-A0"`). Full M3 plan and `D-R6` remain open; each act still needs its own Founder commission and its own Founder merge at an exact head SHA.*
 
 *Base: `main` @ `39148d0` (M2-A9 merge commit, PR #69). Roadmap: [`ROADMAP-madc-post-M0.md`](ROADMAP-madc-post-M0.md) (§0 M3 row, §1 M3, §6 D-R6).*
 
@@ -34,7 +34,7 @@ Build a **second window** onto the same local `@madc/engine` over a local socket
 
 | # | Decision | Recommended default | Why it matters |
 | --- | --- | --- | --- |
-| **D-M3-1** | Accept this M3 build plan as commissionable? | **Draft** until Founder accepts explicitly. | Same governance rule as M1/M2. |
+| **D-M3-1** | Accept this M3 build plan as commissionable? | **Draft** until Founder accepts explicitly. | **M3-A0 started** (`"Yes, start M3-A0"`, Founder 2026-11-23); full M3 plan remains open pending `D-R6` and per-act commissions. |
 | **D-R6** | Desktop stack choice: **Tauri v2** (Rust shell + TypeScript/HTML webview) vs **GPUI** (pure Rust, pre-1.0) vs **Electron**? | **Tauri v2 (TypeScript UI + thin Rust shell)** | Reuses `@madc/core` / protocol types cleanly, avoids GPUI pre-1.0 churn (`ROADMAP` §1), and keeps bundle footprint small compared to Electron. |
 | **D-M3-2** | Local socket transport: Unix domain socket (`$MADC_HOME/engine.sock`, `0600`) vs loopback TCP (`127.0.0.1` + bearer token)? | **Unix domain socket (`0600`) on POSIX** (named pipe on Windows). | OS file permissions (`0600` under `0700` `$MADC_HOME`) give same-user isolation with zero port-collision or token-in-URL surface. |
 | **D-M3-3** | Can M3-A0 (pin) and M3-A1 (engine local socket + `session/search`) start immediately after `D-M3-1` even if `D-R6` is still being finalized? | **Yes** — socket transport is stack-independent. | Unblocks engine work immediately while desktop UI stack is confirmed. |
