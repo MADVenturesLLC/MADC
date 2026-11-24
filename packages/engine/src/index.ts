@@ -136,6 +136,13 @@ export {
   type ProviderPresence,
 } from "./providers/list.ts";
 export {
+  readSessionEvents,
+  type SessionReadResult,
+  type SessionSearchMatch,
+  type SessionSearchResult,
+  searchSessions,
+} from "./search.ts";
+export {
   type EngineSeat,
   MADC_DEFAULT_SEAT,
   memoryPathIssue,
@@ -178,7 +185,13 @@ export {
   SURFACE_ARCHITECT_SEAT,
   seedRosterSeats,
 } from "./seats/roster.ts";
-export { ENGINE_VERSION, EngineConnection, type EngineOptions, runEngine } from "./server.ts";
+export {
+  ENGINE_VERSION,
+  EngineConnection,
+  type EngineOptions,
+  type RoomUpdateReason,
+  runEngine,
+} from "./server.ts";
 export {
   createRedactor,
   type DecisionChainEntry,
@@ -240,4 +253,17 @@ export {
   validateForWrite,
   type WriteRefusal,
 } from "./session-v2.ts";
+export {
+  enginePipeName,
+  engineSocketPath,
+  SOCKET_CLOSE_GRACE_MS,
+  SOCKET_PATH_MAX_BYTES,
+  SOCKET_PROBE_TIMEOUT_MS,
+  type SocketServerDeps,
+  type SocketServerHandle,
+  type SocketServerOptions,
+  SocketStartError,
+  type SocketStartRefusal,
+  startSocketServer,
+} from "./socket.ts";
 export { rereadWorktreeIdentity, resolveWorktreeIdentity } from "./worktree.ts";

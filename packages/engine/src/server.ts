@@ -15,6 +15,7 @@ import { type CredentialStore, createCredentialStore } from "./credentials/store
 import { listOpenDecisions } from "./decisions.ts";
 import { checkHandoffTarget, type HandoffTargetCheck, readHandoffBrief } from "./handoff.ts";
 import { confinedPath, sessionsOwnerReadUnsupported } from "./home.ts";
+import { inspectRoom, type RoomReport } from "./inspect.ts";
 import {
   acquireThreadLock,
   holdsThreadLock,
@@ -80,6 +81,12 @@ import {
   listProviderSummaries,
   type ProviderPresence,
 } from "./providers/list.ts";
+import {
+  readSessionEvents,
+  type SessionReadResult,
+  type SessionSearchResult,
+  searchSessions,
+} from "./search.ts";
 import { type LoadedSeat, loadSeat, seatInvalid } from "./seat-store.ts";
 import { listSeatSummaries } from "./seats/list.ts";
 import { ensureSeatMemoryFile } from "./seats/memory.ts";
@@ -108,6 +115,8 @@ import { type BriefServedMarker, checkV2Payload } from "./session-v2.ts";
 import { createSeatWorktree, rereadWorktreeIdentity, resolveWorktreeIdentity } from "./worktree.ts";
 
 export const ENGINE_VERSION = "0.0.0";
+
+export type RoomUpdateReason = "thread" | "turn" | "handoff" | "decision";
 
 export type EngineOptions = {
   input: Readable;
@@ -163,6 +172,8 @@ export type EngineOptions = {
    * machine. Production never passes this.
    */
   closeRereadBudgetMs?: number;
+  /** M3-A1: optional callback invoked when thread/turn/handoff/decision state changes. */
+  onRoomUpdated?: (event: { readonly reason: RoomUpdateReason; readonly threadId: string }) => void;
 };
 
 type TurnRecord = {
@@ -324,6 +335,9 @@ function requireId(p: Record<string, unknown>, key: string, issues: string[]): s
   return value;
 }
 
+/** `session/search` params (M3 pin §2); any other key is refused (amendment 1 §10.7). */
+const SESSION_SEARCH_KEYS: ReadonlySet<string> = new Set(["query", "limit", "seatId"]);
+
 function throwIfIssues(issues: string[]): void {
   if (issues.length > 0) throw invalidParams(issues);
 }
@@ -373,6 +387,7 @@ function parseUserInput(value: unknown, issues: string[]): UserInput[] {
 export class EngineConnection {
   readonly #opts: EngineOptions;
   #initialized = false;
+  #subscribedRoom = false;
   #closed = false;
   #shutDown = false;
   #rl: Interface | null = null;
@@ -402,6 +417,11 @@ export class EngineConnection {
    * for, never another thread's seat or lane (Copilot r4145107307). Only ever resolves.
    */
   #confirmationTail: Promise<void> = Promise.resolve();
+  /**
+   * M3-A1 pin §3: `room/updated` events raised by a synchronous request that then FAILS (a handoff
+   * abort). They are sent after that request's error response, as `after` hooks are after a result.
+   */
+  readonly #afterError: Array<() => void> = [];
 
   constructor(opts: EngineOptions) {
     this.#opts = opts;
@@ -530,6 +550,18 @@ export class EngineConnection {
     }
     this.#closed = true;
     this.#rl?.close();
+    // M3-A1 pin §3: every thread this connection had loaded is now closed (lock released, with or
+    // without a `session.close` line). This connection itself is shut down, so only OTHER
+    // subscribers (socket broadcast) receive these.
+    for (const threadId of this.#threads.keys()) {
+      try {
+        this.#emitRoomUpdated("thread", threadId);
+      } catch (err) {
+        this.#log(
+          `room/updated (thread close) failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   /**
@@ -686,8 +718,10 @@ export class EngineConnection {
       result = this.#dispatch(msg.method, msg.params);
     } catch (err) {
       this.#sendError(msg.id, err);
+      this.#runAfterError();
       return;
     }
+    this.#afterError.length = 0;
     if (result instanceof Promise) {
       // auth/* are the only async methods (keychain child processes). JSON-RPC imposes no
       // response order, so a slow probe never blocks the lines behind it.
@@ -707,6 +741,17 @@ export class EngineConnection {
     } catch (err) {
       // The response is already on the wire; never answer the same id twice.
       this.#log(`post-response error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  #runAfterError(): void {
+    const hooks = this.#afterError.splice(0);
+    for (const hook of hooks) {
+      try {
+        hook();
+      } catch (err) {
+        this.#log(`post-response error: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 
@@ -750,6 +795,12 @@ export class EngineConnection {
         return { value: this.#decisionList(params) };
       case "decision/resolve":
         return this.#decisionResolve(params);
+      case "room/inspect":
+        return { value: this.#roomInspect(params) };
+      case "session/search":
+        return { value: this.#sessionSearch(params) };
+      case "session/read":
+        return { value: this.#sessionRead(params) };
       default:
         throw methodNotFound(method);
     }
@@ -763,7 +814,7 @@ export class EngineConnection {
    * `founderDecision` and `EvidenceRef`, D-439, preserving own `"__proto__"` keys, F3) before any
    * lock or thread lookup, then appends through the thread's `SessionWriter`.
    */
-  #decisionRaise(params: unknown): { value: DecisionRaiseResult } {
+  #decisionRaise(params: unknown): { value: DecisionRaiseResult; after?: () => void } {
     const p = paramsObject(params);
     const issues: string[] = [];
     const threadId = requireId(p, "threadId", issues);
@@ -820,7 +871,67 @@ export class EngineConnection {
         seq: line.seq,
         hash: line.hash,
       },
+      after: () => this.#emitRoomUpdated("decision", threadId),
     };
+  }
+
+  /**
+   * M3-A1 (`docs/plan/PIN-madc-M3-desktop-protocol.md` §3): send one `room/updated` notification to
+   * this connection if it subscribed at `initialize` (`capabilities.subscribeRoom: true`) and has not
+   * shut down. The socket server calls it on every connection to broadcast one connection's event.
+   */
+  notifyRoomUpdated(reason: RoomUpdateReason, threadId: string): void {
+    if (!this.#initialized || !this.#subscribedRoom || this.#shutDown) return;
+    // Amendment 1 §10.3 (rev 6): an output that has already called `end()`, or is being
+    // destroyed, receives no `room/updated` (its socket is closing; a write would fail or be lost).
+    const out = this.#opts.output;
+    if (out.writableEnded || out.destroyed) return;
+    this.#send({ method: "room/updated", params: { reason, threadId } });
+  }
+
+  #emitRoomUpdated(reason: RoomUpdateReason, threadId: string): void {
+    if (this.#opts.onRoomUpdated !== undefined) {
+      this.#opts.onRoomUpdated({ reason, threadId });
+    } else {
+      this.notifyRoomUpdated(reason, threadId);
+    }
+  }
+
+  #roomInspect(params: unknown): { room: RoomReport } {
+    const p = paramsObject(params);
+    if (Object.keys(p).length > 0) {
+      throw invalidParams(["room/inspect takes no params"]);
+    }
+    return { room: inspectRoom(this.#opts.home) };
+  }
+
+  #sessionSearch(params: unknown): SessionSearchResult {
+    const p = paramsObject(params);
+    // Amendment 1 §10.7: a key outside base pin §2's params is -32602 with a fixed message that
+    // never echoes the key, the same way `room/inspect` refuses (base pin line 22).
+    if (Object.keys(p).some((key) => !SESSION_SEARCH_KEYS.has(key))) {
+      throw invalidParams(["session/search takes only query, limit and seatId"]);
+    }
+    // Pin §2: wire values go to `searchSessions` unchanged, which refuses a blank or non-string
+    // `query`, a `limit` that is not a positive integer and a `seatId` outside the id grammar with
+    // -32602 (Argus #73 L1: a wrong type is refused, never dropped).
+    return searchSessions(this.#opts.home, {
+      query: p.query,
+      ...(p.limit !== undefined ? { limit: p.limit } : {}),
+      ...(p.seatId !== undefined ? { seatId: p.seatId } : {}),
+    });
+  }
+
+  #sessionRead(params: unknown): SessionReadResult {
+    const p = paramsObject(params);
+    // Amendment 1 §10.7: as `session/search` above — unknown keys are -32602, never echoed.
+    if (Object.keys(p).some((key) => key !== "threadId")) {
+      throw invalidParams(["session/read takes only threadId"]);
+    }
+    const issues: string[] = [];
+    const threadId = requireId(p, "threadId", issues);
+    throwIfIssues(issues);
+    return readSessionEvents(this.#opts.home, threadId);
   }
 
   /**
@@ -855,7 +966,9 @@ export class EngineConnection {
    */
   #decisionResolve(
     params: unknown,
-  ): { value: DecisionResolveResult } | Promise<{ value: DecisionResolveResult }> {
+  ):
+    | { value: DecisionResolveResult; after?: () => void }
+    | Promise<{ value: DecisionResolveResult; after?: () => void }> {
     const p = paramsObject(params);
     const issues: string[] = [];
     const threadId = requireId(p, "threadId", issues);
@@ -982,7 +1095,7 @@ export class EngineConnection {
     coldDanglingTurnIds: readonly string[],
     resolvedPayload: FounderDecisionResolvedPayload,
     facts: TerminalFacts,
-  ): Promise<{ value: DecisionResolveResult }> {
+  ): Promise<{ value: DecisionResolveResult; after?: () => void }> {
     const controller = new AbortController();
     if (coldHandle !== null) {
       this.#coldConfirmingLocks.set(threadId, coldHandle);
@@ -1111,6 +1224,8 @@ export class EngineConnection {
         outcome: line.payload.outcome,
         resolution: line.payload.resolution,
       },
+      // M3-A1 pin §3: a decision is resolved.
+      after: () => this.#emitRoomUpdated("decision", threadId),
     };
   }
 
@@ -1218,8 +1333,19 @@ export class EngineConnection {
       if (info.title !== undefined && typeof info.title !== "string")
         issues.push("clientInfo.title must be a string");
     }
+    if (p.capabilities !== undefined) {
+      if (!isPlainObject(p.capabilities)) {
+        issues.push("capabilities must be an object");
+      } else if (
+        p.capabilities.subscribeRoom !== undefined &&
+        typeof p.capabilities.subscribeRoom !== "boolean"
+      ) {
+        issues.push("capabilities.subscribeRoom must be a boolean");
+      }
+    }
     throwIfIssues(issues);
     this.#initialized = true;
+    this.#subscribedRoom = isPlainObject(p.capabilities) && p.capabilities.subscribeRoom === true;
     return {
       serverInfo: { name: SERVER_NAME, version: ENGINE_VERSION },
       protocolVersion: PROTOCOL_VERSION,
@@ -1259,7 +1385,13 @@ export class EngineConnection {
       open: { genesisHash: session.genesisHash ?? "", handoff: null, worktree },
       handoffVerified: false,
     });
-    return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+    return {
+      value: { thread },
+      after: () => {
+        this.#notify("thread/started", { thread });
+        this.#emitRoomUpdated("thread", thread.id);
+      },
+    };
   }
 
   /**
@@ -1379,7 +1511,7 @@ export class EngineConnection {
    * (step 5) and answers that failure. Synchronous throughout: no other request interleaves with
    * the procedure.
    */
-  #threadHandoff(params: unknown): { value: ThreadHandoffResult } {
+  #threadHandoff(params: unknown): { value: ThreadHandoffResult; after?: () => void } {
     const p = paramsObject(params);
     const issues: string[] = [];
     // The source thread id routes the request (protocol pin §4.1 -32602, as on every method); it is
@@ -1474,6 +1606,12 @@ export class EngineConnection {
       throw err;
     }
     record.thread.updatedAt = Math.max(record.thread.updatedAt, outLine.ts);
+    // M3-A1 pin §3 ("a handoff links/aborts"), amendment 1 §10.1-2: from here on `handoff.out` is
+    // durable, so the request announces exactly one `handoff` on the SOURCE thread whatever the
+    // outcome. Every failure below (a `handoff.aborted` record, a link that does not verify, a
+    // failed append) fires this hook after the error answer; success fires its own `after` (same
+    // source thread) and this hook is dropped.
+    this.#afterError.push(() => this.#emitRoomUpdated("handoff", threadId));
     const link: SessionOpenHandoffLink = {
       sourceThreadId: threadId,
       sourceSeatId: record.session.seatId,
@@ -1551,7 +1689,12 @@ export class EngineConnection {
         issues: check.issues,
       });
     }
-    return { value: { handoffId, targetThreadId, targetGenesisHash: genesis.hash } };
+    return {
+      value: { handoffId, targetThreadId, targetGenesisHash: genesis.hash },
+      // Amendment 1 §10.2: `threadId` is always the source, where `handoff.link` was appended;
+      // a client finds the target from that record (`session/read`, `room/inspect`).
+      after: () => this.#emitRoomUpdated("handoff", threadId),
+    };
   }
 
   /**
@@ -1692,7 +1835,13 @@ export class EngineConnection {
         }
         this.#threads.set(threadId, fresh);
         const thread = fresh.thread;
-        return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+        return {
+          value: { thread },
+          after: () => {
+            this.#notify("thread/started", { thread });
+            this.#emitRoomUpdated("thread", thread.id);
+          },
+        };
       }
       // Known in this process: still verify we own the on-disk lock before resuming (§3.3); a
       // re-take reloads the thread from disk (Amendment 2 §3 — row (c): a lost lock is re-taken
@@ -1702,7 +1851,13 @@ export class EngineConnection {
       // checked it inside #loadColdThread; a warm resume checks it here, against the files now).
       this.#handoffGate(current, true);
       const thread = current.thread;
-      return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+      return {
+        value: { thread },
+        after: () => {
+          this.#notify("thread/started", { thread });
+          this.#emitRoomUpdated("thread", thread.id);
+        },
+      };
     }
 
     // Lock first, then load under the lock (§3.3). A live foreign holder wins → -32004.
@@ -1723,7 +1878,13 @@ export class EngineConnection {
     }
     this.#threads.set(threadId, record);
     const thread = record.thread;
-    return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+    return {
+      value: { thread },
+      after: () => {
+        this.#notify("thread/started", { thread });
+        this.#emitRoomUpdated("thread", thread.id);
+      },
+    };
   }
 
   /**
@@ -2153,6 +2314,8 @@ export class EngineConnection {
       value: { turn: snapshot },
       after: () => {
         this.#notify("turn/started", { turn: structuredClone(turn) });
+        // M3-A1 pin §3: a turn starts (before the turn can run, so `turn` start precedes completion).
+        this.#emitRoomUpdated("turn", threadId);
         this.#runTurn(record, turnRecord, { ...turnCtx, turnId: turn.id });
       },
     };
@@ -2686,6 +2849,8 @@ export class EngineConnection {
     record.thread.status = "idle";
     record.thread.updatedAt = now;
     this.#notify("turn/completed", { turn: structuredClone(turn) });
+    // M3-A1 pin §3: a turn completes (every terminal status, including interrupted at shutdown).
+    this.#emitRoomUpdated("turn", turn.threadId);
   }
 
   // ------------------------------------------------------------------ output
