@@ -77,7 +77,9 @@ function makeSnippet(text: string, needleLower: string): string {
  */
 export function searchSessions(
   home: string,
-  params: { readonly query: string; readonly limit?: number; readonly seatId?: string },
+  // `limit` and `seatId` are typed `unknown` so wire values reach the pin §2 checks below unchanged:
+  // a wrong-typed value is refused `-32602`, never silently dropped (Argus #73 L1).
+  params: { readonly query: unknown; readonly limit?: unknown; readonly seatId?: unknown },
 ): SessionSearchResult {
   const query = typeof params.query === "string" ? params.query.trim() : "";
   if (query === "") {
@@ -90,8 +92,10 @@ export function searchSessions(
     }
     limit = Math.min(params.limit, MAX_LIMIT);
   }
-  if (params.seatId !== undefined && !isValidId(params.seatId)) {
-    throw invalidParams(["seatId must match the id grammar"]);
+  let seatFilter: string | undefined;
+  if (params.seatId !== undefined) {
+    if (!isValidId(params.seatId)) throw invalidParams(["seatId must match the id grammar"]);
+    seatFilter = params.seatId;
   }
 
   const dir = join(home, "sessions");
@@ -122,7 +126,7 @@ export function searchSessions(
     const verified = verifySessionFile(path, threadId, {}, home);
     if (!verified.ok) continue;
     const seatId = verified.events[0]?.seatId ?? "";
-    if (params.seatId !== undefined && seatId !== params.seatId) continue;
+    if (seatFilter !== undefined && seatId !== seatFilter) continue;
 
     for (const ev of verified.events) {
       if (matches.length >= limit) break;

@@ -255,8 +255,12 @@ export {
 } from "./session-v2.ts";
 export {
   engineSocketPath,
+  SOCKET_PROBE_TIMEOUT_MS,
+  type SocketServerDeps,
   type SocketServerHandle,
   type SocketServerOptions,
+  SocketStartError,
+  type SocketStartRefusal,
   startSocketServer,
 } from "./socket.ts";
 export { rereadWorktreeIdentity, resolveWorktreeIdentity } from "./worktree.ts";

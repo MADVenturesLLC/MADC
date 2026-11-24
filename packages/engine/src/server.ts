@@ -414,6 +414,11 @@ export class EngineConnection {
    * for, never another thread's seat or lane (Copilot r4145107307). Only ever resolves.
    */
   #confirmationTail: Promise<void> = Promise.resolve();
+  /**
+   * M3-A1 pin §3: `room/updated` events raised by a synchronous request that then FAILS (a handoff
+   * abort). They are sent after that request's error response, as `after` hooks are after a result.
+   */
+  readonly #afterError: Array<() => void> = [];
 
   constructor(opts: EngineOptions) {
     this.#opts = opts;
@@ -542,6 +547,18 @@ export class EngineConnection {
     }
     this.#closed = true;
     this.#rl?.close();
+    // M3-A1 pin §3: every thread this connection had loaded is now closed (lock released, with or
+    // without a `session.close` line). This connection itself is shut down, so only OTHER
+    // subscribers (socket broadcast) receive these.
+    for (const threadId of this.#threads.keys()) {
+      try {
+        this.#emitRoomUpdated("thread", threadId);
+      } catch (err) {
+        this.#log(
+          `room/updated (thread close) failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   /**
@@ -698,8 +715,10 @@ export class EngineConnection {
       result = this.#dispatch(msg.method, msg.params);
     } catch (err) {
       this.#sendError(msg.id, err);
+      this.#runAfterError();
       return;
     }
+    this.#afterError.length = 0;
     if (result instanceof Promise) {
       // auth/* are the only async methods (keychain child processes). JSON-RPC imposes no
       // response order, so a slow probe never blocks the lines behind it.
@@ -719,6 +738,17 @@ export class EngineConnection {
     } catch (err) {
       // The response is already on the wire; never answer the same id twice.
       this.#log(`post-response error: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  #runAfterError(): void {
+    const hooks = this.#afterError.splice(0);
+    for (const hook of hooks) {
+      try {
+        hook();
+      } catch (err) {
+        this.#log(`post-response error: ${err instanceof Error ? err.message : String(err)}`);
+      }
     }
   }
 
@@ -843,9 +873,9 @@ export class EngineConnection {
   }
 
   /**
-   * M2-A6 (`docs/plan/PIN-madc-M2-founder-decision-inbox.md` §4.2, F4): `{ data: OpenDecisionSummary[] }`
-   * across all verified session chains in `$MADC_HOME/sessions`. Read-only; takes no params and
-   * returns a fixed sanitized error message when unexpected params are supplied.
+   * M3-A1 (`docs/plan/PIN-madc-M3-desktop-protocol.md` §3): send one `room/updated` notification to
+   * this connection if it subscribed at `initialize` (`capabilities.subscribeRoom: true`) and has not
+   * shut down. The socket server calls it on every connection to broadcast one connection's event.
    */
   notifyRoomUpdated(reason: RoomUpdateReason, threadId: string): void {
     if (!this.#initialized || !this.#subscribedRoom || this.#shutDown) return;
@@ -870,13 +900,13 @@ export class EngineConnection {
 
   #sessionSearch(params: unknown): SessionSearchResult {
     const p = paramsObject(params);
-    const query = typeof p.query === "string" ? p.query : "";
-    const limit = typeof p.limit === "number" ? p.limit : undefined;
-    const seatId = typeof p.seatId === "string" ? p.seatId : undefined;
+    // Pin §2: wire values go to `searchSessions` unchanged, which refuses a blank or non-string
+    // `query`, a `limit` that is not a positive integer and a `seatId` outside the id grammar with
+    // -32602 (Argus #73 L1: a wrong type is refused, never dropped).
     return searchSessions(this.#opts.home, {
-      query,
-      ...(limit !== undefined ? { limit } : {}),
-      ...(seatId !== undefined ? { seatId } : {}),
+      query: p.query,
+      ...(p.limit !== undefined ? { limit: p.limit } : {}),
+      ...(p.seatId !== undefined ? { seatId: p.seatId } : {}),
     });
   }
 
@@ -888,6 +918,11 @@ export class EngineConnection {
     return readSessionEvents(this.#opts.home, threadId);
   }
 
+  /**
+   * M2-A6 (`docs/plan/PIN-madc-M2-founder-decision-inbox.md` §4.2, F4): `{ data: OpenDecisionSummary[] }`
+   * across all verified session chains in `$MADC_HOME/sessions`. Read-only; takes no params and
+   * returns a fixed sanitized error message when unexpected params are supplied.
+   */
   #decisionList(params: unknown): DecisionListResult {
     const p = paramsObject(params);
     if (Object.keys(p).length > 0) {
@@ -915,7 +950,9 @@ export class EngineConnection {
    */
   #decisionResolve(
     params: unknown,
-  ): { value: DecisionResolveResult } | Promise<{ value: DecisionResolveResult }> {
+  ):
+    | { value: DecisionResolveResult; after?: () => void }
+    | Promise<{ value: DecisionResolveResult; after?: () => void }> {
     const p = paramsObject(params);
     const issues: string[] = [];
     const threadId = requireId(p, "threadId", issues);
@@ -1042,7 +1079,7 @@ export class EngineConnection {
     coldDanglingTurnIds: readonly string[],
     resolvedPayload: FounderDecisionResolvedPayload,
     facts: TerminalFacts,
-  ): Promise<{ value: DecisionResolveResult }> {
+  ): Promise<{ value: DecisionResolveResult; after?: () => void }> {
     const controller = new AbortController();
     if (coldHandle !== null) {
       this.#coldConfirmingLocks.set(threadId, coldHandle);
@@ -1171,6 +1208,8 @@ export class EngineConnection {
         outcome: line.payload.outcome,
         resolution: line.payload.resolution,
       },
+      // M3-A1 pin §3: a decision is resolved.
+      after: () => this.#emitRoomUpdated("decision", threadId),
     };
   }
 
@@ -1551,6 +1590,11 @@ export class EngineConnection {
       throw err;
     }
     record.thread.updatedAt = Math.max(record.thread.updatedAt, outLine.ts);
+    // M3-A1 pin §3 ("a handoff links/aborts"): from here on `handoff.out` is durable, so every
+    // failure below (a `handoff.aborted` record, a link that does not verify, a failed append) has
+    // changed the source session and is announced on the SOURCE thread after the error answer.
+    // Success announces on the target thread instead (below), so this hook is dropped on success.
+    this.#afterError.push(() => this.#emitRoomUpdated("handoff", threadId));
     const link: SessionOpenHandoffLink = {
       sourceThreadId: threadId,
       sourceSeatId: record.session.seatId,
@@ -2251,6 +2295,8 @@ export class EngineConnection {
       value: { turn: snapshot },
       after: () => {
         this.#notify("turn/started", { turn: structuredClone(turn) });
+        // M3-A1 pin §3: a turn starts (before the turn can run, so `turn` start precedes completion).
+        this.#emitRoomUpdated("turn", threadId);
         this.#runTurn(record, turnRecord, { ...turnCtx, turnId: turn.id });
       },
     };
@@ -2784,6 +2830,8 @@ export class EngineConnection {
     record.thread.status = "idle";
     record.thread.updatedAt = now;
     this.#notify("turn/completed", { turn: structuredClone(turn) });
+    // M3-A1 pin §3: a turn completes (every terminal status, including interrupted at shutdown).
+    this.#emitRoomUpdated("turn", turn.threadId);
   }
 
   // ------------------------------------------------------------------ output
