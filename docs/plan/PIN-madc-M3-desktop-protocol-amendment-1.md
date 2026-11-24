@@ -181,10 +181,22 @@ Narrowed:
 
 ## 9. Out of scope
 
-- §3 `room/updated` stays exactly as written. Argus H1 on #73 is a build gap against it, not a pin change.
+- §3 `room/updated` keeps its shape and reasons as written. Argus H1 on #73 is a build gap against it, not a pin change; §10 only pins when each event fires and which thread it names.
 - §4 is unchanged. It still cites no Iris design spec (the evidence-bound rule is D-626; the Iris citation gap is D-618). Out of scope here.
 - **Windows owner-only pipe ACL: an M3 gap, carried and unverified.** The pipe gets no owner-only ACL today (Argus I1, review line 192), and this amendment does not pin an API for one. It must be pinned before Windows is claimed as supported.
 - **Bun's runtime-reserved exit codes: unverified.** No Bun source listing reserved process exit codes was found; if Bun reserves any of 20-24, the launcher's "not in the table means 24" rule (§6) still holds, but the code's meaning would be ambiguous under Bun. Carried; check before M3-A2 ships.
 - **Doctor does not see `engine.lock` residue.** `madc doctor`'s lock check lists `sessions/` only (`packages/cli/src/doctor.ts:748-751` @ `bd037b4`), so an orphaned `engine.lock.reclaim-*` or `engine.lock.tmp-*` in `$MADC_HOME` (M0 Amendment 2 §6 residuals) is not reported. Carried; a CLI-pin change, not made here.
 - Who reconnects after a reused listener's launcher exits, and the desktop's reconnect UX, are M3-A2 build questions; this pin requires only that the launcher does not auto-retry or respawn (§5).
 - Whether `serve` is built in PR #73 (M3-A1) or as the first step of M3-A2 is the Founder's call; this pin does not decide it.
+
+## 10. Builder readings on PR #73, ruled (Hephaestus, local `5ea215b`, 2026-11-24)
+
+Hephaestus built `room/updated` and the new methods to readings the base pin does not state. Each is ruled here against the base pin at `bd037b4` and `PIN-madc-M2-handoff-procedure.md` at `bd037b4`. None changes a method, param, result or code; `protocolVersion` stays `madc-m1/1`.
+
+1. **When `handoff` fires (accepted).** A handoff is reported once `handoff.out` has been appended (handoff pin step 2, line 89): exactly one `room/updated` `handoff` is emitted when the request finishes, whatever the outcome (`handoff.link`, `handoff.aborted`, or a failure that appends nothing further, handoff pin lines 106-114). A refusal before `handoff.out` is appended changed no file and emits nothing.
+2. **`threadId` on `handoff` (changed from the built reading).** `threadId` is always the **source** thread, for a link and an abort alike, because `handoff.out`, `handoff.link` and `handoff.aborted` are all appended to the source file (handoff pin lines 13, 89, 103, 106). One field has one meaning; a client finds the target from the source's records via `session/read` or `room/inspect`. The built reading (target on a link, source on an abort) is not adopted.
+3. **`thread` on connection shutdown (accepted).** When a connection shuts down, one `thread` event is emitted for each thread it had loaded, whether or not `session.close` was written (a failed close still unloads the thread). It goes to every other subscribed connection; the closing connection never receives its own.
+4. **No double announcement (accepted).** A handoff target created on disk is announced only by the source's `handoff` event, and a cold thread loaded by `decision/resolve` only by its `decision` event. Neither also emits `thread`. One action, one event.
+5. **Stale `ENOENT` (already pinned).** Covered by §4 step 4 of this amendment: `ENOENT` on a path step 1 verified as a socket is stale.
+6. **Typed startup refusals to exit codes (already pinned; mapping stated).** Under §6: `live` → 20; `symlink`, `not-socket`, `probe-timeout`, `probe-failed`, `replaced` (socket changed before unlink), `stat-failed` (any `lstat` error other than `ENOENT`) and `chmod-failed` → 21; `listen-failed` → 22, except `EADDRINUSE` → 20. A socket path over the 104/108-byte limit is a `listen` failure → 22 (§6 table). Lifecycle and signals are §3 and §5. The Windows pipe ACL stays carried (§9). Whether `serve` is built in PR #73 or in M3-A2 is still the Founder's call (§9).
+7. **Unknown keys on `session/search` and `session/read` (refused).** Both refuse any key outside their params (base lines 26 and 34) with `-32602 InvalidParams`, matching `room/inspect` (base line 22) in the same pin, and the key is not echoed. The base lines are silent; this closes them the same way.
