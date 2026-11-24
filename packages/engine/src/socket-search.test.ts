@@ -27,10 +27,13 @@ import { dirname, join } from "node:path";
 import { createInterface, type Interface } from "node:readline";
 import { PassThrough, type Writable } from "node:stream";
 import { afterEach, test } from "node:test";
+import { fileURLToPath } from "node:url";
 import { type Agent, echoAgent } from "./agent.ts";
 import type { RoomReport } from "./inspect.ts";
+import { acquireLockAt, engineLockPath, releaseThreadLock } from "./lock.ts";
 import type { PresenceTerminal } from "./presence/terminal.ts";
 import type { SessionReadResult, SessionSearchResult } from "./search.ts";
+import { runServe, SERVE_EXIT } from "./serve.ts";
 import { EngineConnection } from "./server.ts";
 import { unguardedSessionWriterForTests } from "./session-store.ts";
 import {
@@ -1392,4 +1395,147 @@ test("M3-A1 room/inspect: {} returns the room report; unknown keys are -32602", 
     () => c.request("room/inspect", { SECRET_KEY_MARKER: "SECRET_VALUE_MARKER" }),
     unknownKeyRefusal("room/inspect takes no params"),
   );
+});
+
+// ===================================================================== M3-A2 serve socket tests
+
+const ENGINE_BIN = fileURLToPath(new URL("./bin.ts", import.meta.url));
+
+test("M3-A2 serve (M3A2-S1): engine.lock token lost before stale unlink -> exit 20, stale socket untouched, no new socket", async () => {
+  if (!POSIX) return;
+  const { home, cleanup } = makeHome();
+  activeCleanups.push(cleanup);
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  const sockPath = engineSocketPath(home);
+  const lockPath = engineLockPath(home);
+
+  // Plant a real stale Unix socket (listener closed without unlinking via a helper process or
+  // rename trick so the socket inode remains at sockPath).
+  const staleHelper = { sockPath: join(home, "tmp-stale.sock") };
+  const dummy = createServer();
+  await withTimeout(
+    new Promise<void>((r) => dummy.listen(staleHelper.sockPath, () => r())),
+    2000,
+    "dummy listen",
+  );
+  renameSync(staleHelper.sockPath, sockPath);
+  await withTimeout(new Promise<void>((r) => dummy.close(() => r())), 2000, "dummy close");
+  assert.equal(lstatSync(sockPath).isSocket(), true, "stale socket planted");
+  const staleIno = lstatSync(sockPath).ino;
+
+  const stderrChunks: Buffer[] = [];
+  const stderr = new PassThrough();
+  stderr.on("data", (d: Buffer) => stderrChunks.push(d));
+  const stdin = new PassThrough();
+  let exitCode: number | null = null;
+
+  const code = await runServe([], {
+    env: { MADC_HOME: home },
+    stdin,
+    stderr,
+    exit: (c) => {
+      exitCode = c;
+    },
+    agent: echoAgent,
+    beforeStaleUnlinkCheck: () => {
+      // Simulate displacing engine.lock right before the §4 step 4 stale-unlink check.
+      writeFileSync(
+        lockPath,
+        JSON.stringify({ pid: process.pid, startedAt: 1, token: "b".repeat(32) }),
+      );
+    },
+  });
+
+  assert.equal(code, SERVE_EXIT.OWNED);
+  assert.equal(exitCode, 20);
+  assert.match(
+    Buffer.concat(stderrChunks).toString("utf8"),
+    /^madc-engine serve: engine\.lock token lost:/m,
+  );
+  assert.equal(existsSync(sockPath), true, "stale socket was NOT unlinked after token loss");
+  assert.equal(lstatSync(sockPath).ino, staleIno);
+});
+
+test("M3-A2 serve e2e: real bin.ts serve binds 0600 socket, answers initialize + room/inspect, rejects second serve (20), exits 0 on EOF", async () => {
+  const { home, cleanup } = makeHome();
+  activeCleanups.push(cleanup);
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  const sockPath = engineSocketPath(home);
+  const lockPath = engineLockPath(home);
+
+  const child = spawn(process.execPath, [ENGINE_BIN, "serve"], {
+    env: { ...process.env, MADC_HOME: home },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  activeCleanups.push(() => {
+    try {
+      child.kill("SIGKILL");
+    } catch {
+      // Already exited.
+    }
+  });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (d) => {
+    stdout += String(d);
+  });
+  child.stderr.on("data", (d) => {
+    stderr += String(d);
+  });
+
+  await waitFor(() => existsSync(sockPath), 4000, "serve bound engine.sock");
+  assert.equal(existsSync(lockPath), true, "engine.lock exists while serve runs");
+  if (POSIX) {
+    assert.equal(statSync(sockPath).mode & 0o777, 0o600);
+  }
+
+  // Second `madc-engine serve` against the same home exits 20 with holder pid + lock path.
+  const second = spawn(process.execPath, [ENGINE_BIN, "serve"], {
+    env: { ...process.env, MADC_HOME: home },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let secondStderr = "";
+  second.stderr.on("data", (d) => {
+    secondStderr += String(d);
+  });
+  const secondCode = await withTimeout(
+    new Promise<number | null>((r) => second.once("exit", (c) => r(c))),
+    5000,
+    "second serve exit 20",
+  );
+  assert.equal(secondCode, 20, secondStderr);
+  assert.ok(
+    secondStderr.includes(`madc-engine serve: home owned by pid ${child.pid}: ${lockPath}`),
+    secondStderr,
+  );
+
+  // Connect flowing client over engine.sock, initialize (madc-m1/1), and call room/inspect.
+  const client = await connect(sockPath);
+  const initRes = (await client.request("initialize", {
+    clientInfo: { name: "m3-a2-test", version: "0.0.0" },
+    capabilities: { subscribeRoom: true },
+  })) as { protocolVersion: string; serverInfo: { name: string } };
+  assert.equal(initRes.protocolVersion, "madc-m1/1");
+  assert.equal(initRes.serverInfo.name, "madc-engine");
+
+  const roomRes = (await client.request("room/inspect", {})) as { room: RoomReport };
+  assert.equal(typeof roomRes.room.counts.threads, "number");
+
+  // Shut down via stdin EOF -> exit 0, socket & lock cleaned up, stdout completely empty.
+  child.stdin.end();
+  const exitCode = await withTimeout(
+    new Promise<number | null>((r) => child.once("exit", (c) => r(c))),
+    5000,
+    "serve EOF shutdown",
+  );
+  await client.close();
+  assert.equal(exitCode, 0, stderr);
+  assert.equal(stdout, "", "serve stdout stays empty");
+  assert.equal(existsSync(lockPath), false, "engine.lock removed on clean exit");
+  assert.equal(existsSync(sockPath), false, "engine.sock removed on clean exit");
+
+  // Also verify unused imports stay clean by checking acquireLockAt/releaseThreadLock availability.
+  const recheck = acquireLockAt(home, lockPath);
+  assert.equal(recheck.ok, true);
+  if (recheck.ok) releaseThreadLock(recheck.handle);
 });

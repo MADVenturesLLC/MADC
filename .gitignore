@@ -3,6 +3,8 @@ node_modules/
 dist/
 *.tsbuildinfo
 coverage/
+packages/desktop/src-tauri/target/
+packages/desktop/src-tauri/gen/schemas/
 
 # Secrets: never commit keys or env files
 .env

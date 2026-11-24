@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MADC Desktop (M3-A2 Scaffold)</title>
+    <style>
+      /* Neutral scaffold only — M3-A3 owns dark-glass design tokens and status pills.
+         M3 pin §4: zero decorative green anywhere in the shell. */
+      :root {
+        color-scheme: dark;
+        font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      }
+      body {
+        margin: 0;
+        padding: 16px;
+        background: #141417;
+        color: #d8dae0;
+      }
+      [role="toolbar"] {
+        display: flex;
+        gap: 8px;
+        padding: 8px;
+        border: 1px solid #2c2e36;
+        margin-bottom: 16px;
+      }
+      [role="toolbar"] button {
+        background: #1d1f26;
+        color: #d8dae0;
+        border: 1px solid #353844;
+        padding: 6px 12px;
+        cursor: pointer;
+      }
+      [role="toolbar"] button[aria-pressed="true"],
+      [role="toolbar"] button:focus-visible {
+        outline: 2px solid #8fa3bf;
+        border-color: #8fa3bf;
+      }
+      .status-neutral {
+        color: #b4b8c4;
+      }
+      .status-fail {
+        color: #e06c75;
+      }
+      pre {
+        background: #1b1d23;
+        border: 1px solid #2c2e36;
+        padding: 12px;
+        overflow-x: auto;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <nav id="focus-bar" role="toolbar" aria-label="MADC Desktop Focus Bar">
+      <button type="button" data-focus-id="connection" aria-pressed="true">Engine</button>
+      <button type="button" data-focus-id="room" aria-pressed="false">Room</button>
+      <button type="button" data-focus-id="decisions" aria-pressed="false">Decisions</button>
+      <button type="button" data-focus-id="search" aria-pressed="false">Search</button>
+    </nav>
+
+    <main>
+      <h1>MADC Desktop Scaffold (M3-A2)</h1>
+      <p id="connection-status" class="status-neutral">
+        Engine connection: idle (neutral — unverified until engine receipt)
+      </p>
+      <button id="connect-btn" type="button">Connect to @madc/engine</button>
+      <pre id="output">Ready. Use Tab / Arrow keys on the focus bar.</pre>
+    </main>
+
+    <script>
+      const bar = document.getElementById("focus-bar");
+      const buttons = Array.from(bar.querySelectorAll("button[data-focus-id]"));
+      let activeIndex = 0;
+
+      function setFocus(index) {
+        activeIndex = (index + buttons.length) % buttons.length;
+        buttons.forEach((btn, i) => {
+          btn.setAttribute("aria-pressed", String(i === activeIndex));
+          btn.tabIndex = i === activeIndex ? 0 : -1;
+        });
+        buttons[activeIndex].focus();
+      }
+
+      bar.addEventListener("keydown", (ev) => {
+        if (ev.key === "ArrowRight") {
+          ev.preventDefault();
+          setFocus(activeIndex + 1);
+        } else if (ev.key === "ArrowLeft") {
+          ev.preventDefault();
+          setFocus(activeIndex - 1);
+        } else if (ev.key === "Home") {
+          ev.preventDefault();
+          setFocus(0);
+        } else if (ev.key === "End") {
+          ev.preventDefault();
+          setFocus(buttons.length - 1);
+        }
+      });
+
+      buttons.forEach((btn, i) => {
+        btn.addEventListener("click", () => setFocus(i));
+      });
+      setFocus(0);
+
+      const statusEl = document.getElementById("connection-status");
+      const outputEl = document.getElementById("output");
+      const connectBtn = document.getElementById("connect-btn");
+
+      async function invokeTauri(cmd, args) {
+        const internals = window.__TAURI_INTERNALS__;
+        if (!internals || typeof internals.invoke !== "function") {
+          throw new Error("Tauri IPC bridge unavailable outside desktop shell");
+        }
+        return internals.invoke(cmd, args || {});
+      }
+
+      connectBtn.addEventListener("click", async () => {
+        statusEl.className = "status-neutral";
+        statusEl.textContent = "Connecting over engine.sock…";
+        try {
+          const info = await invokeTauri("connect_engine");
+          const room = await invokeTauri("rpc_request", { method: "room/inspect", params: {} });
+          // M3 pin §4: keep connection status neutral until a verified hash/sha/servedModel receipt backs it.
+          statusEl.className = "status-neutral";
+          statusEl.textContent = `Connected (${info.protocolVersion}, ${info.coldStartMs}ms) — neutral`;
+          outputEl.textContent = JSON.stringify({ connection: info, room }, null, 2);
+        } catch (err) {
+          statusEl.className = "status-fail";
+          statusEl.textContent = "Engine connection failed (no automatic retry)";
+          outputEl.textContent = String(err);
+        }
+      });
+    </script>
+  </body>
+</html>

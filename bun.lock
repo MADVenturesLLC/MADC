@@ -31,6 +31,14 @@
       "name": "@madc/core",
       "version": "0.0.0",
     },
+    "packages/desktop": {
+      "name": "@madc/desktop",
+      "version": "0.0.0",
+      "dependencies": {
+        "@madc/core": "0.0.0",
+        "@madc/engine": "0.0.0",
+      },
+    },
     "packages/engine": {
       "name": "@madc/engine",
       "version": "0.0.0",
@@ -116,6 +124,8 @@
     "@madc/cli": ["@madc/cli@workspace:packages/cli"],
 
     "@madc/core": ["@madc/core@workspace:packages/core"],
+
+    "@madc/desktop": ["@madc/desktop@workspace:packages/desktop"],
 
     "@madc/engine": ["@madc/engine@workspace:packages/engine"],
 

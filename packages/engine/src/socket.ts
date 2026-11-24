@@ -40,15 +40,23 @@ export type SocketServerDeps = {
   readonly unlink?: (path: string) => void;
   readonly getuid?: () => number;
   readonly closeGraceMs?: number;
+  /** Amendment 1 §2a / §4 step 4: called after stale verdict, before re-lstat and unlink. */
+  readonly beforeStaleUnlink?: () => void;
+  /** Amendment 1 §2a / §4 Listen: called straight after `listen()` succeeds, before step 5. */
+  readonly afterListen?: () => void;
 };
 
 export type SocketServerOptions = Omit<EngineOptions, "input" | "output"> & {
   readonly socketDeps?: SocketServerDeps;
+  /** Amendment 1 §3 (c): fatal listener error after listening started. */
+  readonly onServerError?: (err: Error) => void;
 };
 
 export type SocketServerHandle = {
   readonly socketPath: string;
   close(): Promise<void>;
+  /** Release every thread lock held by active connections (amendment 1 §3 exit-time cleanup). */
+  releaseLocks(): void;
 };
 
 /**
@@ -261,6 +269,8 @@ async function clearStaleSocket(socketPath: string, deps: SocketServerDeps): Pro
       outcome.code,
     );
   }
+  // Amendment 1 §2a / §4 step 4: re-verify engine.lock before unlinking a stale socket.
+  deps.beforeStaleUnlink?.();
   let now: Stats | null;
   try {
     now = lstatOrNull(socketPath);
@@ -297,7 +307,7 @@ async function clearStaleSocket(socketPath: string, deps: SocketServerDeps): Pro
  * (`chmod-failed`).
  */
 export async function startSocketServer(opts: SocketServerOptions): Promise<SocketServerHandle> {
-  const { socketDeps = {}, ...engineOpts } = opts;
+  const { socketDeps = {}, onServerError, ...engineOpts } = opts;
   mkdirSync(engineOpts.home, { recursive: true, mode: 0o700 });
   enforcePrivateDir(engineOpts.home);
   const socketPath = engineSocketPath(engineOpts.home);
@@ -410,9 +420,33 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
     try {
       const st0 = lstatSync(socketPath);
       bound = { dev: st0.dev, ino: st0.ino };
+    } catch (err) {
+      await shutdownAll();
+      throw new SocketStartError(
+        "chmod-failed",
+        socketPath,
+        `could not lstat bound socket (${err instanceof Error ? err.message : String(err)})`,
+      );
+    }
+  }
+
+  // Amendment 1 §2a / §4 Listen: re-verify engine.lock straight after `listen()` succeeds.
+  // If lost, close the server, unlink only the socket this call bound, and propagate the error.
+  if (socketDeps.afterListen !== undefined) {
+    try {
+      socketDeps.afterListen();
+    } catch (err) {
+      await shutdownAll();
+      unlinkOwnSocket();
+      throw err;
+    }
+  }
+
+  if (posix) {
+    try {
       (socketDeps.chmod ?? chmodSync)(socketPath, 0o600);
       const st = lstatSync(socketPath);
-      if (!st.isSocket() || st.dev !== bound.dev || st.ino !== bound.ino) {
+      if (!st.isSocket() || bound === null || st.dev !== bound.dev || st.ino !== bound.ino) {
         throw new Error("the bound socket was replaced before the mode check");
       }
       if ((st.mode & 0o777) !== 0o600) {
@@ -436,11 +470,18 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
     }
   }
 
+  if (onServerError !== undefined) {
+    server.on("error", onServerError);
+  }
+
   return {
     socketPath,
     async close(): Promise<void> {
       await shutdownAll();
       unlinkOwnSocket();
+    },
+    releaseLocks(): void {
+      for (const c of conns) c.releaseLocks();
     },
   };
 }
