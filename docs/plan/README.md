@@ -42,6 +42,8 @@ Planning documents behind madc. Edit rule, keyed to each file's status line:
 | `PIN-madc-M2-seat-worktree.md` | Present (**proposed until the Founder merges it**, builder-drafted 2026-11-23 under M2-A5, P-M2-2: opt-in `worktree?: boolean` on v2 seats (`D-M2-2`), confined `$MADC_HOME/worktrees/<threadId>` creation, dirty-tree never-remove posture (`D-M2-4`), vendor `cwd` placement (`claude-code`, `codex`, `acp-client`), `repoAllow` and doctor behavior; records Founder `D-M2-9` ruling `"No rate cap in M2"`) |
 | `PIN-madc-M2-handoff-procedure-amendment-2.md` | Present (**proposed until the Founder merges it**, builder-drafted 2026-11-23 under M2-A5, P-M2-5: amends `PIN-madc-M2-handoff-procedure.md` §4 step 3 so a `worktree: true` target seat opens in its own `$MADC_HOME/worktrees/<targetThreadId>` off `record.thread.cwd`) |
 | `PIN-madc-M2-room-and-doctor.md` | Present (P-M2-4 pin for `madc room [--json]` and `madc doctor` `room` row shipped in M2-A8 `#68`; Founder accepted M2-A8 as built on 2026-11-23) |
+| `PLAN-madc-M3-build-plan.md` | Present (accepted for M3-A0, Founder 2026-11-23 `"Yes, start M3-A0"`: Desktop v1 on the same engine, acts M3-A0..A8 — local socket transport, `packages/desktop`, evidence-bound widgets, side-by-side seats, handoff view, decision inbox, session search, M3 conformance/freeze) |
+| `PIN-madc-M3-desktop-protocol.md` | Present (merged `#71` `b0db17b`, builder-drafted 2026-11-23 under M3-A0: local-socket JSONL transport `$MADC_HOME/engine.sock`, `room/inspect`, `session/search`, `session/read`, `room/updated`, evidence-bound UI rule; amends `PIN-madc-M1-protocol-messages.md` additively) |
 
 The plan cites these files at `/workspace/briefs/...`; in this repo the path is `docs/plan/`.
 
