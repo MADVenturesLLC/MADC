@@ -30,6 +30,7 @@ import { listOpenDecisions } from "./decisions.ts";
 import { inspectSessionV2 } from "./handoff.ts";
 import { EngineConnection } from "./server.ts";
 import { verifySessionFile } from "./session-store.ts";
+import { fixtureGitEnv } from "./testing/git-env.ts";
 
 function makeTempDir(prefix: string): string {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), prefix)));
@@ -49,7 +50,7 @@ function git(cwd: string, ...args: string[]): string {
     cwd,
     encoding: "utf8",
     env: {
-      ...process.env,
+      ...fixtureGitEnv(),
       GIT_AUTHOR_NAME: "MADC Test",
       GIT_AUTHOR_EMAIL: "test@madc.invalid",
       GIT_COMMITTER_NAME: "MADC Test",

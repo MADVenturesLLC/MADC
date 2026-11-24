@@ -1,6 +1,6 @@
 /** Shared test helpers: temp MADC_HOME + engine spawn. Not a test file itself. */
 import { spawn } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -48,7 +48,7 @@ applyRegistryTestClock();
 export { REGISTRY_TEST_NOW_ENV, REGISTRY_TEST_NOW_MS };
 
 export function makeHome(): { home: string; cleanup: () => void } {
-  const root = mkdtempSync(join(tmpdir(), "madc-a2-"));
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "madc-a2-")));
   const home = join(root, "home");
   return { home, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }

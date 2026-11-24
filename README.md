@@ -7,9 +7,9 @@ MAD's local-first agent platform: one engine, named seats, any subscription.
 > named roster" ([PLAN-madc-M1-build-plan.md](docs/plan/PLAN-madc-M1-build-plan.md)), has
 > eleven wired lanes and five seeded seats on main; its operator guide is
 > [docs/runbook/M1.md](docs/runbook/M1.md). M2, "the room" (multi-seat work and evidence
-> schema v2; [PLAN-madc-M2-build-plan.md](docs/plan/PLAN-madc-M2-build-plan.md)), has
-> M2-A0 through M2-A8 on main and M2-A9 (conformance, [docs/runbook/M2.md](docs/runbook/M2.md),
-> freeze) at the M2 exit gate. Merges are Founder-only and name the exact head SHA.
+> schema v2; [PLAN-madc-M2-build-plan.md](docs/plan/PLAN-madc-M2-build-plan.md)), is
+> **complete on main** (M2-A0 through M2-A9; [docs/runbook/M2.md](docs/runbook/M2.md)).
+> Merges are Founder-only and name the exact head SHA.
 
 ## The idea
 

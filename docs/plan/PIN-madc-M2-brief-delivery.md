@@ -2,6 +2,8 @@
 
 *Builder-drafted (Hephaestus) under the Founder's M2-A4 execution commission, revision 2, issued 2026-10-06 · 2026-10-06 · Venue: `MADVenturesLLC/MADC` · Status: **proposed until the Founder merges this PR**. P-M2-3's brief-delivery slice only (M2 build plan §9). It changes what `turn/start` does on a handoff target that has not served its brief, and adds one field to that target's first `turn.start` line. Nothing else. For Surface and Argus review (`docs/policy/CODE-ADVISORIES.md`).*
 
+*Amended by `PIN-madc-M2-room-and-doctor.md` (2026-11-23, P-M2-4): `P-M2-4` is now recorded in `PIN-madc-M2-room-and-doctor.md` (`thread/list` unchanged; `madc room [--json]` and `doctor` `room` row pinned).*
+
 *Base: `main` @ `97d17d76ed7f245b4ef51a8bdcc54d978f61de94` (tree `ce776d46f9c7d0f9a34dbbdc2fe441e83ce64846`, the M2-A3 merge, PR #60). Every file cited below was read at that commit. This text is the builder's. It is not Surface's wording and claims no Surface authority.*
 
 **What this pin does.** It fixes D-M2-3's recommended default as the delivery rule: the target's next `turn/start` carries the brief as its opening context, once. The engine reads the brief from the source's `handoff.out`, where it is already hash-pinned and redacted. The target's first `turn.start` records a served marker that cites that line, so the brief is served once and a restart cannot serve it again.
