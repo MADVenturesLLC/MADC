@@ -28,15 +28,8 @@ function makeTempDir(prefix: string): string {
 
 function cleanGitEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
-  for (const k of [
-    "GIT_DIR",
-    "GIT_WORK_TREE",
-    "GIT_INDEX_FILE",
-    "GIT_OBJECT_DIRECTORY",
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-    "GIT_COMMON_DIR",
-  ]) {
-    delete env[k];
+  for (const k of Object.keys(env)) {
+    if (k.startsWith("GIT_")) delete env[k];
   }
   return {
     ...env,

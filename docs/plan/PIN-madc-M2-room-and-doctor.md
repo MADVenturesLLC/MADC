@@ -2,6 +2,8 @@
 
 *Builder-drafted (retroactive pin for `P-M2-4` / `D-596`; Founder accepted M2-A8 as built on 2026-11-23: `"I accept M2-A8 and M2-A9 as built without commissions."`) · Venue: `MADVenturesLLC/MADC`.*
 
+*Amends `PIN-madc-M0-cli.md` §3 (appends the `room` row after `lanes` in `madc doctor`) and resolves the `P-M2-4` deferral noted in `PIN-madc-M2-brief-delivery.md`.*
+
 **What this pin documents.** Records the `P-M2-4` contract shipped in M2-A8 (`#68`, merge commit `5d9a333`):
 
 1. **`thread/list` stays unchanged.** `thread/list` continues to return the M0/M1 thread list without handoff or worktree state.

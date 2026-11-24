@@ -6,6 +6,8 @@
 
 *Amended by `PIN-madc-M0-amendment-3.md` (2026-09-25, rev. 2026-09-26): item 5 rule 4, the doctor `locks` row WARN for a `sessions/` directory without owner read (0300 unsupported in M0), additive.*
 
+*Amended by `PIN-madc-M2-room-and-doctor.md` (2026-11-23, P-M2-4): appends the `room` row after `lanes` in `madc doctor` (§3); M0 and M1 row order unchanged.*
+
 **Authority:**
 
 - `docs/plan/PLAN-madc-M0-build-plan.md` §10 Act M0-A7, Criterion B, and §6 import rule. The plan was Founder-accepted and merged via PR #2 (head `bdf45f42b0b27ee07dcdc30fbc24485de2219417`).
