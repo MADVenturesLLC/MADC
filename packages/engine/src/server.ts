@@ -15,6 +15,7 @@ import { type CredentialStore, createCredentialStore } from "./credentials/store
 import { listOpenDecisions } from "./decisions.ts";
 import { checkHandoffTarget, type HandoffTargetCheck, readHandoffBrief } from "./handoff.ts";
 import { confinedPath, sessionsOwnerReadUnsupported } from "./home.ts";
+import { inspectRoom, type RoomReport } from "./inspect.ts";
 import {
   acquireThreadLock,
   holdsThreadLock,
@@ -80,6 +81,12 @@ import {
   listProviderSummaries,
   type ProviderPresence,
 } from "./providers/list.ts";
+import {
+  readSessionEvents,
+  type SessionReadResult,
+  type SessionSearchResult,
+  searchSessions,
+} from "./search.ts";
 import { type LoadedSeat, loadSeat, seatInvalid } from "./seat-store.ts";
 import { listSeatSummaries } from "./seats/list.ts";
 import { ensureSeatMemoryFile } from "./seats/memory.ts";
@@ -108,6 +115,8 @@ import { type BriefServedMarker, checkV2Payload } from "./session-v2.ts";
 import { createSeatWorktree, rereadWorktreeIdentity, resolveWorktreeIdentity } from "./worktree.ts";
 
 export const ENGINE_VERSION = "0.0.0";
+
+export type RoomUpdateReason = "thread" | "turn" | "handoff" | "decision";
 
 export type EngineOptions = {
   input: Readable;
@@ -163,6 +172,8 @@ export type EngineOptions = {
    * machine. Production never passes this.
    */
   closeRereadBudgetMs?: number;
+  /** M3-A1: optional callback invoked when thread/turn/handoff/decision state changes. */
+  onRoomUpdated?: (event: { readonly reason: RoomUpdateReason; readonly threadId: string }) => void;
 };
 
 type TurnRecord = {
@@ -373,6 +384,7 @@ function parseUserInput(value: unknown, issues: string[]): UserInput[] {
 export class EngineConnection {
   readonly #opts: EngineOptions;
   #initialized = false;
+  #subscribedRoom = false;
   #closed = false;
   #shutDown = false;
   #rl: Interface | null = null;
@@ -750,6 +762,12 @@ export class EngineConnection {
         return { value: this.#decisionList(params) };
       case "decision/resolve":
         return this.#decisionResolve(params);
+      case "room/inspect":
+        return { value: this.#roomInspect(params) };
+      case "session/search":
+        return { value: this.#sessionSearch(params) };
+      case "session/read":
+        return { value: this.#sessionRead(params) };
       default:
         throw methodNotFound(method);
     }
@@ -763,7 +781,7 @@ export class EngineConnection {
    * `founderDecision` and `EvidenceRef`, D-439, preserving own `"__proto__"` keys, F3) before any
    * lock or thread lookup, then appends through the thread's `SessionWriter`.
    */
-  #decisionRaise(params: unknown): { value: DecisionRaiseResult } {
+  #decisionRaise(params: unknown): { value: DecisionRaiseResult; after?: () => void } {
     const p = paramsObject(params);
     const issues: string[] = [];
     const threadId = requireId(p, "threadId", issues);
@@ -820,6 +838,7 @@ export class EngineConnection {
         seq: line.seq,
         hash: line.hash,
       },
+      after: () => this.#emitRoomUpdated("decision", threadId),
     };
   }
 
@@ -828,6 +847,47 @@ export class EngineConnection {
    * across all verified session chains in `$MADC_HOME/sessions`. Read-only; takes no params and
    * returns a fixed sanitized error message when unexpected params are supplied.
    */
+  notifyRoomUpdated(reason: RoomUpdateReason, threadId: string): void {
+    if (!this.#initialized || !this.#subscribedRoom || this.#shutDown) return;
+    this.#send({ method: "room/updated", params: { reason, threadId } });
+  }
+
+  #emitRoomUpdated(reason: RoomUpdateReason, threadId: string): void {
+    if (this.#opts.onRoomUpdated !== undefined) {
+      this.#opts.onRoomUpdated({ reason, threadId });
+    } else {
+      this.notifyRoomUpdated(reason, threadId);
+    }
+  }
+
+  #roomInspect(params: unknown): { room: RoomReport } {
+    const p = paramsObject(params);
+    if (Object.keys(p).length > 0) {
+      throw invalidParams(["room/inspect takes no params"]);
+    }
+    return { room: inspectRoom(this.#opts.home) };
+  }
+
+  #sessionSearch(params: unknown): SessionSearchResult {
+    const p = paramsObject(params);
+    const query = typeof p.query === "string" ? p.query : "";
+    const limit = typeof p.limit === "number" ? p.limit : undefined;
+    const seatId = typeof p.seatId === "string" ? p.seatId : undefined;
+    return searchSessions(this.#opts.home, {
+      query,
+      ...(limit !== undefined ? { limit } : {}),
+      ...(seatId !== undefined ? { seatId } : {}),
+    });
+  }
+
+  #sessionRead(params: unknown): SessionReadResult {
+    const p = paramsObject(params);
+    const issues: string[] = [];
+    const threadId = requireId(p, "threadId", issues);
+    throwIfIssues(issues);
+    return readSessionEvents(this.#opts.home, threadId);
+  }
+
   #decisionList(params: unknown): DecisionListResult {
     const p = paramsObject(params);
     if (Object.keys(p).length > 0) {
@@ -1218,8 +1278,19 @@ export class EngineConnection {
       if (info.title !== undefined && typeof info.title !== "string")
         issues.push("clientInfo.title must be a string");
     }
+    if (p.capabilities !== undefined) {
+      if (!isPlainObject(p.capabilities)) {
+        issues.push("capabilities must be an object");
+      } else if (
+        p.capabilities.subscribeRoom !== undefined &&
+        typeof p.capabilities.subscribeRoom !== "boolean"
+      ) {
+        issues.push("capabilities.subscribeRoom must be a boolean");
+      }
+    }
     throwIfIssues(issues);
     this.#initialized = true;
+    this.#subscribedRoom = isPlainObject(p.capabilities) && p.capabilities.subscribeRoom === true;
     return {
       serverInfo: { name: SERVER_NAME, version: ENGINE_VERSION },
       protocolVersion: PROTOCOL_VERSION,
@@ -1259,7 +1330,13 @@ export class EngineConnection {
       open: { genesisHash: session.genesisHash ?? "", handoff: null, worktree },
       handoffVerified: false,
     });
-    return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+    return {
+      value: { thread },
+      after: () => {
+        this.#notify("thread/started", { thread });
+        this.#emitRoomUpdated("thread", thread.id);
+      },
+    };
   }
 
   /**
@@ -1379,7 +1456,7 @@ export class EngineConnection {
    * (step 5) and answers that failure. Synchronous throughout: no other request interleaves with
    * the procedure.
    */
-  #threadHandoff(params: unknown): { value: ThreadHandoffResult } {
+  #threadHandoff(params: unknown): { value: ThreadHandoffResult; after?: () => void } {
     const p = paramsObject(params);
     const issues: string[] = [];
     // The source thread id routes the request (protocol pin §4.1 -32602, as on every method); it is
@@ -1551,7 +1628,10 @@ export class EngineConnection {
         issues: check.issues,
       });
     }
-    return { value: { handoffId, targetThreadId, targetGenesisHash: genesis.hash } };
+    return {
+      value: { handoffId, targetThreadId, targetGenesisHash: genesis.hash },
+      after: () => this.#emitRoomUpdated("handoff", targetThreadId),
+    };
   }
 
   /**
@@ -1692,7 +1772,13 @@ export class EngineConnection {
         }
         this.#threads.set(threadId, fresh);
         const thread = fresh.thread;
-        return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+        return {
+          value: { thread },
+          after: () => {
+            this.#notify("thread/started", { thread });
+            this.#emitRoomUpdated("thread", thread.id);
+          },
+        };
       }
       // Known in this process: still verify we own the on-disk lock before resuming (§3.3); a
       // re-take reloads the thread from disk (Amendment 2 §3 — row (c): a lost lock is re-taken
@@ -1702,7 +1788,13 @@ export class EngineConnection {
       // checked it inside #loadColdThread; a warm resume checks it here, against the files now).
       this.#handoffGate(current, true);
       const thread = current.thread;
-      return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+      return {
+        value: { thread },
+        after: () => {
+          this.#notify("thread/started", { thread });
+          this.#emitRoomUpdated("thread", thread.id);
+        },
+      };
     }
 
     // Lock first, then load under the lock (§3.3). A live foreign holder wins → -32004.
@@ -1723,7 +1815,13 @@ export class EngineConnection {
     }
     this.#threads.set(threadId, record);
     const thread = record.thread;
-    return { value: { thread }, after: () => this.#notify("thread/started", { thread }) };
+    return {
+      value: { thread },
+      after: () => {
+        this.#notify("thread/started", { thread });
+        this.#emitRoomUpdated("thread", thread.id);
+      },
+    };
   }
 
   /**

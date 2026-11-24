@@ -159,7 +159,10 @@ export type UserInput = TextContent;
 
 export type ClientInfo = { name: string; title?: string; version: string };
 
-export type InitializeParams = { clientInfo: ClientInfo };
+export type InitializeParams = {
+  clientInfo: ClientInfo;
+  capabilities?: { readonly subscribeRoom?: boolean };
+};
 export type InitializeResult = {
   serverInfo: { name: typeof SERVER_NAME; version: string };
   protocolVersion: typeof PROTOCOL_VERSION;
