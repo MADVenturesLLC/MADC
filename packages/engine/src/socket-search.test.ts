@@ -758,10 +758,13 @@ test("M3-A1 socket: close() flushes a slow subscriber's MiB-scale backlog, endin
   assert.deepEqual(summary.updates.at(-1), { reason: "thread", threadId: s.thread.id });
 });
 
-test("M3-A1 socket: close() with a subscriber that never reads still finishes, bounded by the per-socket grace", {
-  skip: !POSIX,
-  timeout: 30000,
-}, async () => {
+/**
+ * Starts an engine on a fresh home with a MiB-scale thread, connects a subscriber that asks for
+ * it and then never reads (so `finish` never fires), and returns how long `close()` took.
+ */
+async function closeWithNeverReadingSubscriber(
+  socketDeps: SocketServerOptions["socketDeps"],
+): Promise<number> {
   const home = freshHome();
   writeSeat(home, "seat-a");
   const dir = join(home, "sessions");
@@ -785,8 +788,7 @@ test("M3-A1 socket: close() with a subscriber that never reads still finishes, b
       },
     });
   }
-  const graceMs = 200;
-  const server = await start(home, { socketDeps: { closeGraceMs: graceMs } });
+  const server = await start(home, socketDeps === undefined ? {} : { socketDeps });
   const child = spawn(process.execPath, ["-e", SLOW_SUBSCRIBER], {
     env: { ...process.env, MADC_TEST_SOCK: server.socketPath, MADC_TEST_REQUESTS: "6" },
     stdio: ["pipe", "pipe", "inherit"],
@@ -800,13 +802,34 @@ test("M3-A1 socket: close() with a subscriber that never reads still finishes, b
     await waitFor(() => out.includes("ready\n"), 10000, "never-reading subscriber ready");
     // No "go": the subscriber never reads its MiB-scale backlog, so `finish` never fires.
     const t0 = Date.now();
-    await withTimeout(server.close(), 5000, "close() with a never-reading subscriber");
-    const took = Date.now() - t0;
-    assert.ok(took >= graceMs - 20, `close() waited out the grace (${took} ms)`);
-    assert.ok(took < graceMs + 2000, `close() bounded by the grace (${took} ms)`);
+    await withTimeout(server.close(), 8000, "close() with a never-reading subscriber");
+    return Date.now() - t0;
   } finally {
     child.kill("SIGKILL");
   }
+}
+
+test("M3-A1 socket: close() with a subscriber that never reads still finishes, bounded by the per-socket grace", {
+  skip: !POSIX,
+  timeout: 30000,
+}, async () => {
+  const graceMs = 200;
+  const took = await closeWithNeverReadingSubscriber({ closeGraceMs: graceMs });
+  assert.ok(took >= graceMs - 20, `close() waited out the grace (${took} ms)`);
+  // Argus (follow-up to #73): the upper bound stays well under the 2 s default, so a close() that
+  // ignores the closeGraceMs seam and waits the fixed 2 s fails here (mutant D3; the old bound,
+  // grace + 2000 ms, let it pass on Bun 1.4.2).
+  assert.ok(took < graceMs + 1000, `close() bounded by the injected grace (${took} ms)`);
+});
+
+test("M3-A1 socket: with no seam, close() waits the pinned 2 s grace for a never-reading subscriber (amendment 1 §3 step 3)", {
+  skip: !POSIX,
+  timeout: 30000,
+}, async () => {
+  // Argus (follow-up to #73): the default grace is the pinned 2 s, measured, not read off a constant.
+  const took = await closeWithNeverReadingSubscriber(undefined);
+  assert.ok(took >= 1900, `close() waited the 2 s grace before destroying (${took} ms)`);
+  assert.ok(took < 3500, `close() did not wait far past the 2 s grace (${took} ms)`);
 });
 
 test("M3-A1 socket: listen runs under umask 0o177 and the previous umask is restored, on success and on a listen failure", {
