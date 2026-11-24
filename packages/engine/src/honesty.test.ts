@@ -58,11 +58,36 @@ test("scanner is not vacuous: it flags planted network code", () => {
   assert.deepEqual(networkHits('import { spawn } from "node:child_process";'), []);
 });
 
-test("§8.7 no WebSocket / HTTP / socket server code paths in any M0 package", () => {
+/**
+ * M3-A1 (`docs/plan/PIN-madc-M3-desktop-protocol.md` §2) introduces the owner-only local Unix
+ * domain socket / Windows named-pipe listener in `packages/engine/src/socket.ts` (and its
+ * integration test `socket-search.test.ts`). HTTP/WebSocket/TCP servers remain banned everywhere.
+ */
+const LOCAL_SOCKET_FILES = new Set([
+  join("engine", "src", "socket.ts"),
+  join("engine", "src", "socket-search.test.ts"),
+]);
+
+const HTTP_AND_WS_PATTERNS: readonly RegExp[] = [
+  /["'](?:node:)?(?:http|https|http2|tls|dgram)["']/,
+  /["'](?:ws|socket\.io|express|fastify|koa|hono)["']/,
+  /\bWebSocket(?:Server)?\b/,
+  /\bBun\.serve\b/,
+  /\bDeno\.serve\b/,
+];
+
+test("§8.7 / M3-A1: no WebSocket / HTTP server anywhere; local-socket net primitives only in socket.ts", () => {
   const files = m0Sources().filter((f) => f !== SELF);
   assert.ok(files.length > 10, "scanner found the package sources");
   const offenders = files
-    .map((f) => ({ file: relative(PACKAGES_DIR, f), hits: networkHits(readFileSync(f, "utf8")) }))
+    .map((f) => {
+      const rel = relative(PACKAGES_DIR, f);
+      const text = readFileSync(f, "utf8");
+      const hits = LOCAL_SOCKET_FILES.has(rel)
+        ? HTTP_AND_WS_PATTERNS.filter((re) => re.test(text)).map((re) => re.source)
+        : networkHits(text);
+      return { file: rel, hits };
+    })
     .filter((o) => o.hits.length > 0);
   assert.deepEqual(offenders, []);
 });
