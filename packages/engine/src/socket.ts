@@ -73,6 +73,7 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
   }
 
   const conns = new Set<EngineConnection>();
+  const sockets = new Set<Socket>();
   const broadcast = (event: { readonly reason: RoomUpdateReason; readonly threadId: string }) => {
     for (const c of conns) {
       c.notifyRoomUpdated(event.reason, event.threadId);
@@ -80,6 +81,8 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
   };
 
   const server: Server = createServer((socket: Socket) => {
+    sockets.add(socket);
+    socket.once("close", () => sockets.delete(socket));
     const conn = new EngineConnection({
       ...opts,
       input: socket,
@@ -90,6 +93,7 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
     void conn.run().finally(() => {
       conns.delete(conn);
       conn.releaseLocks();
+      if (!socket.destroyed) socket.end();
     });
   });
 
@@ -112,6 +116,9 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
     socketPath,
     async close(): Promise<void> {
       for (const c of conns) c.shutdown();
+      for (const s of sockets) {
+        if (!s.destroyed) s.destroy();
+      }
       await new Promise<void>((resolve) => {
         server.close(() => resolve());
       });

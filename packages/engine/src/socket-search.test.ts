@@ -6,16 +6,36 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { createConnection, createServer, type Socket } from "node:net";
 import { join } from "node:path";
-import { createInterface } from "node:readline";
-import { test } from "node:test";
+import { createInterface, type Interface } from "node:readline";
+import { afterEach, test } from "node:test";
 import { echoAgent } from "./agent.ts";
 import type { RoomReport } from "./inspect.ts";
 import type { SessionReadResult, SessionSearchResult } from "./search.ts";
-import { engineSocketPath, startSocketServer } from "./socket.ts";
+import { engineSocketPath, type SocketServerHandle, startSocketServer } from "./socket.ts";
 import { makeHome, writeSeatFile } from "./testing/harness.ts";
+
+function withTimeout<T>(promise: Promise<T>, ms: number, what: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new Error(`timed out after ${ms}ms waiting for ${what}`)),
+      ms,
+    );
+    promise.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
 
 class SocketRpcClient {
   readonly #socket: Socket;
+  readonly #rl: Interface;
   #nextId = 1;
   readonly #pending = new Map<
     number,
@@ -25,7 +45,8 @@ class SocketRpcClient {
 
   constructor(socket: Socket) {
     this.#socket = socket;
-    createInterface({ input: socket, crlfDelay: Number.POSITIVE_INFINITY }).on("line", (line) => {
+    this.#rl = createInterface({ input: socket, crlfDelay: Number.POSITIVE_INFINITY });
+    this.#rl.on("line", (line) => {
       if (!line.trim()) return;
       const msg = JSON.parse(line) as Record<string, unknown>;
       if (typeof msg.id === "number") {
@@ -50,28 +71,63 @@ class SocketRpcClient {
 
   request(method: string, params: unknown): Promise<unknown> {
     const id = this.#nextId++;
-    return new Promise((resolve, reject) => {
+    const p = new Promise((resolve, reject) => {
       this.#pending.set(id, { resolve, reject });
       this.#socket.write(`${JSON.stringify({ id, method, params })}\n`);
     });
+    return withTimeout(p, 2000, `RPC response for ${method}`);
   }
 
   async close(): Promise<void> {
-    await new Promise<void>((resolve) => this.#socket.end(() => resolve()));
+    this.#rl.close();
+    if (this.#socket.destroyed) return;
+    await withTimeout(
+      new Promise<void>((resolve) => {
+        this.#socket.once("close", () => resolve());
+        this.#socket.end();
+        this.#socket.destroy();
+      }),
+      1500,
+      "client socket close",
+    );
   }
 }
 
 async function connectSocketClient(sockPath: string): Promise<SocketRpcClient> {
   const socket = createConnection(sockPath);
-  await new Promise<void>((resolve, reject) => {
-    socket.once("connect", () => resolve());
-    socket.once("error", reject);
-  });
+  await withTimeout(
+    new Promise<void>((resolve, reject) => {
+      socket.once("connect", () => resolve());
+      socket.once("error", reject);
+    }),
+    2000,
+    `socket connect (${sockPath})`,
+  );
   return new SocketRpcClient(socket);
 }
 
+const activeServers: SocketServerHandle[] = [];
+const activeClients: SocketRpcClient[] = [];
+const activeCleanups: Array<() => void> = [];
+
+afterEach(async () => {
+  while (activeClients.length > 0) {
+    const c = activeClients.pop();
+    if (c) await c.close().catch(() => {});
+  }
+  while (activeServers.length > 0) {
+    const s = activeServers.pop();
+    if (s) await s.close().catch(() => {});
+  }
+  while (activeCleanups.length > 0) {
+    const fn = activeCleanups.pop();
+    if (fn) fn();
+  }
+});
+
 test("M3-A1 socket server: binds 0600 socket, serves concurrent clients, broadcasts room/updated, and supports room/inspect, session/search, session/read", async () => {
   const { home, cleanup } = makeHome();
+  activeCleanups.push(cleanup);
   mkdirSync(home, { recursive: true, mode: 0o700 });
   writeSeatFile(home, {
     id: "seat-a",
@@ -88,7 +144,12 @@ test("M3-A1 socket server: binds 0600 socket, serves concurrent clients, broadca
     handoffs: { enabled: true, targets: ["seat-a"] },
   });
 
-  const server = await startSocketServer({ home, agent: echoAgent, log: () => {} });
+  const server = await withTimeout(
+    startSocketServer({ home, agent: echoAgent, log: () => {} }),
+    2000,
+    "startSocketServer",
+  );
+  activeServers.push(server);
   try {
     assert.equal(server.socketPath, engineSocketPath(home));
     if (process.platform !== "win32") {
@@ -98,12 +159,19 @@ test("M3-A1 socket server: binds 0600 socket, serves concurrent clients, broadca
 
     // Symlink and live-listener refusals.
     await assert.rejects(
-      () => startSocketServer({ home, agent: echoAgent, log: () => {} }),
+      () =>
+        withTimeout(
+          startSocketServer({ home, agent: echoAgent, log: () => {} }),
+          2000,
+          "live-listener refusal",
+        ),
       /already in use/,
     );
 
     const c1 = await connectSocketClient(server.socketPath);
+    activeClients.push(c1);
     const c2 = await connectSocketClient(server.socketPath);
+    activeClients.push(c2);
     const c2Updates: Array<{ reason: string; threadId: string }> = [];
     const c1Updates: Array<{ reason: string; threadId: string }> = [];
     c1.onNotification((n) => {
@@ -190,23 +258,31 @@ test("M3-A1 socket server: binds 0600 socket, serves concurrent clients, broadca
       await c2.close();
     }
   } finally {
-    await server.close();
+    await withTimeout(server.close(), 2000, "server.close");
     assert.equal(existsSync(server.socketPath), false, "close unlinks socket");
 
     // Stale socket recovery + symlink refusal on POSIX.
     if (process.platform !== "win32") {
       const dummy = createServer();
-      await new Promise<void>((r) => dummy.listen(server.socketPath, () => r()));
-      await new Promise<void>((r) => dummy.close(() => r()));
-      // Re-create a stale socket file via symlink check:
+      await withTimeout(
+        new Promise<void>((r) => dummy.listen(server.socketPath, () => r())),
+        1500,
+        "dummy.listen",
+      );
+      await withTimeout(new Promise<void>((r) => dummy.close(() => r())), 1500, "dummy.close");
       const symHome = `${home}-sym`;
+      activeCleanups.push(() => rmSync(symHome, { recursive: true, force: true }));
       mkdirSync(symHome, { recursive: true, mode: 0o700 });
       symlinkSync("/tmp/nonexistent-sock-target", engineSocketPath(symHome));
       await assert.rejects(
-        () => startSocketServer({ home: symHome, agent: echoAgent, log: () => {} }),
+        () =>
+          withTimeout(
+            startSocketServer({ home: symHome, agent: echoAgent, log: () => {} }),
+            2000,
+            "symlink refusal",
+          ),
         /symlink/,
       );
-      rmSync(symHome, { recursive: true, force: true });
     }
     cleanup();
   }
