@@ -16,6 +16,7 @@
 - The M0 Witness terminal CLI is on main (PR #35). Rev 6.2 conformance remains unverified.
 - M1-A8 left turn-time catalog staleness for a follow-up; the M1 pre-A9 fix (PR #45) closed it: the turn check reads the clock once, at engine start, and refuses an allow entry that is stale by that clock with `-32007` reason `terms-stale`. On a full TTY the Witness sends an `interactive` mode claim (PR #45); the engine's own presence check still decides. Lanes verified on 2026-09-24 show denied in doctor after 2026-10-24 00:00 UTC, and an engine started after that instant refuses them at turn time, until terms are re-verified or the Founder records a per-entry override.
 - On 2026-10-05 the Founder accepted the M2 build plan as commissionable (D-M2-1); each M2 act still needs its own Founder commission and Founder merge. M2-A0 (`#46`), M2-A1 (`#47`/`#48`), M2-A2 (`#49`), M2-A3 (`#60`), M2-A4 (`#61`), M2-A5 (`#66`, with Founder ruling `2026-11-23` on `D-M2-9`: `"No rate cap in M2"`), M2-A6 (`#63`), M2-A7 (`#67`), and M2-A8 (`#68`) are merged on main; M2-A9 (conformance, `docs/runbook/M2.md`, freeze) is the M2 exit gate.
+- On 2026-11-23 the Founder started M3-A0 (`"Yes, start M3-A0"`, PR #71); `PLAN-madc-M3-build-plan.md` (PR #70) and `D-R6` (desktop stack) remain open.
 
 ## GitHub credentials and identity (agent sessions)
 
