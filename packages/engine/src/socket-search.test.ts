@@ -1540,15 +1540,28 @@ test("M3-A2 serve e2e: real bin.ts serve binds 0600 socket, answers initialize +
   if (recheck.ok) releaseThreadLock(recheck.handle);
 });
 
-test("M3-A2 socket (Argus #76 M2): server.close() preserves a successor socket with a different inode at engine.sock", async () => {
+test("M3-A2 socket (M3A2-N1): shutdownAll never renames or moves a foreign entry at engine.sock (pin line 96)", async () => {
   if (!POSIX) return;
   const { home, cleanup } = makeHome();
   activeCleanups.push(cleanup);
   mkdirSync(home, { recursive: true, mode: 0o700 });
   const sockPath = engineSocketPath(home);
 
+  // Guard: socket.ts itself never imports or calls renameSync.
+  const socketSrc = readFileSync(fileURLToPath(new URL("./socket.ts", import.meta.url)), "utf8");
+  assert.equal(socketSrc.includes("renameSync"), false, "socket.ts must never rename entries");
+  assert.equal(socketSrc.includes(".preserve-"), false, "socket.ts must never create .preserve-*");
+
+  const probeHome = freshHome();
+  const probePath = join(probeHome, "probe.sock");
+  const probe = await listenOn(probePath);
+  await new Promise<void>((resolve) => probe.close(() => resolve()));
+  const runtimeUnlinks = !existsSync(probePath);
+
   const serverA = await startSocketServer({ home, agent: echoAgent, log: () => {} });
   const inoA = lstatSync(sockPath).ino;
+  const clientA = await connect(sockPath);
+  await clientA.init("n1-observer");
 
   // Simulate another same-user process moving A's socket aside and binding successor B at sockPath.
   const movedA = join(home, "moved-a.sock");
@@ -1558,16 +1571,107 @@ test("M3-A2 socket (Argus #76 M2): server.close() preserves a successor socket w
   const inoB = lstatSync(sockPath).ino;
   assert.notEqual(inoB, inoA);
 
-  // Closing server A must NOT unlink server B's successor inode at sockPath.
-  await serverA.close();
-  assert.equal(existsSync(sockPath), true, "successor socket survives serverA.close()");
-  assert.equal(lstatSync(sockPath).ino, inoB, "successor inode unchanged");
+  // Sample the directory while serverA.close() runs; no `.preserve-*` rename-aside may ever exist.
+  const snapshots: string[][] = [];
+  const sampler = setInterval(() => {
+    try {
+      snapshots.push(readdirSync(home));
+    } catch {
+      // ignore
+    }
+  }, 2);
+  try {
+    await withTimeout(serverA.close(), 5000, "serverA.close() N1");
+  } finally {
+    clearInterval(sampler);
+  }
+  await clientA.close();
+  snapshots.push(readdirSync(home));
 
-  // Verify successor B still accepts clients at sockPath.
-  const client = await connect(sockPath);
-  const initRes = (await client.request("initialize", {
-    clientInfo: { name: "m2-successor-check", version: "0.0.0" },
-  })) as { protocolVersion: string };
-  assert.equal(initRes.protocolVersion, "madc-m1/1");
-  await client.close();
+  for (const entries of snapshots) {
+    assert.deepEqual(
+      entries.filter((name) => name.includes(".preserve-")),
+      [],
+      `shutdownAll created a rename-aside entry: ${entries.join(", ")}`,
+    );
+  }
+  if (!runtimeUnlinks) {
+    assert.equal(existsSync(sockPath), true, "unlinkOwnSocket leaves foreign inode intact");
+    assert.equal(lstatSync(sockPath).ino, inoB, "foreign inode unchanged");
+  }
+});
+
+test("M3-A2 serve exit 23 (M3A2-M1): hanging handle.close() past deadline releases held thread locks (sessions/*.lock) and engine.lock", async () => {
+  const { home, cleanup } = makeHome();
+  activeCleanups.push(cleanup);
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  writeSeat(home, "seat-a");
+  const lockPath = engineLockPath(home);
+
+  let releaseCloseBlocker!: () => void;
+  const closeBlocker = new Promise<void>((r) => {
+    releaseCloseBlocker = r;
+  });
+
+  const stdin = new PassThrough();
+  const stderrChunks: Buffer[] = [];
+  const stderr = new PassThrough();
+  stderr.on("data", (d: Buffer) => stderrChunks.push(d));
+  let exitCode: number | null = null;
+  let boundSocketPath = "";
+  let resolveListening!: () => void;
+  const listening = new Promise<void>((r) => {
+    resolveListening = r;
+  });
+
+  const servePromise = runServe([], {
+    env: { MADC_HOME: home },
+    stdin,
+    stderr,
+    exit: (c) => {
+      exitCode = c;
+    },
+    agent: echoAgent,
+    shutdownDeadlineMs: 150,
+    exitWriteGraceMs: 120,
+    totalExitBoundMs: 400,
+    socketDeps: {
+      beforeShutdown: () => closeBlocker,
+    },
+    onListening: ({ socketPath }) => {
+      boundSocketPath = socketPath;
+      resolveListening();
+    },
+  });
+
+  await withTimeout(listening, 4000, "M3A2-M1 serve listening");
+  const client = await connect(boundSocketPath);
+  await client.init("m1-holder");
+  const started = (await client.request("thread/start", { seatId: "seat-a" })) as {
+    thread: { id: string };
+  };
+  const threadLock = join(home, "sessions", `${started.thread.id}.lock`);
+  assert.equal(existsSync(threadLock), true, "thread lock must be held before shutdown trigger");
+
+  // Trigger clean EOF shutdown; handle.close() hangs inside beforeShutdown past the deadline.
+  try {
+    stdin.end();
+    const code = await withTimeout(servePromise, 3000, "M3A2-M1 exit 23");
+
+    assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
+    assert.equal(exitCode, 23);
+    assert.equal(existsSync(lockPath), false, "engine.lock must be released on exit 23");
+    const remainingThreadLocks = readdirSync(join(home, "sessions")).filter((f) =>
+      f.endsWith(".lock"),
+    );
+    assert.deepEqual(
+      remainingThreadLocks,
+      [],
+      `expected zero sessions/*.lock after exit 23, found: ${remainingThreadLocks.join(", ")}`,
+    );
+  } finally {
+    // Release background close() promise and client so nothing leaks even on assertion failure.
+    releaseCloseBlocker();
+    await client.close();
+  }
 });

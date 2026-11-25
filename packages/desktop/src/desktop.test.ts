@@ -2,8 +2,10 @@
  * M3-A2 desktop scaffold tests:
  * - Typed IPC client over `@madc/engine/client` types (no auto-retry/respawn)
  * - Amendment 1 §6 exit code classification & §2a lock-owner manual recovery guidance
- * - Base pin §4 evidence-bound UI rule (never `verified` without verified receipt)
- * - Keyboard focus bar navigation (`Tab`, `Shift+Tab`, arrows, `Home`, `End`)
+ * - Base pin §4 evidence-bound UI rule (engine-returned fields only; never caller-supplied boolean)
+ * - Shipped `ui/shell.js` focus bar & connect wiring (`ArrowRight`, `ArrowLeft`, `Home`, `End`,
+ *   click, neutral status, zero auto-retry) + CSP/no-inline-script guard
+ * - Frozen `DEFAULT_FOCUS_BAR_ITEMS` table
  * - Import-rule honesty guard (`PLAN-madc-M0-build-plan.md:105`, `ROADMAP-madc-post-M0.md:140`)
  */
 import assert from "node:assert/strict";
@@ -12,12 +14,15 @@ import { join, relative } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION } from "@madc/engine/client";
+import { bindDesktopShell, type ShellDocument, type ShellElement } from "../ui/shell.js";
 import {
   classifyServeExit,
   createFocusBarState,
+  DEFAULT_FOCUS_BAR_ITEMS,
   type DesktopConnectionInfo,
   DesktopEngineClient,
   type DesktopIpcTransport,
+  type EvidenceReceipt,
   evidenceTone,
   focusBarSelect,
   isVerifiedReceipt,
@@ -26,36 +31,76 @@ import {
   stepFocusBar,
 } from "./index.ts";
 
-test("M3-A2 §4 evidence-bound UI rule: never returns verified without a verified hash, sha, or servedModel", () => {
+test("M3-A2 §4 evidence-bound UI rule (M3A2-L6): derives verified only from engine-returned fields, never caller boolean", () => {
   const validHash = "a".repeat(64);
   const validSha = "b".repeat(40);
 
   assert.equal(isVerifiedReceipt(null), false);
   assert.equal(isVerifiedReceipt(undefined), false);
-  assert.equal(isVerifiedReceipt({ kind: "hash", hash: validHash, verified: false }), false);
-  assert.equal(isVerifiedReceipt({ kind: "hash", hash: "short", verified: true }), false);
-  assert.equal(isVerifiedReceipt({ kind: "sha", sha: "not-a-sha", verified: true }), false);
+  assert.equal(isVerifiedReceipt({ kind: "hash", chainOk: false, hash: validHash }), false);
+  assert.equal(isVerifiedReceipt({ kind: "hash", chainOk: true, hash: "short" }), false);
+  assert.equal(isVerifiedReceipt({ kind: "sha", sha: "not-a-sha" }), false);
   assert.equal(
-    isVerifiedReceipt({ kind: "servedModel", servedModel: "   ", verified: true }),
+    isVerifiedReceipt({ kind: "servedModel", servedModel: "   ", vendorReported: true }),
+    false,
+  );
+  assert.equal(
+    isVerifiedReceipt({
+      kind: "servedModel",
+      servedModel: "kimi-for-coding",
+      vendorReported: false,
+    }),
+    false,
+  );
+  // A caller-supplied `verified: true` flag must have zero effect when engine fields fail.
+  assert.equal(
+    isVerifiedReceipt({
+      kind: "hash",
+      chainOk: false,
+      hash: validHash,
+      verified: true,
+    } as unknown as EvidenceReceipt),
+    false,
+  );
+  assert.equal(
+    isVerifiedReceipt({
+      kind: "servedModel",
+      servedModel: "kimi-for-coding",
+      vendorReported: false,
+      verified: true,
+    } as unknown as EvidenceReceipt),
     false,
   );
 
-  assert.equal(isVerifiedReceipt({ kind: "hash", hash: validHash, verified: true }), true);
-  assert.equal(isVerifiedReceipt({ kind: "sha", sha: validSha, verified: true }), true);
+  assert.equal(isVerifiedReceipt({ kind: "hash", chainOk: true, hash: validHash }), true);
+  assert.equal(isVerifiedReceipt({ kind: "sha", sha: validSha }), true);
   assert.equal(
-    isVerifiedReceipt({ kind: "servedModel", servedModel: "kimi-for-coding", verified: true }),
+    isVerifiedReceipt({
+      kind: "servedModel",
+      servedModel: "kimi-for-coding",
+      vendorReported: true,
+    }),
     true,
   );
 
   // Even when caller asks for "ok", unverified/missing receipt renders "neutral", never "verified".
   assert.equal(evidenceTone(null, "ok"), "neutral");
-  assert.equal(evidenceTone({ kind: "hash", hash: validHash, verified: false }, "ok"), "neutral");
-  assert.equal(evidenceTone({ kind: "hash", hash: validHash, verified: true }, "ok"), "verified");
-  assert.equal(evidenceTone({ kind: "hash", hash: validHash, verified: true }, "warn"), "warn");
-  assert.equal(evidenceTone({ kind: "hash", hash: validHash, verified: true }, "fail"), "fail");
+  assert.equal(evidenceTone({ kind: "hash", chainOk: false, hash: validHash }, "ok"), "neutral");
+  assert.equal(evidenceTone({ kind: "hash", chainOk: true, hash: validHash }, "ok"), "verified");
+  assert.equal(evidenceTone({ kind: "hash", chainOk: true, hash: validHash }, "warn"), "warn");
+  assert.equal(evidenceTone({ kind: "hash", chainOk: true, hash: validHash }, "fail"), "fail");
 });
 
-test("M3-A2 keyboard focus bar: cycles cleanly across shell landmarks", () => {
+test("M3-A2 keyboard focus bar (M3A2-L4): cycles cleanly across landmarks and freezes DEFAULT_FOCUS_BAR_ITEMS", () => {
+  assert.equal(Object.isFrozen(DEFAULT_FOCUS_BAR_ITEMS), true);
+  assert.throws(() => {
+    (DEFAULT_FOCUS_BAR_ITEMS as unknown as unknown[]).push({ id: "extra", label: "Extra" });
+  }, TypeError);
+  assert.equal(Object.isFrozen(DEFAULT_FOCUS_BAR_ITEMS[0]), true);
+  assert.throws(() => {
+    (DEFAULT_FOCUS_BAR_ITEMS[0] as unknown as Record<string, unknown>).label = "Mutated";
+  }, TypeError);
+
   let state = createFocusBarState();
   assert.equal(state.activeId, "connection");
 
@@ -75,6 +120,146 @@ test("M3-A2 keyboard focus bar: cycles cleanly across shell landmarks", () => {
   assert.equal(state.activeId, "connection");
   state = focusBarSelect(state, "room");
   assert.equal(state.activeId, "room");
+});
+
+test("M3-A2 shipped UI script (M3A2-M5) and CSP/no-inline guard (M3A2-M4)", async () => {
+  const htmlPath = fileURLToPath(new URL("../ui/index.html", import.meta.url));
+  const confPath = fileURLToPath(new URL("../src-tauri/tauri.conf.json", import.meta.url));
+  const html = readFileSync(htmlPath, "utf8");
+  const conf = JSON.parse(readFileSync(confPath, "utf8")) as {
+    app: { security: { csp: string } };
+  };
+
+  // M4: no inline script/style in ui/index.html, and no 'unsafe-inline' in CSP.
+  assert.doesNotMatch(html, /<style[\s>]/i, "no inline <style> in index.html");
+  assert.match(html, /<link\s+rel="stylesheet"\s+href="\.\/styles\.css"\s*\/>/);
+  assert.match(html, /<script\s+type="module"\s+src="\.\/app\.js"><\/script>/);
+  assert.doesNotMatch(html, /<script(?![^>]*\bsrc=)[^>]*>/i, "no inline <script> in index.html");
+  assert.equal(conf.app.security.csp.includes("unsafe-inline"), false, "no unsafe-inline in CSP");
+
+  // M5: exercise the exact shipped `bindDesktopShell` from `ui/shell.js`.
+  type FakeEl = ShellElement & {
+    readonly attrs: Map<string, string>;
+    readonly listeners: Map<string, Array<(ev: unknown) => void>>;
+    focusedCount: number;
+    emit(type: string, ev?: unknown): void;
+  };
+  const makeEl = (attrsInit: Record<string, string> = {}, text = ""): FakeEl => {
+    const attrs = new Map(Object.entries(attrsInit));
+    const listeners = new Map<string, Array<(ev: unknown) => void>>();
+    const el: FakeEl = {
+      attrs,
+      listeners,
+      className: "",
+      textContent: text,
+      tabIndex: 0,
+      focusedCount: 0,
+      setAttribute(name, value) {
+        attrs.set(name, value);
+      },
+      getAttribute(name) {
+        return attrs.get(name) ?? null;
+      },
+      focus() {
+        el.focusedCount += 1;
+      },
+      addEventListener(type, listener) {
+        const list = listeners.get(type) ?? [];
+        list.push(listener);
+        listeners.set(type, list);
+      },
+      querySelectorAll() {
+        return [];
+      },
+      emit(type, ev = {}) {
+        for (const fn of listeners.get(type) ?? []) fn(ev);
+      },
+    };
+    return el;
+  };
+
+  const buttons = DEFAULT_FOCUS_BAR_ITEMS.map((item) =>
+    makeEl({ "data-focus-id": item.id }, item.label),
+  );
+  const bar = makeEl();
+  bar.querySelectorAll = () => buttons;
+  const statusEl = makeEl({}, "idle");
+  const outputEl = makeEl({}, "ready");
+  const connectBtn = makeEl({}, "Connect");
+
+  const byId = new Map<string, ShellElement>([
+    ["focus-bar", bar],
+    ["connection-status", statusEl],
+    ["output", outputEl],
+    ["connect-btn", connectBtn],
+  ]);
+  const doc: ShellDocument = {
+    getElementById(id) {
+      const el = byId.get(id);
+      if (!el) throw new Error(`missing element #${id}`);
+      return el;
+    },
+  };
+
+  const invokes: Array<{ cmd: string; args: Record<string, unknown> | undefined }> = [];
+  let shouldFail = false;
+  const controller = bindDesktopShell(doc, async (cmd, args) => {
+    invokes.push({ cmd, args });
+    if (shouldFail) throw new Error("connect refused");
+    if (cmd === "connect_engine") {
+      return { protocolVersion: PROTOCOL_VERSION, coldStartMs: 25 };
+    }
+    if (cmd === "rpc_request") {
+      return { room: { counts: { threads: 0, openDecisions: 0 } } };
+    }
+    throw new Error(`unexpected cmd ${cmd}`);
+  });
+
+  // Initial state & keyboard navigation on shipped toolbar controller.
+  assert.equal(controller.getFocusState().activeId, "connection");
+  assert.equal(buttons[0]?.getAttribute("aria-pressed"), "true");
+  assert.equal(buttons[0]?.tabIndex, 0);
+  assert.equal(buttons[1]?.tabIndex, -1);
+
+  let prevented = 0;
+  const sendKey = (key: string) =>
+    bar.emit("keydown", {
+      key,
+      preventDefault: () => {
+        prevented += 1;
+      },
+    });
+  sendKey("ArrowRight");
+  assert.equal(controller.getFocusState().activeId, "room");
+  assert.equal(buttons[1]?.getAttribute("aria-pressed"), "true");
+  assert.equal(buttons[1]?.tabIndex, 0);
+  sendKey("End");
+  assert.equal(controller.getFocusState().activeId, "search");
+  sendKey("ArrowRight");
+  assert.equal(controller.getFocusState().activeId, "connection");
+  sendKey("ArrowLeft");
+  assert.equal(controller.getFocusState().activeId, "search");
+  sendKey("Home");
+  assert.equal(controller.getFocusState().activeId, "connection");
+  assert.equal(prevented, 5);
+  buttons[2]?.emit("click");
+  assert.equal(controller.getFocusState().activeId, "decisions");
+
+  // Manual connect: stays neutral (never green without verified receipt).
+  await controller.connect();
+  assert.deepEqual(
+    invokes.map((c) => c.cmd),
+    ["connect_engine", "rpc_request"],
+  );
+  assert.equal(statusEl.className, "status-neutral");
+  assert.match(statusEl.textContent ?? "", /neutral/);
+
+  // Failure path: sets fail class and never auto-retries.
+  invokes.length = 0;
+  shouldFail = true;
+  await controller.connect();
+  assert.equal(invokes.length, 1, "no automatic retry on failure");
+  assert.equal(statusEl.className, "status-fail");
 });
 
 test("M3-A2 amendment 1 §6 exit code classification and §2a manual lock guidance", () => {

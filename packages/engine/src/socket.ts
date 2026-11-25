@@ -2,16 +2,8 @@
  * M3-A1 (`docs/plan/PIN-madc-M3-desktop-protocol.md` §1): local-socket JSONL transport
  * (`$MADC_HOME/engine.sock` on POSIX, `0600` owner-only; named pipe on Windows).
  */
-import { createHash, randomBytes } from "node:crypto";
-import {
-  chmodSync,
-  lstatSync,
-  mkdirSync,
-  realpathSync,
-  renameSync,
-  type Stats,
-  unlinkSync,
-} from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, lstatSync, mkdirSync, realpathSync, type Stats, unlinkSync } from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { enforcePrivateDir } from "./home.ts";
@@ -50,8 +42,14 @@ export type SocketServerDeps = {
   readonly closeGraceMs?: number;
   /** Amendment 1 §2a / §4 step 4: called after stale verdict, before re-lstat and unlink. */
   readonly beforeStaleUnlink?: () => void;
+  /** Test seam: runs immediately before `listen()` (e.g. to exercise EADDRINUSE / EACCES). */
+  readonly beforeListen?: () => void;
   /** Amendment 1 §2a / §4 Listen: called straight after `listen()` succeeds, before step 5. */
   readonly afterListen?: () => void;
+  /** Test seam: runs inside `close()` before connection shutdown (e.g. to hang close() past deadline). */
+  readonly beforeShutdown?: () => Promise<void>;
+  /** Test seam: called after `onServerError` is attached so tests can emit a fatal listener error. */
+  readonly onListenReady?: (controls: { readonly emitError: (err: Error) => void }) => void;
 };
 
 export type SocketServerOptions = Omit<EngineOptions, "input" | "output"> & {
@@ -364,6 +362,7 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
   // Amendment 1 §4 "Listen … under umask 0o177" (Argus #73 P3a): the socket never exists at a
   // wider mode than 0600. The previous umask is restored straight after the bind, in the callback
   // or the error handler, before anything else is created.
+  socketDeps.beforeListen?.();
   const posix = process.platform !== "win32";
   let restoreUmask: (() => void) | null = null;
   if (posix) {
@@ -418,36 +417,16 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
    */
   const closeGraceMs = socketDeps.closeGraceMs ?? SOCKET_CLOSE_GRACE_MS;
   const shutdownAll = async (): Promise<void> => {
-    // Amendment 1 §3 step 5 (Argus #76 M2): Node/Bun's `server.close()` unlinks `socketPath` by
-    // path. If another process replaced `socketPath` with a different inode, move that entry aside
-    // before `server.close()` and restore it afterwards so we never remove a successor's socket.
-    let preservedPath: string | null = null;
-    if (posix && bound !== null) {
-      try {
-        const now = lstatOrNull(socketPath);
-        if (now !== null && (!now.isSocket() || now.dev !== bound.dev || now.ino !== bound.ino)) {
-          const candidate = `${socketPath}.preserve-${randomBytes(8).toString("hex")}`;
-          renameSync(socketPath, candidate);
-          preservedPath = candidate;
-        }
-      } catch {
-        // Best-effort preservation; if lstat/rename fails, proceed with closing connections.
-      }
+    // Amendment 1 §3 step 5 (line 96): never rename or move any entry at `socketPath`.
+    // Only `unlinkOwnSocket()` may unlink `socketPath`, and only if `lstat` still matches our
+    // bound `dev`+`ino`. Runtime `server.close()` unlink-by-path behavior is carried under D-646.
+    if (socketDeps.beforeShutdown !== undefined) {
+      await socketDeps.beforeShutdown();
     }
-    try {
-      const closed = new Promise<void>((resolve) => server.close(() => resolve()));
-      for (const c of conns) c.shutdown();
-      await Promise.all([...sockets].map((sock) => endThenDestroy(sock, closeGraceMs)));
-      await closed;
-    } finally {
-      if (preservedPath !== null) {
-        try {
-          renameSync(preservedPath, socketPath);
-        } catch {
-          // Best-effort restore.
-        }
-      }
-    }
+    const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+    for (const c of conns) c.shutdown();
+    await Promise.all([...sockets].map((sock) => endThenDestroy(sock, closeGraceMs)));
+    await closed;
   };
 
   if (posix) {
@@ -507,6 +486,11 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
   if (onServerError !== undefined) {
     server.on("error", onServerError);
   }
+  socketDeps.onListenReady?.({
+    emitError: (err: Error) => {
+      server.emit("error", err);
+    },
+  });
 
   return {
     socketPath,

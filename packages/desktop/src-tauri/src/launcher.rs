@@ -9,10 +9,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::env;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,6 +26,40 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
 pub const START_WINDOW: Duration = Duration::from_secs(5);
 pub const UNINITIALIZED_KILL_GRACE: Duration = Duration::from_secs(2);
 pub const INITIALIZED_KILL_GRACE: Duration = Duration::from_secs(7);
+pub const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+pub const MAX_STDERR_RETAINED_BYTES: usize = 64 * 1024;
+pub const INTERACTIVE_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// M3-A2 desktop IPC method allowlist (read-only + handshake). Any method outside this set is
+/// refused in Rust before touching the engine socket.
+pub const ALLOWED_RPC_METHODS: &[&str] = &[
+    "initialize",
+    "room/inspect",
+    "session/search",
+    "session/read",
+];
+
+pub fn validate_rpc_method(method: &str) -> Result<(), String> {
+    if ALLOWED_RPC_METHODS.contains(&method) {
+        Ok(())
+    } else {
+        Err(format!("RPC method not allowed by M3-A2 desktop shell: {method}"))
+    }
+}
+
+/// Append a chunk to the retained stderr buffer while keeping only the tail within `max_bytes`
+/// on a valid UTF-8 boundary. The drain thread continues reading until EOF so `serve` never
+/// blocks on a full stderr pipe (§1.3).
+pub fn push_stderr_capped(buf: &mut String, chunk: &str, max_bytes: usize) {
+    buf.push_str(chunk);
+    if buf.len() > max_bytes {
+        let mut cut = buf.len() - max_bytes;
+        while cut < buf.len() && !buf.is_char_boundary(cut) {
+            cut += 1;
+        }
+        buf.drain(..cut);
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -133,20 +167,52 @@ pub fn resolve_madc_home() -> Result<PathBuf, String> {
     Ok(PathBuf::from(home).join(".madc"))
 }
 
-/// Canonical socket/pipe path per amendment 1 §1 & §4.
-/// Windows named pipe hashes canonicalized `MADC_HOME` (Windows branch is unverified in CI).
-pub fn engine_socket_path(home: &Path) -> Result<String, String> {
-    if cfg!(windows) {
-        let canonical = std::fs::canonicalize(home)
-            .map_err(|e| format!("Windows pipe realpath failed (home absent): {e}"))?;
-        let mut hasher = Sha256::new();
-        hasher.update(canonical.to_string_lossy().as_bytes());
-        let digest = hasher.finalize();
-        let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
-        Ok(format!(r"\\.\pipe\madc-{hex}"))
+/// Strip Rust's Windows verbatim prefix (`\\?\` or `\\?\UNC\`) so the canonical path matches
+/// Node's `fs.realpathSync.native(MADC_HOME)` before SHA-256 hashing (amendment 1 §2 / §4).
+/// Windows named-pipe transport remains unverified in CI.
+pub fn strip_windows_verbatim_prefix(path: &str) -> String {
+    if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(rest) = path.strip_prefix(r"\\?\") {
+        rest.to_string()
     } else {
-        Ok(home.join("engine.sock").to_string_lossy().into_owned())
+        path.to_string()
     }
+}
+
+/// Compute the Windows named pipe path from a canonicalized `MADC_HOME` string.
+pub fn windows_pipe_name_from_realpath(canonical_path: &str) -> String {
+    let normalized = strip_windows_verbatim_prefix(canonical_path);
+    let mut hasher = Sha256::new();
+    hasher.update(normalized.as_bytes());
+    let digest = hasher.finalize();
+    let hex: String = digest.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    format!(r"\\.\pipe\madc-{hex}")
+}
+
+/// Canonical socket/pipe path per amendment 1 §1, §2 & §4.
+/// Returns `Ok(None)` on Windows when `$MADC_HOME` does not exist yet (pin line 50: no listener
+/// can exist yet, so the caller skips the probe and spawns `serve`).
+/// Windows branch is unverified in CI.
+pub fn try_engine_socket_path(home: &Path) -> Result<Option<String>, String> {
+    if cfg!(windows) {
+        match std::fs::canonicalize(home) {
+            Ok(canonical) => Ok(Some(windows_pipe_name_from_realpath(
+                &canonical.to_string_lossy(),
+            ))),
+            Err(e) if e.kind() == ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("Windows pipe realpath failed: {e}")),
+        }
+    } else {
+        Ok(Some(home.join("engine.sock").to_string_lossy().into_owned()))
+    }
+}
+
+/// Canonical socket/pipe path when `$MADC_HOME` is expected to exist.
+#[allow(dead_code)]
+pub fn engine_socket_path(home: &Path) -> Result<String, String> {
+    try_engine_socket_path(home)?
+        .ok_or_else(|| "Windows pipe realpath failed (home absent)".to_string())
 }
 
 #[derive(Debug, Clone)]
@@ -179,16 +245,24 @@ struct SpawnedServe {
     child: Child,
     stdin: Option<ChildStdin>,
     stderr_buf: Arc<Mutex<String>>,
+    stderr_done: Option<mpsc::Receiver<()>>,
     stderr_thread: Option<thread::JoinHandle<()>>,
     initialized: bool,
 }
 
 impl SpawnedServe {
-    /// Wait for the stderr drain thread to observe EOF (after child exit) and return all drained
-    /// stderr text (Argus #76 L2).
-    fn drain_stderr(&mut self) -> String {
-        if let Some(handle) = self.stderr_thread.take() {
-            let _ = handle.join();
+    /// Wait (bounded by `timeout`, pattern 1) for the stderr drain thread to observe EOF and
+    /// return the retained tail of drained stderr text.
+    fn drain_stderr(&mut self, timeout: Duration) -> String {
+        if let Some(rx) = self.stderr_done.take() {
+            if rx.recv_timeout(timeout).is_ok() {
+                if let Some(handle) = self.stderr_thread.take() {
+                    let _ = handle.join();
+                }
+            } else {
+                // Bounded wait expired (e.g. a grandchild kept stderr open): detach rather than hang.
+                let _ = self.stderr_thread.take();
+            }
         }
         self.stderr_buf
             .lock()
@@ -200,23 +274,23 @@ impl SpawnedServe {
         self.child.try_wait().ok().flatten()
     }
 
-    /// Stop `serve` per amendment 1 §5:
+    /// Stop `serve` per amendment 1 §5 and return its exit status once reaped:
     /// - Initialized child: close stdin (EOF) first; wait up to 7 s before SIGKILL.
     /// - Never-initialized child: on Unix, SIGTERM first (keeping stdin open so the signal wins
-    ///   as first trigger, Argus #76 L1), then SIGKILL after 2 s; on Windows, close stdin first.
-    fn stop(&mut self) {
+    ///   as first trigger), then SIGKILL after 2 s; on Windows, close stdin first.
+    fn stop(&mut self) -> Option<ExitStatus> {
         if self.initialized {
             // Close stdin (EOF) first (§5 & §4 Windows).
             drop(self.stdin.take());
             let deadline = Instant::now() + INITIALIZED_KILL_GRACE;
             while Instant::now() < deadline {
-                if self.try_wait_status().is_some() {
-                    return;
+                if let Some(status) = self.try_wait_status() {
+                    return Some(status);
                 }
                 thread::sleep(Duration::from_millis(20));
             }
             let _ = self.child.kill();
-            let _ = self.child.wait();
+            self.child.wait().ok()
         } else {
             #[cfg(not(unix))]
             drop(self.stdin.take());
@@ -226,15 +300,16 @@ impl SpawnedServe {
             }
             let deadline = Instant::now() + UNINITIALIZED_KILL_GRACE;
             while Instant::now() < deadline {
-                if self.try_wait_status().is_some() {
+                if let Some(status) = self.try_wait_status() {
                     drop(self.stdin.take());
-                    return;
+                    return Some(status);
                 }
                 thread::sleep(Duration::from_millis(20));
             }
             let _ = self.child.kill();
-            let _ = self.child.wait();
+            let status = self.child.wait().ok();
             drop(self.stdin.take());
+            status
         }
     }
 }
@@ -242,7 +317,7 @@ impl SpawnedServe {
 impl Drop for SpawnedServe {
     fn drop(&mut self) {
         if self.try_wait_status().is_none() {
-            self.stop();
+            let _ = self.stop();
         }
     }
 }
@@ -258,19 +333,27 @@ pub struct SocketClient {
 
 #[cfg(unix)]
 impl SocketClient {
+    /// Connect and run `initialize` within ONE total deadline (`timeout`), matching amendment 1
+    /// §2 line 47 ("within 1 s (connect plus reply)").
     fn connect_and_initialize(
         socket_path: &str,
         timeout: Duration,
         reused_existing: bool,
         started_at: Instant,
     ) -> Result<Self, String> {
+        let deadline = Instant::now() + timeout;
         let stream = UnixStream::connect(socket_path)
             .map_err(|e| format!("connect({socket_path}) failed: {e}"))?;
+
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            return Err("initialize probe timed out after connect".to_string());
+        }
         stream
-            .set_read_timeout(Some(timeout))
+            .set_read_timeout(Some(rem))
             .map_err(|e| format!("set_read_timeout failed: {e}"))?;
         stream
-            .set_write_timeout(Some(timeout))
+            .set_write_timeout(Some(rem))
             .map_err(|e| format!("set_write_timeout failed: {e}"))?;
 
         let writer = stream
@@ -291,12 +374,13 @@ impl SocketClient {
             },
         };
 
-        let init_result = client.request(
+        let init_result = client.request_with_deadline(
             "initialize",
             json!({
                 "clientInfo": { "name": "madc-desktop", "version": "0.0.0" },
                 "capabilities": { "subscribeRoom": true }
             }),
+            deadline,
         )?;
 
         let protocol_version = init_result
@@ -323,13 +407,13 @@ impl SocketClient {
             .unwrap_or("0.0.0")
             .to_string();
 
-        // Clear short probe timeout for subsequent interactive RPC calls (bounded to 10s).
-        let _ = client.writer.set_read_timeout(Some(Duration::from_secs(10)));
-        let _ = client.writer.set_write_timeout(Some(Duration::from_secs(10)));
+        // Set interactive timeout for subsequent RPC calls.
+        let _ = client.writer.set_read_timeout(Some(INTERACTIVE_RPC_TIMEOUT));
+        let _ = client.writer.set_write_timeout(Some(INTERACTIVE_RPC_TIMEOUT));
         let _ = client
             .reader
             .get_ref()
-            .set_read_timeout(Some(Duration::from_secs(10)));
+            .set_read_timeout(Some(INTERACTIVE_RPC_TIMEOUT));
 
         client.info = ConnectionInfo {
             socket_path: socket_path.to_string(),
@@ -343,6 +427,15 @@ impl SocketClient {
     }
 
     pub fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_with_deadline(method, params, Instant::now() + INTERACTIVE_RPC_TIMEOUT)
+    }
+
+    fn request_with_deadline(
+        &mut self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value, String> {
         let id = self.next_id;
         self.next_id += 1;
         let payload = json!({
@@ -353,6 +446,14 @@ impl SocketClient {
         let mut line = serde_json::to_string(&payload)
             .map_err(|e| format!("failed to serialize request: {e}"))?;
         line.push('\n');
+
+        let write_rem = deadline.saturating_duration_since(Instant::now());
+        if write_rem.is_zero() {
+            return Err(format!("RPC {method} timed out before write"));
+        }
+        self.writer
+            .set_write_timeout(Some(write_rem))
+            .map_err(|e| format!("set_write_timeout failed: {e}"))?;
         self.writer
             .write_all(line.as_bytes())
             .map_err(|e| format!("socket write failed: {e}"))?;
@@ -361,6 +462,15 @@ impl SocketClient {
             .map_err(|e| format!("socket flush failed: {e}"))?;
 
         loop {
+            let read_rem = deadline.saturating_duration_since(Instant::now());
+            if read_rem.is_zero() {
+                return Err(format!("RPC {method} timed out waiting for reply"));
+            }
+            self.reader
+                .get_ref()
+                .set_read_timeout(Some(read_rem))
+                .map_err(|e| format!("set_read_timeout failed: {e}"))?;
+
             let mut resp_line = String::new();
             let n = self
                 .reader
@@ -388,7 +498,7 @@ impl SocketClient {
 
     pub fn disconnect(mut self) {
         if let Some(mut s) = self.spawned.take() {
-            s.stop();
+            let _ = s.stop();
         }
     }
 }
@@ -396,18 +506,28 @@ impl SocketClient {
 /// Probe `$MADC_HOME/engine.sock` per amendment 1 §2, or spawn `madc-engine serve` per §1, §2, §5.
 #[cfg(unix)]
 pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
-    let started_at = Instant::now();
-    let socket_path = engine_socket_path(&config.home)?;
+    connect_or_spawn_with_window(config, START_WINDOW)
+}
 
-    // §2: Probe existing listener within 1 s (connect + initialize).
-    if let Ok(client) =
-        SocketClient::connect_and_initialize(&socket_path, PROBE_TIMEOUT, true, started_at)
-    {
-        return Ok(client);
+#[cfg(unix)]
+fn connect_or_spawn_with_window(
+    config: &LaunchConfig,
+    start_window: Duration,
+) -> Result<SocketClient, String> {
+    let started_at = Instant::now();
+
+    // §2: Probe existing listener within 1 s (connect + initialize). If home does not exist yet
+    // (Windows absent home, pin line 50), `try_engine_socket_path` returns Ok(None) and we spawn.
+    if let Some(socket_path) = try_engine_socket_path(&config.home)? {
+        if let Ok(client) =
+            SocketClient::connect_and_initialize(&socket_path, PROBE_TIMEOUT, true, started_at)
+        {
+            return Ok(client);
+        }
     }
 
     // §1.3: Spawn `madc-engine serve` with piped stdin (held open), stdout null, piped stderr
-    // drained for the whole life of `serve`.
+    // drained for the whole life of `serve` (retaining a bounded tail).
     let mut child = Command::new(&config.runtime_bin)
         .arg(&config.engine_entry)
         .arg("serve")
@@ -420,6 +540,7 @@ pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
 
     let stdin = child.stdin.take();
     let stderr_buf = Arc::new(Mutex::new(String::new()));
+    let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
     let stderr_thread = child.stderr.take().map(|mut stderr| {
         let buf_clone = Arc::clone(&stderr_buf);
         thread::spawn(move || {
@@ -430,11 +551,12 @@ pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
                     Ok(n) => {
                         let s = String::from_utf8_lossy(&chunk[..n]);
                         if let Ok(mut guard) = buf_clone.lock() {
-                            guard.push_str(&s);
+                            push_stderr_capped(&mut guard, &s, MAX_STDERR_RETAINED_BYTES);
                         }
                     }
                 }
             }
+            let _ = done_tx.send(());
         })
     });
 
@@ -442,34 +564,43 @@ pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
         child,
         stdin,
         stderr_buf,
+        stderr_done: if stderr_thread.is_some() {
+            Some(done_rx)
+        } else {
+            None
+        },
         stderr_thread,
         initialized: false,
     };
 
-    // §5: Wait up to 5 s for `initialize` to succeed over `engine.sock`.
-    let deadline = Instant::now() + START_WINDOW;
+    // §5: Wait up to `start_window` (5 s) for `initialize` to succeed over `engine.sock`.
+    let deadline = Instant::now() + start_window;
     while Instant::now() < deadline {
         if let Some(status) = spawned.try_wait_status() {
             let code = status.code();
             let signal = status.signal();
             let class = classify_exit(code, signal, false);
-            // §2 & §5: On child exit 20 before initialize, re-probe once until the 5 s window ends.
+            // §2 & §5: On child exit 20 before initialize, re-probe once until the start window ends.
             if code == Some(20) {
                 while Instant::now() < deadline {
-                    let rem = deadline
-                        .saturating_duration_since(Instant::now())
-                        .min(PROBE_TIMEOUT);
-                    if let Ok(client) = SocketClient::connect_and_initialize(
-                        &socket_path,
-                        rem.max(Duration::from_millis(50)),
-                        true,
-                        started_at,
-                    ) {
-                        return Ok(client);
+                    if let Ok(Some(socket_path)) = try_engine_socket_path(&config.home) {
+                        let rem = deadline
+                            .saturating_duration_since(Instant::now())
+                            .min(PROBE_TIMEOUT);
+                        if !rem.is_zero() {
+                            if let Ok(client) = SocketClient::connect_and_initialize(
+                                &socket_path,
+                                rem,
+                                true,
+                                started_at,
+                            ) {
+                                return Ok(client);
+                            }
+                        }
                     }
-                    thread::sleep(Duration::from_millis(25));
+                    thread::sleep(Duration::from_millis(20));
                 }
-                let stderr_text = spawned.drain_stderr();
+                let stderr_text = spawned.drain_stderr(STDERR_DRAIN_TIMEOUT);
                 if let Some(guidance) = format_lock_owner_guidance(&stderr_text) {
                     return Err(format!(
                         "madc-engine serve exited 20 ({class:?}). {guidance}\nstderr:\n{stderr_text}"
@@ -479,39 +610,121 @@ pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
                     "madc-engine serve exited 20 ({class:?}) and re-probe found no listener.\nstderr:\n{stderr_text}"
                 ));
             }
-            let stderr_text = spawned.drain_stderr();
+            let stderr_text = spawned.drain_stderr(STDERR_DRAIN_TIMEOUT);
             return Err(format!(
                 "madc-engine serve exited before initialize (code={code:?}, signal={signal:?}, class={class:?}).\nstderr:\n{stderr_text}"
             ));
         }
 
-        let rem = deadline
-            .saturating_duration_since(Instant::now())
-            .min(PROBE_TIMEOUT);
-        if let Ok(mut client) = SocketClient::connect_and_initialize(
-            &socket_path,
-            rem.max(Duration::from_millis(50)),
-            false,
-            started_at,
-        ) {
-            spawned.initialized = true;
-            client.spawned = Some(spawned);
-            return Ok(client);
+        if let Ok(Some(socket_path)) = try_engine_socket_path(&config.home) {
+            let rem = deadline
+                .saturating_duration_since(Instant::now())
+                .min(PROBE_TIMEOUT);
+            if !rem.is_zero() {
+                if let Ok(mut client) = SocketClient::connect_and_initialize(
+                    &socket_path,
+                    rem,
+                    false,
+                    started_at,
+                ) {
+                    spawned.initialized = true;
+                    client.spawned = Some(spawned);
+                    return Ok(client);
+                }
+            }
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(Duration::from_millis(20));
     }
 
     // §5: Deadline passed without initialize -> SIGTERM, then SIGKILL after 2 s.
-    spawned.stop();
-    let stderr_text = spawned.drain_stderr();
+    // Report the child's exit status and drained stderr (pin §5 line 132).
+    let status = spawned.stop();
+    let code = status.and_then(|s| s.code());
+    let signal = status.and_then(|s| s.signal());
+    let stderr_text = spawned.drain_stderr(STDERR_DRAIN_TIMEOUT);
     Err(format!(
-        "madc-engine serve did not complete initialize within 5 s.\nstderr:\n{stderr_text}"
+        "madc-engine serve did not complete initialize within {} ms (exit code={code:?}, signal={signal:?}).\nstderr:\n{stderr_text}",
+        start_window.as_millis()
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    #[cfg(unix)]
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn rpc_allowlist_permits_only_m3_a2_methods() {
+        for allowed in ["initialize", "room/inspect", "session/search", "session/read"] {
+            assert!(
+                validate_rpc_method(allowed).is_ok(),
+                "expected allowed method {allowed}"
+            );
+        }
+        for denied in [
+            "turn/start",
+            "thread/start",
+            "thread/resume",
+            "thread/handoff",
+            "decision/raise",
+            "decision/resolve",
+            "auth/set",
+            "auth/remove",
+            "room/inspect ",
+            "",
+        ] {
+            let err = validate_rpc_method(denied).expect_err("expected disallowed method");
+            assert!(err.contains("not allowed"), "unexpected err: {err}");
+        }
+    }
+
+    #[test]
+    fn windows_pipe_name_strips_verbatim_prefix_and_matches_node_sha256() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\Users\m\.madc"),
+            r"C:\Users\m\.madc"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\.madc"),
+            r"\\server\share\.madc"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"C:\Users\m\.madc"),
+            r"C:\Users\m\.madc"
+        );
+
+        let from_verbatim = windows_pipe_name_from_realpath(r"\\?\C:\Users\m\.madc");
+        let from_plain = windows_pipe_name_from_realpath(r"C:\Users\m\.madc");
+        assert_eq!(
+            from_verbatim, from_plain,
+            "verbatim \\\\?\\ prefix must hash identically to Node realpathSync.native"
+        );
+        assert!(from_plain.starts_with(r"\\.\pipe\madc-"));
+        assert_eq!(from_plain.len(), r"\\.\pipe\madc-".len() + 16);
+    }
+
+    #[test]
+    fn stderr_retention_caps_to_tail_and_preserves_final_reason_line() {
+        let mut buf = String::new();
+        let filler = "x".repeat(4096);
+        for _ in 0..32 {
+            push_stderr_capped(&mut buf, &filler, MAX_STDERR_RETAINED_BYTES);
+        }
+        let reason = "\nmadc-engine serve: home owned by pid 7777: /tmp/h/engine.lock\n";
+        push_stderr_capped(&mut buf, reason, MAX_STDERR_RETAINED_BYTES);
+        assert!(
+            buf.len() <= MAX_STDERR_RETAINED_BYTES,
+            "buf len {} exceeded cap {}",
+            buf.len(),
+            MAX_STDERR_RETAINED_BYTES
+        );
+        let guidance = format_lock_owner_guidance(&buf).expect("final reason line preserved in tail");
+        assert!(guidance.contains("7777"));
+        assert!(guidance.contains("/tmp/h/engine.lock"));
+    }
 
     #[test]
     fn exit_classification_matches_amendment_1_section_6() {
@@ -549,6 +762,182 @@ mod tests {
         assert!(g.contains("9123"));
         assert!(g.contains("/tmp/h/engine.lock"));
         assert!(g.contains("manually remove /tmp/h/engine.lock"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_and_initialize_enforces_single_total_deadline_across_chatty_reads() {
+        let home = PathBuf::from(format!("/tmp/madc-dt-l1-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let sock_path = home.join("engine.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind test listener");
+
+        let server_thread = thread::spawn(move || {
+            if let Ok((mut conn, _)) = listener.accept() {
+                // Keep sending asynchronous notifications every 40 ms without ever replying to
+                // `initialize`. A per-read timeout would reset on every notification and wait
+                // forever; one total deadline must terminate within ~250 ms.
+                for _ in 0..40 {
+                    let note = "{\"method\":\"room/updated\",\"params\":{\"reason\":\"thread\",\"threadId\":\"thr_1\"}}\n";
+                    if conn.write_all(note.as_bytes()).is_err() {
+                        break;
+                    }
+                    let _ = conn.flush();
+                    thread::sleep(Duration::from_millis(40));
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let res = SocketClient::connect_and_initialize(
+            &sock_path.to_string_lossy(),
+            Duration::from_millis(250),
+            true,
+            started,
+        );
+        let elapsed = started.elapsed();
+        assert!(res.is_err(), "expected timeout against chatty server");
+        assert!(
+            elapsed < Duration::from_millis(600),
+            "single total deadline exceeded: elapsed={elapsed:?}"
+        );
+
+        let _ = server_thread.join();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_20_drains_delayed_stderr_before_returning_guidance_m3a2_n4() {
+        // M3A2-N4: fake `serve` exits 20 immediately while a subshell still holding stderr open
+        // writes the pinned exit-20 reason line after 150 ms. With a 60 ms start_window, the
+        // re-probe loop ends BEFORE the reason line is written, so this test fails without the
+        // bounded stderr drain wait/join in `SpawnedServe::drain_stderr`.
+        let home = PathBuf::from(format!("/tmp/madc-dt-n4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("mkdir home");
+
+        let fake_serve = home.join("fake-serve.sh");
+        std::fs::write(
+            &fake_serve,
+            "#!/bin/sh\n(sleep 0.15; printf 'madc-engine serve: home owned by pid 4242: %s/engine.lock\\n' \"$MADC_HOME\" >&2) &\nexit 20\n",
+        )
+        .expect("write fake serve");
+        std::fs::set_permissions(&fake_serve, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake serve");
+
+        let cfg = LaunchConfig {
+            home: home.clone(),
+            runtime_bin: "/bin/sh".to_string(),
+            engine_entry: fake_serve,
+        };
+
+        let err = match connect_or_spawn_with_window(&cfg, Duration::from_millis(60)) {
+            Ok(_) => panic!("expected exit 20 failure"),
+            Err(e) => e,
+        };
+        assert!(err.contains("exited 20"), "got: {err}");
+        assert!(
+            err.contains("Home lock held by PID 4242"),
+            "expected delayed stderr reason line to be drained via bounded join, got: {err}"
+        );
+        assert!(err.contains("Manual recovery:"), "got: {err}");
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn drain_stderr_respects_timeout_when_grandchild_holds_pipe_open() {
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("(sleep 5) & echo early >&2; exit 20")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn sh");
+        let mut child = child;
+        let stdin = child.stdin.take();
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let (done_tx, done_rx) = mpsc::sync_channel::<()>(1);
+        let stderr_thread = child.stderr.take().map(|mut stderr| {
+            let buf_clone = Arc::clone(&stderr_buf);
+            thread::spawn(move || {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match stderr.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            let s = String::from_utf8_lossy(&chunk[..n]);
+                            if let Ok(mut guard) = buf_clone.lock() {
+                                push_stderr_capped(&mut guard, &s, MAX_STDERR_RETAINED_BYTES);
+                            }
+                        }
+                    }
+                }
+                let _ = done_tx.send(());
+            })
+        });
+        let _ = child.wait();
+        let mut spawned = SpawnedServe {
+            child,
+            stdin,
+            stderr_buf,
+            stderr_done: Some(done_rx),
+            stderr_thread,
+            initialized: false,
+        };
+        let t0 = Instant::now();
+        let text = spawned.drain_stderr(Duration::from_millis(120));
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(1000),
+            "bounded drain_stderr hung waiting on grandchild: {elapsed:?}"
+        );
+        assert!(text.contains("early"), "got: {text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_timeout_reports_child_exit_status_and_stderr() {
+        let home = PathBuf::from(format!("/tmp/madc-dt-l9-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("mkdir home");
+
+        let fake_serve = home.join("hang-serve.sh");
+        std::fs::write(
+            &fake_serve,
+            "#!/bin/sh\necho '[madc-engine] slow-boot-marker' >&2\nexec sleep 10\n",
+        )
+        .expect("write hang serve");
+        std::fs::set_permissions(&fake_serve, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod hang serve");
+
+        let cfg = LaunchConfig {
+            home: home.clone(),
+            runtime_bin: "/bin/sh".to_string(),
+            engine_entry: fake_serve,
+        };
+
+        let err = match connect_or_spawn_with_window(&cfg, Duration::from_millis(150)) {
+            Ok(_) => panic!("expected start timeout"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("did not complete initialize"),
+            "expected timeout message, got: {err}"
+        );
+        assert!(
+            err.contains("exit code=") && err.contains("signal=Some(15)"),
+            "expected child exit status (SIGTERM=15) in start-timeout report, got: {err}"
+        );
+        assert!(
+            err.contains("slow-boot-marker"),
+            "expected drained stderr in start-timeout report, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[cfg(unix)]

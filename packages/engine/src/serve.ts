@@ -27,7 +27,7 @@ import {
 } from "./socket.ts";
 
 /** Amendment 1 §6 exit codes for `madc-engine serve`. */
-export const SERVE_EXIT = {
+export const SERVE_EXIT = Object.freeze({
   OK: 0,
   USAGE_OR_HOME: 2,
   OWNED: 20,
@@ -37,7 +37,7 @@ export const SERVE_EXIT = {
   INTERNAL_FAULT: 24,
   SIGINT: 130,
   SIGTERM: 143,
-} as const;
+} as const);
 
 export type ServeExitCode = (typeof SERVE_EXIT)[keyof typeof SERVE_EXIT];
 
@@ -146,6 +146,7 @@ export async function runServe(
   let activeSocketPath: string | null = null;
   let engineLock: LockHandle | null = null;
   let handle: SocketServerHandle | null = null;
+  let closeStarted = false;
 
   let startupCheckFailed = false;
   let shuttingDown = false;
@@ -162,6 +163,13 @@ export async function runServe(
   const donePromise = new Promise<ServeExitCode>((resolve) => {
     resolveDone = resolve;
   });
+
+  type Raced<T> = { readonly aborted: false; readonly value: T } | { readonly aborted: true };
+  const raceWithExit = <T>(p: Promise<T>): Promise<Raced<T>> =>
+    Promise.race([
+      p.then((value): Raced<T> => ({ aborted: false, value })),
+      donePromise.then((): Raced<T> => ({ aborted: true })),
+    ]);
 
   const releaseAllLocks = (): void => {
     try {
@@ -213,7 +221,7 @@ export async function runServe(
     );
   };
 
-  const detachHandlers = (): void => {
+  const detachTriggerHandlers = (): void => {
     stdin.removeListener("data", onStdinData);
     stdin.removeListener("end", onStdinEnd);
     stdin.removeListener("error", onStdinError);
@@ -222,7 +230,6 @@ export async function runServe(
       process.removeListener("SIGTERM", onSigterm);
       process.removeListener("uncaughtException", onFatalFault);
       process.removeListener("unhandledRejection", onFatalFault);
-      process.removeListener("exit", releaseAllLocks);
     }
   };
 
@@ -261,8 +268,13 @@ export async function runServe(
       clearTimeout(shutdownTimer);
       shutdownTimer = null;
     }
-    detachHandlers();
+    detachTriggerHandlers();
+    // Amendment 1 §3 line 99: release every thread lock still held and engine.lock on every exit
+    // (including 23 and 24). Keep the process "exit" handler attached until releaseAllLocks runs.
     releaseAllLocks();
+    if (installProcessHandlers) {
+      process.removeListener("exit", releaseAllLocks);
+    }
 
     const graceMs =
       firstTriggerAtMs !== null
@@ -323,9 +335,11 @@ export async function runServe(
           log(`shutdown hook failed: ${err instanceof Error ? err.message : String(err)}`);
         }
       }
-      if (handle !== null) {
+      if (handle !== null && !closeStarted) {
+        closeStarted = true;
+        // Keep `handle` referenced while `close()` runs so `releaseAllLocks()` can still release
+        // every held thread lock if `close()` hangs past the 5 s shutdown deadline (exit 23/24).
         const h = handle;
-        handle = null;
         try {
           await h.close();
         } catch (err) {
@@ -470,16 +484,25 @@ export async function runServe(
   let resolvedAgent: Agent;
   try {
     const factoryOrAgent = deps.agent ?? defaultAgentFactory;
-    resolvedAgent =
-      typeof factoryOrAgent === "function"
-        ? await factoryOrAgent({ home: homePath, repoPolicy })
-        : factoryOrAgent;
+    if (typeof factoryOrAgent === "function") {
+      const agentPromise = Promise.resolve(factoryOrAgent({ home: homePath, repoPolicy }));
+      const raced = await raceWithExit(agentPromise);
+      if (raced.aborted) {
+        void agentPromise.catch(() => {});
+        return donePromise;
+      }
+      resolvedAgent = raced.value;
+    } else {
+      resolvedAgent = factoryOrAgent;
+    }
   } catch {
+    if (exitStarted) return donePromise;
     if (flushPendingStartupTrigger()) return donePromise;
     startupCheckFailed = true;
     return exitServe(SERVE_EXIT.INTERNAL_FAULT, `unexpected internal fault: ${homePath}`);
   }
 
+  if (exitStarted) return donePromise;
   if (flushPendingStartupTrigger()) return donePromise;
 
   // 5. Socket bind (§4 steps 1-5 + both engine.lock re-verifications)
@@ -493,7 +516,7 @@ export async function runServe(
   };
 
   try {
-    handle = await startSocketServer({
+    const serverPromise = startSocketServer({
       home: homePath,
       repoPolicy,
       agent: resolvedAgent,
@@ -517,8 +540,18 @@ export async function runServe(
         },
       },
     });
-    activeSocketPath = handle.socketPath;
+    const racedServer = await raceWithExit(serverPromise);
+    if (racedServer.aborted) {
+      void serverPromise.then(
+        (late) => late.close().catch(() => {}),
+        () => {},
+      );
+      return donePromise;
+    }
+    handle = racedServer.value;
+    activeSocketPath = racedServer.value.socketPath;
   } catch (err) {
+    if (exitStarted) return donePromise;
     if (flushPendingStartupTrigger()) return donePromise;
     startupCheckFailed = true;
     if (err instanceof LockLostError) {

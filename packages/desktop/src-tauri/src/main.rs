@@ -6,33 +6,37 @@
 
 mod launcher;
 
-use launcher::{ConnectionInfo, LaunchConfig};
+use launcher::{validate_rpc_method, ConnectionInfo, LaunchConfig};
 use serde_json::Value;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tauri::{Manager, RunEvent, State};
 
 #[cfg(unix)]
-struct EngineState(Mutex<Option<launcher::SocketClient>>);
+struct EngineState(Arc<Mutex<Option<launcher::SocketClient>>>);
 
 #[cfg(not(unix))]
-struct EngineState(Mutex<Option<()>>);
+struct EngineState(Arc<Mutex<Option<()>>>);
 
 #[tauri::command]
-fn connect_engine(state: State<'_, EngineState>) -> Result<ConnectionInfo, String> {
+async fn connect_engine(state: State<'_, EngineState>) -> Result<ConnectionInfo, String> {
     #[cfg(unix)]
     {
-        let mut guard = state
-            .0
-            .lock()
-            .map_err(|_| "engine state lock poisoned".to_string())?;
-        if let Some(existing) = guard.as_ref() {
-            return Ok(existing.info.clone());
-        }
-        let config = LaunchConfig::from_env()?;
-        let client = launcher::connect_or_spawn(&config)?;
-        let info = client.info.clone();
-        *guard = Some(client);
-        Ok(info)
+        let shared = Arc::clone(&state.0);
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut guard = shared
+                .lock()
+                .map_err(|_| "engine state lock poisoned".to_string())?;
+            if let Some(existing) = guard.as_ref() {
+                return Ok(existing.info.clone());
+            }
+            let config = LaunchConfig::from_env()?;
+            let client = launcher::connect_or_spawn(&config)?;
+            let info = client.info.clone();
+            *guard = Some(client);
+            Ok(info)
+        })
+        .await
+        .map_err(|e| format!("connect task failed: {e}"))?
     }
     #[cfg(not(unix))]
     {
@@ -42,21 +46,26 @@ fn connect_engine(state: State<'_, EngineState>) -> Result<ConnectionInfo, Strin
 }
 
 #[tauri::command]
-fn rpc_request(
+async fn rpc_request(
     state: State<'_, EngineState>,
     method: String,
     params: Value,
 ) -> Result<Value, String> {
+    validate_rpc_method(&method)?;
     #[cfg(unix)]
     {
-        let mut guard = state
-            .0
-            .lock()
-            .map_err(|_| "engine state lock poisoned".to_string())?;
-        let client = guard
-            .as_mut()
-            .ok_or_else(|| "not connected to @madc/engine".to_string())?;
-        client.request(&method, params)
+        let shared = Arc::clone(&state.0);
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut guard = shared
+                .lock()
+                .map_err(|_| "engine state lock poisoned".to_string())?;
+            let client = guard
+                .as_mut()
+                .ok_or_else(|| "not connected to @madc/engine".to_string())?;
+            client.request(&method, params)
+        })
+        .await
+        .map_err(|e| format!("rpc task failed: {e}"))?
     }
     #[cfg(not(unix))]
     {
@@ -66,17 +75,21 @@ fn rpc_request(
 }
 
 #[tauri::command]
-fn disconnect_engine(state: State<'_, EngineState>) -> Result<(), String> {
+async fn disconnect_engine(state: State<'_, EngineState>) -> Result<(), String> {
     #[cfg(unix)]
     {
-        let mut guard = state
-            .0
-            .lock()
-            .map_err(|_| "engine state lock poisoned".to_string())?;
-        if let Some(client) = guard.take() {
-            client.disconnect();
-        }
-        Ok(())
+        let shared = Arc::clone(&state.0);
+        tauri::async_runtime::spawn_blocking(move || {
+            let mut guard = shared
+                .lock()
+                .map_err(|_| "engine state lock poisoned".to_string())?;
+            if let Some(client) = guard.take() {
+                client.disconnect();
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| format!("disconnect task failed: {e}"))?
     }
     #[cfg(not(unix))]
     {
@@ -87,7 +100,7 @@ fn disconnect_engine(state: State<'_, EngineState>) -> Result<(), String> {
 
 fn main() {
     let app = tauri::Builder::default()
-        .manage(EngineState(Mutex::new(None)))
+        .manage(EngineState(Arc::new(Mutex::new(None))))
         .invoke_handler(tauri::generate_handler![
             connect_engine,
             rpc_request,
@@ -102,6 +115,7 @@ fn main() {
             if let Some(state) = app_handle.try_state::<EngineState>() {
                 if let Ok(mut guard) = state.0.lock() {
                     if let Some(client) = guard.take() {
+                        // Bounded by `INITIALIZED_KILL_GRACE` (7 s) per amendment 1 §5.
                         client.disconnect();
                     }
                 }

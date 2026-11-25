@@ -1,0 +1,44 @@
+/* Neutral scaffold only — M3-A3 owns dark-glass design tokens and status pills.
+   M3 pin §4: zero decorative green anywhere in the shell. */
+:root {
+  color-scheme: dark;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+body {
+  margin: 0;
+  padding: 16px;
+  background: #141417;
+  color: #d8dae0;
+}
+[role="toolbar"] {
+  display: flex;
+  gap: 8px;
+  padding: 8px;
+  border: 1px solid #2c2e36;
+  margin-bottom: 16px;
+}
+[role="toolbar"] button {
+  background: #1d1f26;
+  color: #d8dae0;
+  border: 1px solid #353844;
+  padding: 6px 12px;
+  cursor: pointer;
+}
+[role="toolbar"] button[aria-pressed="true"],
+[role="toolbar"] button:focus-visible {
+  outline: 2px solid #8fa3bf;
+  border-color: #8fa3bf;
+}
+.status-neutral {
+  color: #b4b8c4;
+}
+.status-fail {
+  color: #e06c75;
+}
+pre {
+  background: #1b1d23;
+  border: 1px solid #2c2e36;
+  padding: 12px;
+  overflow-x: auto;
+  white-space: pre-wrap;
+}

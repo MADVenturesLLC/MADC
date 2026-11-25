@@ -454,19 +454,23 @@ test("serve exit 20 (M3A2-S2): engine.lock token lost straight after listen -> e
   const stdin = new PassThrough();
   let exitCode: number | null = null;
 
-  const code = await runServe([], {
-    env: { MADC_HOME: home },
-    stdin,
-    stderr: err.stream,
-    exit: (c) => {
-      exitCode = c;
-    },
-    agent: echoAgent,
-    afterListenCheck: () => {
-      // Simulate another engine displacing engine.lock right after listen().
-      writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: 1, token: TOKEN_B }));
-    },
-  });
+  const code = await withTimeout(
+    runServe([], {
+      env: { MADC_HOME: home },
+      stdin,
+      stderr: err.stream,
+      exit: (c) => {
+        exitCode = c;
+      },
+      agent: echoAgent,
+      afterListenCheck: () => {
+        // Simulate another engine displacing engine.lock right after listen().
+        writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: 1, token: TOKEN_B }));
+      },
+    }),
+    5000,
+    "M3A2-S2 token lost after listen",
+  );
   assert.equal(code, SERVE_EXIT.OWNED);
   assert.equal(exitCode, 20);
   assert.match(err.text(), /^madc-engine serve: engine\.lock token lost:/m);
@@ -870,4 +874,396 @@ test("serve §3 EPIPE: closed stderr reader still exits with intended code 20 (n
   );
   assert.equal(code, 20);
   releaseThreadLock(acq.handle);
+});
+
+// ===================================================================== M3-A2 hardening & §6 matrix
+
+test("serve constants (M3A2-L4): SERVE_EXIT is frozen against mutation", () => {
+  assert.equal(Object.isFrozen(SERVE_EXIT), true);
+  assert.throws(() => {
+    (SERVE_EXIT as Record<string, number>).OK = 99;
+  }, TypeError);
+});
+
+test("engine.lock parity (M3A2-L5): acquireThreadLock matches pre-delegation outcomes across all edge cases", async () => {
+  const home = trackedHome();
+  // Invalid threadId throws -32602 before touching sessions/.
+  assert.throws(
+    () => acquireThreadLock(home, "../escape"),
+    (err: unknown) => (err as { code?: number }).code === -32602,
+  );
+  assert.equal(existsSync(join(home, "sessions")), false);
+
+  // Valid acquire, live holder refusal, holds/release.
+  const first = acquireThreadLock(home, "thr_parity_1");
+  assert.equal(first.ok, true);
+  if (!first.ok) return;
+  assert.equal(holdsThreadLock(first.handle), true);
+  const dup = acquireThreadLock(home, "thr_parity_1");
+  assert.deepEqual(dup, { ok: false, path: first.path, holderPid: process.pid });
+  assert.equal(releaseThreadLock(first.handle), true);
+  assert.equal(holdsThreadLock(first.handle), false);
+
+  // Dead holder reclaimed.
+  const dead = await deadPid();
+  writeFileSync(first.path, JSON.stringify({ pid: dead, startedAt: 1, token: TOKEN_A }));
+  const reclaimed = acquireThreadLock(home, "thr_parity_1");
+  assert.equal(reclaimed.ok, true);
+  if (reclaimed.ok) assert.equal(releaseThreadLock(reclaimed.handle), true);
+
+  // Non-regular lock path throws LockPathNotAFileError.
+  mkdirSync(first.path);
+  assert.throws(() => acquireThreadLock(home, "thr_parity_1"), LockPathNotAFileError);
+  rmSync(first.path, { recursive: true });
+
+  if (POSIX) {
+    // Symlinked $MADC_HOME still succeeds; symlinked sessions/ is refused -32603.
+    const symHome = `${home}-sym-home`;
+    cleanups.push(() => rmSync(symHome, { force: true }));
+    symlinkSync(home, symHome);
+    const viaSym = acquireThreadLock(symHome, "thr_via_sym");
+    assert.equal(viaSym.ok, true);
+    if (viaSym.ok) assert.equal(releaseThreadLock(viaSym.handle), true);
+
+    const badHome = trackedHome();
+    const outsideDir = `${badHome}-outside-sessions`;
+    cleanups.push(() => rmSync(outsideDir, { recursive: true, force: true }));
+    mkdirSync(outsideDir, { recursive: true, mode: 0o700 });
+    symlinkSync(outsideDir, join(badHome, "sessions"));
+    assert.throws(
+      () => acquireThreadLock(badHome, "thr_sym_sessions"),
+      (err: unknown) => (err as { code?: number }).code === -32603,
+    );
+    assert.equal(existsSync(join(outsideDir, "thr_sym_sessions.lock")), false);
+  }
+});
+
+test("serve exit 23 (M3A2-N2 / M3A2-N3): never-settling agentFactory + stdin EOF exits 23 within deadline+200ms and settles runServe", async () => {
+  const home = trackedHome();
+  const err = captureStream();
+  const stdin = new PassThrough();
+  let exitCode: number | null = null;
+  let triggerAt = 0;
+  let exitAt = 0;
+  const shutdownDeadlineMs = 250;
+
+  const runPromise = runServe([], {
+    env: { MADC_HOME: home },
+    stdin,
+    stderr: err.stream,
+    exit: (c) => {
+      exitCode = c;
+      exitAt = Date.now();
+    },
+    agent: () => new Promise(() => {}),
+    shutdownDeadlineMs,
+    exitWriteGraceMs: 100,
+    totalExitBoundMs: shutdownDeadlineMs + 180,
+  });
+
+  setTimeout(() => {
+    triggerAt = Date.now();
+    stdin.end();
+  }, 50);
+
+  const code = await withTimeout(
+    runPromise,
+    shutdownDeadlineMs + 800,
+    "M3A2-N2 never-settling agentFactory exit 23",
+  );
+  const elapsed = exitAt - triggerAt;
+  assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
+  assert.equal(exitCode, 23);
+  assert.ok(
+    elapsed >= shutdownDeadlineMs - 30 && elapsed <= shutdownDeadlineMs + 200,
+    `expected exit within [${shutdownDeadlineMs - 30}, ${shutdownDeadlineMs + 200}] ms of EOF trigger, got ${elapsed}ms`,
+  );
+  assert.match(err.text(), /^madc-engine serve: shutdown deadline exceeded:/m);
+  assert.equal(existsSync(engineLockPath(home)), false, "engine.lock released on exit 23");
+});
+
+test("serve §6 precedence (M3A2-P1): fatal listener error after listen exits 22 even if shutdown hangs past deadline", async () => {
+  const home = trackedHome();
+  const err = captureStream();
+  const stdin = new PassThrough();
+  let exitCode: number | null = null;
+  let releaseBlocker!: () => void;
+  const blocker = new Promise<void>((r) => {
+    releaseBlocker = r;
+  });
+  let emitError: ((e: Error) => void) | null = null;
+
+  const code = await withTimeout(
+    runServe([], {
+      env: { MADC_HOME: home },
+      stdin,
+      stderr: err.stream,
+      exit: (c) => {
+        exitCode = c;
+      },
+      agent: echoAgent,
+      shutdownDeadlineMs: 80,
+      exitWriteGraceMs: 100,
+      totalExitBoundMs: 300,
+      beforeClose: () => blocker,
+      socketDeps: {
+        onListenReady: (controls) => {
+          emitError = controls.emitError;
+        },
+      },
+      onListening: () => {
+        emitError?.(Object.assign(new Error("listener EIO"), { code: "EIO" }));
+      },
+    }),
+    3000,
+    "M3A2-P1 fatal listener error exit 22",
+  );
+  releaseBlocker();
+  assert.equal(code, SERVE_EXIT.LISTEN_ERROR);
+  assert.equal(exitCode, 22);
+  assert.match(err.text(), /^madc-engine serve: fatal listener error \(EIO\):/m);
+  assert.equal(existsSync(engineLockPath(home)), false);
+});
+
+test("serve §6 precedence (M3A2-P2): listen EADDRINUSE exits 20 and releases engine.lock", async () => {
+  if (!POSIX) return;
+  const home = trackedHome();
+  const sockPath = engineSocketPath(home);
+  const err = captureStream();
+  const stdin = new PassThrough();
+  let exitCode: number | null = null;
+
+  const code = await withTimeout(
+    runServe([], {
+      env: { MADC_HOME: home },
+      stdin,
+      stderr: err.stream,
+      exit: (c) => {
+        exitCode = c;
+      },
+      agent: echoAgent,
+      socketDeps: {
+        beforeListen: () => {
+          // Planting a directory immediately before listen() yields EADDRINUSE on Node & Bun.
+          mkdirSync(sockPath, { mode: 0o700 });
+        },
+      },
+    }),
+    5000,
+    "M3A2-P2 listen EADDRINUSE exit 20",
+  );
+  assert.equal(code, SERVE_EXIT.OWNED);
+  assert.equal(exitCode, 20);
+  assert.match(err.text(), /^madc-engine serve: socket address already in use:/m);
+  assert.equal(existsSync(engineLockPath(home)), false);
+});
+
+test("serve §6 precedence (M3A2-P3): non-EADDRINUSE listen failure exits 22", async () => {
+  if (!POSIX) return;
+  const home = trackedHome();
+  const err = captureStream();
+  const stdin = new PassThrough();
+  let exitCode: number | null = null;
+
+  const code = await withTimeout(
+    runServe([], {
+      env: { MADC_HOME: home },
+      stdin,
+      stderr: err.stream,
+      exit: (c) => {
+        exitCode = c;
+      },
+      agent: echoAgent,
+      socketDeps: {
+        beforeListen: () => {
+          // Removing home immediately before listen() yields ENOENT (non-EADDRINUSE) on all runtimes.
+          rmSync(home, { recursive: true, force: true });
+        },
+      },
+    }),
+    5000,
+    "M3A2-P3 non-EADDRINUSE listen failure exit 22",
+  );
+  assert.equal(code, SERVE_EXIT.LISTEN_ERROR);
+  assert.equal(exitCode, 22);
+  assert.match(err.text(), /^madc-engine serve: listen failed \((?!EADDRINUSE)[A-Z0-9_]+\):/m);
+});
+
+test("serve §6 precedence (M3A2-P4): runtime uncaughtException and unhandledRejection exit 24 in subprocess with cleanup", async () => {
+  for (const mode of ["uncaughtException", "unhandledRejection"] as const) {
+    const home = trackedHome();
+    const driverPath = `${home}-fault-${mode}.ts`;
+    cleanups.push(() => rmSync(driverPath, { force: true }));
+    const triggerCode =
+      mode === "uncaughtException"
+        ? `setTimeout(() => { throw new Error("secret-${mode}-detail"); }, 20);`
+        : `setTimeout(() => { void Promise.reject(new Error("secret-${mode}-detail")); }, 20);`;
+    writeFileSync(
+      driverPath,
+      [
+        `import { runServe } from ${JSON.stringify(SERVE_MODULE)};`,
+        `await runServe([], { onListening: () => { ${triggerCode} } });`,
+      ].join("\n"),
+    );
+
+    const child = spawn(process.execPath, [driverPath], {
+      env: { ...process.env, MADC_HOME: home },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    cleanups.push(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already exited.
+      }
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => {
+      stdout += String(d);
+    });
+    child.stderr.on("data", (d) => {
+      stderr += String(d);
+    });
+
+    const code = await withTimeout(
+      new Promise<number | null>((r) => child.once("exit", (c) => r(c))),
+      6000,
+      `M3A2-P4 ${mode} subprocess exit 24`,
+    );
+    assert.equal(code, SERVE_EXIT.INTERNAL_FAULT, `${mode} stderr: ${stderr}`);
+    assert.equal(stdout, "", `${mode} must never write stdout`);
+    assert.match(stderr, /^madc-engine serve: unexpected internal fault:/m);
+    assert.equal(stderr.includes(`secret-${mode}-detail`), false, "no raw error leaked");
+    assert.equal(stderr.includes("\n    at "), false, "no stack trace leaked");
+    assert.equal(existsSync(engineLockPath(home)), false, `${mode} released engine.lock`);
+    assert.equal(existsSync(engineSocketPath(home)), false, `${mode} removed engine.sock`);
+  }
+});
+
+test("serve §6 precedence (M3A2-P5): fault or failing step during shutdown keeps trigger code (or 23 on deadline)", async () => {
+  // 1. Fatal listener error + failing shutdown step during clean EOF shutdown -> keeps 0.
+  {
+    const home = trackedHome();
+    const err = captureStream();
+    const stdin = new PassThrough();
+    let exitCode: number | null = null;
+    let emitError: ((e: Error) => void) | null = null;
+
+    const code = await withTimeout(
+      runServe([], {
+        env: { MADC_HOME: home },
+        stdin,
+        stderr: err.stream,
+        exit: (c) => {
+          exitCode = c;
+        },
+        agent: echoAgent,
+        socketDeps: {
+          onListenReady: (controls) => {
+            emitError = controls.emitError;
+          },
+        },
+        beforeClose: async () => {
+          emitError?.(Object.assign(new Error("late listener fault"), { code: "EIO" }));
+          throw new Error("failing shutdown step");
+        },
+        onListening: () => {
+          stdin.end();
+        },
+      }),
+      5000,
+      "M3A2-P5 fault during clean shutdown keeps 0",
+    );
+    assert.equal(code, SERVE_EXIT.OK);
+    assert.equal(exitCode, 0);
+    assert.match(err.text(), /fault during shutdown:/);
+    assert.match(err.text(), /shutdown hook failed:/);
+    assert.equal(existsSync(engineLockPath(home)), false);
+  }
+
+  // 2. Fatal listener error during clean shutdown that exceeds deadline -> 23 (not 22).
+  {
+    const home = trackedHome();
+    const err = captureStream();
+    const stdin = new PassThrough();
+    let exitCode: number | null = null;
+    let emitError: ((e: Error) => void) | null = null;
+    let releaseBlocker!: () => void;
+    const blocker = new Promise<void>((r) => {
+      releaseBlocker = r;
+    });
+
+    const code = await withTimeout(
+      runServe([], {
+        env: { MADC_HOME: home },
+        stdin,
+        stderr: err.stream,
+        exit: (c) => {
+          exitCode = c;
+        },
+        agent: echoAgent,
+        shutdownDeadlineMs: 80,
+        exitWriteGraceMs: 100,
+        totalExitBoundMs: 300,
+        socketDeps: {
+          onListenReady: (controls) => {
+            emitError = controls.emitError;
+          },
+        },
+        beforeClose: async () => {
+          emitError?.(Object.assign(new Error("late listener fault"), { code: "EIO" }));
+          await blocker;
+        },
+        onListening: () => {
+          stdin.end();
+        },
+      }),
+      3000,
+      "M3A2-P5 fault during timed-out clean shutdown exits 23",
+    );
+    releaseBlocker();
+    assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
+    assert.equal(exitCode, 23);
+    assert.equal(existsSync(engineLockPath(home)), false);
+  }
+});
+
+test("serve §6 precedence (M3A2-P6): second trigger during shutdown changes nothing", async () => {
+  const home = trackedHome();
+  const err = captureStream();
+  const stdin = new PassThrough();
+  let exitCode: number | null = null;
+  let emitError: ((e: Error) => void) | null = null;
+
+  const code = await withTimeout(
+    runServe([], {
+      env: { MADC_HOME: home },
+      stdin,
+      stderr: err.stream,
+      exit: (c) => {
+        exitCode = c;
+      },
+      agent: echoAgent,
+      socketDeps: {
+        onListenReady: (controls) => {
+          emitError = controls.emitError;
+        },
+      },
+      beforeClose: async () => {
+        // Fire second clean trigger (stdin error) and a late listener error while shutdown is active.
+        stdin.emit("error", new Error("second trigger"));
+        emitError?.(Object.assign(new Error("late error"), { code: "EIO" }));
+        await new Promise((r) => setTimeout(r, 40));
+      },
+      onListening: () => {
+        stdin.end();
+      },
+    }),
+    5000,
+    "M3A2-P6 second trigger during shutdown",
+  );
+  assert.equal(code, SERVE_EXIT.OK);
+  assert.equal(exitCode, 0);
+  assert.equal(existsSync(engineLockPath(home)), false);
 });
