@@ -1418,4 +1418,140 @@ mod tests {
             );
         }
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn start_window_is_pinned_at_5s_and_enforced_by_connect_or_spawn_b1a() {
+        // Pin amendment 1 §5 line 128: wait up to 5 s for `initialize` after spawning.
+        assert_eq!(START_WINDOW, Duration::from_secs(5));
+
+        let home = PathBuf::from(format!("/tmp/madc-dt-b1a-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("mkdir home");
+
+        let fake_serve = home.join("never-binds-serve.sh");
+        std::fs::write(
+            &fake_serve,
+            "#!/bin/sh\necho 'never-binds-b1a' >&2\nexec sleep 40\n",
+        )
+        .expect("write fake serve");
+        std::fs::set_permissions(&fake_serve, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake serve");
+
+        let cfg = LaunchConfig {
+            home: home.clone(),
+            runtime_bin: "/bin/sh".to_string(),
+            engine_entry: fake_serve,
+        };
+
+        let t0 = Instant::now();
+        let err = match connect_or_spawn(&cfg) {
+            Ok(_) => panic!("expected START_WINDOW timeout when spawned serve never binds socket"),
+            Err(e) => e,
+        };
+        let elapsed = t0.elapsed();
+
+        assert!(
+            err.contains("did not complete initialize within 5000 ms"),
+            "expected 5000 ms START_WINDOW timeout message, got: {err}"
+        );
+        assert!(
+            err.contains("never-binds-b1a"),
+            "expected drained stderr marker, got: {err}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(4500) && elapsed <= Duration::from_millis(6500),
+            "production connect_or_spawn did not enforce START_WINDOW (5 s): elapsed={elapsed:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninitialized_child_ignoring_sigterm_and_eof_is_killed_at_2s_grace_b1b() {
+        // Pin amendment 1 §5 line 130: SIGTERM, then SIGKILL 2 s later for never-initialized child.
+        assert_eq!(UNINITIALIZED_KILL_GRACE, Duration::from_secs(2));
+
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; echo READY; exec sleep 40")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn uninitialized sigterm-ignoring child");
+
+        let stdin = child.stdin.take();
+        {
+            let stdout = child.stdout.take().expect("piped stdout");
+            let mut reader = BufReader::new(stdout);
+            let mut ready = String::new();
+            reader.read_line(&mut ready).expect("read READY line");
+            assert_eq!(ready.trim(), "READY");
+        }
+
+        let mut spawned = SpawnedServe {
+            child,
+            stdin,
+            stderr_buf: Arc::new(Mutex::new(String::new())),
+            stderr_done: None,
+            stderr_thread: None,
+            initialized: false,
+        };
+
+        let t0 = Instant::now();
+        let status = spawned.stop().expect("killed child exit status");
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "expected SIGKILL after 2 s uninitialized grace, got {status:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(1800) && elapsed <= Duration::from_millis(3200),
+            "production stop() did not enforce 2 s uninitialized grace: elapsed={elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_child_ignoring_eof_is_killed_at_7s_grace_b2() {
+        // Pin amendment 1 §5 line 131: wait 7 s after stdin EOF before SIGKILL.
+        assert_eq!(INITIALIZED_KILL_GRACE, Duration::from_secs(7));
+
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat >/dev/null; exec sleep 40")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn initialized eof-ignoring child");
+
+        let stdin = child.stdin.take();
+        let mut spawned = SpawnedServe {
+            child,
+            stdin,
+            stderr_buf: Arc::new(Mutex::new(String::new())),
+            stderr_done: None,
+            stderr_thread: None,
+            initialized: true,
+        };
+
+        let t0 = Instant::now();
+        let status = spawned.stop().expect("killed child exit status");
+        let elapsed = t0.elapsed();
+
+        assert_eq!(
+            status.signal(),
+            Some(libc::SIGKILL),
+            "expected SIGKILL after 7 s initialized grace, got {status:?}"
+        );
+        assert!(
+            elapsed >= Duration::from_millis(6500) && elapsed <= Duration::from_millis(8500),
+            "production stop() did not enforce 7 s initialized grace (6.5..=8.5 s): elapsed={elapsed:?}"
+        );
+    }
 }

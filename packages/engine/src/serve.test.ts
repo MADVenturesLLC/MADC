@@ -1488,10 +1488,10 @@ test("serve §3 total-exit cap (M3A2-A2): blocked stderr write callback is cut o
 
   // Same ordering as production (5 s deadline, 2 s grace, 6 s total: grace < total < deadline + grace)
   // so both Mutant I (cap removed) and Mutant I2 (elapsed subtraction dropped) exit at ~deadline + grace
-  // (~600 ms) instead of ~total (~400 ms).
-  const shutdownDeadlineMs = 250;
-  const exitWriteGraceMs = 350;
-  const totalExitBoundMs = 400;
+  // (~1200 ms) instead of ~total (~800 ms), while Mutant I4 (grace forced to 0) exits at ~500 ms.
+  const shutdownDeadlineMs = 500;
+  const exitWriteGraceMs = 700;
+  const totalExitBoundMs = 800;
 
   const runPromise = runServe([], {
     env: { MADC_HOME: home },
@@ -1515,24 +1515,24 @@ test("serve §3 total-exit cap (M3A2-A2): blocked stderr write callback is cut o
   try {
     const code = await withTimeout(
       runPromise,
-      2000,
+      3000,
       "M3A2-A2 totalExitBoundMs cap on blocked stderr",
     );
     const elapsed = exitAt - triggerAt;
     assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
     assert.equal(exitCode, 23);
-    // With the cap (serve.ts:283), exit fires around totalExitBoundMs (~400 ms).
-    // With grace forced to 0 (Mutant I4), exit fires at ~shutdownDeadlineMs (~250 ms), failing the
+    // With the cap (serve.ts:283), exit fires around totalExitBoundMs (~800 ms).
+    // With grace forced to 0 (Mutant I4), exit fires at ~shutdownDeadlineMs (~500 ms), failing the
     // lower bound. Without the cap (Mutant I) or without elapsed-time subtraction (Mutant I2),
-    // exit waits the full exitWriteGraceMs after shutdownDeadlineMs (~250 + 350 = 600 ms), failing
+    // exit waits the full exitWriteGraceMs after shutdownDeadlineMs (~500 + 700 = 1200 ms), failing
     // the upper bound.
     assert.ok(
-      elapsed >= totalExitBoundMs - 50,
-      `expected exit at or after ${totalExitBoundMs - 50}ms (totalExitBoundMs cap), got ${elapsed}ms`,
+      elapsed >= totalExitBoundMs - 100,
+      `expected exit at or after ${totalExitBoundMs - 100}ms (totalExitBoundMs cap), got ${elapsed}ms`,
     );
     assert.ok(
-      elapsed <= totalExitBoundMs + 100,
-      `expected exit within ${totalExitBoundMs + 100}ms (totalExitBoundMs cap), got ${elapsed}ms`,
+      elapsed <= totalExitBoundMs + 200,
+      `expected exit within ${totalExitBoundMs + 200}ms (totalExitBoundMs cap), got ${elapsed}ms`,
     );
     assert.equal(existsSync(engineLockPath(home)), false, "engine.lock released on exit 23");
   } finally {
