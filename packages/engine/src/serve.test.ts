@@ -1522,11 +1522,13 @@ test("serve §3 total-exit cap (M3A2-A2): blocked stderr write callback is cut o
     assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
     assert.equal(exitCode, 23);
     // With the cap (serve.ts:283), exit fires around totalExitBoundMs (~400 ms).
-    // Without the cap (Mutant I) or without elapsed-time subtraction (Mutant I2), exit waits the
-    // full exitWriteGraceMs after shutdownDeadlineMs (~250 + 350 = 600 ms), failing the upper bound.
+    // With grace forced to 0 (Mutant I4), exit fires at ~shutdownDeadlineMs (~250 ms), failing the
+    // lower bound. Without the cap (Mutant I) or without elapsed-time subtraction (Mutant I2),
+    // exit waits the full exitWriteGraceMs after shutdownDeadlineMs (~250 + 350 = 600 ms), failing
+    // the upper bound.
     assert.ok(
-      elapsed >= shutdownDeadlineMs,
-      `expected exit at or after shutdownDeadlineMs (${shutdownDeadlineMs}ms), got ${elapsed}ms`,
+      elapsed >= totalExitBoundMs - 50,
+      `expected exit at or after ${totalExitBoundMs - 50}ms (totalExitBoundMs cap), got ${elapsed}ms`,
     );
     assert.ok(
       elapsed <= totalExitBoundMs + 100,
