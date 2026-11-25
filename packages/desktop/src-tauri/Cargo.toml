@@ -2,7 +2,7 @@
 name = "madc-desktop"
 version = "0.0.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.90"
 description = "MADC Desktop v1 shell (Tauri v2, M3-A2 scaffold)"
 publish = false
 
