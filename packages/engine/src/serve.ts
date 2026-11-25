@@ -226,6 +226,29 @@ export async function runServe(
     }
   };
 
+  let shutdownTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const armShutdownDeadline = (
+    code: ServeExitCode,
+    reason: string | null,
+    kind: "clean" | "fatal",
+  ): void => {
+    if (shutdownTimer !== null || exitStarted) return;
+    const elapsed = firstTriggerAtMs !== null ? Date.now() - firstTriggerAtMs : 0;
+    const remainingMs = Math.max(0, shutdownDeadlineMs - elapsed);
+    shutdownTimer = setTimeout(() => {
+      shutdownTimer = null;
+      if (kind === "clean") {
+        void exitServe(
+          SERVE_EXIT.SHUTDOWN_DEADLINE,
+          `shutdown deadline exceeded: ${activeSocketPath ?? lockPath ?? homePath ?? "$MADC_HOME"}`,
+        );
+      } else {
+        void exitServe(code, reason);
+      }
+    }, remainingMs);
+  };
+
   /**
    * Amendment 1 §3 "Explicit exit on every path": release locks, write final reason line (for
    * non-zero exits) with a write callback, and exit from that callback or when the bounded grace
@@ -234,6 +257,10 @@ export async function runServe(
   const exitServe = (code: ServeExitCode, reason: string | null): Promise<ServeExitCode> => {
     if (exitStarted) return donePromise;
     exitStarted = true;
+    if (shutdownTimer !== null) {
+      clearTimeout(shutdownTimer);
+      shutdownTimer = null;
+    }
     detachHandlers();
     releaseAllLocks();
 
@@ -272,8 +299,6 @@ export async function runServe(
     return donePromise;
   };
 
-  let shutdownTimer: ReturnType<typeof setTimeout> | null = null;
-
   const beginShutdown = (
     code: ServeExitCode,
     reason: string | null,
@@ -288,18 +313,7 @@ export async function runServe(
     }
     shuttingDown = true;
     if (firstTriggerAtMs === null) firstTriggerAtMs = Date.now();
-
-    shutdownTimer = setTimeout(() => {
-      shutdownTimer = null;
-      if (kind === "clean") {
-        void exitServe(
-          SERVE_EXIT.SHUTDOWN_DEADLINE,
-          `shutdown deadline exceeded: ${activeSocketPath ?? lockPath ?? homePath ?? "$MADC_HOME"}`,
-        );
-      } else {
-        void exitServe(code, reason);
-      }
-    }, shutdownDeadlineMs);
+    armShutdownDeadline(code, reason, kind);
 
     void (async () => {
       if (deps.beforeClose !== undefined) {
@@ -346,6 +360,8 @@ export async function runServe(
       return;
     }
     if (firstTriggerAtMs === null) firstTriggerAtMs = Date.now();
+    // Amendment 1 §3: the 5 s shutdown deadline starts at the FIRST trigger, even during startup.
+    armShutdownDeadline(code, reason, kind);
     if (!startupComplete) {
       if (startupState.trigger === null) {
         startupState.trigger = { code, reason, kind };

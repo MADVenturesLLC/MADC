@@ -2,8 +2,16 @@
  * M3-A1 (`docs/plan/PIN-madc-M3-desktop-protocol.md` §1): local-socket JSONL transport
  * (`$MADC_HOME/engine.sock` on POSIX, `0600` owner-only; named pipe on Windows).
  */
-import { createHash } from "node:crypto";
-import { chmodSync, lstatSync, mkdirSync, realpathSync, type Stats, unlinkSync } from "node:fs";
+import { createHash, randomBytes } from "node:crypto";
+import {
+  chmodSync,
+  lstatSync,
+  mkdirSync,
+  realpathSync,
+  renameSync,
+  type Stats,
+  unlinkSync,
+} from "node:fs";
 import { createConnection, createServer, type Server, type Socket } from "node:net";
 import { join } from "node:path";
 import { enforcePrivateDir } from "./home.ts";
@@ -410,10 +418,36 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
    */
   const closeGraceMs = socketDeps.closeGraceMs ?? SOCKET_CLOSE_GRACE_MS;
   const shutdownAll = async (): Promise<void> => {
-    const closed = new Promise<void>((resolve) => server.close(() => resolve()));
-    for (const c of conns) c.shutdown();
-    await Promise.all([...sockets].map((sock) => endThenDestroy(sock, closeGraceMs)));
-    await closed;
+    // Amendment 1 §3 step 5 (Argus #76 M2): Node/Bun's `server.close()` unlinks `socketPath` by
+    // path. If another process replaced `socketPath` with a different inode, move that entry aside
+    // before `server.close()` and restore it afterwards so we never remove a successor's socket.
+    let preservedPath: string | null = null;
+    if (posix && bound !== null) {
+      try {
+        const now = lstatOrNull(socketPath);
+        if (now !== null && (!now.isSocket() || now.dev !== bound.dev || now.ino !== bound.ino)) {
+          const candidate = `${socketPath}.preserve-${randomBytes(8).toString("hex")}`;
+          renameSync(socketPath, candidate);
+          preservedPath = candidate;
+        }
+      } catch {
+        // Best-effort preservation; if lstat/rename fails, proceed with closing connections.
+      }
+    }
+    try {
+      const closed = new Promise<void>((resolve) => server.close(() => resolve()));
+      for (const c of conns) c.shutdown();
+      await Promise.all([...sockets].map((sock) => endThenDestroy(sock, closeGraceMs)));
+      await closed;
+    } finally {
+      if (preservedPath !== null) {
+        try {
+          renameSync(preservedPath, socketPath);
+        } catch {
+          // Best-effort restore.
+        }
+      }
+    }
   };
 
   if (posix) {

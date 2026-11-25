@@ -179,11 +179,17 @@ struct SpawnedServe {
     child: Child,
     stdin: Option<ChildStdin>,
     stderr_buf: Arc<Mutex<String>>,
+    stderr_thread: Option<thread::JoinHandle<()>>,
     initialized: bool,
 }
 
 impl SpawnedServe {
-    fn stderr_snapshot(&self) -> String {
+    /// Wait for the stderr drain thread to observe EOF (after child exit) and return all drained
+    /// stderr text (Argus #76 L2).
+    fn drain_stderr(&mut self) -> String {
+        if let Some(handle) = self.stderr_thread.take() {
+            let _ = handle.join();
+        }
         self.stderr_buf
             .lock()
             .map(|g| g.clone())
@@ -196,7 +202,8 @@ impl SpawnedServe {
 
     /// Stop `serve` per amendment 1 §5:
     /// - Initialized child: close stdin (EOF) first; wait up to 7 s before SIGKILL.
-    /// - Never-initialized child: SIGTERM, then SIGKILL after 2 s.
+    /// - Never-initialized child: on Unix, SIGTERM first (keeping stdin open so the signal wins
+    ///   as first trigger, Argus #76 L1), then SIGKILL after 2 s; on Windows, close stdin first.
     fn stop(&mut self) {
         if self.initialized {
             // Close stdin (EOF) first (§5 & §4 Windows).
@@ -211,6 +218,7 @@ impl SpawnedServe {
             let _ = self.child.kill();
             let _ = self.child.wait();
         } else {
+            #[cfg(not(unix))]
             drop(self.stdin.take());
             #[cfg(unix)]
             unsafe {
@@ -219,12 +227,14 @@ impl SpawnedServe {
             let deadline = Instant::now() + UNINITIALIZED_KILL_GRACE;
             while Instant::now() < deadline {
                 if self.try_wait_status().is_some() {
+                    drop(self.stdin.take());
                     return;
                 }
                 thread::sleep(Duration::from_millis(20));
             }
             let _ = self.child.kill();
             let _ = self.child.wait();
+            drop(self.stdin.take());
         }
     }
 }
@@ -410,7 +420,7 @@ pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
 
     let stdin = child.stdin.take();
     let stderr_buf = Arc::new(Mutex::new(String::new()));
-    if let Some(mut stderr) = child.stderr.take() {
+    let stderr_thread = child.stderr.take().map(|mut stderr| {
         let buf_clone = Arc::clone(&stderr_buf);
         thread::spawn(move || {
             let mut chunk = [0u8; 4096];
@@ -425,13 +435,14 @@ pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
                     }
                 }
             }
-        });
-    }
+        })
+    });
 
     let mut spawned = SpawnedServe {
         child,
         stdin,
         stderr_buf,
+        stderr_thread,
         initialized: false,
     };
 
@@ -458,7 +469,7 @@ pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
                     }
                     thread::sleep(Duration::from_millis(25));
                 }
-                let stderr_text = spawned.stderr_snapshot();
+                let stderr_text = spawned.drain_stderr();
                 if let Some(guidance) = format_lock_owner_guidance(&stderr_text) {
                     return Err(format!(
                         "madc-engine serve exited 20 ({class:?}). {guidance}\nstderr:\n{stderr_text}"
@@ -468,7 +479,7 @@ pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
                     "madc-engine serve exited 20 ({class:?}) and re-probe found no listener.\nstderr:\n{stderr_text}"
                 ));
             }
-            let stderr_text = spawned.stderr_snapshot();
+            let stderr_text = spawned.drain_stderr();
             return Err(format!(
                 "madc-engine serve exited before initialize (code={code:?}, signal={signal:?}, class={class:?}).\nstderr:\n{stderr_text}"
             ));
@@ -492,7 +503,7 @@ pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
 
     // §5: Deadline passed without initialize -> SIGTERM, then SIGKILL after 2 s.
     spawned.stop();
-    let stderr_text = spawned.stderr_snapshot();
+    let stderr_text = spawned.drain_stderr();
     Err(format!(
         "madc-engine serve did not complete initialize within 5 s.\nstderr:\n{stderr_text}"
     ))
@@ -582,6 +593,48 @@ mod tests {
         c1.disconnect();
         assert!(!sock.exists(), "engine.sock removed on clean shutdown");
         assert!(!lock.exists(), "engine.lock removed on clean shutdown");
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_20_drains_stderr_and_surfaces_manual_lock_guidance_without_removing_lock() {
+        let home = PathBuf::from(format!("/tmp/madc-dt-lk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let lock = home.join("engine.lock");
+        let pid = std::process::id();
+        std::fs::write(
+            &lock,
+            format!(
+                "{{\"pid\":{pid},\"startedAt\":1,\"token\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}}"
+            ),
+        )
+        .expect("write live lock");
+
+        let runtime_bin = env::var("MADC_ENGINE_RUNTIME").unwrap_or_else(|_| "node".to_string());
+        let engine_entry = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../engine/src/bin.ts");
+        let cfg = LaunchConfig {
+            home: home.clone(),
+            runtime_bin,
+            engine_entry,
+        };
+
+        let err = match connect_or_spawn(&cfg) {
+            Ok(_) => panic!("expected exit 20 failure when live engine.lock has no listener"),
+            Err(e) => e,
+        };
+        assert!(err.contains("exited 20"), "got: {err}");
+        assert!(
+            err.contains(&format!("Home lock held by PID {pid}")),
+            "expected §2a lock holder guidance, got: {err}"
+        );
+        assert!(
+            err.contains("Manual recovery:"),
+            "expected manual recovery instructions, got: {err}"
+        );
+        assert!(lock.exists(), "launcher must never delete engine.lock");
         let _ = std::fs::remove_dir_all(&home);
     }
 }

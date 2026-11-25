@@ -1539,3 +1539,35 @@ test("M3-A2 serve e2e: real bin.ts serve binds 0600 socket, answers initialize +
   assert.equal(recheck.ok, true);
   if (recheck.ok) releaseThreadLock(recheck.handle);
 });
+
+test("M3-A2 socket (Argus #76 M2): server.close() preserves a successor socket with a different inode at engine.sock", async () => {
+  if (!POSIX) return;
+  const { home, cleanup } = makeHome();
+  activeCleanups.push(cleanup);
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  const sockPath = engineSocketPath(home);
+
+  const serverA = await startSocketServer({ home, agent: echoAgent, log: () => {} });
+  const inoA = lstatSync(sockPath).ino;
+
+  // Simulate another same-user process moving A's socket aside and binding successor B at sockPath.
+  const movedA = join(home, "moved-a.sock");
+  renameSync(sockPath, movedA);
+  const serverB = await startSocketServer({ home, agent: echoAgent, log: () => {} });
+  activeServers.push(serverB);
+  const inoB = lstatSync(sockPath).ino;
+  assert.notEqual(inoB, inoA);
+
+  // Closing server A must NOT unlink server B's successor inode at sockPath.
+  await serverA.close();
+  assert.equal(existsSync(sockPath), true, "successor socket survives serverA.close()");
+  assert.equal(lstatSync(sockPath).ino, inoB, "successor inode unchanged");
+
+  // Verify successor B still accepts clients at sockPath.
+  const client = await connect(sockPath);
+  const initRes = (await client.request("initialize", {
+    clientInfo: { name: "m2-successor-check", version: "0.0.0" },
+  })) as { protocolVersion: string };
+  assert.equal(initRes.protocolVersion, "madc-m1/1");
+  await client.close();
+});

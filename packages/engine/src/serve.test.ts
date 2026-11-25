@@ -607,6 +607,52 @@ test("serve exit 23: clean trigger whose shutdown exceeds deadline exits 23 and 
   assert.equal(existsSync(engineLockPath(home)), false, "engine.lock released on deadline exit");
 });
 
+test("serve exit 23 (Argus #76 M1): trigger during slow startup does not restart shutdown deadline", async () => {
+  const home = trackedHome();
+  const err = captureStream();
+  const stdin = new PassThrough();
+  let triggerAt = 0;
+  let exitAt = 0;
+  let releaseBlocker!: () => void;
+  const blocker = new Promise<void>((r) => {
+    releaseBlocker = r;
+  });
+
+  // Agent triggers EOF immediately, then takes 300 ms before returning, and beforeClose hangs.
+  // With shutdownDeadlineMs = 500, resetting the timer after the 300 ms startup step would exit at
+  // >= 800 ms; counting from the first trigger exits at ~500 ms (< 700 ms).
+  const code = await withTimeout(
+    runServe([], {
+      env: { MADC_HOME: home },
+      stdin,
+      stderr: err.stream,
+      exit: () => {
+        exitAt = Date.now();
+      },
+      agent: async () => {
+        triggerAt = Date.now();
+        stdin.end();
+        await new Promise((r) => setTimeout(r, 300));
+        return echoAgent;
+      },
+      shutdownDeadlineMs: 500,
+      exitWriteGraceMs: 150,
+      totalExitBoundMs: 700,
+      beforeClose: () => blocker,
+    }),
+    2000,
+    "startup-trigger deadline exit 23",
+  );
+  releaseBlocker();
+  const elapsed = exitAt - triggerAt;
+  assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
+  assert.ok(
+    elapsed < 700,
+    `expected exit within 700ms of first startup trigger (500ms deadline, not reset after 300ms), got ${elapsed}ms`,
+  );
+  assert.equal(existsSync(engineLockPath(home)), false, "engine.lock released on deadline exit");
+});
+
 test("serve exit 24: unexpected startup fault exits 24 with no stack trace and releases engine.lock", async () => {
   const home = trackedHome();
   const err = captureStream();
