@@ -1255,24 +1255,39 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).expect("mkdir home");
         let sock_path = home.join("engine.sock");
-        let listener = UnixListener::bind(&sock_path).expect("bind stalled listener");
-
-        let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
-        let server_thread = thread::spawn(move || {
-            let _ = listener.set_nonblocking(true);
-            let mut held = Vec::new();
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                if stop_rx.try_recv().is_ok() {
-                    break;
+        // Helper: bind a stalled listener at `engine.sock` that accepts ONE probe connection,
+        // keeps that connection open without replying (forcing the probe to hit its timeout), and
+        // immediately drops the listener + removes `engine.sock` so the post-spawn loop does not
+        // re-probe the stale test listener after `connect_or_spawn` falls through to spawning.
+        let spawn_one_shot_stalled_listener = |sock: PathBuf| {
+            let listener = UnixListener::bind(&sock).expect("bind stalled listener");
+            let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
+            let handle = thread::spawn(move || {
+                let _ = listener.set_nonblocking(true);
+                let mut held: Option<UnixStream> = None;
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    if held.is_none() {
+                        if let Ok((conn, _)) = listener.accept() {
+                            held = Some(conn);
+                            // Remove the socket path now that the initial probe holds `conn` open;
+                            // `listener` is not accepted again, so post-spawn probing sees ENOENT.
+                            let _ = std::fs::remove_file(&sock);
+                            break;
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(5));
                 }
-                if let Ok((conn, _)) = listener.accept() {
-                    // Accept and never reply so the probe must time out at its bound.
-                    held.push(conn);
-                }
-                thread::sleep(Duration::from_millis(10));
-            }
-        });
+                // Drop `listener` while keeping `held` open until the test stops us or deadline.
+                drop(listener);
+                let _ = stop_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+                drop(held);
+            });
+            (stop_tx, handle)
+        };
 
         let fake_serve = home.join("exit2-serve.sh");
         std::fs::write(&fake_serve, "#!/bin/sh\necho 'fallback-spawn-marker' >&2\nexit 2\n")
@@ -1285,22 +1300,26 @@ mod tests {
             engine_entry: fake_serve,
         };
 
-        // 1. Production PROBE_TIMEOUT (1 s) cuts off stalled listener around 1 s and falls through
-        //    to spawning `serve`.
+        // 1. Production `connect_or_spawn` cuts off a stalled listener at PROBE_TIMEOUT (1 s)
+        //    and falls through to spawning `serve` (guards N14a production wiring at :566).
+        let (stop1, handle1) = spawn_one_shot_stalled_listener(sock_path.clone());
         let t0 = Instant::now();
-        let err = match connect_or_spawn_with_window(&cfg, Duration::from_millis(200)) {
+        let err = match connect_or_spawn(&cfg) {
             Ok(_) => panic!("expected fake serve exit 2 after stalled 1 s probe"),
             Err(e) => e,
         };
         let elapsed_prod = t0.elapsed();
+        let _ = stop1.send(());
+        let _ = handle1.join();
         assert!(err.contains("fallback-spawn-marker"), "got: {err}");
         assert!(
-            elapsed_prod >= Duration::from_millis(850) && elapsed_prod < Duration::from_millis(1900),
-            "production PROBE_TIMEOUT (1 s) not honored: elapsed={elapsed_prod:?}"
+            elapsed_prod >= Duration::from_millis(850) && elapsed_prod <= Duration::from_millis(1500),
+            "production PROBE_TIMEOUT (1 s) not honored by connect_or_spawn: elapsed={elapsed_prod:?}"
         );
 
         // 2. Injectable shorter probe timeout (200 ms) cuts off stalled listener at ~200 ms,
-        //    proving connect_or_spawn passes its timeout parameter rather than hardcoding.
+        //    proving connect_or_spawn_with_timeouts honors its timeout parameter.
+        let (stop2, handle2) = spawn_one_shot_stalled_listener(sock_path);
         let t1 = Instant::now();
         let err2 = match connect_or_spawn_with_timeouts(
             &cfg,
@@ -1311,14 +1330,14 @@ mod tests {
             Err(e) => e,
         };
         let elapsed_short = t1.elapsed();
+        let _ = stop2.send(());
+        let _ = handle2.join();
         assert!(err2.contains("fallback-spawn-marker"), "got: {err2}");
         assert!(
             elapsed_short >= Duration::from_millis(170) && elapsed_short < Duration::from_millis(750),
             "injectable probe timeout (200 ms) not honored: elapsed={elapsed_short:?}"
         );
 
-        let _ = stop_tx.send(());
-        let _ = server_thread.join();
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1329,11 +1348,13 @@ mod tests {
         assert_eq!(INITIALIZED_KILL_GRACE, Duration::from_secs(7));
         assert_eq!(UNINITIALIZED_KILL_GRACE, Duration::from_secs(2));
 
-        // 1. Production `stop()` waits through a 250 ms post-EOF shutdown without killing early.
+        // 1. Production `stop()` waits through a ~3 s post-EOF shutdown (strictly between
+        //    UNINITIALIZED_KILL_GRACE = 2 s and INITIALIZED_KILL_GRACE = 7 s) without killing
+        //    early (guards N14b production wiring at :282).
         {
             let mut child = Command::new("/bin/sh")
                 .arg("-c")
-                .arg("cat >/dev/null; sleep 0.25; exit 0")
+                .arg("cat >/dev/null; sleep 3; exit 0")
                 .stdin(Stdio::piped())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -1357,7 +1378,7 @@ mod tests {
                 "expected clean exit 0 within 7 s grace, got {status:?}"
             );
             assert!(
-                elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(2),
+                elapsed >= Duration::from_millis(2700) && elapsed < Duration::from_secs(6),
                 "unexpected clean stop duration: {elapsed:?}"
             );
         }

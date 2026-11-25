@@ -1486,9 +1486,12 @@ test("serve §3 total-exit cap (M3A2-A2): blocked stderr write callback is cut o
     },
   });
 
-  const shutdownDeadlineMs = 120;
-  const exitWriteGraceMs = 450;
-  const totalExitBoundMs = 180;
+  // Same ordering as production (5 s deadline, 2 s grace, 6 s total: grace < total < deadline + grace)
+  // so both Mutant I (cap removed) and Mutant I2 (elapsed subtraction dropped) exit at ~deadline + grace
+  // (~600 ms) instead of ~total (~400 ms).
+  const shutdownDeadlineMs = 250;
+  const exitWriteGraceMs = 350;
+  const totalExitBoundMs = 400;
 
   const runPromise = runServe([], {
     env: { MADC_HOME: home },
@@ -1518,12 +1521,16 @@ test("serve §3 total-exit cap (M3A2-A2): blocked stderr write callback is cut o
     const elapsed = exitAt - triggerAt;
     assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
     assert.equal(exitCode, 23);
-    // With the cap (serve.ts:283), exit fires around totalExitBoundMs (180 ms).
-    // Without the cap (Argus mutant I), exit waits the full exitWriteGraceMs after the
-    // shutdown deadline (~120 + 450 = 570 ms), failing this upper bound.
+    // With the cap (serve.ts:283), exit fires around totalExitBoundMs (~400 ms).
+    // Without the cap (Mutant I) or without elapsed-time subtraction (Mutant I2), exit waits the
+    // full exitWriteGraceMs after shutdownDeadlineMs (~250 + 350 = 600 ms), failing the upper bound.
     assert.ok(
-      elapsed <= totalExitBoundMs + 150,
-      `expected exit within ${totalExitBoundMs + 150}ms (totalExitBoundMs cap), got ${elapsed}ms`,
+      elapsed >= shutdownDeadlineMs,
+      `expected exit at or after shutdownDeadlineMs (${shutdownDeadlineMs}ms), got ${elapsed}ms`,
+    );
+    assert.ok(
+      elapsed <= totalExitBoundMs + 100,
+      `expected exit within ${totalExitBoundMs + 100}ms (totalExitBoundMs cap), got ${elapsed}ms`,
     );
     assert.equal(existsSync(engineLockPath(home)), false, "engine.lock released on exit 23");
   } finally {
