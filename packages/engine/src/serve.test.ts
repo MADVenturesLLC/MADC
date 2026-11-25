@@ -12,6 +12,7 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   readdirSync,
@@ -1266,4 +1267,72 @@ test("serve §6 precedence (M3A2-P6): second trigger during shutdown changes not
   assert.equal(code, SERVE_EXIT.OK);
   assert.equal(exitCode, 0);
   assert.equal(existsSync(engineLockPath(home)), false);
+});
+
+test("serve §3 line 101 (M3A2-N8a): non-ENOENT socket unlink failure logs one stderr line and keeps trigger exit code", async () => {
+  if (!POSIX) return;
+  const home = trackedHome();
+  const sockPath = engineSocketPath(home);
+  const err = captureStream();
+  const stdin = new PassThrough();
+  let exitCode: number | null = null;
+  let unlinkCalled = false;
+
+  // Restore home mode on cleanup even if assertions fail mid-test.
+  cleanups.push(() => {
+    try {
+      chmodSync(home, 0o700);
+    } catch {
+      // ignore
+    }
+  });
+
+  const code = await withTimeout(
+    runServe([], {
+      env: { MADC_HOME: home },
+      stdin,
+      stderr: err.stream,
+      exit: (c) => {
+        exitCode = c;
+      },
+      agent: echoAgent,
+      socketDeps: {
+        // Prevent runtime `server.close()` from unlinking `engine.sock` before `unlinkOwnSocket()`
+        // runs on Node 22 / Bun 1.4.x; restore `0o700` inside `unlink` so `engine.lock` still
+        // releases cleanly afterwards.
+        beforeShutdown: async () => {
+          chmodSync(home, 0o500);
+        },
+        unlink: () => {
+          unlinkCalled = true;
+          chmodSync(home, 0o700);
+          throw Object.assign(new Error("EACCES: unlink refused"), { code: "EACCES" });
+        },
+      },
+      onListening: () => {
+        stdin.end();
+      },
+    }),
+    5000,
+    "M3A2-N8a shutdown unlink EACCES",
+  );
+
+  chmodSync(home, 0o700);
+  assert.equal(unlinkCalled, true, "unlinkOwnSocket invoked injected unlink dep");
+  assert.equal(code, SERVE_EXIT.OK, "trigger exit code unchanged");
+  assert.equal(exitCode, 0);
+  assert.equal(existsSync(engineLockPath(home)), false, "engine.lock still released cleanly");
+  const unlinkLogLines = err
+    .text()
+    .split("\n")
+    .filter((line) => line.includes("socket unlink failed (EACCES)"));
+  assert.equal(
+    unlinkLogLines.length,
+    1,
+    `expected exactly one stderr log line naming EACCES, got:\n${err.text()}`,
+  );
+  assert.ok(
+    unlinkLogLines[0]?.includes(sockPath),
+    `expected socket path in log: ${unlinkLogLines[0]}`,
+  );
 });

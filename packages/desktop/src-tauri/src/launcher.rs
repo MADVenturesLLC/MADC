@@ -332,6 +332,37 @@ pub struct SocketClient {
 }
 
 #[cfg(unix)]
+fn connect_unix_with_deadline_using<F>(
+    socket_path: &str,
+    deadline: Instant,
+    connector: F,
+) -> Result<UnixStream, String>
+where
+    F: FnOnce(&str) -> std::io::Result<UnixStream> + Send + 'static,
+{
+    let rem = deadline.saturating_duration_since(Instant::now());
+    if rem.is_zero() {
+        return Err(format!("connect({socket_path}) timed out before connect"));
+    }
+    let path_owned = socket_path.to_string();
+    let (tx, rx) = mpsc::sync_channel::<std::io::Result<UnixStream>>(1);
+    thread::spawn(move || {
+        let res = connector(&path_owned);
+        // If the caller already timed out and dropped `rx`, `send` fails and drops any late
+        // `UnixStream` cleanly rather than leaking the fd.
+        let _ = tx.send(res);
+    });
+    match rx.recv_timeout(rem) {
+        Ok(Ok(stream)) => Ok(stream),
+        Ok(Err(e)) => Err(format!("connect({socket_path}) failed: {e}")),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(format!("connect({socket_path}) timed out")),
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            Err(format!("connect({socket_path}) thread exited unexpectedly"))
+        }
+    }
+}
+
+#[cfg(unix)]
 impl SocketClient {
     /// Connect and run `initialize` within ONE total deadline (`timeout`), matching amendment 1
     /// §2 line 47 ("within 1 s (connect plus reply)").
@@ -341,9 +372,27 @@ impl SocketClient {
         reused_existing: bool,
         started_at: Instant,
     ) -> Result<Self, String> {
+        Self::connect_and_initialize_with_connector(
+            socket_path,
+            timeout,
+            reused_existing,
+            started_at,
+            |p| UnixStream::connect(p),
+        )
+    }
+
+    fn connect_and_initialize_with_connector<F>(
+        socket_path: &str,
+        timeout: Duration,
+        reused_existing: bool,
+        started_at: Instant,
+        connector: F,
+    ) -> Result<Self, String>
+    where
+        F: FnOnce(&str) -> std::io::Result<UnixStream> + Send + 'static,
+    {
         let deadline = Instant::now() + timeout;
-        let stream = UnixStream::connect(socket_path)
-            .map_err(|e| format!("connect({socket_path}) failed: {e}"))?;
+        let stream = connect_unix_with_deadline_using(socket_path, deadline, connector)?;
 
         let rem = deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
@@ -805,6 +854,158 @@ mod tests {
 
         let _ = server_thread.join();
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connect_and_initialize_bounds_connect_on_full_backlog_and_stalled_connect_l1() {
+        // 1. Cross-platform Unix check (macOS + Linux): a stalled connect respects the single
+        //    deadline and returns Err within deadline + 500 ms (never hangs).
+        {
+            let (release_tx, release_rx) = mpsc::sync_channel::<()>(1);
+            let probe_timeout = Duration::from_millis(200);
+            let watchdog_timeout = probe_timeout + Duration::from_millis(800);
+            let (done_tx, done_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+
+            let t0 = Instant::now();
+            thread::spawn(move || {
+                let res = SocketClient::connect_and_initialize_with_connector(
+                    "/tmp/madc-dt-l1-stall.sock",
+                    probe_timeout,
+                    true,
+                    Instant::now(),
+                    move |_| {
+                        let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                        Err(std::io::Error::new(ErrorKind::TimedOut, "stalled"))
+                    },
+                )
+                .map(|_| ());
+                let _ = done_tx.send(res);
+            });
+
+            let result = done_rx.recv_timeout(watchdog_timeout);
+            let elapsed = t0.elapsed();
+            let _ = release_tx.send(());
+            let err = result
+                .expect("connect_and_initialize hung past watchdog timeout")
+                .expect_err("expected Err on stalled connect");
+            assert!(
+                err.contains("timed out"),
+                "expected connect timeout error, got: {err}"
+            );
+            assert!(
+                elapsed < probe_timeout + Duration::from_millis(500),
+                "stalled connect exceeded deadline + 500 ms: elapsed={elapsed:?}"
+            );
+        }
+
+        // 2. Full AF_UNIX listen backlog (backlog=1, never accept): on Linux, a blocking
+        //    `UnixStream::connect` waits in the kernel once the backlog is full; on macOS/XNU it
+        //    returns ECONNREFUSED immediately. Both platforms compile and exercise the exact
+        //    `connect_and_initialize` path under a bounded watchdog.
+        struct RawFdGuard(libc::c_int);
+        impl Drop for RawFdGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::close(self.0);
+                }
+            }
+        }
+
+        let home = PathBuf::from(format!("/tmp/madc-dt-l1-bl-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let sock_path = home.join("engine.sock");
+        let sock_str = sock_path.to_string_lossy().into_owned();
+
+        let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+        assert!(fd >= 0, "socket(AF_UNIX) failed");
+        let _listener_guard = RawFdGuard(fd);
+
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let path_bytes = sock_str.as_bytes();
+        assert!(path_bytes.len() < addr.sun_path.len());
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                path_bytes.as_ptr(),
+                addr.sun_path.as_mut_ptr().cast::<u8>(),
+                path_bytes.len(),
+            );
+            let rc_bind = libc::bind(
+                fd,
+                (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            );
+            assert_eq!(rc_bind, 0, "bind failed: {}", std::io::Error::last_os_error());
+            let rc_listen = libc::listen(fd, 1);
+            assert_eq!(rc_listen, 0, "listen(1) failed: {}", std::io::Error::last_os_error());
+        }
+
+        // Fill the listen backlog without calling accept() using non-blocking sockets.
+        let mut fillers: Vec<RawFdGuard> = Vec::new();
+        let mut hit_would_block = false;
+        for _ in 0..32 {
+            let cfd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+            assert!(cfd >= 0);
+            unsafe {
+                let flags = libc::fcntl(cfd, libc::F_GETFL, 0);
+                libc::fcntl(cfd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                let rc = libc::connect(
+                    cfd,
+                    (&addr as *const libc::sockaddr_un).cast::<libc::sockaddr>(),
+                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                );
+                if rc == 0 {
+                    fillers.push(RawFdGuard(cfd));
+                } else {
+                    let err = std::io::Error::last_os_error();
+                    libc::close(cfd);
+                    if err.kind() == ErrorKind::WouldBlock {
+                        hit_would_block = true;
+                    }
+                    break;
+                }
+            }
+        }
+        assert!(!fillers.is_empty(), "expected at least one backlog filler connection");
+
+        let probe_timeout = Duration::from_millis(200);
+        let watchdog_timeout = probe_timeout + Duration::from_millis(800);
+        let (done_tx, done_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+        let sock_for_thread = sock_str.clone();
+        let t0 = Instant::now();
+        thread::spawn(move || {
+            let res = SocketClient::connect_and_initialize(
+                &sock_for_thread,
+                probe_timeout,
+                true,
+                Instant::now(),
+            )
+            .map(|_| ());
+            let _ = done_tx.send(res);
+        });
+
+        let result = done_rx.recv_timeout(watchdog_timeout);
+        let elapsed = t0.elapsed();
+        drop(fillers);
+        drop(_listener_guard);
+        let _ = std::fs::remove_dir_all(&home);
+
+        let err = result
+            .expect("connect_and_initialize hung past watchdog timeout on full backlog")
+            .expect_err("expected Err on full backlog");
+        if cfg!(target_os = "linux") {
+            assert!(hit_would_block, "expected EAGAIN/WouldBlock on full Linux AF_UNIX backlog");
+            assert!(
+                err.contains("timed out"),
+                "expected connect timeout on full Linux backlog, got: {err}"
+            );
+        }
+        assert!(
+            elapsed < probe_timeout + Duration::from_millis(500),
+            "full-backlog connect exceeded deadline + 500 ms: elapsed={elapsed:?}"
+        );
     }
 
     #[cfg(unix)]

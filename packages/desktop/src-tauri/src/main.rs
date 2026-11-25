@@ -45,31 +45,39 @@ async fn connect_engine(state: State<'_, EngineState>) -> Result<ConnectionInfo,
     }
 }
 
+#[cfg(unix)]
+fn rpc_request_blocking(
+    shared: &Mutex<Option<launcher::SocketClient>>,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    validate_rpc_method(method)?;
+    let mut guard = shared
+        .lock()
+        .map_err(|_| "engine state lock poisoned".to_string())?;
+    let client = guard
+        .as_mut()
+        .ok_or_else(|| "not connected to @madc/engine".to_string())?;
+    client.request(method, params)
+}
+
 #[tauri::command]
 async fn rpc_request(
     state: State<'_, EngineState>,
     method: String,
     params: Value,
 ) -> Result<Value, String> {
-    validate_rpc_method(&method)?;
     #[cfg(unix)]
     {
         let shared = Arc::clone(&state.0);
-        tauri::async_runtime::spawn_blocking(move || {
-            let mut guard = shared
-                .lock()
-                .map_err(|_| "engine state lock poisoned".to_string())?;
-            let client = guard
-                .as_mut()
-                .ok_or_else(|| "not connected to @madc/engine".to_string())?;
-            client.request(&method, params)
-        })
-        .await
-        .map_err(|e| format!("rpc task failed: {e}"))?
+        tauri::async_runtime::spawn_blocking(move || rpc_request_blocking(&shared, &method, params))
+            .await
+            .map_err(|e| format!("rpc task failed: {e}"))?
     }
     #[cfg(not(unix))]
     {
-        let _ = (state, method, params);
+        validate_rpc_method(&method)?;
+        let _ = (state, params);
         Err("Windows named-pipe desktop transport is unverified in M3-A2".to_string())
     }
 }
@@ -122,4 +130,32 @@ fn main() {
             }
         }
     });
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn rpc_request_blocking_enforces_allowlist_before_lock_and_connection_check_n7() {
+        let state: Mutex<Option<launcher::SocketClient>> = Mutex::new(None);
+        let denied = rpc_request_blocking(&state, "turn/start", json!({}))
+            .expect_err("disallowed method must fail allowlist check");
+        assert!(
+            denied.contains("not allowed"),
+            "expected 'not allowed' error, got: {denied}"
+        );
+        assert!(
+            !denied.contains("not connected"),
+            "allowlist must run before connection check, got: {denied}"
+        );
+
+        let allowed = rpc_request_blocking(&state, "room/inspect", json!({}))
+            .expect_err("allowed method with no client should reach connection check");
+        assert!(
+            allowed.contains("not connected"),
+            "expected 'not connected' for allowed method, got: {allowed}"
+        );
+    }
 }

@@ -400,10 +400,15 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
     try {
       const now = lstatSync(socketPath);
       if (now.isSocket() && now.dev === bound.dev && now.ino === bound.ino) {
-        unlinkSync(socketPath);
+        (socketDeps.unlink ?? unlinkSync)(socketPath);
       }
-    } catch {
+    } catch (err) {
       // Already removed (Node and Bun 1.4.x unlink a Unix socket path in `server.close()`).
+      if (errCode(err) === "ENOENT") return;
+      // Amendment 1 §3 line 101: a failing shutdown step writes one stderr log line and continues.
+      engineOpts.log?.(
+        `socket unlink failed (${errCode(err) ?? (err instanceof Error ? err.message : String(err))}): ${socketPath}`,
+      );
     }
   };
 
