@@ -1269,8 +1269,9 @@ test("serve §6 precedence (M3A2-P6): second trigger during shutdown changes not
   assert.equal(existsSync(engineLockPath(home)), false);
 });
 
-test("serve §3 line 101 (M3A2-N8a): non-ENOENT socket unlink failure logs one stderr line and keeps trigger exit code", async () => {
-  if (!POSIX) return;
+test("serve §3 line 101 (M3A2-N8a): non-ENOENT socket unlink failure logs one stderr line and keeps trigger exit code", {
+  skip: !POSIX,
+}, async () => {
   const home = trackedHome();
   const sockPath = engineSocketPath(home);
   const err = captureStream();
@@ -1334,5 +1335,69 @@ test("serve §3 line 101 (M3A2-N8a): non-ENOENT socket unlink failure logs one s
   assert.ok(
     unlinkLogLines[0]?.includes(sockPath),
     `expected socket path in log: ${unlinkLogLines[0]}`,
+  );
+});
+
+test("serve §3 line 101 (M3A2-N9): ENOENT during socket unlink logs nothing and keeps trigger exit code", {
+  skip: !POSIX,
+}, async () => {
+  const home = trackedHome();
+  const err = captureStream();
+  const stdin = new PassThrough();
+  let exitCode: number | null = null;
+  let unlinkCalled = false;
+
+  // Restore home mode on cleanup even if assertions fail mid-test.
+  cleanups.push(() => {
+    try {
+      chmodSync(home, 0o700);
+    } catch {
+      // ignore
+    }
+  });
+
+  const code = await withTimeout(
+    runServe([], {
+      env: { MADC_HOME: home },
+      stdin,
+      stderr: err.stream,
+      exit: (c) => {
+        exitCode = c;
+      },
+      agent: echoAgent,
+      socketDeps: {
+        // Keep `engine.sock` present past `server.close()` on every runtime (Node 22, Bun 1.3.11,
+        // Bun 1.4.x) so `unlinkOwnSocket()` always invokes `socketDeps.unlink` directly.
+        beforeShutdown: async () => {
+          chmodSync(home, 0o500);
+        },
+        unlink: (p) => {
+          unlinkCalled = true;
+          chmodSync(home, 0o700);
+          try {
+            unlinkSync(p);
+          } catch {
+            // ignore
+          }
+          throw Object.assign(new Error("ENOENT: already unlinked"), { code: "ENOENT" });
+        },
+      },
+      onListening: () => {
+        stdin.end();
+      },
+    }),
+    5000,
+    "M3A2-N9 shutdown unlink ENOENT",
+  );
+
+  chmodSync(home, 0o700);
+  assert.equal(unlinkCalled, true, "unlinkOwnSocket invoked injected unlink dep");
+  assert.equal(code, SERVE_EXIT.OK, "trigger exit code unchanged");
+  assert.equal(exitCode, 0);
+  assert.equal(existsSync(engineLockPath(home)), false, "engine.lock still released cleanly");
+  assert.equal(
+    err.text().includes("socket unlink failed"),
+    false,
+    `expected zero 'socket unlink failed' lines on ENOENT, got:\n${err.text()}`,
   );
 });
