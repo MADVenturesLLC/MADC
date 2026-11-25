@@ -1401,60 +1401,74 @@ test("M3-A1 room/inspect: {} returns the room report; unknown keys are -32602", 
 
 const ENGINE_BIN = fileURLToPath(new URL("./bin.ts", import.meta.url));
 
-test("M3-A2 serve (M3A2-S1): engine.lock token lost before stale unlink -> exit 20, stale socket untouched, no new socket", async () => {
-  if (!POSIX) return;
-  const { home, cleanup } = makeHome();
-  activeCleanups.push(cleanup);
-  mkdirSync(home, { recursive: true, mode: 0o700 });
-  const sockPath = engineSocketPath(home);
-  const lockPath = engineLockPath(home);
-
-  // Plant a real stale Unix socket (listener closed without unlinking via a helper process or
-  // rename trick so the socket inode remains at sockPath).
-  const staleHelper = { sockPath: join(home, "tmp-stale.sock") };
-  const dummy = createServer();
-  await withTimeout(
-    new Promise<void>((r) => dummy.listen(staleHelper.sockPath, () => r())),
-    2000,
-    "dummy listen",
+if (!POSIX) {
+  test.skip(
+    "M3-A2 serve (M3A2-S1): engine.lock token lost before stale unlink -> exit 20, stale socket untouched, no new socket",
   );
-  renameSync(staleHelper.sockPath, sockPath);
-  await withTimeout(new Promise<void>((r) => dummy.close(() => r())), 2000, "dummy close");
-  assert.equal(lstatSync(sockPath).isSocket(), true, "stale socket planted");
-  const staleIno = lstatSync(sockPath).ino;
+} else {
+  test("M3-A2 serve (M3A2-S1): engine.lock token lost before stale unlink -> exit 20, stale socket untouched, no new socket", async () => {
+    const { home, cleanup } = makeHome();
+    activeCleanups.push(cleanup);
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    const sockPath = engineSocketPath(home);
+    const lockPath = engineLockPath(home);
 
-  const stderrChunks: Buffer[] = [];
-  const stderr = new PassThrough();
-  stderr.on("data", (d: Buffer) => stderrChunks.push(d));
-  const stdin = new PassThrough();
-  let exitCode: number | null = null;
-
-  const code = await runServe([], {
-    env: { MADC_HOME: home },
-    stdin,
-    stderr,
-    exit: (c) => {
-      exitCode = c;
-    },
-    agent: echoAgent,
-    beforeStaleUnlinkCheck: () => {
-      // Simulate displacing engine.lock right before the §4 step 4 stale-unlink check.
-      writeFileSync(
-        lockPath,
-        JSON.stringify({ pid: process.pid, startedAt: 1, token: "b".repeat(32) }),
+    // Plant a real stale Unix socket (listener closed without unlinking via a helper process or
+    // rename trick so the socket inode remains at sockPath).
+    const staleHelper = { sockPath: join(home, "tmp-stale.sock") };
+    const dummy = createServer();
+    try {
+      await withTimeout(
+        new Promise<void>((r) => dummy.listen(staleHelper.sockPath, () => r())),
+        2000,
+        "dummy listen",
       );
-    },
-  });
+      renameSync(staleHelper.sockPath, sockPath);
+    } finally {
+      await withTimeout(new Promise<void>((r) => dummy.close(() => r())), 2000, "dummy close");
+    }
+    assert.equal(lstatSync(sockPath).isSocket(), true, "stale socket planted");
+    const staleIno = lstatSync(sockPath).ino;
 
-  assert.equal(code, SERVE_EXIT.OWNED);
-  assert.equal(exitCode, 20);
-  assert.match(
-    Buffer.concat(stderrChunks).toString("utf8"),
-    /^madc-engine serve: engine\.lock token lost:/m,
-  );
-  assert.equal(existsSync(sockPath), true, "stale socket was NOT unlinked after token loss");
-  assert.equal(lstatSync(sockPath).ino, staleIno);
-});
+    const stderrChunks: Buffer[] = [];
+    const stderr = new PassThrough();
+    stderr.on("data", (d: Buffer) => stderrChunks.push(d));
+    const stdin = new PassThrough();
+    let exitCode: number | null = null;
+
+    const runPromise = runServe([], {
+      env: { MADC_HOME: home },
+      stdin,
+      stderr,
+      exit: (c) => {
+        exitCode = c;
+      },
+      agent: echoAgent,
+      beforeStaleUnlinkCheck: () => {
+        // Simulate displacing engine.lock right before the §4 step 4 stale-unlink check.
+        writeFileSync(
+          lockPath,
+          JSON.stringify({ pid: process.pid, startedAt: 1, token: "b".repeat(32) }),
+        );
+      },
+    });
+
+    try {
+      const code = await withTimeout(runPromise, 5000, "M3A2-S1 token lost before stale unlink");
+      assert.equal(code, SERVE_EXIT.OWNED);
+      assert.equal(exitCode, 20);
+      assert.match(
+        Buffer.concat(stderrChunks).toString("utf8"),
+        /^madc-engine serve: engine\.lock token lost:/m,
+      );
+      assert.equal(existsSync(sockPath), true, "stale socket was NOT unlinked after token loss");
+      assert.equal(lstatSync(sockPath).ino, staleIno);
+    } finally {
+      stdin.end();
+      await withTimeout(runPromise, 2000, "M3A2-S1 cleanup").catch(() => {});
+    }
+  });
+}
 
 test("M3-A2 serve e2e: real bin.ts serve binds 0600 socket, answers initialize + room/inspect, rejects second serve (20), exits 0 on EOF", async () => {
   const { home, cleanup } = makeHome();
@@ -1540,66 +1554,79 @@ test("M3-A2 serve e2e: real bin.ts serve binds 0600 socket, answers initialize +
   if (recheck.ok) releaseThreadLock(recheck.handle);
 });
 
-test("M3-A2 socket (M3A2-N1): shutdownAll never renames or moves a foreign entry at engine.sock (pin line 96)", async () => {
-  if (!POSIX) return;
-  const { home, cleanup } = makeHome();
-  activeCleanups.push(cleanup);
-  mkdirSync(home, { recursive: true, mode: 0o700 });
-  const sockPath = engineSocketPath(home);
+if (!POSIX) {
+  test.skip(
+    "M3-A2 socket (M3A2-N1): shutdownAll never renames or moves a foreign entry at engine.sock (pin line 96)",
+  );
+} else {
+  test("M3-A2 socket (M3A2-N1): shutdownAll never renames or moves a foreign entry at engine.sock (pin line 96)", async () => {
+    const { home, cleanup } = makeHome();
+    activeCleanups.push(cleanup);
+    mkdirSync(home, { recursive: true, mode: 0o700 });
+    const sockPath = engineSocketPath(home);
 
-  // Guard: socket.ts itself never imports or calls renameSync.
-  const socketSrc = readFileSync(fileURLToPath(new URL("./socket.ts", import.meta.url)), "utf8");
-  assert.equal(socketSrc.includes("renameSync"), false, "socket.ts must never rename entries");
-  assert.equal(socketSrc.includes(".preserve-"), false, "socket.ts must never create .preserve-*");
-
-  const probeHome = freshHome();
-  const probePath = join(probeHome, "probe.sock");
-  const probe = await listenOn(probePath);
-  await new Promise<void>((resolve) => probe.close(() => resolve()));
-  const runtimeUnlinks = !existsSync(probePath);
-
-  const serverA = await startSocketServer({ home, agent: echoAgent, log: () => {} });
-  const inoA = lstatSync(sockPath).ino;
-  const clientA = await connect(sockPath);
-  await clientA.init("n1-observer");
-
-  // Simulate another same-user process moving A's socket aside and binding successor B at sockPath.
-  const movedA = join(home, "moved-a.sock");
-  renameSync(sockPath, movedA);
-  const serverB = await startSocketServer({ home, agent: echoAgent, log: () => {} });
-  activeServers.push(serverB);
-  const inoB = lstatSync(sockPath).ino;
-  assert.notEqual(inoB, inoA);
-
-  // Sample the directory while serverA.close() runs; no `.preserve-*` rename-aside may ever exist.
-  const snapshots: string[][] = [];
-  const sampler = setInterval(() => {
-    try {
-      snapshots.push(readdirSync(home));
-    } catch {
-      // ignore
-    }
-  }, 2);
-  try {
-    await withTimeout(serverA.close(), 5000, "serverA.close() N1");
-  } finally {
-    clearInterval(sampler);
-  }
-  await clientA.close();
-  snapshots.push(readdirSync(home));
-
-  for (const entries of snapshots) {
-    assert.deepEqual(
-      entries.filter((name) => name.includes(".preserve-")),
-      [],
-      `shutdownAll created a rename-aside entry: ${entries.join(", ")}`,
+    // Guard: socket.ts itself never imports or calls renameSync.
+    const socketSrc = readFileSync(fileURLToPath(new URL("./socket.ts", import.meta.url)), "utf8");
+    assert.equal(socketSrc.includes("renameSync"), false, "socket.ts must never rename entries");
+    assert.equal(
+      socketSrc.includes(".preserve-"),
+      false,
+      "socket.ts must never create .preserve-*",
     );
-  }
-  if (!runtimeUnlinks) {
-    assert.equal(existsSync(sockPath), true, "unlinkOwnSocket leaves foreign inode intact");
-    assert.equal(lstatSync(sockPath).ino, inoB, "foreign inode unchanged");
-  }
-});
+
+    const probeHome = freshHome();
+    const probePath = join(probeHome, "probe.sock");
+    const probe = await listenOn(probePath);
+    await new Promise<void>((resolve) => probe.close(() => resolve()));
+    const runtimeUnlinks = !existsSync(probePath);
+
+    const serverA = await startSocketServer({ home, agent: echoAgent, log: () => {} });
+    activeServers.push(serverA);
+    const inoA = lstatSync(sockPath).ino;
+    const clientA = await connect(sockPath);
+    try {
+      await clientA.init("n1-observer");
+
+      // Simulate another same-user process moving A's socket aside and binding successor B at sockPath.
+      const movedA = join(home, "moved-a.sock");
+      renameSync(sockPath, movedA);
+      const serverB = await startSocketServer({ home, agent: echoAgent, log: () => {} });
+      activeServers.push(serverB);
+      const inoB = lstatSync(sockPath).ino;
+      assert.notEqual(inoB, inoA);
+
+      // Sample the directory while serverA.close() runs; no `.preserve-*` rename-aside may ever exist.
+      const snapshots: string[][] = [];
+      const sampler = setInterval(() => {
+        try {
+          snapshots.push(readdirSync(home));
+        } catch {
+          // ignore
+        }
+      }, 2);
+      try {
+        await withTimeout(serverA.close(), 5000, "serverA.close() N1");
+      } finally {
+        clearInterval(sampler);
+      }
+      snapshots.push(readdirSync(home));
+
+      for (const entries of snapshots) {
+        assert.deepEqual(
+          entries.filter((name) => name.includes(".preserve-")),
+          [],
+          `shutdownAll created a rename-aside entry: ${entries.join(", ")}`,
+        );
+      }
+      if (!runtimeUnlinks) {
+        assert.equal(existsSync(sockPath), true, "unlinkOwnSocket leaves foreign inode intact");
+        assert.equal(lstatSync(sockPath).ino, inoB, "foreign inode unchanged");
+      }
+    } finally {
+      await clientA.close();
+    }
+  });
+}
 
 test("M3-A2 serve exit 23 (M3A2-M1): hanging handle.close() past deadline releases held thread locks (sessions/*.lock) and engine.lock", async () => {
   const { home, cleanup } = makeHome();
@@ -1644,17 +1671,18 @@ test("M3-A2 serve exit 23 (M3A2-M1): hanging handle.close() past deadline releas
     },
   });
 
-  await withTimeout(listening, 4000, "M3A2-M1 serve listening");
-  const client = await connect(boundSocketPath);
-  await client.init("m1-holder");
-  const started = (await client.request("thread/start", { seatId: "seat-a" })) as {
-    thread: { id: string };
-  };
-  const threadLock = join(home, "sessions", `${started.thread.id}.lock`);
-  assert.equal(existsSync(threadLock), true, "thread lock must be held before shutdown trigger");
-
-  // Trigger clean EOF shutdown; handle.close() hangs inside beforeShutdown past the deadline.
+  let client: SocketRpcClient | null = null;
   try {
+    await withTimeout(listening, 4000, "M3A2-M1 serve listening");
+    client = await connect(boundSocketPath);
+    await client.init("m1-holder");
+    const started = (await client.request("thread/start", { seatId: "seat-a" })) as {
+      thread: { id: string };
+    };
+    const threadLock = join(home, "sessions", `${started.thread.id}.lock`);
+    assert.equal(existsSync(threadLock), true, "thread lock must be held before shutdown trigger");
+
+    // Trigger clean EOF shutdown; handle.close() hangs inside beforeShutdown past the deadline.
     stdin.end();
     const code = await withTimeout(servePromise, 3000, "M3A2-M1 exit 23");
 
@@ -1672,6 +1700,8 @@ test("M3-A2 serve exit 23 (M3A2-M1): hanging handle.close() past deadline releas
   } finally {
     // Release background close() promise and client so nothing leaks even on assertion failure.
     releaseCloseBlocker();
-    await client.close();
+    stdin.end();
+    if (client !== null) await client.close().catch(() => {});
+    await withTimeout(servePromise, 2000, "M3A2-M1 cleanup").catch(() => {});
   }
 });

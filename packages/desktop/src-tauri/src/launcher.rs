@@ -279,10 +279,18 @@ impl SpawnedServe {
     /// - Never-initialized child: on Unix, SIGTERM first (keeping stdin open so the signal wins
     ///   as first trigger), then SIGKILL after 2 s; on Windows, close stdin first.
     fn stop(&mut self) -> Option<ExitStatus> {
+        self.stop_with_grace(INITIALIZED_KILL_GRACE, UNINITIALIZED_KILL_GRACE)
+    }
+
+    fn stop_with_grace(
+        &mut self,
+        initialized_grace: Duration,
+        uninitialized_grace: Duration,
+    ) -> Option<ExitStatus> {
         if self.initialized {
             // Close stdin (EOF) first (§5 & §4 Windows).
             drop(self.stdin.take());
-            let deadline = Instant::now() + INITIALIZED_KILL_GRACE;
+            let deadline = Instant::now() + initialized_grace;
             while Instant::now() < deadline {
                 if let Some(status) = self.try_wait_status() {
                     return Some(status);
@@ -298,7 +306,7 @@ impl SpawnedServe {
             unsafe {
                 libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
             }
-            let deadline = Instant::now() + UNINITIALIZED_KILL_GRACE;
+            let deadline = Instant::now() + uninitialized_grace;
             while Instant::now() < deadline {
                 if let Some(status) = self.try_wait_status() {
                     drop(self.stdin.take());
@@ -555,12 +563,21 @@ impl SocketClient {
 /// Probe `$MADC_HOME/engine.sock` per amendment 1 §2, or spawn `madc-engine serve` per §1, §2, §5.
 #[cfg(unix)]
 pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
-    connect_or_spawn_with_window(config, START_WINDOW)
+    connect_or_spawn_with_timeouts(config, PROBE_TIMEOUT, START_WINDOW)
+}
+
+#[cfg(all(unix, test))]
+fn connect_or_spawn_with_window(
+    config: &LaunchConfig,
+    start_window: Duration,
+) -> Result<SocketClient, String> {
+    connect_or_spawn_with_timeouts(config, PROBE_TIMEOUT, start_window)
 }
 
 #[cfg(unix)]
-fn connect_or_spawn_with_window(
+fn connect_or_spawn_with_timeouts(
     config: &LaunchConfig,
+    probe_timeout: Duration,
     start_window: Duration,
 ) -> Result<SocketClient, String> {
     let started_at = Instant::now();
@@ -569,7 +586,7 @@ fn connect_or_spawn_with_window(
     // (Windows absent home, pin line 50), `try_engine_socket_path` returns Ok(None) and we spawn.
     if let Some(socket_path) = try_engine_socket_path(&config.home)? {
         if let Ok(client) =
-            SocketClient::connect_and_initialize(&socket_path, PROBE_TIMEOUT, true, started_at)
+            SocketClient::connect_and_initialize(&socket_path, probe_timeout, true, started_at)
         {
             return Ok(client);
         }
@@ -1226,5 +1243,158 @@ mod tests {
         );
         assert!(lock.exists(), "launcher must never delete engine.lock");
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_timeout_is_pinned_at_1s_and_enforced_by_connect_or_spawn_a3_r4() {
+        // Pin amendment 1 §2 line 47: "within 1 s (connect plus reply)".
+        assert_eq!(PROBE_TIMEOUT, Duration::from_secs(1));
+
+        let home = PathBuf::from(format!("/tmp/madc-dt-a3-r4-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let sock_path = home.join("engine.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind stalled listener");
+
+        let (stop_tx, stop_rx) = mpsc::sync_channel::<()>(1);
+        let server_thread = thread::spawn(move || {
+            let _ = listener.set_nonblocking(true);
+            let mut held = Vec::new();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                if stop_rx.try_recv().is_ok() {
+                    break;
+                }
+                if let Ok((conn, _)) = listener.accept() {
+                    // Accept and never reply so the probe must time out at its bound.
+                    held.push(conn);
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+        });
+
+        let fake_serve = home.join("exit2-serve.sh");
+        std::fs::write(&fake_serve, "#!/bin/sh\necho 'fallback-spawn-marker' >&2\nexit 2\n")
+            .expect("write fake serve");
+        std::fs::set_permissions(&fake_serve, std::fs::Permissions::from_mode(0o700))
+            .expect("chmod fake serve");
+        let cfg = LaunchConfig {
+            home: home.clone(),
+            runtime_bin: "/bin/sh".to_string(),
+            engine_entry: fake_serve,
+        };
+
+        // 1. Production PROBE_TIMEOUT (1 s) cuts off stalled listener around 1 s and falls through
+        //    to spawning `serve`.
+        let t0 = Instant::now();
+        let err = match connect_or_spawn_with_window(&cfg, Duration::from_millis(200)) {
+            Ok(_) => panic!("expected fake serve exit 2 after stalled 1 s probe"),
+            Err(e) => e,
+        };
+        let elapsed_prod = t0.elapsed();
+        assert!(err.contains("fallback-spawn-marker"), "got: {err}");
+        assert!(
+            elapsed_prod >= Duration::from_millis(850) && elapsed_prod < Duration::from_millis(1900),
+            "production PROBE_TIMEOUT (1 s) not honored: elapsed={elapsed_prod:?}"
+        );
+
+        // 2. Injectable shorter probe timeout (200 ms) cuts off stalled listener at ~200 ms,
+        //    proving connect_or_spawn passes its timeout parameter rather than hardcoding.
+        let t1 = Instant::now();
+        let err2 = match connect_or_spawn_with_timeouts(
+            &cfg,
+            Duration::from_millis(200),
+            Duration::from_millis(200),
+        ) {
+            Ok(_) => panic!("expected fake serve exit 2 after stalled 200 ms probe"),
+            Err(e) => e,
+        };
+        let elapsed_short = t1.elapsed();
+        assert!(err2.contains("fallback-spawn-marker"), "got: {err2}");
+        assert!(
+            elapsed_short >= Duration::from_millis(170) && elapsed_short < Duration::from_millis(750),
+            "injectable probe timeout (200 ms) not honored: elapsed={elapsed_short:?}"
+        );
+
+        let _ = stop_tx.send(());
+        let _ = server_thread.join();
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn initialized_kill_grace_is_pinned_at_7s_and_enforced_by_stop_a3_r5() {
+        // Pin amendment 1 §5 line 131: wait 7 s before SIGKILL for an initialized child.
+        assert_eq!(INITIALIZED_KILL_GRACE, Duration::from_secs(7));
+        assert_eq!(UNINITIALIZED_KILL_GRACE, Duration::from_secs(2));
+
+        // 1. Production `stop()` waits through a 250 ms post-EOF shutdown without killing early.
+        {
+            let mut child = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("cat >/dev/null; sleep 0.25; exit 0")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn clean-after-eof child");
+            let stdin = child.stdin.take();
+            let mut spawned = SpawnedServe {
+                child,
+                stdin,
+                stderr_buf: Arc::new(Mutex::new(String::new())),
+                stderr_done: None,
+                stderr_thread: None,
+                initialized: true,
+            };
+            let t0 = Instant::now();
+            let status = spawned.stop().expect("child exit status");
+            let elapsed = t0.elapsed();
+            assert_eq!(
+                status.code(),
+                Some(0),
+                "expected clean exit 0 within 7 s grace, got {status:?}"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(200) && elapsed < Duration::from_secs(2),
+                "unexpected clean stop duration: {elapsed:?}"
+            );
+        }
+
+        // 2. An initialized child that ignores stdin EOF is cut off with SIGKILL at the grace bound.
+        {
+            let mut child = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("cat >/dev/null; exec sleep 10")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn stuck-after-eof child");
+            let stdin = child.stdin.take();
+            let mut spawned = SpawnedServe {
+                child,
+                stdin,
+                stderr_buf: Arc::new(Mutex::new(String::new())),
+                stderr_done: None,
+                stderr_thread: None,
+                initialized: true,
+            };
+            let t0 = Instant::now();
+            let status = spawned
+                .stop_with_grace(Duration::from_millis(200), UNINITIALIZED_KILL_GRACE)
+                .expect("killed child exit status");
+            let elapsed = t0.elapsed();
+            assert_eq!(
+                status.signal(),
+                Some(libc::SIGKILL),
+                "expected SIGKILL after grace elapsed, got {status:?}"
+            );
+            assert!(
+                elapsed >= Duration::from_millis(180) && elapsed < Duration::from_millis(1000),
+                "stop_with_grace(200 ms) did not enforce bound: elapsed={elapsed:?}"
+            );
+        }
     }
 }

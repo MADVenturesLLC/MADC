@@ -23,7 +23,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
-import { PassThrough } from "node:stream";
+import { PassThrough, Writable } from "node:stream";
 import { afterEach, test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { echoAgent } from "./agent.ts";
@@ -293,29 +293,34 @@ test("engine.lock M3A2-L6: three-engine reclaim race leaves displaced lock aside
   if (r3Handle !== null) assert.equal(releaseThreadLock(r3Handle), true);
 });
 
-test("engine.lock M3A2-L7: symlink at engine.lock is never followed, treated as corrupt and reclaimed leaving target intact", () => {
-  if (!POSIX) return;
-  const home = trackedHome();
-  const lockPath = engineLockPath(home);
-  const target = `${home}-sym-target.json`;
-  cleanups.push(() => rmSync(target, { force: true }));
-  writeFileSync(target, JSON.stringify({ pid: process.pid, startedAt: 1, token: TOKEN_A }));
-  symlinkSync(target, lockPath);
+if (!POSIX) {
+  test.skip(
+    "engine.lock M3A2-L7: symlink at engine.lock is never followed, treated as corrupt and reclaimed leaving target intact",
+  );
+} else {
+  test("engine.lock M3A2-L7: symlink at engine.lock is never followed, treated as corrupt and reclaimed leaving target intact", () => {
+    const home = trackedHome();
+    const lockPath = engineLockPath(home);
+    const target = `${home}-sym-target.json`;
+    cleanups.push(() => rmSync(target, { force: true }));
+    writeFileSync(target, JSON.stringify({ pid: process.pid, startedAt: 1, token: TOKEN_A }));
+    symlinkSync(target, lockPath);
 
-  assert.equal(readLock(lockPath).state, "corrupt");
-  assert.equal(
-    releaseThreadLock({ path: lockPath, pid: process.pid, startedAt: 1, token: TOKEN_A }),
-    false,
-  );
-  assert.equal(
-    holdsThreadLock({ path: lockPath, pid: process.pid, startedAt: 1, token: TOKEN_A }),
-    false,
-  );
-  const acq = acquireLockAt(home, lockPath);
-  assert.equal(acq.ok, true);
-  assert.equal(existsSync(target), true, "symlink target untouched");
-  if (acq.ok) releaseThreadLock(acq.handle);
-});
+    assert.equal(readLock(lockPath).state, "corrupt");
+    assert.equal(
+      releaseThreadLock({ path: lockPath, pid: process.pid, startedAt: 1, token: TOKEN_A }),
+      false,
+    );
+    assert.equal(
+      holdsThreadLock({ path: lockPath, pid: process.pid, startedAt: 1, token: TOKEN_A }),
+      false,
+    );
+    const acq = acquireLockAt(home, lockPath);
+    assert.equal(acq.ok, true);
+    assert.equal(existsSync(target), true, "symlink target untouched");
+    if (acq.ok) releaseThreadLock(acq.handle);
+  });
+}
 
 test("engine.lock M3A2-L8: directory or FIFO at engine.lock throws LockPathNotAFileError without blocking", () => {
   const home = trackedHome();
@@ -455,27 +460,32 @@ test("serve exit 20 (M3A2-S2): engine.lock token lost straight after listen -> e
   const stdin = new PassThrough();
   let exitCode: number | null = null;
 
-  const code = await withTimeout(
-    runServe([], {
-      env: { MADC_HOME: home },
-      stdin,
-      stderr: err.stream,
-      exit: (c) => {
-        exitCode = c;
-      },
-      agent: echoAgent,
-      afterListenCheck: () => {
-        // Simulate another engine displacing engine.lock right after listen().
-        writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: 1, token: TOKEN_B }));
-      },
-    }),
-    5000,
-    "M3A2-S2 token lost after listen",
-  );
-  assert.equal(code, SERVE_EXIT.OWNED);
-  assert.equal(exitCode, 20);
-  assert.match(err.text(), /^madc-engine serve: engine\.lock token lost:/m);
-  assert.equal(existsSync(sockPath), false, "bound socket unlinked when token lost after listen");
+  const runPromise = runServe([], {
+    env: { MADC_HOME: home },
+    stdin,
+    stderr: err.stream,
+    exit: (c) => {
+      exitCode = c;
+    },
+    agent: echoAgent,
+    afterListenCheck: () => {
+      // Simulate another engine displacing engine.lock right after listen().
+      writeFileSync(lockPath, JSON.stringify({ pid: process.pid, startedAt: 1, token: TOKEN_B }));
+    },
+  });
+
+  try {
+    const code = await withTimeout(runPromise, 5000, "M3A2-S2 token lost after listen");
+    assert.equal(code, SERVE_EXIT.OWNED);
+    assert.equal(exitCode, 20);
+    assert.match(err.text(), /^madc-engine serve: engine\.lock token lost:/m);
+    assert.equal(existsSync(sockPath), false, "bound socket unlinked when token lost after listen");
+  } finally {
+    // Always close stdin and wait briefly for any unexpectedly bound listener to shut down so
+    // a failing run (e.g. mutant skipping afterListen re-verify) never hangs the test runner.
+    stdin.end();
+    await withTimeout(runPromise, 2000, "M3A2-S2 cleanup").catch(() => {});
+  }
 });
 
 test("serve exit 21: non-regular engine.lock (dir), symlink/file at engine.sock, and chmod failure", async () => {
@@ -559,23 +569,32 @@ test("serve exit 21: non-regular engine.lock (dir), symlink/file at engine.sock,
   }
 });
 
-test("serve exit 22: socket path too long (pre-listen sun_path check)", async () => {
-  if (!POSIX) return;
-  const base = trackedHome();
-  const longHome = join(base, "a".repeat(120));
-  const err = captureStream();
-  const stdin = new PassThrough();
-  const code = await runServe([], {
-    env: { MADC_HOME: longHome },
-    stdin,
-    stderr: err.stream,
-    exit: () => {},
-    agent: echoAgent,
+if (!POSIX) {
+  test.skip("serve exit 22: socket path too long (pre-listen sun_path check)");
+} else {
+  test("serve exit 22: socket path too long (pre-listen sun_path check)", async () => {
+    const base = trackedHome();
+    const longHome = join(base, "a".repeat(120));
+    const err = captureStream();
+    const stdin = new PassThrough();
+    const runPromise = runServe([], {
+      env: { MADC_HOME: longHome },
+      stdin,
+      stderr: err.stream,
+      exit: () => {},
+      agent: echoAgent,
+    });
+    try {
+      const code = await withTimeout(runPromise, 5000, "serve exit 22 path too long");
+      assert.equal(code, SERVE_EXIT.LISTEN_ERROR);
+      assert.match(err.text(), /^madc-engine serve: socket path too long:/m);
+      assert.equal(existsSync(engineLockPath(longHome)), false, "engine.lock released");
+    } finally {
+      stdin.end();
+      await withTimeout(runPromise, 2000, "serve exit 22 cleanup").catch(() => {});
+    }
   });
-  assert.equal(code, SERVE_EXIT.LISTEN_ERROR);
-  assert.match(err.text(), /^madc-engine serve: socket path too long:/m);
-  assert.equal(existsSync(engineLockPath(longHome)), false, "engine.lock released");
-});
+}
 
 test("serve exit 23: clean trigger whose shutdown exceeds deadline exits 23 and releases engine.lock", async () => {
   const home = trackedHome();
@@ -604,12 +623,17 @@ test("serve exit 23: clean trigger whose shutdown exceeds deadline exits 23 and 
     },
   });
 
-  const code = await withTimeout(runPromise, 2000, "serve exit 23");
-  releaseBlocker();
-  assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
-  assert.equal(exitCode, 23);
-  assert.match(err.text(), /^madc-engine serve: shutdown deadline exceeded:/m);
-  assert.equal(existsSync(engineLockPath(home)), false, "engine.lock released on deadline exit");
+  try {
+    const code = await withTimeout(runPromise, 2000, "serve exit 23");
+    assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
+    assert.equal(exitCode, 23);
+    assert.match(err.text(), /^madc-engine serve: shutdown deadline exceeded:/m);
+    assert.equal(existsSync(engineLockPath(home)), false, "engine.lock released on deadline exit");
+  } finally {
+    releaseBlocker();
+    stdin.end();
+    await withTimeout(runPromise, 2000, "serve exit 23 cleanup").catch(() => {});
+  }
 });
 
 test("serve exit 23 (Argus #76 M1): trigger during slow startup does not restart shutdown deadline", async () => {
@@ -626,36 +650,39 @@ test("serve exit 23 (Argus #76 M1): trigger during slow startup does not restart
   // Agent triggers EOF immediately, then takes 300 ms before returning, and beforeClose hangs.
   // With shutdownDeadlineMs = 500, resetting the timer after the 300 ms startup step would exit at
   // >= 800 ms; counting from the first trigger exits at ~500 ms (< 700 ms).
-  const code = await withTimeout(
-    runServe([], {
-      env: { MADC_HOME: home },
-      stdin,
-      stderr: err.stream,
-      exit: () => {
-        exitAt = Date.now();
-      },
-      agent: async () => {
-        triggerAt = Date.now();
-        stdin.end();
-        await new Promise((r) => setTimeout(r, 300));
-        return echoAgent;
-      },
-      shutdownDeadlineMs: 500,
-      exitWriteGraceMs: 150,
-      totalExitBoundMs: 700,
-      beforeClose: () => blocker,
-    }),
-    2000,
-    "startup-trigger deadline exit 23",
-  );
-  releaseBlocker();
-  const elapsed = exitAt - triggerAt;
-  assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
-  assert.ok(
-    elapsed < 700,
-    `expected exit within 700ms of first startup trigger (500ms deadline, not reset after 300ms), got ${elapsed}ms`,
-  );
-  assert.equal(existsSync(engineLockPath(home)), false, "engine.lock released on deadline exit");
+  const runPromise = runServe([], {
+    env: { MADC_HOME: home },
+    stdin,
+    stderr: err.stream,
+    exit: () => {
+      exitAt = Date.now();
+    },
+    agent: async () => {
+      triggerAt = Date.now();
+      stdin.end();
+      await new Promise((r) => setTimeout(r, 300));
+      return echoAgent;
+    },
+    shutdownDeadlineMs: 500,
+    exitWriteGraceMs: 150,
+    totalExitBoundMs: 700,
+    beforeClose: () => blocker,
+  });
+
+  try {
+    const code = await withTimeout(runPromise, 2000, "startup-trigger deadline exit 23");
+    const elapsed = exitAt - triggerAt;
+    assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
+    assert.ok(
+      elapsed < 700,
+      `expected exit within 700ms of first startup trigger (500ms deadline, not reset after 300ms), got ${elapsed}ms`,
+    );
+    assert.equal(existsSync(engineLockPath(home)), false, "engine.lock released on deadline exit");
+  } finally {
+    releaseBlocker();
+    stdin.end();
+    await withTimeout(runPromise, 2000, "Argus #76 M1 cleanup").catch(() => {});
+  }
 });
 
 test("serve exit 24: unexpected startup fault exits 24 with no stack trace and releases engine.lock", async () => {
@@ -791,68 +818,73 @@ test("serve subprocess: stdin EOF (0), SIGINT (130), SIGTERM (143), stdout stays
   }
 });
 
-test("serve §3 required test: slow stderr reader (>64 KiB unread) still receives final reason line", async () => {
-  if (!POSIX) return;
-  const home = trackedHome();
-  const holder = liveHolder();
-  const holderPid = holder.pid ?? 0;
-  const lockPath = engineLockPath(home);
-  const acq = acquireLockAt(home, lockPath, holderPid);
-  assert.equal(acq.ok, true);
-  if (!acq.ok) return;
-
-  // Subprocess writes 200 KiB of stderr logs before running runServe([], ...) which hits exit 20.
-  // A separate reader process (`sleep 0.3; cat`) reads from a real OS pipe so >64 KiB sits unread
-  // in the kernel pipe buffer before draining (avoids Bun 1.3.11 in-process pause/resume bug,
-  // amendment 1 §3 step 3 test note & `exitflush.log` shellpipe method).
-  const driverPath = `${home}-slow-stderr.ts`;
-  const codeFile = `${home}-slow-stderr.code`;
-  cleanups.push(() => rmSync(driverPath, { force: true }));
-  cleanups.push(() => rmSync(codeFile, { force: true }));
-  writeFileSync(
-    driverPath,
-    `import { runServe } from ${JSON.stringify(SERVE_MODULE)};\nprocess.stderr.write("x".repeat(200000) + "\\n");\nawait runServe([]);\n`,
+if (!POSIX) {
+  test.skip(
+    "serve §3 required test: slow stderr reader (>64 KiB unread) still receives final reason line",
   );
-  const child = spawn(
-    "sh",
-    [
-      "-c",
-      '( "$1" "$2" 2>&1 1>/dev/null; echo $? > "$3" ) | ( sleep 0.3; cat )',
-      "--",
-      process.execPath,
+} else {
+  test("serve §3 required test: slow stderr reader (>64 KiB unread) still receives final reason line", async () => {
+    const home = trackedHome();
+    const holder = liveHolder();
+    const holderPid = holder.pid ?? 0;
+    const lockPath = engineLockPath(home);
+    const acq = acquireLockAt(home, lockPath, holderPid);
+    assert.equal(acq.ok, true);
+    if (!acq.ok) return;
+
+    // Subprocess writes 200 KiB of stderr logs before running runServe([], ...) which hits exit 20.
+    // A separate reader process (`sleep 0.3; cat`) reads from a real OS pipe so >64 KiB sits unread
+    // in the kernel pipe buffer before draining (avoids Bun 1.3.11 in-process pause/resume bug,
+    // amendment 1 §3 step 3 test note & `exitflush.log` shellpipe method).
+    const driverPath = `${home}-slow-stderr.ts`;
+    const codeFile = `${home}-slow-stderr.code`;
+    cleanups.push(() => rmSync(driverPath, { force: true }));
+    cleanups.push(() => rmSync(codeFile, { force: true }));
+    writeFileSync(
       driverPath,
-      codeFile,
-    ],
-    {
-      env: { ...process.env, MADC_HOME: home },
-      stdio: ["ignore", "pipe", "pipe"],
-    },
-  );
-  cleanups.push(() => {
-    try {
-      child.kill("SIGKILL");
-    } catch {
-      // Already exited.
-    }
+      `import { runServe } from ${JSON.stringify(SERVE_MODULE)};\nprocess.stderr.write("x".repeat(200000) + "\\n");\nawait runServe([]);\n`,
+    );
+    const child = spawn(
+      "sh",
+      [
+        "-c",
+        '( "$1" "$2" 2>&1 1>/dev/null; echo $? > "$3" ) | ( sleep 0.3; cat )',
+        "--",
+        process.execPath,
+        driverPath,
+        codeFile,
+      ],
+      {
+        env: { ...process.env, MADC_HOME: home },
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    cleanups.push(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // Already exited.
+      }
+    });
+
+    const chunks: Buffer[] = [];
+    child.stdout.on("data", (d: Buffer) => chunks.push(d));
+    const exitPromise = new Promise<number | null>((r) => child.once("exit", (c) => r(c)));
+    const endPromise = new Promise<void>((r) => child.stdout.once("end", () => r()));
+
+    await withTimeout(Promise.all([exitPromise, endPromise]), 5000, "slow stderr serve exit");
+
+    const code = Number(readFileSync(codeFile, "utf8").trim());
+    const stderrText = Buffer.concat(chunks).toString("utf8");
+    assert.equal(code, 20);
+    assert.ok(stderrText.length > 200_000, `expected >200000 bytes, got ${stderrText.length}`);
+    assert.ok(
+      stderrText.includes(`madc-engine serve: home owned by pid ${holderPid}: ${lockPath}`),
+      "final reason line survived >64 KiB slow stderr pipe",
+    );
+    releaseThreadLock(acq.handle);
   });
-
-  const chunks: Buffer[] = [];
-  child.stdout.on("data", (d: Buffer) => chunks.push(d));
-  const exitPromise = new Promise<number | null>((r) => child.once("exit", (c) => r(c)));
-  const endPromise = new Promise<void>((r) => child.stdout.once("end", () => r()));
-
-  await withTimeout(Promise.all([exitPromise, endPromise]), 5000, "slow stderr serve exit");
-
-  const code = Number(readFileSync(codeFile, "utf8").trim());
-  const stderrText = Buffer.concat(chunks).toString("utf8");
-  assert.equal(code, 20);
-  assert.ok(stderrText.length > 200_000, `expected >200000 bytes, got ${stderrText.length}`);
-  assert.ok(
-    stderrText.includes(`madc-engine serve: home owned by pid ${holderPid}: ${lockPath}`),
-    "final reason line survived >64 KiB slow stderr pipe",
-  );
-  releaseThreadLock(acq.handle);
-});
+}
 
 test("serve §3 EPIPE: closed stderr reader still exits with intended code 20 (never 24 or hang)", async () => {
   const home = trackedHome();
@@ -994,48 +1026,52 @@ test("serve §6 precedence (M3A2-P1): fatal listener error after listen exits 22
   });
   let emitError: ((e: Error) => void) | null = null;
 
-  const code = await withTimeout(
-    runServe([], {
-      env: { MADC_HOME: home },
-      stdin,
-      stderr: err.stream,
-      exit: (c) => {
-        exitCode = c;
+  const runPromise = runServe([], {
+    env: { MADC_HOME: home },
+    stdin,
+    stderr: err.stream,
+    exit: (c) => {
+      exitCode = c;
+    },
+    agent: echoAgent,
+    shutdownDeadlineMs: 80,
+    exitWriteGraceMs: 100,
+    totalExitBoundMs: 300,
+    beforeClose: () => blocker,
+    socketDeps: {
+      onListenReady: (controls) => {
+        emitError = controls.emitError;
       },
-      agent: echoAgent,
-      shutdownDeadlineMs: 80,
-      exitWriteGraceMs: 100,
-      totalExitBoundMs: 300,
-      beforeClose: () => blocker,
-      socketDeps: {
-        onListenReady: (controls) => {
-          emitError = controls.emitError;
-        },
-      },
-      onListening: () => {
-        emitError?.(Object.assign(new Error("listener EIO"), { code: "EIO" }));
-      },
-    }),
-    3000,
-    "M3A2-P1 fatal listener error exit 22",
-  );
-  releaseBlocker();
-  assert.equal(code, SERVE_EXIT.LISTEN_ERROR);
-  assert.equal(exitCode, 22);
-  assert.match(err.text(), /^madc-engine serve: fatal listener error \(EIO\):/m);
-  assert.equal(existsSync(engineLockPath(home)), false);
+    },
+    onListening: () => {
+      emitError?.(Object.assign(new Error("listener EIO"), { code: "EIO" }));
+    },
+  });
+
+  try {
+    const code = await withTimeout(runPromise, 3000, "M3A2-P1 fatal listener error exit 22");
+    assert.equal(code, SERVE_EXIT.LISTEN_ERROR);
+    assert.equal(exitCode, 22);
+    assert.match(err.text(), /^madc-engine serve: fatal listener error \(EIO\):/m);
+    assert.equal(existsSync(engineLockPath(home)), false);
+  } finally {
+    releaseBlocker();
+    stdin.end();
+    await withTimeout(runPromise, 2000, "M3A2-P1 cleanup").catch(() => {});
+  }
 });
 
-test("serve §6 precedence (M3A2-P2): listen EADDRINUSE exits 20 and releases engine.lock", async () => {
-  if (!POSIX) return;
-  const home = trackedHome();
-  const sockPath = engineSocketPath(home);
-  const err = captureStream();
-  const stdin = new PassThrough();
-  let exitCode: number | null = null;
+if (!POSIX) {
+  test.skip("serve §6 precedence (M3A2-P2): listen EADDRINUSE exits 20 and releases engine.lock");
+} else {
+  test("serve §6 precedence (M3A2-P2): listen EADDRINUSE exits 20 and releases engine.lock", async () => {
+    const home = trackedHome();
+    const sockPath = engineSocketPath(home);
+    const err = captureStream();
+    const stdin = new PassThrough();
+    let exitCode: number | null = null;
 
-  const code = await withTimeout(
-    runServe([], {
+    const runPromise = runServe([], {
       env: { MADC_HOME: home },
       stdin,
       stderr: err.stream,
@@ -1049,25 +1085,30 @@ test("serve §6 precedence (M3A2-P2): listen EADDRINUSE exits 20 and releases en
           mkdirSync(sockPath, { mode: 0o700 });
         },
       },
-    }),
-    5000,
-    "M3A2-P2 listen EADDRINUSE exit 20",
-  );
-  assert.equal(code, SERVE_EXIT.OWNED);
-  assert.equal(exitCode, 20);
-  assert.match(err.text(), /^madc-engine serve: socket address already in use:/m);
-  assert.equal(existsSync(engineLockPath(home)), false);
-});
+    });
+    try {
+      const code = await withTimeout(runPromise, 5000, "M3A2-P2 listen EADDRINUSE exit 20");
+      assert.equal(code, SERVE_EXIT.OWNED);
+      assert.equal(exitCode, 20);
+      assert.match(err.text(), /^madc-engine serve: socket address already in use:/m);
+      assert.equal(existsSync(engineLockPath(home)), false);
+    } finally {
+      stdin.end();
+      await withTimeout(runPromise, 2000, "M3A2-P2 cleanup").catch(() => {});
+    }
+  });
+}
 
-test("serve §6 precedence (M3A2-P3): non-EADDRINUSE listen failure exits 22", async () => {
-  if (!POSIX) return;
-  const home = trackedHome();
-  const err = captureStream();
-  const stdin = new PassThrough();
-  let exitCode: number | null = null;
+if (!POSIX) {
+  test.skip("serve §6 precedence (M3A2-P3): non-EADDRINUSE listen failure exits 22");
+} else {
+  test("serve §6 precedence (M3A2-P3): non-EADDRINUSE listen failure exits 22", async () => {
+    const home = trackedHome();
+    const err = captureStream();
+    const stdin = new PassThrough();
+    let exitCode: number | null = null;
 
-  const code = await withTimeout(
-    runServe([], {
+    const runPromise = runServe([], {
       env: { MADC_HOME: home },
       stdin,
       stderr: err.stream,
@@ -1081,14 +1122,22 @@ test("serve §6 precedence (M3A2-P3): non-EADDRINUSE listen failure exits 22", a
           rmSync(home, { recursive: true, force: true });
         },
       },
-    }),
-    5000,
-    "M3A2-P3 non-EADDRINUSE listen failure exit 22",
-  );
-  assert.equal(code, SERVE_EXIT.LISTEN_ERROR);
-  assert.equal(exitCode, 22);
-  assert.match(err.text(), /^madc-engine serve: listen failed \((?!EADDRINUSE)[A-Z0-9_]+\):/m);
-});
+    });
+    try {
+      const code = await withTimeout(
+        runPromise,
+        5000,
+        "M3A2-P3 non-EADDRINUSE listen failure exit 22",
+      );
+      assert.equal(code, SERVE_EXIT.LISTEN_ERROR);
+      assert.equal(exitCode, 22);
+      assert.match(err.text(), /^madc-engine serve: listen failed \((?!EADDRINUSE)[A-Z0-9_]+\):/m);
+    } finally {
+      stdin.end();
+      await withTimeout(runPromise, 2000, "M3A2-P3 cleanup").catch(() => {});
+    }
+  });
+}
 
 test("serve §6 precedence (M3A2-P4): runtime uncaughtException and unhandledRejection exit 24 in subprocess with cleanup", async () => {
   for (const mode of ["uncaughtException", "unhandledRejection"] as const) {
@@ -1195,38 +1244,44 @@ test("serve §6 precedence (M3A2-P5): fault or failing step during shutdown keep
       releaseBlocker = r;
     });
 
-    const code = await withTimeout(
-      runServe([], {
-        env: { MADC_HOME: home },
-        stdin,
-        stderr: err.stream,
-        exit: (c) => {
-          exitCode = c;
+    const runPromise = runServe([], {
+      env: { MADC_HOME: home },
+      stdin,
+      stderr: err.stream,
+      exit: (c) => {
+        exitCode = c;
+      },
+      agent: echoAgent,
+      shutdownDeadlineMs: 80,
+      exitWriteGraceMs: 100,
+      totalExitBoundMs: 300,
+      socketDeps: {
+        onListenReady: (controls) => {
+          emitError = controls.emitError;
         },
-        agent: echoAgent,
-        shutdownDeadlineMs: 80,
-        exitWriteGraceMs: 100,
-        totalExitBoundMs: 300,
-        socketDeps: {
-          onListenReady: (controls) => {
-            emitError = controls.emitError;
-          },
-        },
-        beforeClose: async () => {
-          emitError?.(Object.assign(new Error("late listener fault"), { code: "EIO" }));
-          await blocker;
-        },
-        onListening: () => {
-          stdin.end();
-        },
-      }),
-      3000,
-      "M3A2-P5 fault during timed-out clean shutdown exits 23",
-    );
-    releaseBlocker();
-    assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
-    assert.equal(exitCode, 23);
-    assert.equal(existsSync(engineLockPath(home)), false);
+      },
+      beforeClose: async () => {
+        emitError?.(Object.assign(new Error("late listener fault"), { code: "EIO" }));
+        await blocker;
+      },
+      onListening: () => {
+        stdin.end();
+      },
+    });
+    try {
+      const code = await withTimeout(
+        runPromise,
+        3000,
+        "M3A2-P5 fault during timed-out clean shutdown exits 23",
+      );
+      assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
+      assert.equal(exitCode, 23);
+      assert.equal(existsSync(engineLockPath(home)), false);
+    } finally {
+      releaseBlocker();
+      stdin.end();
+      await withTimeout(runPromise, 2000, "M3A2-P5 cleanup").catch(() => {});
+    }
   }
 });
 
@@ -1411,3 +1466,70 @@ if (!POSIX) {
     );
   });
 }
+
+test("serve §3 total-exit cap (M3A2-A2): blocked stderr write callback is cut off by totalExitBoundMs (not full exitWriteGraceMs)", async () => {
+  const home = trackedHome();
+  const stdin = new PassThrough();
+  let exitCode: number | null = null;
+  let triggerAt = 0;
+  let exitAt = 0;
+  let releaseBlocker!: () => void;
+  const blocker = new Promise<void>((r) => {
+    releaseBlocker = r;
+  });
+
+  // Stalled stderr stream: never invokes the write callback (simulating a blocked stderr pipe).
+  const pendingCallbacks: Array<() => void> = [];
+  const stalledStderr = new Writable({
+    write(_chunk, _encoding, callback) {
+      pendingCallbacks.push(callback);
+    },
+  });
+
+  const shutdownDeadlineMs = 120;
+  const exitWriteGraceMs = 450;
+  const totalExitBoundMs = 180;
+
+  const runPromise = runServe([], {
+    env: { MADC_HOME: home },
+    stdin,
+    stderr: stalledStderr,
+    exit: (c) => {
+      exitCode = c;
+      exitAt = Date.now();
+    },
+    agent: echoAgent,
+    shutdownDeadlineMs,
+    exitWriteGraceMs,
+    totalExitBoundMs,
+    beforeClose: () => blocker,
+    onListening: () => {
+      triggerAt = Date.now();
+      stdin.end();
+    },
+  });
+
+  try {
+    const code = await withTimeout(
+      runPromise,
+      2000,
+      "M3A2-A2 totalExitBoundMs cap on blocked stderr",
+    );
+    const elapsed = exitAt - triggerAt;
+    assert.equal(code, SERVE_EXIT.SHUTDOWN_DEADLINE);
+    assert.equal(exitCode, 23);
+    // With the cap (serve.ts:283), exit fires around totalExitBoundMs (180 ms).
+    // Without the cap (Argus mutant I), exit waits the full exitWriteGraceMs after the
+    // shutdown deadline (~120 + 450 = 570 ms), failing this upper bound.
+    assert.ok(
+      elapsed <= totalExitBoundMs + 150,
+      `expected exit within ${totalExitBoundMs + 150}ms (totalExitBoundMs cap), got ${elapsed}ms`,
+    );
+    assert.equal(existsSync(engineLockPath(home)), false, "engine.lock released on exit 23");
+  } finally {
+    releaseBlocker();
+    stdin.end();
+    for (const cb of pendingCallbacks) cb();
+    await withTimeout(runPromise, 2000, "M3A2-A2 cleanup").catch(() => {});
+  }
+});
