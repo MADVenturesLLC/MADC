@@ -917,21 +917,25 @@ kbd {
     --madc-glass-fill: var(--madc-lighter);
     --madc-glass-fill-strong: var(--madc-lighter);
   }
-  .glass {
+  .glass,
+  .palette.glass {
     backdrop-filter: none;
   }
 }
 
 @supports not (backdrop-filter: blur(1px)) {
-  .glass {
+  .glass,
+  .palette.glass {
     background: var(--madc-lighter);
   }
 }
 
 @media (prefers-reduced-motion: reduce) {
   * {
-    transition: none;
-    animation: none;
+    /* biome-ignore lint/complexity/noImportantStyles: spec §3.4 mandatory reduced-motion override */
+    transition: none !important;
+    /* biome-ignore lint/complexity/noImportantStyles: spec §3.4 mandatory reduced-motion override */
+    animation: none !important;
   }
 }
 

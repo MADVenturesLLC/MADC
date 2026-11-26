@@ -756,6 +756,20 @@ test("M3-A3 §9.1–§9.3 static CSS, tokens, zero-network, zero-HTML-sink, no d
   // §9.3: Forced-colors uses .pill .pill-glyph, never .glyph.
   assert.doesNotMatch(css, /\.glyph\b/);
   assert.match(css, /@media\s*\(forced-colors:\s*active\)[\s\S]*\.pill\s+\.pill-glyph/);
+
+  // N1 & N3: Accessibility fallbacks cover .palette.glass and reduced-motion uses !important.
+  assert.match(
+    css,
+    /@media\s*\(prefers-reduced-transparency:\s*reduce\)[\s\S]*\.glass,\s*\.palette\.glass\s*\{\s*backdrop-filter:\s*none;\s*\}/,
+  );
+  assert.match(
+    css,
+    /@supports\s+not\s*\(backdrop-filter:\s*blur\(1px\)\)\s*\{\s*\.glass,\s*\.palette\.glass\s*\{\s*background:\s*var\(--madc-lighter\);\s*\}\s*\}/,
+  );
+  assert.match(
+    css,
+    /@media\s*\(prefers-reduced-motion:\s*reduce\)[\s\S]*transition:\s*none\s*!important;[\s\S]*animation:\s*none\s*!important;/,
+  );
 });
 
 test("M3-A3 §9.4, §9.5, §9.2, §9.13 Room table initial state, on-demand session/read, and Receipts well honesty", async () => {
@@ -1228,9 +1242,33 @@ test("M3-A3 review fixes: H1 single keydown listener, M1 inert-aware focus, L3 C
     "single ArrowDown must step exactly one enabled row",
   );
 
-  // §9.10: Tab / Shift+Tab trapped while open, Home jumps to first enabled row.
-  doc.emit("keydown", { key: "Tab", preventDefault() {} });
-  assert.equal(doc.activeElement, byId.get("palette-input"));
+  // §9.10: Tab / Shift+Tab trapped while open (preventDefault + focus stays on input), Home jumps to first enabled row.
+  const palInput = byId.get("palette-input");
+  const focusBeforeTab = palInput?.focusedCount ?? 0;
+  let tabPrevented = 0;
+  doc.emit("keydown", {
+    key: "Tab",
+    shiftKey: false,
+    preventDefault() {
+      tabPrevented += 1;
+    },
+  });
+  assert.equal(tabPrevented, 1, "Tab must call preventDefault while palette is open");
+  assert.equal(palInput?.focusedCount, focusBeforeTab + 1);
+  assert.equal(doc.activeElement, palInput);
+
+  let shiftTabPrevented = 0;
+  doc.emit("keydown", {
+    key: "Tab",
+    shiftKey: true,
+    preventDefault() {
+      shiftTabPrevented += 1;
+    },
+  });
+  assert.equal(shiftTabPrevented, 1, "Shift+Tab must call preventDefault while palette is open");
+  assert.equal(palInput?.focusedCount, focusBeforeTab + 2);
+  assert.equal(doc.activeElement, palInput);
+
   doc.emit("keydown", { key: "End", preventDefault() {} });
   assert.equal(
     byId.get("palette-input")?.getAttribute("aria-activedescendant"),
@@ -1239,14 +1277,28 @@ test("M3-A3 review fixes: H1 single keydown listener, M1 inert-aware focus, L3 C
   doc.emit("keydown", { key: "Home", preventDefault() {} });
   assert.equal(byId.get("palette-input")?.getAttribute("aria-activedescendant"), "cmd-connect");
 
-  // M1: Focus Room clears inert BEFORE focusing Room button.
-  doc.emit("keydown", { key: "ArrowDown", preventDefault() {} }); // cmd-focus-engine
-  doc.emit("keydown", { key: "ArrowDown", preventDefault() {} }); // cmd-focus-room
-  assert.equal(byId.get("palette-input")?.getAttribute("aria-activedescendant"), "cmd-focus-room");
-  doc.emit("keydown", { key: "Enter", preventDefault() {} });
-  assert.equal(byId.get("palette")?.hidden, true);
-  assert.equal(byId.get("focus-bar")?.inert, false);
-  assert.equal(doc.activeElement, buttons[1], "Focus Room must focus Room button");
+  // M1 + L-M1b: All four Focus commands clear inert BEFORE focusing the target button.
+  const focusCases: Array<{ cmdId: string; buttonIndex: number; label: string }> = [
+    { cmdId: "cmd-focus-engine", buttonIndex: 0, label: "Focus Engine" },
+    { cmdId: "cmd-focus-room", buttonIndex: 1, label: "Focus Room" },
+    { cmdId: "cmd-focus-decisions", buttonIndex: 2, label: "Focus Decisions" },
+    { cmdId: "cmd-focus-search", buttonIndex: 3, label: "Focus Search" },
+  ];
+  for (const fc of focusCases) {
+    if (byId.get("palette")?.hidden) {
+      doc.emit("keydown", { key: "k", metaKey: true, ctrlKey: false, preventDefault() {} });
+    }
+    let steps = 0;
+    while (byId.get("palette-input")?.getAttribute("aria-activedescendant") !== fc.cmdId) {
+      doc.emit("keydown", { key: "ArrowDown", preventDefault() {} });
+      steps += 1;
+      assert.ok(steps < 12, `could not reach ${fc.cmdId}`);
+    }
+    doc.emit("keydown", { key: "Enter", preventDefault() {} });
+    assert.equal(byId.get("palette")?.hidden, true);
+    assert.equal(byId.get("focus-bar")?.inert, false);
+    assert.equal(doc.activeElement, buttons[fc.buttonIndex], `${fc.label} must focus button`);
+  }
 
   // §9.10: Non-Mac Ctrl+K and empty state ("No matching command", Enter is no-op).
   const { doc: linDoc, byId: linById } = createShellHarness();
@@ -1395,11 +1447,11 @@ test("M3-A3 review fixes: §9.6 G3/G6, §9.8 protocol mismatch, §9.9 R4/disconn
     /expected madc-m1\/1 · got madc-m0\/1/,
   );
 
-  // §9.9: disconnect_engine rejection ("engine state lock poisoned") + R4 variants + N5 + L4.
+  // §9.9: disconnect_engine rejection ("engine state lock poisoned") + real R4 variants + N5 + L4.
   for (const r4Err of [
-    "engine request failed: broken pipe",
-    "engine response invalid: unexpected EOF",
-    "engine request task failed: join error",
+    "engine socket closed before response",
+    "RPC room/inspect timed out waiting for reply",
+    "socket read failed: broken pipe",
   ]) {
     const { doc, byId } = createShellHarness();
     const deferred: {
@@ -1407,7 +1459,8 @@ test("M3-A3 review fixes: §9.6 G3/G6, §9.8 protocol mismatch, §9.9 R4/disconn
       rejectDisc: ((e: unknown) => void) | null;
     } = { resolveDisc: null, rejectDisc: null };
     let discCalls = 0;
-    let rpcCalls = 0;
+    let inspectCalls = 0;
+    const rpcMethods: string[] = [];
     const ctrl = bindDesktopShell(doc, (cmd, args) => {
       if (cmd === "connect_engine") {
         return Promise.resolve({
@@ -1426,23 +1479,33 @@ test("M3-A3 review fixes: §9.6 G3/G6, §9.8 protocol mismatch, §9.9 R4/disconn
           deferred.rejectDisc = rej;
         });
       }
-      if (cmd === "rpc_request" && args?.method === "room/inspect") {
-        rpcCalls += 1;
-        if (rpcCalls === 1) {
-          return Promise.resolve({
-            room: {
-              counts: { threads: 0, pass: 0, warn: 0, fail: 0, openDecisions: 0 },
-              threads: [],
-            },
-          });
+      if (cmd === "rpc_request") {
+        const method = String(args?.method ?? "");
+        rpcMethods.push(method);
+        if (method === "room/inspect") {
+          inspectCalls += 1;
+          if (inspectCalls === 1) {
+            return Promise.resolve({
+              room: {
+                counts: { threads: 0, pass: 0, warn: 0, fail: 0, openDecisions: 0 },
+                threads: [],
+              },
+            });
+          }
+          return Promise.reject(r4Err);
         }
-        return Promise.reject(r4Err);
+        return Promise.resolve({ threadId: "thr_unexpected", events: [], chainOk: true });
       }
       return Promise.reject(new Error(`unexpected ${cmd}`));
     });
+
+    // selectThread inert when IDLE (not CONNECTED).
+    await ctrl.selectThread("thr_while_idle");
+    assert.equal(rpcMethods.filter((m) => m === "session/read").length, 0);
+
     await ctrl.connect();
 
-    // selectThread inert while disconnectPending is true.
+    // Trigger R4 -> disconnectPending is true.
     const insp = ctrl.inspectRoom();
     await new Promise((r) => setTimeout(r, 0));
     assert.equal(discCalls, 1);
@@ -1456,7 +1519,11 @@ test("M3-A3 review fixes: §9.6 G3/G6, §9.8 protocol mismatch, §9.9 R4/disconn
     ctrl.closePalette();
 
     await ctrl.selectThread("thr_inert");
-    assert.equal(rpcCalls, 2, "selectThread must be inert while disconnectPending");
+    assert.equal(
+      rpcMethods.filter((m) => m === "session/read").length,
+      0,
+      "selectThread must be inert while disconnectPending",
+    );
 
     deferred.rejectDisc?.("engine state lock poisoned");
     await insp;
@@ -1464,6 +1531,63 @@ test("M3-A3 review fixes: §9.6 G3/G6, §9.8 protocol mismatch, §9.9 R4/disconn
     assert.equal(byId.get("output")?.textContent, "engine state lock poisoned");
     assert.equal(byId.get("connect-btn")?.disabled, false);
     assert.equal(discCalls, 1, "no retry on disconnect_engine reject");
+
+    await ctrl.selectThread("thr_while_failed");
+    assert.equal(
+      rpcMethods.filter((m) => m === "session/read").length,
+      0,
+      "selectThread must be inert when FAILED",
+    );
+  }
+
+  // N5: selectThread must ALSO be inert during user-initiated disconnect (state stays CONNECTED while disconnectPending).
+  {
+    const { doc } = createShellHarness();
+    const deferred: { resolveDisc: (() => void) | null } = { resolveDisc: null };
+    const rpcMethods: string[] = [];
+    const ctrl = bindDesktopShell(doc, (cmd, args) => {
+      if (cmd === "connect_engine") {
+        return Promise.resolve({
+          socketPath: "/tmp/e.sock",
+          reusedExisting: false,
+          protocolVersion: PROTOCOL_VERSION,
+          serverName: "madc-engine",
+          serverVersion: "0.0.0",
+          coldStartMs: 10,
+        });
+      }
+      if (cmd === "disconnect_engine") {
+        return new Promise<void>((res) => {
+          deferred.resolveDisc = res;
+        });
+      }
+      if (cmd === "rpc_request") {
+        const method = String(args?.method ?? "");
+        rpcMethods.push(method);
+        if (method === "room/inspect") {
+          return Promise.resolve({
+            room: {
+              counts: { threads: 0, pass: 0, warn: 0, fail: 0, openDecisions: 0 },
+              threads: [],
+            },
+          });
+        }
+        return Promise.resolve({ threadId: "thr_unexpected", events: [], chainOk: true });
+      }
+      return Promise.reject(new Error(`unexpected ${cmd}`));
+    });
+    await ctrl.connect();
+    const userDisc = ctrl.disconnect();
+    assert.equal(ctrl.getConnectionState(), "CONNECTED");
+    await ctrl.selectThread("thr_during_user_disconnect");
+    assert.equal(
+      rpcMethods.filter((m) => m === "session/read").length,
+      0,
+      "selectThread must be inert while user disconnect is pending",
+    );
+    deferred.resolveDisc?.();
+    await userDisc;
+    assert.equal(ctrl.getConnectionState(), "DISCONNECTED");
   }
 
   // N5 + L4: earlier-epoch room/inspect R2 & R4 rejections do not clear cache or change state/disconnect.
