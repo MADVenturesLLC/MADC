@@ -1542,3 +1542,65 @@ test("serve §3 total-exit cap (M3A2-A2): blocked stderr write callback is cut o
     await withTimeout(runPromise, 2000, "M3A2-A2 cleanup").catch(() => {});
   }
 });
+
+test("serve exit 0 (M3A2-C1): stdin error is treated as EOF", async () => {
+  const home = trackedHome();
+  const lockPath = engineLockPath(home);
+  const sockPath = engineSocketPath(home);
+  const err = captureStream();
+  const stdin = new PassThrough();
+  let exitCode: number | null = null;
+  let triggerAt = 0;
+  let exitAt = 0;
+  let resolveListening!: () => void;
+  const listening = new Promise<void>((r) => {
+    resolveListening = r;
+  });
+
+  const uncaught: unknown[] = [];
+  const onUncaught = (e: unknown): void => {
+    uncaught.push(e);
+  };
+  process.on("uncaughtException", onUncaught);
+
+  const runPromise = runServe([], {
+    env: { MADC_HOME: home },
+    stdin,
+    stderr: err.stream,
+    exit: (c) => {
+      exitCode = c;
+      exitAt = Date.now();
+    },
+    agent: echoAgent,
+    onListening: () => {
+      resolveListening();
+    },
+  });
+
+  try {
+    await withTimeout(listening, 5000, "M3A2-C1 serve listening");
+    assert.equal(existsSync(lockPath), true, "engine.lock held while listening");
+    if (POSIX) {
+      assert.equal(existsSync(sockPath), true, "engine.sock bound while listening");
+    }
+
+    // Trigger stdin error without calling stdin.end() first (FOUNDER-B / amendment 1 §3(a)).
+    triggerAt = Date.now();
+    stdin.emit("error", new Error("EPIPE-sim"));
+
+    const code = await withTimeout(runPromise, 6000, "M3A2-C1 exit on stdin error");
+    const elapsed = exitAt - triggerAt;
+    assert.equal(uncaught.length, 0, `expected no uncaught exception, got: ${String(uncaught[0])}`);
+    assert.equal(code, SERVE_EXIT.OK);
+    assert.equal(exitCode, 0);
+    assert.ok(elapsed <= 6000, `expected exit within 6000ms pin bound, got ${elapsed}ms`);
+    assert.equal(existsSync(sockPath), false, "engine.sock removed after stdin error exit");
+    assert.equal(existsSync(lockPath), false, "engine.lock released after stdin error exit");
+  } finally {
+    process.removeListener("uncaughtException", onUncaught);
+    if (!stdin.destroyed) {
+      stdin.end();
+    }
+    await withTimeout(runPromise, 2000, "M3A2-C1 cleanup").catch(() => {});
+  }
+});
