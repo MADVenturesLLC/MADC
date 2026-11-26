@@ -20,4 +20,15 @@ export type EvidenceReceipt =
 
 export type EvidenceTone = "verified" | "neutral" | "warn" | "fail";
 
+export type PillLabel =
+  | "VERIFIED"
+  | "NO RECEIPT"
+  | "IDLE"
+  | "CONNECTING"
+  | "CONNECTED"
+  | "DISCONNECTED"
+  | "UNVERIFIED"
+  | "STOPPED"
+  | "FAILED";
+
 export { evidenceTone, isVerifiedReceipt } from "../ui/shell.js";

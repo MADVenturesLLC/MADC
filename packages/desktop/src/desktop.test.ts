@@ -9,12 +9,23 @@
  * - Import-rule honesty guard (`PLAN-madc-M0-build-plan.md:105`, `ROADMAP-madc-post-M0.md:140`)
  */
 import assert from "node:assert/strict";
-import { readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import { join, relative } from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION } from "@madc/engine/client";
-import { bindDesktopShell, type ShellDocument, type ShellElement } from "../ui/shell.js";
+import {
+  bindDesktopShell,
+  createPaletteState,
+  EXPECTED_PROTOCOL_VERSION,
+  filterCommands,
+  lockOwnerGuidanceFromStderr,
+  PALETTE_COMMANDS,
+  type ShellDocument,
+  type ShellElement,
+  serveExitFromCode,
+  stepPalette,
+} from "../ui/shell.js";
 import {
   classifyServeExit,
   createFocusBarState,
@@ -141,18 +152,25 @@ test("M3-A2 shipped UI script (M3A2-M5) and CSP/no-inline guard (M3A2-M4)", asyn
   type FakeEl = ShellElement & {
     readonly attrs: Map<string, string>;
     readonly listeners: Map<string, Array<(ev: unknown) => void>>;
+    readonly children: FakeEl[];
     focusedCount: number;
     emit(type: string, ev?: unknown): void;
   };
+  let activeEl: FakeEl | null = null;
   const makeEl = (attrsInit: Record<string, string> = {}, text = ""): FakeEl => {
     const attrs = new Map(Object.entries(attrsInit));
     const listeners = new Map<string, Array<(ev: unknown) => void>>();
+    const children: FakeEl[] = [];
     const el: FakeEl = {
       attrs,
       listeners,
+      children,
       className: "",
       textContent: text,
       tabIndex: 0,
+      hidden: false,
+      disabled: false,
+      inert: false,
       focusedCount: 0,
       setAttribute(name, value) {
         attrs.set(name, value);
@@ -160,8 +178,25 @@ test("M3-A2 shipped UI script (M3A2-M5) and CSP/no-inline guard (M3A2-M4)", asyn
       getAttribute(name) {
         return attrs.get(name) ?? null;
       },
+      removeAttribute(name) {
+        attrs.delete(name);
+      },
+      hasAttribute(name) {
+        return attrs.has(name);
+      },
+      appendChild(child) {
+        children.push(child as FakeEl);
+        el.textContent = children.map((c) => c.textContent ?? "").join("");
+        return child;
+      },
+      replaceChildren(...nodes) {
+        children.length = 0;
+        for (const n of nodes) children.push(n as FakeEl);
+        el.textContent = children.map((c) => c.textContent ?? "").join("");
+      },
       focus() {
         el.focusedCount += 1;
+        activeEl = el;
       },
       addEventListener(type, listener) {
         const list = listeners.get(type) ?? [];
@@ -192,12 +227,33 @@ test("M3-A2 shipped UI script (M3A2-M5) and CSP/no-inline guard (M3A2-M4)", asyn
     ["connection-status", statusEl],
     ["output", outputEl],
     ["connect-btn", connectBtn],
+    ["main-content", makeEl()],
+    ["room-counts", makeEl()],
+    ["room-rows", makeEl()],
+    ["receipt-rows", makeEl()],
+    ["engine-pill", makeEl()],
+    ["kv-socket", makeEl()],
+    ["kv-protocol", makeEl()],
+    ["kv-server", makeEl()],
+    ["kv-cold-start", makeEl()],
+    ["kv-reused", makeEl()],
+    ["palette", makeEl()],
+    ["palette-input", makeEl()],
+    ["palette-list", makeEl()],
+    ["palette-live", makeEl()],
+    ["palette-keycap", makeEl()],
   ]);
   const doc: ShellDocument = {
+    get activeElement() {
+      return activeEl;
+    },
     getElementById(id) {
       const el = byId.get(id);
       if (!el) throw new Error(`missing element #${id}`);
       return el;
+    },
+    createElement() {
+      return makeEl();
     },
   };
 
@@ -251,7 +307,7 @@ test("M3-A2 shipped UI script (M3A2-M5) and CSP/no-inline guard (M3A2-M4)", asyn
     invokes.map((c) => c.cmd),
     ["connect_engine", "rpc_request"],
   );
-  assert.equal(statusEl.className, "status-neutral");
+  assert.equal(statusEl.getAttribute("data-tone"), "neutral");
   assert.match(statusEl.textContent ?? "", /neutral/);
 
   // Failure path: sets fail class and never auto-retries.
@@ -259,7 +315,7 @@ test("M3-A2 shipped UI script (M3A2-M5) and CSP/no-inline guard (M3A2-M4)", asyn
   shouldFail = true;
   await controller.connect();
   assert.equal(invokes.length, 1, "no automatic retry on failure");
-  assert.equal(statusEl.className, "status-fail");
+  assert.equal(statusEl.getAttribute("data-tone"), "fail");
 });
 
 test("M3-A2 amendment 1 §6 exit code classification and §2a manual lock guidance", () => {
@@ -429,4 +485,711 @@ test("M3-A2 import-rule honesty guard: packages/desktop/src imports only @madc/c
     }
   }
   assert.deepEqual(violations, []);
+});
+
+// ---------------------------------------------------------------------------
+// M3-A3 Precision Instrument Glass acceptance tests (pin §9 items 1–13 & N5)
+// ---------------------------------------------------------------------------
+
+type TestFakeEl = ShellElement & {
+  readonly attrs: Map<string, string>;
+  readonly listeners: Map<string, Array<(ev: unknown) => void>>;
+  readonly children: TestFakeEl[];
+  focusedCount: number;
+  emit(type: string, ev?: unknown): void;
+};
+
+function createShellHarness() {
+  let activeEl: TestFakeEl | null = null;
+  const makeEl = (attrsInit: Record<string, string> = {}, text = ""): TestFakeEl => {
+    const attrs = new Map(Object.entries(attrsInit));
+    const listeners = new Map<string, Array<(ev: unknown) => void>>();
+    const children: TestFakeEl[] = [];
+    const el: TestFakeEl = {
+      attrs,
+      listeners,
+      children,
+      className: "",
+      textContent: text,
+      tabIndex: 0,
+      hidden: false,
+      disabled: false,
+      inert: false,
+      focusedCount: 0,
+      setAttribute(name, value) {
+        attrs.set(name, value);
+      },
+      getAttribute(name) {
+        return attrs.get(name) ?? null;
+      },
+      removeAttribute(name) {
+        attrs.delete(name);
+      },
+      hasAttribute(name) {
+        return attrs.has(name);
+      },
+      appendChild(child) {
+        children.push(child as TestFakeEl);
+        el.textContent = children.map((c) => c.textContent ?? "").join("");
+        return child;
+      },
+      replaceChildren(...nodes) {
+        children.length = 0;
+        for (const n of nodes) children.push(n as TestFakeEl);
+        el.textContent = children.map((c) => c.textContent ?? "").join("");
+      },
+      focus() {
+        el.focusedCount += 1;
+        activeEl = el;
+      },
+      addEventListener(type, listener) {
+        const list = listeners.get(type) ?? [];
+        list.push(listener);
+        listeners.set(type, list);
+      },
+      querySelectorAll() {
+        return [];
+      },
+      emit(type, ev = {}) {
+        for (const fn of listeners.get(type) ?? []) fn(ev);
+      },
+    };
+    return el;
+  };
+
+  const buttons = DEFAULT_FOCUS_BAR_ITEMS.map((item) =>
+    makeEl({ "data-focus-id": item.id }, item.label),
+  );
+  const bar = makeEl();
+  bar.querySelectorAll = () => buttons;
+
+  const byId = new Map<string, TestFakeEl>([
+    ["focus-bar", bar],
+    ["connection-status", makeEl({}, "idle")],
+    ["output", makeEl({}, "ready")],
+    ["connect-btn", makeEl({}, "Connect")],
+    ["main-content", makeEl()],
+    ["room-counts", makeEl()],
+    ["room-rows", makeEl()],
+    ["receipt-rows", makeEl()],
+    ["engine-pill", makeEl()],
+    ["kv-socket", makeEl()],
+    ["kv-protocol", makeEl()],
+    ["kv-server", makeEl()],
+    ["kv-cold-start", makeEl()],
+    ["kv-reused", makeEl()],
+    ["palette", makeEl()],
+    ["palette-input", makeEl()],
+    ["palette-list", makeEl()],
+    ["palette-live", makeEl()],
+    ["palette-keycap", makeEl()],
+  ]);
+
+  const docListeners = new Map<string, Array<(ev: unknown) => void>>();
+  const doc: ShellDocument & { emit(type: string, ev?: unknown): void } = {
+    get activeElement() {
+      return activeEl;
+    },
+    getElementById(id) {
+      const el = byId.get(id);
+      if (!el) throw new Error(`missing element #${id}`);
+      return el;
+    },
+    createElement() {
+      return makeEl();
+    },
+    addEventListener(type, listener) {
+      const list = docListeners.get(type) ?? [];
+      list.push(listener);
+      docListeners.set(type, list);
+    },
+    emit(type, ev = {}) {
+      for (const fn of docListeners.get(type) ?? []) fn(ev);
+    },
+  };
+
+  return { doc, byId, buttons };
+}
+
+test("M3-A3 §9.1–§9.3 static CSS, tokens, zero-network, zero-HTML-sink, no decorative green, glass & forced-colors", () => {
+  const uiDir = fileURLToPath(new URL("../ui/", import.meta.url));
+  const css = readFileSync(join(uiDir, "styles.css"), "utf8");
+  const html = readFileSync(join(uiDir, "index.html"), "utf8");
+  const shellJs = readFileSync(join(uiDir, "shell.js"), "utf8");
+  const appJs = readFileSync(join(uiDir, "app.js"), "utf8");
+
+  // Forbidden files must not exist.
+  assert.equal(existsSync(join(uiDir, "tokens.css")), false);
+  assert.equal(existsSync(join(uiDir, "palette.js")), false);
+  assert.equal(existsSync(fileURLToPath(new URL("./palette.ts", import.meta.url))), false);
+
+  // §9.1: exact 11 color tokens + §3.2 tokens in :root.
+  const rootMatch = /:root\s*\{([\s\S]*?)\n\}/.exec(css);
+  assert.ok(rootMatch !== null, ":root block must exist");
+  const rootBody = rootMatch[1] ?? "";
+  const expectedTokens = [
+    ["--madc-darker", "#0e0e14"],
+    ["--madc-bg", "#1a1b26"],
+    ["--madc-lighter", "#24283b"],
+    ["--madc-fg", "#a9b1d6"],
+    ["--madc-bright", "#c0caf5"],
+    ["--madc-muted", "#565f89"],
+    ["--madc-border", "#414868"],
+    ["--madc-accent", "#7aa2f7"],
+    ["--madc-green", "#9ece6a"],
+    ["--madc-red", "#f7768e"],
+    ["--madc-yellow", "#e0af68"],
+    ["--madc-radius-sm", "3px"],
+    ["--madc-radius-md", "4px"],
+    ["--madc-radius-lg", "6px"],
+    ["--madc-glass-blur", "blur(14px)"],
+    ["--madc-glass-blur-strong", "blur(18px) saturate(120%)"],
+  ];
+  for (const [token, value] of expectedTokens) {
+    assert.ok(rootBody.includes(`${token}: ${value};`), `missing ${token}: ${value}`);
+  }
+
+  // No hex literal outside :root in styles.css, or anywhere in index.html / ui/*.js.
+  const cssOutsideRoot = css.replace(/:root\s*\{[\s\S]*?\n\}/, "");
+  assert.doesNotMatch(cssOutsideRoot, /#[0-9a-fA-F]{3,8}\b/, "no hex outside :root");
+  assert.doesNotMatch(html, /#[0-9a-fA-F]{3,8}\b/, "no hex in index.html");
+  assert.doesNotMatch(shellJs, /#[0-9a-fA-F]{3,8}\b/, "no hex in shell.js");
+  assert.doesNotMatch(appJs, /#[0-9a-fA-F]{3,8}\b/, "no hex in app.js");
+
+  // Zero network URLs & zero HTML sinks.
+  for (const [name, content] of [
+    ["styles.css", css],
+    ["index.html", html],
+    ["shell.js", shellJs],
+    ["app.js", appJs],
+  ] as const) {
+    assert.doesNotMatch(content, /https?:\/\//i, `no http(s):// in ${name}`);
+  }
+  assert.doesNotMatch(
+    css,
+    /(?:url\(\s*["']?|@import\s+["']?)\/\//i,
+    "no protocol-relative CSS url",
+  );
+  assert.doesNotMatch(html, /(?:src|href)\s*=\s*["']\/\//i, "no protocol-relative HTML src/href");
+  for (const [name, content] of [
+    ["shell.js", shellJs],
+    ["app.js", appJs],
+  ] as const) {
+    assert.doesNotMatch(
+      content,
+      /\b(innerHTML|outerHTML|insertAdjacentHTML|document\.write)\b/,
+      `no HTML sink in ${name}`,
+    );
+  }
+
+  // Vendored fonts + licenses exist and total <= 1 MB.
+  const fontsDir = join(uiDir, "fonts");
+  const expectedFonts = [
+    "IBMPlexSans-Regular.woff2",
+    "IBMPlexSans-Medium.woff2",
+    "IBMPlexSans-SemiBold.woff2",
+    "JetBrainsMono-Regular.woff2",
+    "JetBrainsMono-Medium.woff2",
+    "JetBrainsMono-SemiBold.woff2",
+  ];
+  let totalBytes = 0;
+  for (const f of expectedFonts) {
+    const p = join(fontsDir, f);
+    assert.equal(existsSync(p), true, `missing font ${f}`);
+    totalBytes += statSync(p).size;
+    assert.ok(
+      css.includes(`url("./fonts/${f}") format("woff2")`),
+      `@font-face must reference ./fonts/${f}`,
+    );
+  }
+  assert.equal(existsSync(join(fontsDir, "LICENSE-IBM-PLEX.txt")), true);
+  assert.equal(existsSync(join(fontsDir, "LICENSE-JETBRAINS-MONO.txt")), true);
+  assert.ok(totalBytes <= 1024 * 1024, `fonts exceed 1MB (${totalBytes})`);
+  assert.match(css, /font-display:\s*block;/);
+
+  // §9.2: No decorative green & no legacy status classes.
+  assert.doesNotMatch(css, /\.(status-|tone-|green\b|ok\b|success\b)/);
+  const ruleMatches = cssOutsideRoot.matchAll(/([^{}@]+)\{([^{}]+)\}/g);
+  for (const m of ruleMatches) {
+    const selector = (m[1] ?? "").trim();
+    const body = m[2] ?? "";
+    if (/#9ece6a|158\s+206\s+106|--madc-green|--madc-tone-fill-verified/.test(body)) {
+      assert.ok(
+        selector.includes('[data-tone="verified"]'),
+        `green token used outside [data-tone="verified"]: ${selector}`,
+      );
+    }
+    if (/backdrop-filter\s*:/.test(body)) {
+      assert.equal(selector.includes(".well"), false, "well must never blur");
+      assert.ok(selector.includes(".glass") || selector.includes(".palette"));
+    }
+    if (/^\.pill\[data-tone=/.test(selector)) {
+      for (const line of body.split(";")) {
+        const prop = line.split(":")[0]?.trim();
+        if (!prop) continue;
+        assert.ok(
+          ["color", "background", "background-color", "border-color"].includes(prop),
+          `pill[data-tone] may only set colour properties, got ${prop}`,
+        );
+      }
+    }
+  }
+
+  // §9.3: Forced-colors uses .pill .pill-glyph, never .glyph.
+  assert.doesNotMatch(css, /\.glyph\b/);
+  assert.match(css, /@media\s*\(forced-colors:\s*active\)[\s\S]*\.pill\s+\.pill-glyph/);
+});
+
+test("M3-A3 §9.4, §9.5, §9.2, §9.13 Room table initial state, on-demand session/read, and Receipts well honesty", async () => {
+  const { doc, byId } = createShellHarness();
+  const calls: Array<{ cmd: string; args: Record<string, unknown> | undefined }> = [];
+  let sessionReadMode: "verified" | "torn" | "short-hash" | "not-found" = "verified";
+
+  const controller = bindDesktopShell(doc, async (cmd, args) => {
+    calls.push({ cmd, args });
+    if (cmd === "connect_engine") {
+      return {
+        socketPath: "/tmp/madc/engine.sock",
+        reusedExisting: false,
+        protocolVersion: PROTOCOL_VERSION,
+        serverName: "madc-engine",
+        serverVersion: "0.0.0",
+        coldStartMs: 18,
+      };
+    }
+    if (cmd === "rpc_request" && args?.method === "room/inspect") {
+      return {
+        room: {
+          home: "/tmp/madc",
+          counts: { threads: 4, pass: 1, warn: 1, fail: 2, openDecisions: 0 },
+          threads: [
+            {
+              threadId: "thr_pass",
+              path: "/tmp/madc/sessions/thr_pass.jsonl",
+              seatId: "kimi",
+              level: "pass",
+              chain: { ok: true },
+              handoff: { inbound: null, outboundCount: 0, oneWay: false },
+              worktree: { open: null, close: null, missing: false },
+              openDecisions: [],
+              findings: [],
+            },
+            {
+              threadId: "thr_warn",
+              path: "/tmp/madc/sessions/thr_warn.jsonl",
+              seatId: "codex",
+              level: "warn",
+              chain: { ok: true },
+              handoff: { inbound: null, outboundCount: 0, oneWay: false },
+              worktree: { open: null, close: null, missing: false },
+              openDecisions: [],
+              findings: [{ level: "warn", code: "W_TEST", detail: "stale lock" }],
+            },
+            {
+              threadId: "thr_torn",
+              path: "/tmp/madc/sessions/thr_torn.jsonl",
+              seatId: "claude",
+              level: "fail",
+              chain: { ok: false, kind: "torn-tail", line: 7, reason: "truncated line" },
+              handoff: { inbound: null, outboundCount: 0, oneWay: false },
+              worktree: { open: null, close: null, missing: false },
+              openDecisions: [],
+              findings: [],
+            },
+            {
+              threadId: "thr_int",
+              path: "/tmp/madc/sessions/thr_int.jsonl",
+              seatId: "gemini",
+              level: "fail",
+              chain: { ok: false, kind: "integrity", line: 11, reason: "prev hash mismatch" },
+              handoff: { inbound: null, outboundCount: 0, oneWay: false },
+              worktree: { open: null, close: null, missing: false },
+              openDecisions: [],
+              findings: [],
+            },
+          ],
+        },
+      };
+    }
+    if (cmd === "rpc_request" && args?.method === "session/read") {
+      if (sessionReadMode === "verified") {
+        return {
+          threadId: "thr_pass",
+          chainOk: true,
+          events: [{ seq: 1, hash: "a".repeat(64) }],
+        };
+      }
+      if (sessionReadMode === "torn") {
+        return { threadId: "thr_torn", chainOk: false, events: [] };
+      }
+      if (sessionReadMode === "short-hash") {
+        return { threadId: "thr_pass", chainOk: true, events: [{ seq: 1, hash: "short" }] };
+      }
+      throw 'engine RPC error: {"code":-32002,"message":"ThreadNotFound"}';
+    }
+    throw new Error(`unexpected ${cmd}`);
+  });
+
+  // §9.13: Receipts well empty on startup, no fake rows.
+  const receiptRowsEl = byId.get("receipt-rows");
+  assert.equal(receiptRowsEl?.children.length, 0);
+  assert.doesNotMatch(receiptRowsEl?.textContent ?? "", /servedModel|repo head|engine\.lock/);
+
+  // Connect + room/inspect: no session/read invoked, no verified tone anywhere.
+  await controller.connect();
+  assert.equal(
+    calls.filter((c) => c.cmd === "rpc_request" && c.args?.method === "session/read").length,
+    0,
+  );
+  assert.equal(byId.get("connection-status")?.getAttribute("data-tone"), "neutral");
+  assert.equal(
+    byId.get("room-counts")?.textContent,
+    "4 threads · 1 pass · 1 warn · 2 fail · 0 open decisions",
+  );
+
+  const roomRows = byId.get("room-rows")?.children ?? [];
+  assert.equal(roomRows.length, 4);
+  assert.equal(roomRows[0]?.getAttribute("data-tone"), "neutral");
+  assert.equal(roomRows[1]?.getAttribute("data-tone"), "warn");
+  assert.equal(roomRows[2]?.getAttribute("data-tone"), "fail");
+  assert.match(roomRows[2]?.textContent ?? "", /torn tail/);
+  assert.match(roomRows[2]?.textContent ?? "", /crash residue, not tamper/);
+  assert.equal(roomRows[3]?.getAttribute("data-tone"), "fail");
+  assert.match(roomRows[3]?.textContent ?? "", /prev hash mismatch/);
+
+  // §9.5: Click thr_pass -> session/read once -> verified.
+  roomRows[0]?.emit("click");
+  await new Promise((r) => setTimeout(r, 0));
+  const updatedRows = byId.get("room-rows")?.children ?? [];
+  assert.equal(updatedRows[0]?.getAttribute("data-tone"), "verified");
+  assert.equal(updatedRows[0]?.children[3]?.textContent, "1");
+
+  // Torn tail with chainOk: false stays fail, events stays "—", adds chainOk false chip.
+  sessionReadMode = "torn";
+  updatedRows[2]?.emit("keydown", { key: "Enter", preventDefault() {} });
+  await new Promise((r) => setTimeout(r, 0));
+  const afterTorn = byId.get("room-rows")?.children ?? [];
+  assert.equal(afterTorn[2]?.getAttribute("data-tone"), "fail");
+  assert.equal(afterTorn[2]?.children[3]?.textContent, "—");
+  assert.match(afterTorn[2]?.textContent ?? "", /chainOkfalse/);
+
+  // Short hash -> neutral.
+  sessionReadMode = "short-hash";
+  await controller.selectThread("thr_pass");
+  assert.equal(byId.get("room-rows")?.children[0]?.getAttribute("data-tone"), "neutral");
+
+  // R3 -32002 -> fail, stays CONNECTED.
+  sessionReadMode = "not-found";
+  await controller.selectThread("thr_pass");
+  assert.equal(byId.get("room-rows")?.children[0]?.getAttribute("data-tone"), "fail");
+  assert.match(byId.get("room-rows")?.children[0]?.textContent ?? "", /session\/read: -32002/);
+  assert.equal(controller.getConnectionState(), "CONNECTED");
+
+  // Inspect room discards cached reads.
+  await controller.inspectRoom();
+  assert.equal(byId.get("room-rows")?.children[0]?.getAttribute("data-tone"), "neutral");
+  assert.equal(byId.get("room-rows")?.children[0]?.children[3]?.textContent, "—");
+});
+
+test("M3-A3 §9.6–§9.7 connect_engine failure grammars G1–G6 & ipc.ts parity", async () => {
+  assert.equal(EXPECTED_PROTOCOL_VERSION, PROTOCOL_VERSION);
+
+  for (const code of [0, 1, 2, 20, 21, 22, 23, 24, 99, 130, 143, null]) {
+    assert.deepEqual(serveExitFromCode(code, null), classifyServeExit({ code, signal: null }));
+  }
+  assert.deepEqual(serveExitFromCode(null, "9"), classifyServeExit({ code: null, signal: "9" }));
+
+  const stderrSamples = [
+    "[boot]\nmadc-engine serve: home owned by pid 4182: /h/engine.lock\n",
+    "madc-engine serve: symlink: /h/engine.sock\n",
+    "madc-engine serve: home owned by pid 0: /h/engine.lock\n",
+    "madc-engine serve: home owned by pid 11: /a\nmadc-engine serve: home owned by pid 22: /b\n",
+  ];
+  for (const s of stderrSamples) {
+    assert.deepEqual(lockOwnerGuidanceFromStderr(s, "darwin"), parseLockOwnerGuidance(s, "darwin"));
+    assert.deepEqual(lockOwnerGuidanceFromStderr(s, "win32"), parseLockOwnerGuidance(s, "win32"));
+  }
+
+  const cases: Array<{ err: string; expectedState: string; receiptMatch?: RegExp }> = [
+    {
+      err: "madc-engine serve exited 20 (Owned { code: 20 }). Home lock held by PID 4182 (/h/engine.lock).\nstderr:\nmadc-engine serve: home owned by pid 4182: /h/engine.lock",
+      expectedState: "FAILED",
+      receiptMatch: /20 owned.*4182.*manually remove \/h\/engine\.lock/,
+    },
+    {
+      err: "madc-engine serve exited 20 (Owned { code: 20 }).",
+      expectedState: "FAILED",
+      receiptMatch: /20 owned.*home owned by another process/,
+    },
+    {
+      err: "madc-engine serve exited before initialize (code=Some(0), signal=None, class=Clean)",
+      expectedState: "DISCONNECTED",
+    },
+    {
+      err: "madc-engine serve exited before initialize (code=None, signal=Some(9), class=Stopped)",
+      expectedState: "STOPPED",
+      receiptMatch: /signal 9/,
+    },
+    {
+      err: "madc-engine serve exited before initialize (code=Some(23), signal=None, class=Deadline)",
+      expectedState: "FAILED",
+      receiptMatch: /23 shutdown-deadline/,
+    },
+    {
+      err: "madc-engine serve exited before initialize (code=Some(1), signal=None, class=Fault)",
+      expectedState: "FAILED",
+      receiptMatch: /24 internal-fault.*raw1/,
+    },
+    {
+      err: "madc-engine serve did not complete initialize within 5000 ms (exit code=None, signal=None)",
+      expectedState: "FAILED",
+    },
+    {
+      err: "Windows named-pipe desktop transport is unverified in M3-A2",
+      expectedState: "FAILED",
+    },
+  ];
+
+  for (const c of cases) {
+    const { doc, byId } = createShellHarness();
+    let count = 0;
+    const ctrl = bindDesktopShell(doc, async () => {
+      count += 1;
+      throw c.err;
+    });
+    await ctrl.connect();
+    assert.equal(count, 1, "no retry");
+    assert.equal(ctrl.getConnectionState(), c.expectedState);
+    if (c.receiptMatch) {
+      assert.match(byId.get("receipt-rows")?.textContent ?? "", c.receiptMatch);
+    }
+  }
+});
+
+test("M3-A3 §9.8–§9.9 & N5 single-flight connect/disconnect, R2/R4 cleanup, and stale-epoch guard", async () => {
+  const { doc, byId } = createShellHarness();
+  const deferred: {
+    resolveConnect: ((v: unknown) => void) | null;
+    resolveDisconnect: (() => void) | null;
+    rejectStaleRpc: ((e: unknown) => void) | null;
+  } = {
+    resolveConnect: null,
+    resolveDisconnect: null,
+    rejectStaleRpc: null,
+  };
+  let connectCount = 0;
+  let disconnectCount = 0;
+  let rpcCount = 0;
+
+  const ctrl = bindDesktopShell(doc, (cmd, args) => {
+    if (cmd === "connect_engine") {
+      connectCount += 1;
+      return new Promise((r) => {
+        deferred.resolveConnect = r;
+      });
+    }
+    if (cmd === "disconnect_engine") {
+      disconnectCount += 1;
+      return new Promise<void>((r) => {
+        deferred.resolveDisconnect = r;
+      });
+    }
+    if (cmd === "rpc_request") {
+      rpcCount += 1;
+      if (args?.method === "room/inspect" && rpcCount === 1) {
+        return Promise.resolve({
+          room: {
+            counts: { threads: 1, pass: 1, warn: 0, fail: 0, openDecisions: 0 },
+            threads: [
+              {
+                threadId: "thr_1",
+                path: "/t",
+                seatId: "kimi",
+                level: "pass",
+                chain: { ok: true },
+                handoff: { inbound: null, outboundCount: 0, oneWay: false },
+                worktree: { open: null, close: null, missing: false },
+                openDecisions: [],
+                findings: [],
+              },
+            ],
+          },
+        });
+      }
+      if (args?.method === "session/read") {
+        return new Promise((_, rej) => {
+          deferred.rejectStaleRpc = rej;
+        });
+      }
+      return Promise.reject("engine socket closed before response");
+    }
+    return Promise.reject(new Error(`unexpected ${cmd}`));
+  });
+
+  // Single-flight connect.
+  const p1 = ctrl.connect();
+  const p2 = ctrl.connect();
+  assert.equal(connectCount, 1);
+  assert.equal(byId.get("connect-btn")?.disabled, true);
+  ctrl.openPalette();
+  assert.equal(byId.get("palette-list")?.children[1]?.getAttribute("aria-disabled"), "true");
+  ctrl.closePalette();
+  deferred.resolveConnect?.({
+    socketPath: "/tmp/e.sock",
+    reusedExisting: false,
+    protocolVersion: PROTOCOL_VERSION,
+    serverName: "madc-engine",
+    serverVersion: "0.0.0",
+    coldStartMs: 10,
+  });
+  await Promise.all([p1, p2]);
+  assert.equal(ctrl.getConnectionState(), "CONNECTED");
+
+  // Start an in-flight session/read in epoch 1 (also test in-flight dedupe).
+  const read1 = ctrl.selectThread("thr_1");
+  const read2 = ctrl.selectThread("thr_1");
+  assert.equal(rpcCount, 2, "second selectThread while pending must dedupe");
+
+  // Trigger R4 on room/inspect -> FAILED + single disconnect_engine.
+  const inspectPromise = ctrl.inspectRoom();
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(ctrl.getConnectionState(), "FAILED");
+  assert.equal(disconnectCount, 1);
+  assert.equal(byId.get("connect-btn")?.disabled, true);
+
+  // Second disconnect while pending issues no second call.
+  const d2 = ctrl.disconnect();
+  assert.equal(disconnectCount, 1);
+
+  // N5: stale-epoch R2 rejection must NOT flip FAILED to DISCONNECTED (both while pending and after settle).
+  deferred.rejectStaleRpc?.("not connected to @madc/engine");
+  await Promise.all([read1, read2]);
+  assert.equal(ctrl.getConnectionState(), "FAILED");
+
+  deferred.resolveDisconnect?.();
+  await Promise.all([inspectPromise, d2]);
+  assert.equal(ctrl.getConnectionState(), "FAILED");
+  assert.equal(byId.get("connect-btn")?.disabled, false);
+
+  // Also test stale-epoch R2 rejection after disconnectPending has settled (only reqEpoch !== epoch guards this).
+  const { doc: doc2 } = createShellHarness();
+  let rejectEpoch1Read: ((e: unknown) => void) | null = null;
+  let rpcCallNum = 0;
+  const ctrl2 = bindDesktopShell(doc2, (cmd, args) => {
+    if (cmd === "connect_engine") {
+      return Promise.resolve({
+        socketPath: "/tmp/e.sock",
+        reusedExisting: false,
+        protocolVersion: PROTOCOL_VERSION,
+        serverName: "madc-engine",
+        serverVersion: "0.0.0",
+        coldStartMs: 10,
+      });
+    }
+    if (cmd === "disconnect_engine") return Promise.resolve();
+    if (cmd === "rpc_request") {
+      rpcCallNum += 1;
+      if (args?.method === "room/inspect" && rpcCallNum === 1) {
+        return Promise.resolve({
+          room: {
+            counts: { threads: 1, pass: 1, warn: 0, fail: 0, openDecisions: 0 },
+            threads: [
+              {
+                threadId: "thr_1",
+                path: "/t",
+                seatId: "kimi",
+                level: "pass",
+                chain: { ok: true },
+                handoff: { inbound: null, outboundCount: 0, oneWay: false },
+                worktree: { open: null, close: null, missing: false },
+                openDecisions: [],
+                findings: [],
+              },
+            ],
+          },
+        });
+      }
+      if (args?.method === "session/read") {
+        return new Promise((_, rej) => {
+          rejectEpoch1Read = rej;
+        });
+      }
+      return Promise.reject("engine socket closed before response");
+    }
+    return Promise.reject(new Error(`unexpected ${cmd}`));
+  });
+  await ctrl2.connect();
+  const staleRead = ctrl2.selectThread("thr_1");
+  await ctrl2.inspectRoom(); // R4 -> FAILED, disconnect_engine settles
+  assert.equal(ctrl2.getConnectionState(), "FAILED");
+  (rejectEpoch1Read as ((e: unknown) => void) | null)?.("not connected to @madc/engine");
+  await staleRead;
+  assert.equal(ctrl2.getConnectionState(), "FAILED");
+});
+
+test("M3-A3 §9.10, §9.12 Command palette closed list, subsequence filter, keyboard nav, and tauri.conf.json", () => {
+  assert.deepEqual(
+    PALETTE_COMMANDS.map((c) => c.id),
+    [
+      "cmd-connect",
+      "cmd-inspect-room",
+      "cmd-disconnect",
+      "cmd-focus-engine",
+      "cmd-focus-room",
+      "cmd-focus-decisions",
+      "cmd-focus-search",
+      "cmd-copy-chain-head",
+      "cmd-copy-served-model",
+    ],
+  );
+
+  // Subsequence over command name only (group name "evidence" matches nothing).
+  assert.deepEqual(
+    filterCommands(PALETTE_COMMANDS, "insrm").map((m) => m.command.id),
+    ["cmd-inspect-room"],
+  );
+  assert.equal(filterCommands(PALETTE_COMMANDS, "evidence").length, 0);
+
+  // Step palette skips disabled rows and wraps.
+  const cmds = PALETTE_COMMANDS.map((c) => ({
+    ...c,
+    disabled: c.id === "cmd-inspect-room" || c.id === "cmd-disconnect",
+  }));
+  let state = createPaletteState(cmds, "", true);
+  assert.equal(state.activeId, "cmd-connect");
+  state = stepPalette(state, "ArrowDown");
+  assert.equal(state.activeId, "cmd-focus-engine");
+  state = stepPalette(state, "End");
+  assert.equal(state.activeId, "cmd-copy-served-model");
+  state = stepPalette(state, "ArrowDown");
+  assert.equal(state.activeId, "cmd-connect");
+  state = stepPalette(state, "ArrowUp");
+  assert.equal(state.activeId, "cmd-copy-served-model");
+
+  // Toggle + Esc focus restore in harness.
+  const { doc, byId } = createShellHarness();
+  const connectBtn = byId.get("connect-btn");
+  const ctrl = bindDesktopShell(doc, async () => ({}), { platform: "darwin" });
+  connectBtn?.focus();
+  ctrl.handleKeydown({ key: "k", metaKey: true, ctrlKey: false, preventDefault() {} });
+  assert.equal(byId.get("palette")?.hidden, false);
+  assert.equal(byId.get("main-content")?.inert, true);
+  ctrl.handleKeydown({ key: "Escape", preventDefault() {} });
+  assert.equal(byId.get("palette")?.hidden, true);
+  assert.equal(doc.activeElement, connectBtn);
+
+  // §9.12: tauri.conf.json window minimum.
+  const confPath = fileURLToPath(new URL("../src-tauri/tauri.conf.json", import.meta.url));
+  const conf = JSON.parse(readFileSync(confPath, "utf8")) as {
+    app: { windows: Array<Record<string, unknown>>; security: { csp: string } };
+    bundle: { active: boolean };
+  };
+  const win = conf.app.windows[0];
+  assert.equal(win?.minWidth, 960);
+  assert.equal(win?.minHeight, 640);
+  assert.equal(win?.width, 1200);
+  assert.equal(win?.height, 800);
+  assert.equal(win?.resizable, true);
+  assert.equal(conf.bundle.active, false);
+  assert.equal(conf.app.security.csp, "default-src 'self'; script-src 'self'; style-src 'self'");
 });
