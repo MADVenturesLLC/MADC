@@ -83,7 +83,7 @@ const ENGINE_PROBE_MS = 5_000;
  */
 const LANES_PROBE_MS = 20_000;
 const INIT_TIMEOUT_MS = 30_000;
-const FLOOR = { node: "22.19.0", bun: "1.2.0" } as const;
+const FLOOR = { node: "22.19.0", bun: "1.3.11" } as const;
 const DEFAULT_SEAT = "madc-default";
 /**
  * Clock ticks per second for /proc/<pid>/stat `starttime`: Linux USER_HZ, ASSUMED to be 100 (the
@@ -225,10 +225,7 @@ function errText(err: unknown): string {
 
 // ------------------------------------------------------------------ checks
 
-function checkRuntime(): Check {
-  const bun = process.versions.bun;
-  const runtime = bun !== undefined ? "bun" : "node";
-  const version = bun ?? process.versions.node;
+export function evaluateRuntimeFloor(runtime: "node" | "bun", version: string): Check {
   const floor = FLOOR[runtime];
   const shortFloor = floor.replace(/\.0$/, "");
   const ok = versionAtLeast(version, floor);
@@ -240,6 +237,13 @@ function checkRuntime(): Check {
       : `${runtime} ${version} below floor ${shortFloor}`,
     evidence: { runtime, version, floor },
   };
+}
+
+function checkRuntime(): Check {
+  const bun = process.versions.bun;
+  const runtime = bun !== undefined ? "bun" : "node";
+  const version = bun ?? process.versions.node;
+  return evaluateRuntimeFloor(runtime, version);
 }
 
 type ProbeResult =

@@ -69,7 +69,7 @@ From [the v2 idea plan, §1](docs/plan/PLAN-madc-idea-plan-v2.md):
 
 ## Working in this repo
 
-Requirements: Node **22.19+** and Bun **1.2+**.
+Requirements: Node **22.19+** and Bun **1.3.11+**.
 
 ```sh
 npm install          # also installs the pre-push hook (core.hooksPath=.githooks)
