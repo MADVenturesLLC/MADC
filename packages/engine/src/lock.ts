@@ -7,11 +7,13 @@ import {
   lstatSync,
   openSync,
   readFileSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { confinedPath } from "./home.ts";
+import { dirname, join, resolve } from "node:path";
+import { confinedPath, isStrictlyUnder } from "./home.ts";
 
 /**
  * Contents of `sessions/<threadId>.lock` — exactly `{ pid, startedAt, token }` (protocol pin §3.3,
@@ -49,6 +51,11 @@ export type AcquireResult =
 
 export function threadLockPath(home: string, threadId: string): string {
   return confinedPath(home, "sessions", threadId, ".lock");
+}
+
+/** Canonical lifetime lock path for `madc-engine serve` (amendment 1 §2a). */
+export function engineLockPath(home: string): string {
+  return join(resolve(home), "engine.lock");
 }
 
 export function newLockToken(): string {
@@ -245,34 +252,70 @@ export function reclaimIfUnchanged(
 }
 
 /**
- * Take `sessions/<threadId>.lock` with a fresh token. A holder whose pid is alive — including this
- * process under a different token — refuses with its pid (-32004 upstream). A dead pid, or a body
- * with no usable pid, is reclaimed per `reclaimIfUnchanged` and creation retried.
+ * Take an exclusive lock at `path` (which must lie strictly inside `home`) with a fresh token
+ * (M0 Amendment 1; M3 amendment 1 §2a). Refuses any `path` not strictly inside `$MADC_HOME`
+ * (`isStrictlyUnder`, `home.ts:36-39`) before touching the filesystem. A holder whose pid is alive
+ * — including this process under a different token — refuses with its pid. A dead pid, a symlink,
+ * or a body with no usable pid is reclaimed per `reclaimIfUnchanged` and creation retried.
+ */
+export function acquireLockAt(
+  home: string,
+  path: string,
+  pid: number = process.pid,
+): AcquireResult {
+  const absHome = resolve(home);
+  const absPath = resolve(path);
+  let realHome: string | null = null;
+  try {
+    realHome = realpathSync(absHome);
+  } catch {
+    realHome = null;
+  }
+  const underLexical = isStrictlyUnder(absPath, absHome);
+  const underReal = realHome !== null && isStrictlyUnder(absPath, realHome);
+  if (!underLexical && !underReal) {
+    throw new Error(`lock path escapes MADC_HOME: ${path}`);
+  }
+  if (realHome !== null) {
+    try {
+      const realParent = realpathSync(dirname(absPath));
+      if (realParent !== realHome && !isStrictlyUnder(realParent, realHome)) {
+        throw new Error(`lock path escapes MADC_HOME: ${path}`);
+      }
+    } catch (err) {
+      if (errCode(err) !== "ENOENT") throw err;
+    }
+  }
+  let lastHolder: number | null = null;
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const created = createExclusive(absPath, pid);
+    if (created !== null) return { ok: true, path: absPath, handle: created };
+
+    const current = readLock(absPath);
+    if (current.state === "missing") continue;
+    if (current.state === "held") {
+      lastHolder = current.pid;
+      // Live pid → locked, whatever the token (pin §3.3 (c)); ownership is never adopted.
+      if (isPidAlive(current.pid)) return { ok: false, path: absPath, holderPid: current.pid };
+    }
+    const result = reclaimIfUnchanged(absPath, current.fingerprint);
+    if (result.outcome === "restored") {
+      return { ok: false, path: absPath, holderPid: result.holderPid ?? lastHolder };
+    }
+  }
+  return { ok: false, path: absPath, holderPid: lastHolder };
+}
+
+/**
+ * Take `sessions/<threadId>.lock` with a fresh token. Delegates to {@link acquireLockAt} unchanged
+ * (M3 amendment 1 §2a).
  */
 export function acquireThreadLock(
   home: string,
   threadId: string,
   pid: number = process.pid,
 ): AcquireResult {
-  const path = threadLockPath(home, threadId);
-  let lastHolder: number | null = null;
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const created = createExclusive(path, pid);
-    if (created !== null) return { ok: true, path, handle: created };
-
-    const current = readLock(path);
-    if (current.state === "missing") continue;
-    if (current.state === "held") {
-      lastHolder = current.pid;
-      // Live pid → locked, whatever the token (pin §3.3 (c)); ownership is never adopted.
-      if (isPidAlive(current.pid)) return { ok: false, path, holderPid: current.pid };
-    }
-    const result = reclaimIfUnchanged(path, current.fingerprint);
-    if (result.outcome === "restored") {
-      return { ok: false, path, holderPid: result.holderPid ?? lastHolder };
-    }
-  }
-  return { ok: false, path, holderPid: lastHolder };
+  return acquireLockAt(home, threadLockPath(home, threadId), pid);
 }
 
 /**

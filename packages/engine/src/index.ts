@@ -66,11 +66,14 @@ export {
 } from "./inspect.ts";
 export {
   type AcquireResult,
+  acquireLockAt,
   acquireThreadLock,
+  engineLockPath,
   holdsThreadLock,
   isPidAlive,
   type LockHandle,
   type LockInfo,
+  LockPathNotAFileError,
   readLock,
   releaseThreadLock,
   threadLockPath,
@@ -185,6 +188,16 @@ export {
   SURFACE_ARCHITECT_SEAT,
   seedRosterSeats,
 } from "./seats/roster.ts";
+export {
+  LockLostError,
+  runServe,
+  SERVE_EXIT,
+  SERVE_EXIT_WRITE_GRACE_MS,
+  SERVE_SHUTDOWN_DEADLINE_MS,
+  SERVE_TOTAL_EXIT_BOUND_MS,
+  type ServeDeps,
+  type ServeExitCode,
+} from "./serve.ts";
 export {
   ENGINE_VERSION,
   EngineConnection,

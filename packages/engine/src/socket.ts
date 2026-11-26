@@ -40,15 +40,29 @@ export type SocketServerDeps = {
   readonly unlink?: (path: string) => void;
   readonly getuid?: () => number;
   readonly closeGraceMs?: number;
+  /** Amendment 1 §2a / §4 step 4: called after stale verdict, before re-lstat and unlink. */
+  readonly beforeStaleUnlink?: () => void;
+  /** Test seam: runs immediately before `listen()` (e.g. to exercise EADDRINUSE / EACCES). */
+  readonly beforeListen?: () => void;
+  /** Amendment 1 §2a / §4 Listen: called straight after `listen()` succeeds, before step 5. */
+  readonly afterListen?: () => void;
+  /** Test seam: runs inside `close()` before connection shutdown (e.g. to hang close() past deadline). */
+  readonly beforeShutdown?: () => Promise<void>;
+  /** Test seam: called after `onServerError` is attached so tests can emit a fatal listener error. */
+  readonly onListenReady?: (controls: { readonly emitError: (err: Error) => void }) => void;
 };
 
 export type SocketServerOptions = Omit<EngineOptions, "input" | "output"> & {
   readonly socketDeps?: SocketServerDeps;
+  /** Amendment 1 §3 (c): fatal listener error after listening started. */
+  readonly onServerError?: (err: Error) => void;
 };
 
 export type SocketServerHandle = {
   readonly socketPath: string;
   close(): Promise<void>;
+  /** Release every thread lock held by active connections (amendment 1 §3 exit-time cleanup). */
+  releaseLocks(): void;
 };
 
 /**
@@ -261,6 +275,8 @@ async function clearStaleSocket(socketPath: string, deps: SocketServerDeps): Pro
       outcome.code,
     );
   }
+  // Amendment 1 §2a / §4 step 4: re-verify engine.lock before unlinking a stale socket.
+  deps.beforeStaleUnlink?.();
   let now: Stats | null;
   try {
     now = lstatOrNull(socketPath);
@@ -297,7 +313,7 @@ async function clearStaleSocket(socketPath: string, deps: SocketServerDeps): Pro
  * (`chmod-failed`).
  */
 export async function startSocketServer(opts: SocketServerOptions): Promise<SocketServerHandle> {
-  const { socketDeps = {}, ...engineOpts } = opts;
+  const { socketDeps = {}, onServerError, ...engineOpts } = opts;
   mkdirSync(engineOpts.home, { recursive: true, mode: 0o700 });
   enforcePrivateDir(engineOpts.home);
   const socketPath = engineSocketPath(engineOpts.home);
@@ -346,6 +362,7 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
   // Amendment 1 §4 "Listen … under umask 0o177" (Argus #73 P3a): the socket never exists at a
   // wider mode than 0600. The previous umask is restored straight after the bind, in the callback
   // or the error handler, before anything else is created.
+  socketDeps.beforeListen?.();
   const posix = process.platform !== "win32";
   let restoreUmask: (() => void) | null = null;
   if (posix) {
@@ -383,10 +400,15 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
     try {
       const now = lstatSync(socketPath);
       if (now.isSocket() && now.dev === bound.dev && now.ino === bound.ino) {
-        unlinkSync(socketPath);
+        (socketDeps.unlink ?? unlinkSync)(socketPath);
       }
-    } catch {
+    } catch (err) {
       // Already removed (Node and Bun 1.4.x unlink a Unix socket path in `server.close()`).
+      if (errCode(err) === "ENOENT") return;
+      // Amendment 1 §3 line 101: a failing shutdown step writes one stderr log line and continues.
+      engineOpts.log?.(
+        `socket unlink failed (${errCode(err) ?? (err instanceof Error ? err.message : String(err))}): ${socketPath}`,
+      );
     }
   };
 
@@ -400,6 +422,12 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
    */
   const closeGraceMs = socketDeps.closeGraceMs ?? SOCKET_CLOSE_GRACE_MS;
   const shutdownAll = async (): Promise<void> => {
+    // Amendment 1 §3 step 5 (line 96): never rename or move any entry at `socketPath`.
+    // Only `unlinkOwnSocket()` may unlink `socketPath`, and only if `lstat` still matches our
+    // bound `dev`+`ino`. Runtime `server.close()` unlink-by-path behavior is carried under D-646.
+    if (socketDeps.beforeShutdown !== undefined) {
+      await socketDeps.beforeShutdown();
+    }
     const closed = new Promise<void>((resolve) => server.close(() => resolve()));
     for (const c of conns) c.shutdown();
     await Promise.all([...sockets].map((sock) => endThenDestroy(sock, closeGraceMs)));
@@ -410,9 +438,33 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
     try {
       const st0 = lstatSync(socketPath);
       bound = { dev: st0.dev, ino: st0.ino };
+    } catch (err) {
+      await shutdownAll();
+      throw new SocketStartError(
+        "chmod-failed",
+        socketPath,
+        `could not lstat bound socket (${err instanceof Error ? err.message : String(err)})`,
+      );
+    }
+  }
+
+  // Amendment 1 §2a / §4 Listen: re-verify engine.lock straight after `listen()` succeeds.
+  // If lost, close the server, unlink only the socket this call bound, and propagate the error.
+  if (socketDeps.afterListen !== undefined) {
+    try {
+      socketDeps.afterListen();
+    } catch (err) {
+      await shutdownAll();
+      unlinkOwnSocket();
+      throw err;
+    }
+  }
+
+  if (posix) {
+    try {
       (socketDeps.chmod ?? chmodSync)(socketPath, 0o600);
       const st = lstatSync(socketPath);
-      if (!st.isSocket() || st.dev !== bound.dev || st.ino !== bound.ino) {
+      if (!st.isSocket() || bound === null || st.dev !== bound.dev || st.ino !== bound.ino) {
         throw new Error("the bound socket was replaced before the mode check");
       }
       if ((st.mode & 0o777) !== 0o600) {
@@ -436,11 +488,23 @@ export async function startSocketServer(opts: SocketServerOptions): Promise<Sock
     }
   }
 
+  if (onServerError !== undefined) {
+    server.on("error", onServerError);
+  }
+  socketDeps.onListenReady?.({
+    emitError: (err: Error) => {
+      server.emit("error", err);
+    },
+  });
+
   return {
     socketPath,
     async close(): Promise<void> {
       await shutdownAll();
       unlinkOwnSocket();
+    },
+    releaseLocks(): void {
+      for (const c of conns) c.releaseLocks();
     },
   };
 }

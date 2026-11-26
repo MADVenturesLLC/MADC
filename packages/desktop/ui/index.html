@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MADC Desktop (M3-A2 Scaffold)</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <nav id="focus-bar" role="toolbar" aria-label="MADC Desktop Focus Bar">
+      <button type="button" data-focus-id="connection" aria-pressed="true">Engine</button>
+      <button type="button" data-focus-id="room" aria-pressed="false">Room</button>
+      <button type="button" data-focus-id="decisions" aria-pressed="false">Decisions</button>
+      <button type="button" data-focus-id="search" aria-pressed="false">Search</button>
+    </nav>
+
+    <main>
+      <h1>MADC Desktop Scaffold (M3-A2)</h1>
+      <p id="connection-status" class="status-neutral">
+        Engine connection: idle (neutral — unverified until engine receipt)
+      </p>
+      <button id="connect-btn" type="button">Connect to @madc/engine</button>
+      <pre id="output">Ready. Use Tab / Arrow keys on the focus bar.</pre>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>
