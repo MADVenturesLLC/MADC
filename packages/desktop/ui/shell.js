@@ -481,7 +481,7 @@ export function stepPalette(state, key) {
     return state.activeId === null ? state : { ...state, activeId: null };
   }
   const currentIdx = enabled.findIndex((entry) => entry.command.id === state.activeId);
-  let nextIdx = currentIdx;
+  let nextIdx;
   switch (key) {
     case "ArrowDown":
       nextIdx = currentIdx === -1 ? 0 : (currentIdx + 1) % enabled.length;
@@ -884,27 +884,24 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
   }
 
   function findBestChainHead() {
-    if (selectedThreadId) {
-      const entry = sessionReadCache.get(selectedThreadId);
-      if (entry?.ok === true && entry.result?.chainOk === true) {
-        const events = Array.isArray(entry.result.events) ? entry.result.events : [];
-        const last = events.length > 0 ? events[events.length - 1] : null;
-        if (typeof last?.hash === "string" && SHA256_HEX.test(last.hash)) {
-          return last.hash;
-        }
-      }
-    }
     const threads = Array.isArray(currentRoom?.threads) ? currentRoom.threads : [];
-    for (let i = threads.length - 1; i >= 0; i -= 1) {
-      const thr = threads[i];
-      const entry = thr ? sessionReadCache.get(thr.threadId) : null;
-      if (entry?.ok === true && entry.result?.chainOk === true) {
-        const events = Array.isArray(entry.result.events) ? entry.result.events : [];
-        const last = events.length > 0 ? events[events.length - 1] : null;
-        if (typeof last?.hash === "string" && SHA256_HEX.test(last.hash)) {
-          return last.hash;
-        }
-      }
+    const verifiedHashFor = (thr) => {
+      if (!thr) return null;
+      const evaluated = evaluateRoomRow(thr, sessionReadCache.get(thr.threadId) ?? null);
+      return evaluated.tone === "verified" ? evaluated.hashFull : null;
+    };
+
+    if (selectedThreadId) {
+      const selectedThr = threads.find((t) => t.threadId === selectedThreadId);
+      const hash = verifiedHashFor(selectedThr);
+      if (hash !== null) return hash;
+    }
+
+    const cachedIds = Array.from(sessionReadCache.keys()).reverse();
+    for (const threadId of cachedIds) {
+      const thr = threads.find((t) => t.threadId === threadId);
+      const hash = verifiedHashFor(thr);
+      if (hash !== null) return hash;
     }
     return null;
   }
@@ -1077,6 +1074,9 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       renderRoomTable();
       if (paletteOpen) renderPalette();
     } catch (err) {
+      if (reqEpoch !== epoch) {
+        return;
+      }
       const cls = classifyRpcError(err);
       outputEl.textContent = sanitizeEngineText(cls.message);
       inspectGeneration += 1;
@@ -1137,6 +1137,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       if (reqEpoch !== epoch || reqGen !== inspectGeneration || connectionState !== "CONNECTED") {
         return;
       }
+      sessionReadCache.delete(threadId);
       sessionReadCache.set(threadId, { ok: true, result: res });
       renderRoomTable();
       if (paletteOpen) renderPalette();
@@ -1494,7 +1495,6 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     const entry = state.filtered.find((e) => e.command.id === cmdId);
     if (!entry || entry.command.disabled) return;
 
-    let handledFocus = false;
     switch (cmdId) {
       case "cmd-connect":
         closePalette(true);
@@ -1509,21 +1509,21 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         await startDisconnect("DISCONNECTED");
         return;
       case "cmd-focus-engine":
+        closePalette(false);
         applyFocus(focusBarSelect(focusState, "connection"), true);
-        handledFocus = true;
-        break;
+        return;
       case "cmd-focus-room":
+        closePalette(false);
         applyFocus(focusBarSelect(focusState, "room"), true);
-        handledFocus = true;
-        break;
+        return;
       case "cmd-focus-decisions":
+        closePalette(false);
         applyFocus(focusBarSelect(focusState, "decisions"), true);
-        handledFocus = true;
-        break;
+        return;
       case "cmd-focus-search":
+        closePalette(false);
         applyFocus(focusBarSelect(focusState, "search"), true);
-        handledFocus = true;
-        break;
+        return;
       case "cmd-copy-chain-head": {
         const hash = findBestChainHead();
         if (hash && typeof globalObj?.navigator?.clipboard?.writeText === "function") {
@@ -1534,7 +1534,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       case "cmd-copy-served-model":
         break;
     }
-    closePalette(!handledFocus);
+    closePalette(true);
   }
 
   paletteInputEl.addEventListener("input", (ev) => {
@@ -1588,10 +1588,6 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       }
     }
   };
-
-  if (typeof doc.addEventListener === "function") {
-    doc.addEventListener("keydown", handleGlobalKeydown);
-  }
 
   renderConnectionChrome();
   renderReceiptsWell();

@@ -495,6 +495,7 @@ type TestFakeEl = ShellElement & {
   readonly attrs: Map<string, string>;
   readonly listeners: Map<string, Array<(ev: unknown) => void>>;
   readonly children: TestFakeEl[];
+  parent: TestFakeEl | null;
   focusedCount: number;
   emit(type: string, ev?: unknown): void;
 };
@@ -509,6 +510,7 @@ function createShellHarness() {
       attrs,
       listeners,
       children,
+      parent: null,
       className: "",
       textContent: text,
       tabIndex: 0,
@@ -529,16 +531,27 @@ function createShellHarness() {
         return attrs.has(name);
       },
       appendChild(child) {
-        children.push(child as TestFakeEl);
-        el.textContent = children.map((c) => c.textContent ?? "").join("");
+        const c = child as TestFakeEl;
+        c.parent = el;
+        children.push(c);
+        el.textContent = children.map((item) => item.textContent ?? "").join("");
         return child;
       },
       replaceChildren(...nodes) {
         children.length = 0;
-        for (const n of nodes) children.push(n as TestFakeEl);
-        el.textContent = children.map((c) => c.textContent ?? "").join("");
+        for (const n of nodes) {
+          const c = n as TestFakeEl;
+          c.parent = el;
+          children.push(c);
+        }
+        el.textContent = children.map((item) => item.textContent ?? "").join("");
       },
       focus() {
+        let cur: TestFakeEl | null = el;
+        while (cur !== null) {
+          if (cur.inert) return;
+          cur = cur.parent;
+        }
         el.focusedCount += 1;
         activeEl = el;
       },
@@ -561,6 +574,7 @@ function createShellHarness() {
     makeEl({ "data-focus-id": item.id }, item.label),
   );
   const bar = makeEl();
+  for (const b of buttons) b.parent = bar;
   bar.querySelectorAll = () => buttons;
 
   const byId = new Map<string, TestFakeEl>([
@@ -705,7 +719,11 @@ test("M3-A3 §9.1–§9.3 static CSS, tokens, zero-network, zero-HTML-sink, no d
   assert.equal(existsSync(join(fontsDir, "LICENSE-IBM-PLEX.txt")), true);
   assert.equal(existsSync(join(fontsDir, "LICENSE-JETBRAINS-MONO.txt")), true);
   assert.ok(totalBytes <= 1024 * 1024, `fonts exceed 1MB (${totalBytes})`);
-  assert.match(css, /font-display:\s*block;/);
+  const fontFaceBlocks = Array.from(css.matchAll(/@font-face\s*\{([\s\S]*?)\}/g));
+  assert.equal(fontFaceBlocks.length, 6, "expected 6 @font-face blocks");
+  for (const block of fontFaceBlocks) {
+    assert.match(block[1] ?? "", /font-display:\s*block;/, "every @font-face must use block");
+  }
 
   // §9.2: No decorative green & no legacy status classes.
   assert.doesNotMatch(css, /\.(status-|tone-|green\b|ok\b|success\b)/);
@@ -721,7 +739,7 @@ test("M3-A3 §9.1–§9.3 static CSS, tokens, zero-network, zero-HTML-sink, no d
     }
     if (/backdrop-filter\s*:/.test(body)) {
       assert.equal(selector.includes(".well"), false, "well must never blur");
-      assert.ok(selector.includes(".glass") || selector.includes(".palette"));
+      assert.ok(selector.includes(".glass"), `backdrop-filter outside .glass: ${selector}`);
     }
     if (/^\.pill\[data-tone=/.test(selector)) {
       for (const line of body.split(";")) {
@@ -1192,4 +1210,336 @@ test("M3-A3 §9.10, §9.12 Command palette closed list, subsequence filter, keyb
   assert.equal(win?.resizable, true);
   assert.equal(conf.bundle.active, false);
   assert.equal(conf.app.security.csp, "default-src 'self'; script-src 'self'; style-src 'self'");
+});
+
+test("M3-A3 review fixes: H1 single keydown listener, M1 inert-aware focus, L3 Copy chain head honesty, and §9.10 keys", async () => {
+  // H1: app.js-style single doc keydown listener toggles once and steps once.
+  const { doc, byId, buttons } = createShellHarness();
+  const ctrl = bindDesktopShell(doc, async () => ({}), { platform: "darwin" });
+  doc.addEventListener?.("keydown", (ev) => ctrl.handleKeydown(ev));
+
+  doc.emit("keydown", { key: "k", metaKey: true, ctrlKey: false, preventDefault() {} });
+  assert.equal(byId.get("palette")?.hidden, false, "single Cmd+K must leave palette open");
+  assert.equal(byId.get("palette-input")?.getAttribute("aria-activedescendant"), "cmd-connect");
+  doc.emit("keydown", { key: "ArrowDown", preventDefault() {} });
+  assert.equal(
+    byId.get("palette-input")?.getAttribute("aria-activedescendant"),
+    "cmd-focus-engine",
+    "single ArrowDown must step exactly one enabled row",
+  );
+
+  // §9.10: Tab / Shift+Tab trapped while open, Home jumps to first enabled row.
+  doc.emit("keydown", { key: "Tab", preventDefault() {} });
+  assert.equal(doc.activeElement, byId.get("palette-input"));
+  doc.emit("keydown", { key: "End", preventDefault() {} });
+  assert.equal(
+    byId.get("palette-input")?.getAttribute("aria-activedescendant"),
+    "cmd-focus-search",
+  );
+  doc.emit("keydown", { key: "Home", preventDefault() {} });
+  assert.equal(byId.get("palette-input")?.getAttribute("aria-activedescendant"), "cmd-connect");
+
+  // M1: Focus Room clears inert BEFORE focusing Room button.
+  doc.emit("keydown", { key: "ArrowDown", preventDefault() {} }); // cmd-focus-engine
+  doc.emit("keydown", { key: "ArrowDown", preventDefault() {} }); // cmd-focus-room
+  assert.equal(byId.get("palette-input")?.getAttribute("aria-activedescendant"), "cmd-focus-room");
+  doc.emit("keydown", { key: "Enter", preventDefault() {} });
+  assert.equal(byId.get("palette")?.hidden, true);
+  assert.equal(byId.get("focus-bar")?.inert, false);
+  assert.equal(doc.activeElement, buttons[1], "Focus Room must focus Room button");
+
+  // §9.10: Non-Mac Ctrl+K and empty state ("No matching command", Enter is no-op).
+  const { doc: linDoc, byId: linById } = createShellHarness();
+  const linCtrl = bindDesktopShell(linDoc, async () => ({}), { platform: "linux" });
+  linDoc.addEventListener?.("keydown", (ev) => linCtrl.handleKeydown(ev));
+  linDoc.emit("keydown", { key: "k", metaKey: false, ctrlKey: true, preventDefault() {} });
+  assert.equal(linById.get("palette")?.hidden, false);
+  const inputEl = linById.get("palette-input");
+  if (inputEl) {
+    inputEl.value = "zzzzz";
+    inputEl.emit("input", { target: { value: "zzzzz" } });
+  }
+  assert.equal(linById.get("palette-list")?.textContent, "No matching command");
+  assert.equal(linById.get("palette-live")?.textContent, "No matching command");
+  linDoc.emit("keydown", { key: "Enter", preventDefault() {} });
+  assert.equal(linById.get("palette")?.hidden, false, "Enter on empty state does nothing");
+
+  // L3: warn row with chainOk: true and 64-hex hash must NOT enable Copy chain head.
+  const { doc: l3Doc, byId: l3ById } = createShellHarness();
+  const l3Ctrl = bindDesktopShell(
+    l3Doc,
+    async (cmd, args) => {
+      if (cmd === "connect_engine") {
+        return {
+          socketPath: "/tmp/e.sock",
+          reusedExisting: false,
+          protocolVersion: PROTOCOL_VERSION,
+          serverName: "madc-engine",
+          serverVersion: "0.0.0",
+          coldStartMs: 5,
+        };
+      }
+      if (cmd === "rpc_request" && args?.method === "room/inspect") {
+        return {
+          room: {
+            counts: { threads: 1, pass: 0, warn: 1, fail: 0, openDecisions: 0 },
+            threads: [
+              {
+                threadId: "thr_warn",
+                path: "/t",
+                seatId: "kimi",
+                level: "warn",
+                chain: { ok: true },
+                handoff: { inbound: null, outboundCount: 0, oneWay: false },
+                worktree: { open: null, close: null, missing: false },
+                openDecisions: [],
+                findings: [{ level: "warn", code: "W_TEST", detail: "warn" }],
+              },
+            ],
+          },
+        };
+      }
+      if (cmd === "rpc_request" && args?.method === "session/read") {
+        return {
+          threadId: "thr_warn",
+          chainOk: true,
+          events: [{ seq: 1, hash: "b".repeat(64) }],
+        };
+      }
+      return {};
+    },
+    { globalObj: { navigator: { clipboard: { writeText: async () => {} } } } },
+  );
+  await l3Ctrl.connect();
+  await l3Ctrl.selectThread("thr_warn");
+  l3Ctrl.openPalette();
+  const copyRow = l3ById.get("palette-list")?.children.find((c) => c.id === "cmd-copy-chain-head");
+  assert.equal(copyRow?.getAttribute("aria-disabled"), "true");
+});
+
+test("M3-A3 review fixes: §9.6 G3/G6, §9.8 protocol mismatch, §9.9 R4/disconnect reject, L2 FAILED text, N5/L4 stale room/inspect", async () => {
+  // §9.6: G3 (2, 21, 22, 24, 130, 143) and G6 unclassified rejection + L2 lowercase FAILED text.
+  const g3Cases: Array<{ err: string; state: string; receipt?: RegExp }> = [
+    {
+      err: "madc-engine serve exited before initialize (code=Some(2), signal=None, class=Usage)",
+      state: "FAILED",
+      receipt: /2 usage-or-home/,
+    },
+    {
+      err: "madc-engine serve exited before initialize (code=Some(21), signal=None, class=Unsafe)",
+      state: "FAILED",
+      receipt: /21 unsafe-path/,
+    },
+    {
+      err: "madc-engine serve exited before initialize (code=Some(22), signal=None, class=Listen)",
+      state: "FAILED",
+      receipt: /22 listen-error/,
+    },
+    {
+      err: "madc-engine serve exited before initialize (code=Some(24), signal=None, class=Fault)",
+      state: "FAILED",
+      receipt: /24 internal-fault/,
+    },
+    {
+      err: "madc-engine serve exited before initialize (code=Some(130), signal=None, class=Clean)",
+      state: "DISCONNECTED",
+      receipt: /serve exit130/,
+    },
+    {
+      err: "madc-engine serve exited before initialize (code=Some(143), signal=None, class=Clean)",
+      state: "DISCONNECTED",
+      receipt: /serve exit143/,
+    },
+    { err: "failed to spawn madc-engine serve: ENOENT", state: "FAILED" },
+  ];
+  for (const c of g3Cases) {
+    const { doc, byId } = createShellHarness();
+    const ctrl = bindDesktopShell(doc, async () => {
+      throw c.err;
+    });
+    await ctrl.connect();
+    assert.equal(ctrl.getConnectionState(), c.state);
+    if (c.state === "FAILED") {
+      assert.equal(
+        byId.get("connection-status")?.children[1]?.textContent,
+        "engine connection failed (no automatic retry)",
+      );
+    }
+    if (c.receipt) {
+      assert.match(byId.get("receipt-rows")?.textContent ?? "", c.receipt);
+    }
+  }
+
+  // §9.8: Protocol mismatch invokes disconnect_engine once, skips room/inspect, stays FAILED.
+  const { doc: pmDoc, byId: pmById } = createShellHarness();
+  const pmCalls: string[] = [];
+  const pmCtrl = bindDesktopShell(pmDoc, async (cmd) => {
+    pmCalls.push(cmd);
+    if (cmd === "connect_engine") {
+      return {
+        socketPath: "/tmp/e.sock",
+        reusedExisting: false,
+        protocolVersion: "madc-m0/1",
+        serverName: "madc-engine",
+        serverVersion: "0.0.0",
+        coldStartMs: 12,
+      };
+    }
+    return undefined;
+  });
+  await pmCtrl.connect();
+  assert.deepEqual(pmCalls, ["connect_engine", "disconnect_engine"]);
+  assert.equal(pmCtrl.getConnectionState(), "FAILED");
+  assert.match(
+    pmById.get("receipt-rows")?.textContent ?? "",
+    /expected madc-m1\/1 · got madc-m0\/1/,
+  );
+
+  // §9.9: disconnect_engine rejection ("engine state lock poisoned") + R4 variants + N5 + L4.
+  for (const r4Err of [
+    "engine request failed: broken pipe",
+    "engine response invalid: unexpected EOF",
+    "engine request task failed: join error",
+  ]) {
+    const { doc, byId } = createShellHarness();
+    const deferred: {
+      resolveDisc: (() => void) | null;
+      rejectDisc: ((e: unknown) => void) | null;
+    } = { resolveDisc: null, rejectDisc: null };
+    let discCalls = 0;
+    let rpcCalls = 0;
+    const ctrl = bindDesktopShell(doc, (cmd, args) => {
+      if (cmd === "connect_engine") {
+        return Promise.resolve({
+          socketPath: "/tmp/e.sock",
+          reusedExisting: false,
+          protocolVersion: PROTOCOL_VERSION,
+          serverName: "madc-engine",
+          serverVersion: "0.0.0",
+          coldStartMs: 10,
+        });
+      }
+      if (cmd === "disconnect_engine") {
+        discCalls += 1;
+        return new Promise<void>((res, rej) => {
+          deferred.resolveDisc = res;
+          deferred.rejectDisc = rej;
+        });
+      }
+      if (cmd === "rpc_request" && args?.method === "room/inspect") {
+        rpcCalls += 1;
+        if (rpcCalls === 1) {
+          return Promise.resolve({
+            room: {
+              counts: { threads: 0, pass: 0, warn: 0, fail: 0, openDecisions: 0 },
+              threads: [],
+            },
+          });
+        }
+        return Promise.reject(r4Err);
+      }
+      return Promise.reject(new Error(`unexpected ${cmd}`));
+    });
+    await ctrl.connect();
+
+    // selectThread inert while disconnectPending is true.
+    const insp = ctrl.inspectRoom();
+    await new Promise((r) => setTimeout(r, 0));
+    assert.equal(discCalls, 1);
+    ctrl.openPalette();
+    const connectRow = byId.get("palette-list")?.children.find((c) => c.id === "cmd-connect");
+    const discRow = byId.get("palette-list")?.children.find((c) => c.id === "cmd-disconnect");
+    assert.equal(connectRow?.getAttribute("aria-disabled"), "true");
+    assert.equal(discRow?.getAttribute("aria-disabled"), "true");
+    assert.match(connectRow?.textContent ?? "", /disconnecting/);
+    assert.match(discRow?.textContent ?? "", /disconnecting/);
+    ctrl.closePalette();
+
+    await ctrl.selectThread("thr_inert");
+    assert.equal(rpcCalls, 2, "selectThread must be inert while disconnectPending");
+
+    deferred.rejectDisc?.("engine state lock poisoned");
+    await insp;
+    assert.equal(ctrl.getConnectionState(), "FAILED");
+    assert.equal(byId.get("output")?.textContent, "engine state lock poisoned");
+    assert.equal(byId.get("connect-btn")?.disabled, false);
+    assert.equal(discCalls, 1, "no retry on disconnect_engine reject");
+  }
+
+  // N5 + L4: earlier-epoch room/inspect R2 & R4 rejections do not clear cache or change state/disconnect.
+  for (const staleErr of [
+    "not connected to @madc/engine",
+    "engine socket closed before response",
+  ]) {
+    const { doc, byId } = createShellHarness();
+    const deferred: { rejectInspect: ((e: unknown) => void) | null } = { rejectInspect: null };
+    let inspectNum = 0;
+    let discCalls = 0;
+    const ctrl = bindDesktopShell(doc, (cmd, args) => {
+      if (cmd === "connect_engine") {
+        return Promise.resolve({
+          socketPath: "/tmp/e.sock",
+          reusedExisting: false,
+          protocolVersion: PROTOCOL_VERSION,
+          serverName: "madc-engine",
+          serverVersion: "0.0.0",
+          coldStartMs: 10,
+        });
+      }
+      if (cmd === "disconnect_engine") {
+        discCalls += 1;
+        return Promise.resolve();
+      }
+      if (cmd === "rpc_request" && args?.method === "room/inspect") {
+        inspectNum += 1;
+        if (inspectNum === 1) {
+          return Promise.resolve({
+            room: {
+              counts: { threads: 1, pass: 1, warn: 0, fail: 0, openDecisions: 0 },
+              threads: [
+                {
+                  threadId: "thr_keep",
+                  path: "/t",
+                  seatId: "kimi",
+                  level: "pass",
+                  chain: { ok: true },
+                  handoff: { inbound: null, outboundCount: 0, oneWay: false },
+                  worktree: { open: null, close: null, missing: false },
+                  openDecisions: [],
+                  findings: [],
+                },
+              ],
+            },
+          });
+        }
+        return new Promise((_, rej) => {
+          deferred.rejectInspect = rej;
+        });
+      }
+      if (cmd === "rpc_request" && args?.method === "session/read") {
+        return Promise.resolve({
+          threadId: "thr_keep",
+          chainOk: true,
+          events: [{ seq: 1, hash: "c".repeat(64) }],
+        });
+      }
+      return Promise.reject(new Error(`unexpected ${cmd}`));
+    });
+    await ctrl.connect();
+    await ctrl.selectThread("thr_keep");
+    assert.equal(byId.get("room-rows")?.children[0]?.getAttribute("data-tone"), "verified");
+
+    const staleInspect = ctrl.inspectRoom();
+    await ctrl.disconnect(); // increments epoch, transitions to DISCONNECTED
+    assert.equal(discCalls, 1);
+    deferred.rejectInspect?.(staleErr);
+    await staleInspect;
+    assert.equal(ctrl.getConnectionState(), "DISCONNECTED");
+    assert.equal(discCalls, 1, "stale room/inspect must not invoke disconnect_engine");
+    assert.equal(
+      byId.get("room-rows")?.children[0]?.getAttribute("data-tone"),
+      "verified",
+      "L4: stale room/inspect rejection must not wipe room well",
+    );
+  }
 });

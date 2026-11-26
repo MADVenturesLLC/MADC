@@ -739,7 +739,7 @@ kbd {
 }
 
 /* Command palette (tier 2 strong glass, spec §7.2) */
-.palette {
+.palette.glass {
   position: fixed;
   top: 148px;
   right: 8px;
