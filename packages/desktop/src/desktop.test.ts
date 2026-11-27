@@ -1667,3 +1667,355 @@ test("M3-A3 review fixes: §9.6 G3/G6, §9.8 protocol mismatch, §9.9 R4/disconn
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// Room-table track budget (spec §5.4, pin §5.2).
+//
+// `styles.css` is resolved arithmetically, the way a grid engine resolves the track forms
+// this file uses: fixed lengths, `clamp()`, `minmax(A, B)`, `minmax(A, Bfr)` and `Nfr`. A
+// page-level overflow check cannot see the bug this guards. The Room well is
+// `overflow: hidden`, so at the 960px minimum the receipt track resolved to 0px and every
+// evidence chip was invisible while `scrollWidth` stayed equal to `clientWidth`.
+// ---------------------------------------------------------------------------
+
+/**
+ * Spec §5.4: chip values truncate to the 12-hex rule and never below it. The 12-hex `hash`
+ * chip measures 144.81px, and the widest pre-read chip pair (`chain FAILED` + `line 2`)
+ * 181.81px, in WebKit 27.2 and Chromium 159. 168px keeps the hash chip inside the track and
+ * that pair inside the track plus the row's 16px right padding.
+ */
+const RECEIPT_TRACK_MIN_PX = 168;
+
+/**
+ * The uppercase `THREAD` header label measures 49px. At 960px the frame's 100 : 108 : 194
+ * ratio would give the thread track 47.12px and cut the label, so the track keeps a 50px floor.
+ */
+const THREAD_TRACK_MIN_PX = 50;
+
+type GridTrack = { base: number; limit: number; flex: number };
+type CssRule = {
+  selectors: string[];
+  maxWidth: number | null;
+  declarations: Record<string, string>;
+};
+type DesktopLayout = {
+  viewport: number;
+  /** Resolved `#main-content` column tracks, the gap between them, and the content box. */
+  columns: number[];
+  columnGap: number;
+  mainBox: number;
+  /** Resolved Room-table tracks, the gap between them, and the row's content box. */
+  tracks: number[];
+  trackGap: number;
+  roomBox: number;
+};
+
+const FRACTION = "(\\d+(?:\\.\\d+)?)";
+const sum = (values: readonly number[]): number =>
+  values.reduce((total, value) => total + value, 0);
+
+/** One `grid-template-columns` value, with `clamp()` resolved against `viewport`. */
+function parseGridTracks(value: string, viewport: number): GridTrack[] {
+  return value
+    .trim()
+    .replace(/,\s+/g, ",")
+    .split(/\s+/)
+    .map((token): GridTrack => {
+      const clamp = token.match(
+        new RegExp(`^clamp\\(${FRACTION}px,${FRACTION}vw,${FRACTION}px\\)$`),
+      );
+      if (clamp) {
+        // `<n>vw` is n hundredths of the viewport width.
+        const preferred = (Number(clamp[2]) / 100) * viewport;
+        const size = Math.min(Math.max(preferred, Number(clamp[1])), Number(clamp[3]));
+        return { base: size, limit: size, flex: 0 };
+      }
+      // `minmax(0, 1fr)`: a minimum may be a unitless zero.
+      const range = token.match(new RegExp(`^minmax\\(${FRACTION}(?:px)?,${FRACTION}(px|fr)\\)$`));
+      if (range) {
+        const base = Number(range[1]);
+        return range[3] === "fr"
+          ? { base, limit: Number.POSITIVE_INFINITY, flex: Number(range[2]) }
+          : { base, limit: Number(range[2]), flex: 0 };
+      }
+      const fixed = token.match(new RegExp(`^${FRACTION}px$`));
+      if (fixed) return { base: Number(fixed[1]), limit: Number(fixed[1]), flex: 0 };
+      const flex = token.match(new RegExp(`^${FRACTION}fr$`));
+      if (flex) return { base: 0, limit: Number.POSITIVE_INFINITY, flex: Number(flex[1]) };
+      throw new Error(`desktop.test.ts: unsupported grid track "${token}"`);
+    });
+}
+
+/** Track sizes inside a `box`px content box: maximize first, then expand flexible tracks. */
+function sizeGridTracks(tracks: readonly GridTrack[], box: number): number[] {
+  const size = tracks.map((track) => track.base);
+  for (let spare = box - sum(size); spare > 0; spare = box - sum(size)) {
+    const growable = tracks.flatMap((track, index) =>
+      track.flex === 0 && (size[index] ?? 0) < track.limit ? [index] : [],
+    );
+    if (growable.length === 0) break;
+    for (const index of growable) {
+      size[index] = Math.min(
+        tracks[index]?.limit ?? 0,
+        (size[index] ?? 0) + spare / growable.length,
+      );
+    }
+  }
+  // A flexible track that would land below its base is frozen there and the rest re-divide.
+  const frozen = new Set<number>();
+  for (;;) {
+    const flexible = tracks.flatMap((track, index) =>
+      track.flex > 0 && !frozen.has(index) ? [index] : [],
+    );
+    if (flexible.length === 0) break;
+    // Leftover space is measured against what the other tracks already occupy.
+    const used = tracks.reduce(
+      (total, track, index) =>
+        total + (track.flex === 0 || frozen.has(index) ? (size[index] ?? 0) : 0),
+      0,
+    );
+    const flexSum = Math.max(1, sum(flexible.map((index) => tracks[index]?.flex ?? 0)));
+    const fr = Math.max(0, box - used) / flexSum;
+    const belowBase = flexible.filter((index) => {
+      const track = tracks[index];
+      return track !== undefined && fr * track.flex < track.base;
+    });
+    if (belowBase.length === 0) {
+      for (const index of flexible) size[index] = fr * (tracks[index]?.flex ?? 0);
+      break;
+    }
+    for (const index of belowBase) {
+      frozen.add(index);
+      size[index] = tracks[index]?.base ?? 0;
+    }
+  }
+  return size;
+}
+
+/** Every style rule in `css`, each tagged with the `max-width` of its enclosing media block. */
+function cssRules(css: string): CssRule[] {
+  const rules: CssRule[] = [];
+  const maxWidths: Array<number | null> = [];
+  let prelude = "";
+  let selectorText = "";
+  let body: string | null = null;
+  for (const char of css.replace(/\/\*[\s\S]*?\*\//g, "")) {
+    if (char === "{") {
+      selectorText = prelude.trim();
+      if (selectorText === "@font-face") {
+        body = "";
+      } else if (selectorText.startsWith("@")) {
+        const media = selectorText.match(/^@media \(max-width: (\d+)px\)$/);
+        maxWidths.push(media ? Number(media[1]) : null);
+      } else {
+        body = "";
+      }
+      prelude = "";
+    } else if (char === "}") {
+      if (body === null) {
+        maxWidths.pop();
+      } else {
+        const selectors = selectorText.split(",").map((selector) => selector.trim());
+        if ((selectors[0] ?? "").startsWith("@") === false) {
+          const declarations: Record<string, string> = {};
+          for (const entry of body.split(";")) {
+            const colon = entry.indexOf(":");
+            if (colon !== -1) {
+              declarations[entry.slice(0, colon).trim()] = entry.slice(colon + 1).trim();
+            }
+          }
+          rules.push({ selectors, maxWidth: maxWidths.at(-1) ?? null, declarations });
+        }
+        body = null;
+      }
+      prelude = "";
+    } else if (body === null) {
+      prelude += char;
+    } else {
+      body += char;
+    }
+  }
+  return rules;
+}
+
+/** The last rule in source order that has `selector` and declares `property` at `width`. */
+function lastRule(
+  rules: readonly CssRule[],
+  selector: string,
+  property: string,
+  width: number,
+): CssRule {
+  let found: CssRule | undefined;
+  for (const rule of rules) {
+    if (
+      rule.selectors.includes(selector) &&
+      (rule.maxWidth === null || rule.maxWidth >= width) &&
+      rule.declarations[property] !== undefined
+    ) {
+      found = rule;
+    }
+  }
+  assert.ok(found !== undefined, `${selector} declares no ${property} at ${width}px`);
+  return found;
+}
+
+function desktopLayoutAt(rules: readonly CssRule[], viewport: number): DesktopLayout {
+  const declaration = (selector: string, property: string): string =>
+    lastRule(rules, selector, property, viewport).declarations[property] ?? "";
+  const length = (value: string): number => {
+    const token = value.match(/^var\((--[\w-]+)\)$/);
+    const resolved = token ? declaration(":root", token[1] ?? "") : value;
+    assert.match(resolved, /^\d+(?:\.\d+)?px$/, `not a pixel length: ${value}`);
+    return Number.parseFloat(resolved);
+  };
+  /** Horizontal part of a one- or two-value padding shorthand. */
+  const horizontal = (value: string): number => {
+    const parts = value.split(/\s+/);
+    return length(parts.length === 1 ? (parts[0] ?? "") : (parts[1] ?? ""));
+  };
+
+  const mainTracks = parseGridTracks(
+    declaration("#main-content", "grid-template-columns"),
+    viewport,
+  );
+  const columnGap = length(declaration("#main-content", "gap"));
+  const mainBox = viewport - 2 * horizontal(declaration("#main-content", "padding"));
+  const columns = sizeGridTracks(mainTracks, mainBox - columnGap);
+
+  const leftColumn = columns[0] ?? 0;
+  const roomTracks = parseGridTracks(
+    declaration(".room-thead", "grid-template-columns"),
+    leftColumn,
+  );
+  const trackGap = length(declaration(".room-thead", "gap"));
+  const wellBorder = length(declaration(".well", "border").split(/\s+/)[0] ?? "");
+  const roomBox = leftColumn - 2 * wellBorder - 2 * horizontal(declaration(".room-row", "padding"));
+  const tracks = sizeGridTracks(roomTracks, roomBox - trackGap * (roomTracks.length - 1));
+  return { viewport, columns, columnGap, mainBox, tracks, trackGap, roomBox };
+}
+
+function describeLayout(layout: DesktopLayout): string {
+  const tracks = (values: readonly number[]): string =>
+    values.map((value) => value.toFixed(2)).join(" + ");
+  return `${layout.viewport}px: #main-content ${tracks(layout.columns)} (gap ${layout.columnGap}) in ${layout.mainBox}px; Room ${tracks(layout.tracks)} (gap ${layout.trackGap}) in ${layout.roomBox}px`;
+}
+
+test("M3-A3 spec §5.4 track budget: the Room receipt track never collapses from the 960px minimum up", () => {
+  const css = readFileSync(fileURLToPath(new URL("../ui/styles.css", import.meta.url)), "utf8");
+  const rules = cssRules(css);
+  const widths = [...Array.from({ length: 441 }, (_, index) => 960 + index), 1440, 1920, 2560];
+  for (const width of widths) {
+    const layout = desktopLayoutAt(rules, width);
+    const at = describeLayout(layout);
+    assert.equal(layout.columns.length, 2, `${at}: no longer two columns`);
+    const rightColumn = layout.columns[1] ?? 0;
+    assert.ok(rightColumn >= 360 && rightColumn <= 440, `${at}: right column size`);
+    assert.ok(
+      Math.abs(sum(layout.columns) + layout.columnGap - layout.mainBox) < 0.01,
+      `${at}: #main-content overflows`,
+    );
+    assert.ok(
+      layout.tracks.every((track) => track > 0),
+      `${at}: a Room track collapsed`,
+    );
+    assert.ok(
+      Math.abs(sum(layout.tracks) + layout.trackGap * (layout.tracks.length - 1) - layout.roomBox) <
+        0.01,
+      `${at}: Room tracks overflow the row`,
+    );
+    const receipt = layout.tracks.at(-1) ?? 0;
+    assert.ok(receipt >= RECEIPT_TRACK_MIN_PX, `${at}: receipt track below its floor`);
+    if (width < 1200) {
+      assert.ok(
+        (layout.tracks[1] ?? 0) >= THREAD_TRACK_MIN_PX,
+        `${at}: thread track below its floor`,
+      );
+    }
+    if (width >= 1200) {
+      assert.deepEqual(layout.tracks.slice(0, 4), [148, 100, 108, 48], `${at}: frame columns`);
+      assert.ok(receipt >= 194, `${at}: frame receipt track`);
+    }
+  }
+
+  // The pinned minimum, spelled out (spec §5.4): 960 - 2x28 padding - 24 gap - 360 right
+  // column leaves 520px; less the well border and row padding, 486px for five tracks.
+  const minimum = desktopLayoutAt(rules, 960);
+  const expected = [
+    [520, 360],
+    [140, 50, 48, 48, 168],
+  ];
+  for (const [index, values] of [minimum.columns, minimum.tracks].entries()) {
+    const wanted = expected[index] ?? [];
+    for (const [position, value] of values.entries()) {
+      assert.ok(Math.abs(value - (wanted[position] ?? 0)) < 0.01, describeLayout(minimum));
+    }
+  }
+});
+
+test("M3-A3 spec §5.4 breakpoints: the right column narrows to 360px and the Room grid keeps a receipt floor (960-1199px)", () => {
+  const css = readFileSync(fileURLToPath(new URL("../ui/styles.css", import.meta.url)), "utf8");
+  const rules = cssRules(css);
+  const columnsAt = (width: number): string =>
+    lastRule(rules, "#main-content", "grid-template-columns", width).declarations[
+      "grid-template-columns"
+    ] ?? "";
+  const tracksAt = (width: number): CssRule =>
+    lastRule(rules, ".room-thead", "grid-template-columns", width);
+
+  // 960-1199px: two columns, the right one shrinking to 360px at the 960px minimum.
+  const band = lastRule(rules, "#main-content", "grid-template-columns", 1199);
+  assert.equal(band.maxWidth, 1199);
+  assert.equal(columnsAt(1199), "minmax(0, 1fr) clamp(360px, 37.5vw, 440px)");
+  // 1200px and up: the frame rule, unchanged.
+  assert.equal(columnsAt(1200), "minmax(0, 1fr) 440px");
+  // Below the pinned minimum: the single-column guard, unchanged.
+  assert.equal(columnsAt(959), "1fr");
+
+  // 960-1199px: thread, seat and receipt share what is left in the frame's 100 : 108 : 194
+  // ratio. The receipt track can never fall below its floor, nor the thread track below the
+  // width of its header label.
+  const bandTracks = tracksAt(1199);
+  assert.equal(bandTracks.maxWidth, 1199);
+  assert.deepEqual(bandTracks.selectors, [".room-thead", ".room-row"]);
+  assert.equal(
+    bandTracks.declarations["grid-template-columns"],
+    "140px minmax(50px, 1fr) minmax(0, 1.08fr) 48px minmax(168px, 1.94fr)",
+  );
+  assert.equal(lastRule(rules, ".room-thead", "gap", 1199).declarations.gap, "var(--madc-space-2)");
+  // 1200px and up: the frame columns, unchanged.
+  assert.equal(
+    tracksAt(1200).declarations["grid-template-columns"],
+    "148px 100px 108px 48px minmax(0, 1fr)",
+  );
+  // Below the pinned minimum: the single-column guard keeps its own tracks and restores the
+  // frame's 12px gap, which the 960-1199px band would otherwise carry down into it.
+  const guard = tracksAt(959);
+  assert.equal(guard.maxWidth, 959);
+  assert.equal(guard.declarations["grid-template-columns"], "148px 100px 48px minmax(0, 1fr)");
+  assert.equal(lastRule(rules, ".room-thead", "gap", 959).declarations.gap, "var(--madc-space-3)");
+
+  // The empty-state row is also a `.room-row`. Its one-column rule must outrank every rule
+  // that targets `.room-row`, or the five- and four-track grids would apply to it.
+  const weight = (selector: string): number =>
+    100 * (selector.match(/#[\w-]+/g) ?? []).length + (selector.match(/\.[\w-]+/g) ?? []).length;
+  const empty = lastRule(rules, ".room-row.room-row--empty", "grid-template-columns", 960);
+  assert.deepEqual(empty.declarations["grid-template-columns"], "1fr");
+  for (const width of [960, 1199, 959]) {
+    const rivals = rules.filter(
+      (rule) =>
+        rule.selectors.includes(".room-row") &&
+        (rule.maxWidth === null || rule.maxWidth >= width) &&
+        rule.declarations["grid-template-columns"] !== undefined,
+    );
+    // The frame and band rules apply at all three widths; the guard only at 959px.
+    assert.ok(rivals.length >= 2, `expected the frame and band rules at ${width}px`);
+    for (const rival of rivals) {
+      for (const selector of rival.selectors) {
+        assert.ok(
+          weight(".room-row.room-row--empty") > weight(selector),
+          `${selector} at ${width}px outranks the empty-state row`,
+        );
+      }
+    }
+  }
+});

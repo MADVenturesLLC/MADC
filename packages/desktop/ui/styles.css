@@ -348,7 +348,8 @@ kbd {
   box-shadow: var(--madc-select-edge);
 }
 
-.room-row--empty {
+/* One full-width column at every size, so the five-track rules above and below never apply. */
+.room-row.room-row--empty {
   grid-template-columns: 1fr;
   cursor: default;
   color: var(--madc-fg);
@@ -889,9 +890,23 @@ kbd {
 }
 
 /* Responsive breakpoints (spec §5.4, pin §5.2) */
+
+/* 960-1199px: two columns, the right one narrowing to 360px at the 960px minimum, where the
+   left column is 520px (960 - 2x28 padding - 24 gap - 360). Less the well border and row
+   padding that leaves 486px for five Room tracks, so the tracks tighten: the evidence track
+   to the pill's own 140px, the gap to 8px, and thread, seat and receipt share the rest in the
+   frame's 100 : 108 : 194 ratio. Two floors keep the row legible: the receipt never drops
+   below 168px, which holds the 12-hex `hash` chip, so it can never collapse to 0px and hide
+   the evidence, and the thread never drops below 50px, the width of its header label. */
 @media (max-width: 1199px) {
   #main-content {
-    grid-template-columns: minmax(0, 1fr) minmax(360px, 440px);
+    grid-template-columns: minmax(0, 1fr) clamp(360px, 37.5vw, 440px);
+  }
+
+  .room-thead,
+  .room-row {
+    grid-template-columns: 140px minmax(50px, 1fr) minmax(0, 1.08fr) 48px minmax(168px, 1.94fr);
+    gap: var(--madc-space-2);
   }
 }
 
@@ -903,6 +918,8 @@ kbd {
   .room-thead,
   .room-row {
     grid-template-columns: 148px 100px 48px minmax(0, 1fr);
+    /* The 960-1199px band above also matches here, so the frame's gap is restated. */
+    gap: var(--madc-space-3);
   }
 
   .cell-seat,
