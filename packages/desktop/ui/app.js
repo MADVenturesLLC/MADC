@@ -1,3 +1,7 @@
 import { bindDesktopShell, invokeTauri } from "./shell.js";
 
-bindDesktopShell(document, (cmd, args) => invokeTauri(cmd, args, window));
+const controller = bindDesktopShell(document, (cmd, args) => invokeTauri(cmd, args, window));
+
+document.addEventListener("keydown", (ev) => {
+  controller.handleKeydown(ev);
+});

@@ -3,25 +3,114 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>MADC Desktop (M3-A2 Scaffold)</title>
+    <title>MADC Desktop</title>
     <link rel="stylesheet" href="./styles.css" />
   </head>
   <body>
-    <nav id="focus-bar" role="toolbar" aria-label="MADC Desktop Focus Bar">
-      <button type="button" data-focus-id="connection" aria-pressed="true">Engine</button>
-      <button type="button" data-focus-id="room" aria-pressed="false">Room</button>
-      <button type="button" data-focus-id="decisions" aria-pressed="false">Decisions</button>
-      <button type="button" data-focus-id="search" aria-pressed="false">Search</button>
+    <nav id="focus-bar" class="glass" role="toolbar" aria-label="MADC Desktop Focus Bar">
+      <div class="focus-group">
+        <button type="button" data-focus-id="connection" aria-pressed="true">Engine</button>
+        <button type="button" data-focus-id="room" aria-pressed="false">Room</button>
+        <button type="button" data-focus-id="decisions" aria-pressed="false">Decisions</button>
+        <button type="button" data-focus-id="search" aria-pressed="false">Search</button>
+      </div>
+      <div class="focus-hints" aria-hidden="true">
+        <span class="hint-pair"><kbd>Tab</kbd><kbd>←</kbd><kbd>→</kbd> move</span>
+        <span class="hint-pair"><kbd id="palette-keycap">Ctrl K</kbd> commands</span>
+      </div>
     </nav>
 
-    <main>
-      <h1>MADC Desktop Scaffold (M3-A2)</h1>
-      <p id="connection-status" class="status-neutral">
-        Engine connection: idle (neutral — unverified until engine receipt)
-      </p>
-      <button id="connect-btn" type="button">Connect to @madc/engine</button>
-      <pre id="output">Ready. Use Tab / Arrow keys on the focus bar.</pre>
+    <main id="main-content">
+      <div class="col-left">
+        <header class="section-head">
+          <span class="micro-label">ROOM/INSPECT</span>
+          <h1>Room</h1>
+          <p id="room-counts" class="counts-line">—</p>
+        </header>
+
+        <section class="well room-well" aria-label="Room threads">
+          <div class="room-thead" aria-hidden="true">
+            <span>evidence</span>
+            <span>thread</span>
+            <span class="room-thead-seat">seat</span>
+            <span>events</span>
+            <span>receipt</span>
+          </div>
+          <div id="room-rows" class="room-rows" role="listbox" aria-label="Room threads"></div>
+        </section>
+
+        <section class="well receipts-well" aria-label="Receipts">
+          <div class="well-head">
+            <span class="micro-label">RECEIPTS</span>
+            <span class="well-head-meta">session receipts</span>
+          </div>
+          <div id="receipt-rows" class="receipt-rows"></div>
+        </section>
+      </div>
+
+      <div class="col-right">
+        <section class="card engine-card" aria-label="Engine connection">
+          <div class="engine-card-head">
+            <span class="micro-label">ENGINE</span>
+            <span id="engine-pill" class="pill pill--sm" data-tone="neutral" role="status" aria-label="idle, no receipt"><span class="pill-glyph" aria-hidden="true">○</span><span class="pill-label">IDLE</span></span>
+          </div>
+          <dl class="engine-kv">
+            <dt>socket</dt>
+            <dd id="kv-socket" class="tabular-nums">—</dd>
+            <dt>protocol</dt>
+            <dd id="kv-protocol" class="kv-accent tabular-nums">—</dd>
+            <dt>server</dt>
+            <dd id="kv-server" class="tabular-nums">—</dd>
+            <dt>cold start</dt>
+            <dd id="kv-cold-start" class="tabular-nums">—</dd>
+            <dt>reused</dt>
+            <dd id="kv-reused" class="tabular-nums">—</dd>
+          </dl>
+          <p class="engine-note">Connection alone is not evidence.</p>
+        </section>
+
+        <section class="well output-well" aria-label="Engine output">
+          <div class="well-head">
+            <span class="micro-label">OUTPUT</span>
+            <span class="well-head-meta">room/inspect · read-only</span>
+          </div>
+          <pre id="output">Ready. Use Tab / Arrow keys on the focus bar.</pre>
+        </section>
+
+        <button id="connect-btn" type="button">Connect to @madc/engine</button>
+      </div>
     </main>
+
+    <footer id="connection-status" class="glass" data-tone="neutral" role="status">
+      <span class="strip-left">engine · ~/.madc/engine.sock</span>
+      <span class="strip-center">idle · no receipt</span>
+      <span class="strip-right">cold start — · model —</span>
+    </footer>
+
+    <div id="palette" class="palette glass" role="dialog" aria-modal="true" aria-label="Command palette" hidden>
+      <div class="pal-filter">
+        <span class="pal-prompt" aria-hidden="true">&gt;</span>
+        <input
+          id="palette-input"
+          type="text"
+          role="combobox"
+          aria-expanded="true"
+          aria-controls="palette-list"
+          aria-autocomplete="list"
+          autocomplete="off"
+          spellcheck="false"
+          placeholder="Type a command"
+        />
+        <kbd>Esc</kbd>
+      </div>
+      <div id="palette-list" role="listbox" aria-label="Commands"></div>
+      <div id="palette-live" class="sr-only" aria-live="polite"></div>
+      <div class="pal-foot" aria-hidden="true">
+        <kbd>↑</kbd><kbd>↓</kbd><span>move ·</span>
+        <kbd>Enter</kbd><span>run ·</span>
+        <kbd>Esc</kbd><span>close</span>
+      </div>
+    </div>
 
     <script type="module" src="./app.js"></script>
   </body>
