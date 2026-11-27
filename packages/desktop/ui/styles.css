@@ -141,9 +141,11 @@ body {
   outline-offset: 2px;
 }
 
-/* Tier 2: Elevated glass */
+/* Tier 2: Elevated glass. WebKit before Safari 18 knows the blur only with its -webkit- prefix,
+   so every `backdrop-filter` below is paired with one. */
 .glass {
   background: var(--madc-glass-fill);
+  -webkit-backdrop-filter: var(--madc-glass-blur);
   backdrop-filter: var(--madc-glass-blur);
   box-shadow: var(--madc-glass-edge);
   border: var(--madc-border-w) solid var(--madc-border);
@@ -748,6 +750,7 @@ kbd {
   min-width: 360px;
   max-width: calc(100vw - 48px);
   background: var(--madc-glass-fill-strong);
+  -webkit-backdrop-filter: var(--madc-glass-blur-strong);
   backdrop-filter: var(--madc-glass-blur-strong);
   border: var(--madc-border-w) solid var(--madc-muted);
   border-radius: var(--madc-radius-lg);
@@ -936,6 +939,7 @@ kbd {
   }
   .glass,
   .palette.glass {
+    -webkit-backdrop-filter: none;
     backdrop-filter: none;
   }
 }

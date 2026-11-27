@@ -740,6 +740,15 @@ test("M3-A3 §9.1–§9.3 static CSS, tokens, zero-network, zero-HTML-sink, no d
     if (/backdrop-filter\s*:/.test(body)) {
       assert.equal(selector.includes(".well"), false, "well must never blur");
       assert.ok(selector.includes(".glass"), `backdrop-filter outside .glass: ${selector}`);
+      // Prefixed and unprefixed travel together with one value: WebKit before Safari 18 knows
+      // the property only as `-webkit-backdrop-filter`.
+      const blur = (property: string): string | undefined =>
+        body.match(new RegExp(`(?:^|;)\\s*${property}\\s*:\\s*([^;]+);`))?.[1]?.trim();
+      assert.equal(
+        blur("-webkit-backdrop-filter"),
+        blur("backdrop-filter"),
+        `${selector}: backdrop-filter without its -webkit- pair`,
+      );
     }
     if (/^\.pill\[data-tone=/.test(selector)) {
       for (const line of body.split(";")) {
@@ -758,9 +767,10 @@ test("M3-A3 §9.1–§9.3 static CSS, tokens, zero-network, zero-HTML-sink, no d
   assert.match(css, /@media\s*\(forced-colors:\s*active\)[\s\S]*\.pill\s+\.pill-glyph/);
 
   // N1 & N3: Accessibility fallbacks cover .palette.glass and reduced-motion uses !important.
+  // The no-blur fallback switches off both forms of the property.
   assert.match(
     css,
-    /@media\s*\(prefers-reduced-transparency:\s*reduce\)[\s\S]*\.glass,\s*\.palette\.glass\s*\{\s*backdrop-filter:\s*none;\s*\}/,
+    /@media\s*\(prefers-reduced-transparency:\s*reduce\)[\s\S]*\.glass,\s*\.palette\.glass\s*\{\s*-webkit-backdrop-filter:\s*none;\s*backdrop-filter:\s*none;\s*\}/,
   );
   assert.match(
     css,
