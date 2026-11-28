@@ -29,14 +29,21 @@ pub const INITIALIZED_KILL_GRACE: Duration = Duration::from_secs(7);
 pub const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_STDERR_RETAINED_BYTES: usize = 64 * 1024;
 pub const INTERACTIVE_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+pub const MAX_CWD_BYTES: usize = 4096;
+pub const MAX_TURN_INPUT_BYTES: usize = 65_536;
 
-/// M3-A2 desktop IPC method allowlist (read-only + handshake). Any method outside this set is
-/// refused in Rust before touching the engine socket.
+/// M3-A4 desktop IPC method allowlist. Any method outside this set is refused in Rust before
+/// taking any lock or touching the engine socket. Refusal string keeps the A2/A3 prefix
+/// verbatim (`AM2 §1.1` item 4).
 pub const ALLOWED_RPC_METHODS: &[&str] = &[
     "initialize",
     "room/inspect",
     "session/search",
     "session/read",
+    "seat/list",
+    "thread/start",
+    "turn/start",
+    "turn/interrupt",
 ];
 
 pub fn validate_rpc_method(method: &str) -> Result<(), String> {
@@ -44,6 +51,169 @@ pub fn validate_rpc_method(method: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!("RPC method not allowed by M3-A2 desktop shell: {method}"))
+    }
+}
+
+pub fn is_valid_id(s: &str) -> bool {
+    if s.is_empty() || s.len() > 128 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    bytes[0].is_ascii_alphanumeric()
+        && bytes[1..]
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || *b == b'_' || *b == b'-')
+}
+
+fn rpc_param_refused(method: &str, reason: &str) -> String {
+    format!("RPC params refused by desktop shell for {method}: {reason}")
+}
+
+fn require_empty_object(method: &str, params: &Value) -> Result<(), String> {
+    let obj = params
+        .as_object()
+        .ok_or_else(|| rpc_param_refused(method, "params must be an object"))?;
+    if !obj.is_empty() {
+        return Err(rpc_param_refused(method, "unknown parameter"));
+    }
+    Ok(())
+}
+
+/// Rust-side parameter validation for M3-A4 desktop methods (`AM2 §1.2`, R5).
+/// Runs after `validate_rpc_method` and BEFORE any lock, connection check, or socket write.
+/// Never echoes unknown key names and never triggers `disconnect_engine`.
+pub fn validate_rpc_params(method: &str, params: &Value) -> Result<(), String> {
+    match method {
+        "initialize" | "session/search" | "session/read" => Ok(()),
+        "room/inspect" | "seat/list" => require_empty_object(method, params),
+        "thread/start" => {
+            let obj = params
+                .as_object()
+                .ok_or_else(|| rpc_param_refused(method, "params must be an object"))?;
+            for key in obj.keys() {
+                if key != "seatId" && key != "cwd" {
+                    return Err(rpc_param_refused(method, "unknown parameter"));
+                }
+            }
+            if let Some(seat_val) = obj.get("seatId") {
+                let seat = seat_val
+                    .as_str()
+                    .ok_or_else(|| rpc_param_refused(method, "seatId must be a valid id"))?;
+                if !is_valid_id(seat) {
+                    return Err(rpc_param_refused(method, "seatId must be a valid id"));
+                }
+            }
+            if let Some(cwd_val) = obj.get("cwd") {
+                let cwd = cwd_val.as_str().ok_or_else(|| {
+                    rpc_param_refused(method, "cwd must be an absolute path string")
+                })?;
+                if cwd.is_empty() || cwd.len() > MAX_CWD_BYTES {
+                    return Err(rpc_param_refused(
+                        method,
+                        "cwd length must be 1..=4096 bytes",
+                    ));
+                }
+                if cwd.as_bytes().contains(&0) {
+                    return Err(rpc_param_refused(method, "cwd must not contain NUL"));
+                }
+                if !Path::new(cwd).is_absolute() {
+                    return Err(rpc_param_refused(method, "cwd must be an absolute path"));
+                }
+            }
+            Ok(())
+        }
+        "turn/start" => {
+            let obj = params
+                .as_object()
+                .ok_or_else(|| rpc_param_refused(method, "params must be an object"))?;
+            for key in obj.keys() {
+                if key != "threadId" && key != "input" && key != "mode" {
+                    return Err(rpc_param_refused(method, "unknown parameter"));
+                }
+            }
+            let thread_id = obj
+                .get("threadId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| rpc_param_refused(method, "threadId must be a valid id"))?;
+            if !is_valid_id(thread_id) {
+                return Err(rpc_param_refused(method, "threadId must be a valid id"));
+            }
+            let input_arr = obj
+                .get("input")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| {
+                    rpc_param_refused(method, "input must be an array of one text item")
+                })?;
+            if input_arr.len() != 1 {
+                return Err(rpc_param_refused(
+                    method,
+                    "input must contain exactly one item",
+                ));
+            }
+            let item = input_arr[0]
+                .as_object()
+                .ok_or_else(|| rpc_param_refused(method, "input item must be an object"))?;
+            if item.len() != 2
+                || item.get("type").and_then(|v| v.as_str()) != Some("text")
+                || item.get("text").and_then(|v| v.as_str()).is_none()
+            {
+                return Err(rpc_param_refused(
+                    method,
+                    "input item must have exactly type \"text\" and string text",
+                ));
+            }
+            let text = item
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if text.trim().is_empty() {
+                return Err(rpc_param_refused(
+                    method,
+                    "input text must not be empty",
+                ));
+            }
+            if text.len() > MAX_TURN_INPUT_BYTES {
+                return Err(rpc_param_refused(
+                    method,
+                    "input text exceeds 65536 bytes",
+                ));
+            }
+            if let Some(mode_val) = obj.get("mode") {
+                if mode_val.as_str() != Some("headless") {
+                    return Err(rpc_param_refused(
+                        method,
+                        "mode must be absent or \"headless\"",
+                    ));
+                }
+            }
+            Ok(())
+        }
+        "turn/interrupt" => {
+            let obj = params
+                .as_object()
+                .ok_or_else(|| rpc_param_refused(method, "params must be an object"))?;
+            for key in obj.keys() {
+                if key != "threadId" && key != "turnId" {
+                    return Err(rpc_param_refused(method, "unknown parameter"));
+                }
+            }
+            let thread_id = obj
+                .get("threadId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| rpc_param_refused(method, "threadId must be a valid id"))?;
+            if !is_valid_id(thread_id) {
+                return Err(rpc_param_refused(method, "threadId must be a valid id"));
+            }
+            let turn_id = obj
+                .get("turnId")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| rpc_param_refused(method, "turnId must be a valid id"))?;
+            if !is_valid_id(turn_id) {
+                return Err(rpc_param_refused(method, "turnId must be a valid id"));
+            }
+            Ok(())
+        }
+        _ => Err(rpc_param_refused(method, "unknown method")),
     }
 }
 
@@ -372,6 +542,11 @@ where
 
 #[cfg(unix)]
 impl SocketClient {
+    #[cfg(test)]
+    pub fn connect_existing_for_test(socket_path: &str) -> Result<Self, String> {
+        Self::connect_and_initialize(socket_path, Duration::from_secs(2), true, Instant::now())
+    }
+
     /// Connect and run `initialize` within ONE total deadline (`timeout`), matching amendment 1
     /// §2 line 47 ("within 1 s (connect plus reply)").
     fn connect_and_initialize(
@@ -723,28 +898,180 @@ mod tests {
     use std::os::unix::net::UnixListener;
 
     #[test]
-    fn rpc_allowlist_permits_only_m3_a2_methods() {
-        for allowed in ["initialize", "room/inspect", "session/search", "session/read"] {
+    fn rpc_allowlist_permits_only_m3_a4_methods() {
+        for allowed in [
+            "initialize",
+            "room/inspect",
+            "session/search",
+            "session/read",
+            "seat/list",
+            "thread/start",
+            "turn/start",
+            "turn/interrupt",
+        ] {
             assert!(
                 validate_rpc_method(allowed).is_ok(),
                 "expected allowed method {allowed}"
             );
         }
         for denied in [
-            "turn/start",
-            "thread/start",
             "thread/resume",
+            "thread/list",
             "thread/handoff",
-            "decision/raise",
-            "decision/resolve",
-            "auth/set",
+            "provider/list",
+            "auth/status",
             "auth/remove",
+            "auth/set",
+            "decision/raise",
+            "decision/list",
+            "decision/resolve",
             "room/inspect ",
+            "turn/start ",
+            "TURN/START",
             "",
         ] {
             let err = validate_rpc_method(denied).expect_err("expected disallowed method");
-            assert!(err.contains("not allowed"), "unexpected err: {err}");
+            assert!(
+                err.starts_with("RPC method not allowed by M3-A2 desktop shell: "),
+                "unexpected err prefix: {err}"
+            );
         }
+    }
+
+    #[test]
+    fn validate_rpc_params_enforces_r5_without_echoing_keys() {
+        assert!(validate_rpc_params("seat/list", &json!({})).is_ok());
+        assert!(validate_rpc_params("room/inspect", &json!({})).is_ok());
+        let seat_extra = validate_rpc_params("seat/list", &json!({ "secretExtraKey": 1 }))
+            .expect_err("seat/list rejects unknown keys");
+        assert!(seat_extra.starts_with("RPC params refused by desktop shell for seat/list: "));
+        assert!(!seat_extra.contains("secretExtraKey"));
+
+        assert!(validate_rpc_params("thread/start", &json!({})).is_ok());
+        assert!(
+            validate_rpc_params(
+                "thread/start",
+                &json!({ "seatId": "seat-1", "cwd": "/tmp/work" })
+            )
+            .is_ok()
+        );
+        let rel_cwd = validate_rpc_params("thread/start", &json!({ "cwd": "relative/dir" }))
+            .expect_err("relative cwd must be rejected");
+        assert!(rel_cwd.starts_with("RPC params refused by desktop shell for thread/start: "));
+        assert!(validate_rpc_params("thread/start", &json!({ "cwd": "" })).is_err());
+        assert!(validate_rpc_params("thread/start", &json!({ "cwd": "/tmp/\0bad" })).is_err());
+        assert!(
+            validate_rpc_params("thread/start", &json!({ "cwd": format!("/{}", "a".repeat(4096)) }))
+                .is_err()
+        );
+        assert!(validate_rpc_params("thread/start", &json!({ "seatId": "../bad" })).is_err());
+        let ts_extra =
+            validate_rpc_params("thread/start", &json!({ "unknownFieldProbe": true }))
+                .expect_err("unknown key must be rejected");
+        assert!(!ts_extra.contains("unknownFieldProbe"));
+
+        assert!(
+            validate_rpc_params(
+                "turn/start",
+                &json!({
+                    "threadId": "thr_1",
+                    "input": [{ "type": "text", "text": "hello" }]
+                })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_rpc_params(
+                "turn/start",
+                &json!({
+                    "threadId": "thr_1",
+                    "input": [{ "type": "text", "text": "hello" }],
+                    "mode": "headless"
+                })
+            )
+            .is_ok()
+        );
+        let mode_int = validate_rpc_params(
+            "turn/start",
+            &json!({
+                "threadId": "thr_1",
+                "input": [{ "type": "text", "text": "hello" }],
+                "mode": "interactive"
+            }),
+        )
+        .expect_err("interactive mode must be refused");
+        assert_eq!(
+            mode_int,
+            "RPC params refused by desktop shell for turn/start: mode must be absent or \"headless\""
+        );
+        assert!(
+            validate_rpc_params(
+                "turn/start",
+                &json!({
+                    "threadId": "thr_1",
+                    "input": [{ "type": "text", "text": "   " }]
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_rpc_params(
+                "turn/start",
+                &json!({
+                    "threadId": "thr_1",
+                    "input": [
+                        { "type": "text", "text": "a" },
+                        { "type": "text", "text": "b" }
+                    ]
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_rpc_params(
+                "turn/start",
+                &json!({
+                    "threadId": "thr_1",
+                    "input": [{ "type": "text", "text": "a", "extra": 1 }]
+                })
+            )
+            .is_err()
+        );
+        assert!(
+            validate_rpc_params(
+                "turn/start",
+                &json!({
+                    "threadId": "thr_1",
+                    "input": [{ "type": "text", "text": "x".repeat(65_537) }]
+                })
+            )
+            .is_err()
+        );
+
+        assert!(
+            validate_rpc_params(
+                "turn/interrupt",
+                &json!({ "threadId": "thr_1", "turnId": "turn_1" })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_rpc_params(
+                "turn/interrupt",
+                &json!({ "threadId": "thr_1", "turnId": "turn_1", "extra": 1 })
+            )
+            .is_err()
+        );
+        assert!(validate_rpc_params("turn/interrupt", &json!({ "threadId": "thr_1" })).is_err());
+
+        // Static source check: R5 params validator must never reference disconnect.
+        let src = include_str!("launcher.rs");
+        let start = src.find("pub fn validate_rpc_params").unwrap();
+        let end = src[start..].find("\n/// Append a chunk").unwrap() + start;
+        assert!(
+            !src[start..end].contains("disconnect"),
+            "validate_rpc_params must not contain disconnect"
+        );
     }
 
     #[test]
