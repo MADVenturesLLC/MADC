@@ -8,10 +8,11 @@ mod launcher;
 
 #[cfg(not(unix))]
 use launcher::{validate_rpc_method, validate_rpc_params};
-use launcher::{ConnectionInfo, LaunchConfig};
+use launcher::{CloseDecision, ConnectionInfo, LaunchConfig, QuitCommandResult};
 use serde_json::Value;
 use std::sync::Arc;
-use tauri::{AppHandle, Emitter, Manager, RunEvent, State};
+use std::time::Instant;
+use tauri::{AppHandle, Emitter, Manager, RunEvent, State, WindowEvent};
 
 #[cfg(unix)]
 struct TauriEventSink(AppHandle);
@@ -98,6 +99,79 @@ async fn disconnect_engine(state: State<'_, EngineState>) -> Result<(), String> 
     }
 }
 
+#[tauri::command]
+async fn quit_dialog_shown(
+    state: State<'_, EngineState>,
+    epoch: u64,
+    request_id: u64,
+) -> Result<QuitCommandResult, String> {
+    #[cfg(unix)]
+    {
+        let ctrl = Arc::clone(&state.0);
+        tauri::async_runtime::spawn_blocking(move || {
+            Ok(ctrl.quit_dialog_shown_at(epoch, request_id, Instant::now()))
+        })
+        .await
+        .map_err(|e| format!("quit_dialog_shown task failed: {e}"))?
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (state, epoch, request_id);
+        Ok(QuitCommandResult { accepted: false })
+    }
+}
+
+#[tauri::command]
+async fn ack_quit(
+    state: State<'_, EngineState>,
+    epoch: u64,
+    request_id: u64,
+) -> Result<QuitCommandResult, String> {
+    #[cfg(unix)]
+    {
+        let ctrl = Arc::clone(&state.0);
+        tauri::async_runtime::spawn_blocking(move || {
+            Ok(ctrl.ack_quit_at(epoch, request_id, Instant::now()))
+        })
+        .await
+        .map_err(|e| format!("ack_quit task failed: {e}"))?
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (state, epoch, request_id);
+        Ok(QuitCommandResult { accepted: false })
+    }
+}
+
+#[tauri::command]
+async fn confirm_quit(
+    app: AppHandle,
+    state: State<'_, EngineState>,
+    epoch: u64,
+    request_id: u64,
+) -> Result<QuitCommandResult, String> {
+    #[cfg(unix)]
+    {
+        let ctrl = Arc::clone(&state.0);
+        let app_c = app.clone();
+        let res = tauri::async_runtime::spawn_blocking(move || {
+            let sink = TauriEventSink(app_c);
+            ctrl.confirm_quit_at(epoch, request_id, &sink, Instant::now())
+        })
+        .await
+        .map_err(|e| format!("confirm_quit task failed: {e}"))?;
+        if res.accepted {
+            app.exit(0);
+        }
+        Ok(res)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (app, state, epoch, request_id);
+        Ok(QuitCommandResult { accepted: false })
+    }
+}
+
 fn main() {
     #[cfg(unix)]
     let state = EngineState(Arc::new(launcher::DesktopController::new()));
@@ -106,21 +180,63 @@ fn main() {
 
     let app = tauri::Builder::default()
         .manage(state)
+        .on_window_event(|window, event| {
+            #[cfg(unix)]
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() != "main" {
+                    return;
+                }
+                if let Some(state) = window.app_handle().try_state::<EngineState>() {
+                    let sink = TauriEventSink(window.app_handle().clone());
+                    let dec = state.0.handle_close_or_exit_at(&sink, Instant::now());
+                    if matches!(
+                        dec,
+                        CloseDecision::PreventQuitRequested { .. }
+                            | CloseDecision::PreventAlreadyPending
+                    ) {
+                        api.prevent_close();
+                    }
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = (window, event);
+        })
         .invoke_handler(tauri::generate_handler![
             connect_engine,
             rpc_request,
-            disconnect_engine
+            disconnect_engine,
+            quit_dialog_shown,
+            ack_quit,
+            confirm_quit
         ])
         .build(tauri::generate_context!())
         .expect("error while building MADC Desktop");
 
-    app.run(|app_handle, event| {
-        if let RunEvent::Exit = event {
+    app.run(|app_handle, event| match event {
+        RunEvent::ExitRequested { api, .. } => {
             #[cfg(unix)]
             if let Some(state) = app_handle.try_state::<EngineState>() {
-                let _ = state.0.disconnect_engine_blocking();
+                let sink = TauriEventSink(app_handle.clone());
+                let dec = state.0.handle_close_or_exit_at(&sink, Instant::now());
+                if matches!(
+                    dec,
+                    CloseDecision::PreventQuitRequested { .. }
+                        | CloseDecision::PreventAlreadyPending
+                ) {
+                    api.prevent_exit();
+                }
+            }
+            #[cfg(not(unix))]
+            let _ = (app_handle, api);
+        }
+        RunEvent::Exit => {
+            #[cfg(unix)]
+            if let Some(state) = app_handle.try_state::<EngineState>() {
+                let sink = TauriEventSink(app_handle.clone());
+                state.0.handle_run_event_exit(&sink, Instant::now());
             }
         }
+        _ => {}
     });
 }
 
@@ -205,7 +321,7 @@ mod tests {
 
         let client = launcher::SocketClient::connect_existing_for_test(tmp.to_str().unwrap())
             .expect("connect test socket");
-        *ctrl.client.lock().unwrap() = Some(client);
+        ctrl.set_client_for_test(client);
         let refused = ctrl
             .rpc_request_blocking(
                 "turn/start",

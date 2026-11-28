@@ -1656,12 +1656,6 @@ impl DropRateLimiter {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct ForwardedNotification {
-    pub method: String,
-    pub params: Value,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionInfo {
@@ -2300,6 +2294,150 @@ impl ClientOwner {
             }
         }
     }
+
+    fn expire_outstanding_if_due(&mut self, now: Instant) {
+        if let Some(ref mut rec) = self.quit_record {
+            if rec.phase == QuitPhase::Outstanding && now >= rec.expires_at {
+                rec.phase = QuitPhase::Settled;
+                self.quit_fallback_set_at = Some(rec.expires_at);
+            }
+        }
+    }
+
+    /// Close/exit guard + quit lifecycle decision inside the owner (`L1`, `L9`, `L10`, `L13`).
+    pub fn evaluate_close_request_at(
+        &mut self,
+        exit_started_flag: bool,
+        sink: &dyn EventSink,
+        now: Instant,
+    ) -> CloseDecision {
+        // Check exit_started FIRST before guard (T-L13 invariant).
+        if exit_started_flag {
+            return CloseDecision::Coalesce;
+        }
+        if !matches!(self.phase, LifecyclePhase::Open) {
+            return CloseDecision::AllowExit;
+        }
+        self.expire_outstanding_if_due(now);
+        let fallback_live = self
+            .quit_fallback_set_at
+            .is_some_and(|t| now.saturating_duration_since(t) < QUIT_FALLBACK_TTL);
+        if self.guard_count() == 0 || fallback_live {
+            self.close_to_closed("exit", sink);
+            return CloseDecision::AllowExit;
+        }
+        match self.quit_record {
+            Some(ref rec) if rec.phase == QuitPhase::Outstanding => {
+                CloseDecision::PreventAlreadyPending
+            }
+            Some(ref rec) if rec.phase == QuitPhase::Shown => {
+                let req_id = rec.request_id;
+                let payload = json!({ "epoch": self.epoch, "requestId": req_id });
+                if sink.emit_quit_requested(payload).is_err() {
+                    if let Some(ref mut r) = self.quit_record {
+                        r.phase = QuitPhase::Settled;
+                    }
+                    self.quit_fallback_set_at = Some(now);
+                }
+                CloseDecision::PreventQuitRequested {
+                    epoch: self.epoch,
+                    request_id: req_id,
+                }
+            }
+            _ => {
+                let req_id = NEXT_QUIT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+                self.quit_record = Some(QuitRecord {
+                    request_id: req_id,
+                    phase: QuitPhase::Outstanding,
+                    expires_at: now + QUIT_SHOWN_ACK_BOUND,
+                });
+                let payload = json!({ "epoch": self.epoch, "requestId": req_id });
+                if sink.emit_quit_requested(payload).is_err() {
+                    if let Some(ref mut r) = self.quit_record {
+                        r.phase = QuitPhase::Settled;
+                    }
+                    self.quit_fallback_set_at = Some(now);
+                }
+                CloseDecision::PreventQuitRequested {
+                    epoch: self.epoch,
+                    request_id: req_id,
+                }
+            }
+        }
+    }
+
+    pub fn quit_dialog_shown_at(&mut self, epoch: u64, request_id: u64, now: Instant) -> bool {
+        if !matches!(self.phase, LifecyclePhase::Open) || self.epoch != epoch {
+            return false;
+        }
+        self.expire_outstanding_if_due(now);
+        match self.quit_record {
+            Some(ref mut rec) if rec.request_id == request_id && rec.phase == QuitPhase::Outstanding => {
+                rec.phase = QuitPhase::Shown;
+                true
+            }
+            Some(ref rec) if rec.request_id == request_id && rec.phase == QuitPhase::Shown => true,
+            _ => false,
+        }
+    }
+
+    pub fn ack_quit_at(&mut self, epoch: u64, request_id: u64, now: Instant) -> bool {
+        if !matches!(self.phase, LifecyclePhase::Open) || self.epoch != epoch {
+            return false;
+        }
+        self.expire_outstanding_if_due(now);
+        match self.quit_record {
+            Some(ref mut rec)
+                if rec.request_id == request_id
+                    && matches!(rec.phase, QuitPhase::Outstanding | QuitPhase::Shown) =>
+            {
+                rec.phase = QuitPhase::Settled;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    pub fn confirm_quit_at(
+        &mut self,
+        epoch: u64,
+        request_id: u64,
+        sink: &dyn EventSink,
+        now: Instant,
+    ) -> bool {
+        if !matches!(self.phase, LifecyclePhase::Open) || self.epoch != epoch {
+            return false;
+        }
+        self.expire_outstanding_if_due(now);
+        let ok = matches!(
+            self.quit_record,
+            Some(ref rec)
+                if rec.request_id == request_id
+                    && matches!(rec.phase, QuitPhase::Outstanding | QuitPhase::Shown)
+        );
+        if !ok {
+            return false;
+        }
+        if let Some(ref mut rec) = self.quit_record {
+            rec.phase = QuitPhase::Settled;
+        }
+        self.close_to_closed("exit", sink);
+        true
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct QuitCommandResult {
+    pub accepted: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CloseDecision {
+    AllowExit,
+    PreventQuitRequested { epoch: u64, request_id: u64 },
+    PreventAlreadyPending,
+    Coalesce,
 }
 
 #[derive(Clone, Default)]
@@ -2317,7 +2455,7 @@ struct StopInFlight {
 }
 
 #[cfg(unix)]
-struct StopState {
+pub(crate) struct StopState {
     cancel_stream: Option<UnixStream>,
     spawned: Option<SpawnedServe>,
     in_flight: Option<Arc<StopInFlight>>,
@@ -2326,7 +2464,7 @@ struct StopState {
 }
 
 #[cfg(unix)]
-pub fn stop_child(stop_arc: &Arc<Mutex<StopState>>, deadline: Instant) {
+pub(crate) fn stop_child(stop_arc: &Arc<Mutex<StopState>>, deadline: Instant) {
     let (in_flight, run_inline) = {
         let mut g = match stop_arc.lock() {
             Ok(g) => g,
@@ -3412,11 +3550,32 @@ fn connect_or_spawn_with_timeouts(
 }
 
 #[cfg(unix)]
+fn lock_with_deadline<'a, T>(
+    m: &'a Mutex<T>,
+    deadline: Instant,
+) -> Option<std::sync::MutexGuard<'a, T>> {
+    loop {
+        match m.try_lock() {
+            Ok(g) => return Some(g),
+            Err(std::sync::TryLockError::Poisoned(p)) => return Some(p.into_inner()),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
 pub struct DesktopController {
     pub exit_started: AtomicBool,
     pub shutting_down: AtomicBool,
     pub connect_mutex: Mutex<()>,
     pub client: Mutex<Option<SocketClient>>,
+    pub(crate) stop_fallback: Mutex<Option<Arc<Mutex<StopState>>>>,
+    pub first_starter_at: Mutex<Option<Instant>>,
 }
 
 #[cfg(unix)]
@@ -3434,6 +3593,28 @@ impl DesktopController {
             shutting_down: AtomicBool::new(false),
             connect_mutex: Mutex::new(()),
             client: Mutex::new(None),
+            stop_fallback: Mutex::new(None),
+            first_starter_at: Mutex::new(None),
+        }
+    }
+
+    pub fn set_client_for_test(&self, client: SocketClient) {
+        *self.stop_fallback.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Arc::clone(&client.inner.stop_state));
+        *self.client.lock().unwrap_or_else(|p| p.into_inner()) = Some(client);
+    }
+
+    fn record_or_get_first_starter(&self, now: Instant) -> Instant {
+        let mut g = self
+            .first_starter_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        match *g {
+            Some(t) => t,
+            None => {
+                *g = Some(now);
+                now
+            }
         }
     }
 
@@ -3484,6 +3665,8 @@ impl DesktopController {
             return Err("engine socket closed during connect".to_string());
         }
         let info = new_client.info.clone();
+        *self.stop_fallback.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some(Arc::clone(&new_client.inner.stop_state));
         *self
             .client
             .lock()
@@ -3525,6 +3708,200 @@ impl DesktopController {
             client.close_and_stop("disconnect", Instant::now() + DISCONNECT_STOP_BOUND);
         }
         Ok(())
+    }
+
+    /// Close/exit request decision (`CloseRequested` or `ExitRequested`). Runs bounded L7 `stop_child`
+    /// ONLY on `AllowExit` (outside owner lock on L7 worker thread, never on `Prevent*` / `Coalesce`).
+    pub fn handle_close_or_exit_at(&self, sink: &dyn EventSink, now: Instant) -> CloseDecision {
+        if self.exit_started.load(Ordering::Acquire) {
+            return CloseDecision::Coalesce;
+        }
+        let lock_deadline = now + EXIT_LOCK_WAIT;
+        let client_opt = match lock_with_deadline(&self.client, lock_deadline) {
+            Some(g) => g.clone(),
+            None => {
+                // Wedged past EXIT_LOCK_WAIT: allow close & stop fallback child within EXIT_BOUND.
+                let first_seen = self.record_or_get_first_starter(now);
+                self.shutting_down.store(true, Ordering::Release);
+                self.exit_started.store(true, Ordering::Release);
+                if let Some(fb) = self
+                    .stop_fallback
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .clone()
+                {
+                    stop_child(&fb, first_seen + EXIT_BOUND);
+                }
+                return CloseDecision::AllowExit;
+            }
+        };
+
+        let Some(client) = client_opt else {
+            let first_seen = self.record_or_get_first_starter(now);
+            self.shutting_down.store(true, Ordering::Release);
+            self.exit_started.store(true, Ordering::Release);
+            if let Some(fb) = self
+                .stop_fallback
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
+            {
+                stop_child(&fb, first_seen + EXIT_BOUND);
+            }
+            return CloseDecision::AllowExit;
+        };
+
+        let decision = {
+            let Some(mut owner_g) = lock_with_deadline(&client.inner.owner, lock_deadline) else {
+                let first_seen = self.record_or_get_first_starter(now);
+                self.shutting_down.store(true, Ordering::Release);
+                self.exit_started.store(true, Ordering::Release);
+                let stop_arc = Arc::clone(&client.inner.stop_state);
+                drop(client);
+                stop_child(&stop_arc, first_seen + EXIT_BOUND);
+                return CloseDecision::AllowExit;
+            };
+            let already_exiting = self.exit_started.load(Ordering::Acquire);
+            let dec = owner_g.evaluate_close_request_at(already_exiting, sink, now);
+            if dec == CloseDecision::AllowExit {
+                self.record_or_get_first_starter(now);
+                self.shutting_down.store(true, Ordering::Release);
+                self.exit_started.store(true, Ordering::Release);
+            }
+            dec
+        };
+
+        if decision == CloseDecision::AllowExit {
+            client.inner.drain_cv.notify_all();
+            if let Ok(mut wg) = client.inner.write_half.lock() {
+                let _ = wg.take();
+            }
+            let first_seen = self.record_or_get_first_starter(now);
+            stop_child(&client.inner.stop_state, first_seen + EXIT_BOUND);
+        }
+        decision
+    }
+
+    pub fn quit_dialog_shown_at(
+        &self,
+        epoch: u64,
+        request_id: u64,
+        now: Instant,
+    ) -> QuitCommandResult {
+        if self.exit_started.load(Ordering::Acquire) {
+            return QuitCommandResult { accepted: false };
+        }
+        let client_opt = self
+            .client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(client) = client_opt else {
+            return QuitCommandResult { accepted: false };
+        };
+        let mut o = client.inner.owner.lock().unwrap_or_else(|p| p.into_inner());
+        QuitCommandResult {
+            accepted: o.quit_dialog_shown_at(epoch, request_id, now),
+        }
+    }
+
+    pub fn ack_quit_at(&self, epoch: u64, request_id: u64, now: Instant) -> QuitCommandResult {
+        if self.exit_started.load(Ordering::Acquire) {
+            return QuitCommandResult { accepted: false };
+        }
+        let client_opt = self
+            .client
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+        let Some(client) = client_opt else {
+            return QuitCommandResult { accepted: false };
+        };
+        let mut o = client.inner.owner.lock().unwrap_or_else(|p| p.into_inner());
+        QuitCommandResult {
+            accepted: o.ack_quit_at(epoch, request_id, now),
+        }
+    }
+
+    pub fn confirm_quit_at(
+        &self,
+        epoch: u64,
+        request_id: u64,
+        sink: &dyn EventSink,
+        now: Instant,
+    ) -> QuitCommandResult {
+        if self.exit_started.load(Ordering::Acquire) {
+            return QuitCommandResult { accepted: false };
+        }
+        let lock_deadline = now + EXIT_LOCK_WAIT;
+        let Some(client) = lock_with_deadline(&self.client, lock_deadline).and_then(|g| g.clone())
+        else {
+            return QuitCommandResult { accepted: false };
+        };
+        let accepted = {
+            let Some(mut o) = lock_with_deadline(&client.inner.owner, lock_deadline) else {
+                return QuitCommandResult { accepted: false };
+            };
+            if self.exit_started.load(Ordering::Acquire) {
+                return QuitCommandResult { accepted: false };
+            }
+            let ok = o.confirm_quit_at(epoch, request_id, sink, now);
+            if ok {
+                self.record_or_get_first_starter(now);
+                self.shutting_down.store(true, Ordering::Release);
+                self.exit_started.store(true, Ordering::Release);
+            }
+            ok
+        };
+        if accepted {
+            client.inner.drain_cv.notify_all();
+            if let Ok(mut wg) = client.inner.write_half.lock() {
+                let _ = wg.take();
+            }
+            let first_seen = self.record_or_get_first_starter(now);
+            stop_child(&client.inner.stop_state, first_seen + EXIT_BOUND);
+        }
+        QuitCommandResult { accepted }
+    }
+
+    /// `RunEvent::Exit`: NEVER dropped (`AM2 §6`, `L13`). Shares one `EXIT_LOCK_WAIT` (2 s) across
+    /// request/client/owner locks; falls back to `stop_fallback` if wedged; never extends `EXIT_BOUND` (9 s).
+    pub fn handle_run_event_exit(&self, sink: &dyn EventSink, now: Instant) {
+        let first_seen = self.record_or_get_first_starter(now);
+        let lock_deadline = first_seen + EXIT_LOCK_WAIT;
+        let bound_deadline = first_seen + EXIT_BOUND;
+
+        self.shutting_down.store(true, Ordering::Release);
+
+        let client_opt = lock_with_deadline(&self.client, lock_deadline).and_then(|mut g| g.take());
+        let mut stop_target = self
+            .stop_fallback
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+
+        if let Some(ref client) = client_opt {
+            stop_target = Some(Arc::clone(&client.inner.stop_state));
+            if !self.exit_started.load(Ordering::Acquire) {
+                if let Some(mut owner_g) = lock_with_deadline(&client.inner.owner, lock_deadline) {
+                    if !self.exit_started.swap(true, Ordering::AcqRel) {
+                        owner_g.close_to_closed("exit", sink);
+                    }
+                } else {
+                    self.exit_started.store(true, Ordering::Release);
+                }
+            }
+            client.inner.drain_cv.notify_all();
+            if let Ok(mut wg) = client.inner.write_half.lock() {
+                let _ = wg.take();
+            }
+        } else {
+            self.exit_started.store(true, Ordering::Release);
+        }
+
+        if let Some(stop_arc) = stop_target {
+            stop_child(&stop_arc, bound_deadline);
+        }
     }
 }
 
@@ -5086,11 +5463,12 @@ mod tests {
     }
 
     #[test]
-    fn owner_randomized_10k_schedule_preserves_l1_l3_l4_l5_l6_t_l1() {
-        // T-L1: 10,000-seed randomized interleaving over ClientOwner operations checking L3-L6 + L1.
+    fn owner_randomized_10k_schedule_preserves_l1_l3_l4_l5_l6_l10_t_l1() {
+        // T-L1: 10,000-seed randomized interleaving over ClientOwner operations checking L3-L6 + L1 + L10.
         struct L1CheckSink {
             owner: Arc<Mutex<ClientOwner>>,
-            events: Mutex<Vec<Value>>,
+            engine_events: Mutex<Vec<Value>>,
+            quit_events: Mutex<Vec<Value>>,
         }
         impl EventSink for L1CheckSink {
             fn emit_engine_event(&self, payload: Value) -> Result<(), String> {
@@ -5098,12 +5476,12 @@ mod tests {
                     self.owner.try_lock().is_err(),
                     "T-L1 killed mutation: emit started outside owner!"
                 );
-                self.events.lock().unwrap().push(payload);
+                self.engine_events.lock().unwrap().push(payload);
                 Ok(())
             }
             fn emit_quit_requested(&self, payload: Value) -> Result<(), String> {
                 assert!(self.owner.try_lock().is_err());
-                self.events.lock().unwrap().push(payload);
+                self.quit_events.lock().unwrap().push(payload);
                 Ok(())
             }
         }
@@ -5118,13 +5496,20 @@ mod tests {
             let owner = Arc::new(Mutex::new(ClientOwner::new(seed + 1)));
             let sink = L1CheckSink {
                 owner: Arc::clone(&owner),
-                events: Mutex::new(Vec::new()),
+                engine_events: Mutex::new(Vec::new()),
+                quit_events: Mutex::new(Vec::new()),
             };
             let mut was_published = false;
+            let mut exit_started_sim = false;
             let mut turn_counter = 0u64;
+            let base_clock = Instant::now();
+            let mut fake_ms = 0u64;
+            let mut last_quit_req_id = 0u64;
 
-            for _step in 0..16 {
-                let op = next_u32() % 7;
+            for _step in 0..20 {
+                let op = next_u32() % 11;
+                fake_ms += (next_u32() % 2500) as u64;
+                let now = base_clock + Duration::from_millis(fake_ms);
                 let mut o = owner.lock().unwrap();
                 match op {
                     0 => {
@@ -5161,7 +5546,7 @@ mod tests {
                             o.finish_pending_turn_start("thr_1", Some(&tid));
                         }
                     }
-                    _ => {
+                    6 => {
                         if matches!(o.phase, LifecyclePhase::Open) {
                             o.observe_turn_notification(
                                 "turn/completed",
@@ -5169,8 +5554,30 @@ mod tests {
                             );
                         }
                     }
+                    7 => {
+                        let dec = o.evaluate_close_request_at(exit_started_sim, &sink, now);
+                        if dec == CloseDecision::AllowExit {
+                            exit_started_sim = true;
+                        } else if let CloseDecision::PreventQuitRequested { request_id, .. } = dec {
+                            assert!(request_id >= last_quit_req_id, "L10 requestId must not decrease");
+                            last_quit_req_id = request_id;
+                        }
+                    }
+                    8 => {
+                        let ep = o.epoch;
+                        let _ = o.quit_dialog_shown_at(ep, last_quit_req_id, now);
+                    }
+                    9 => {
+                        let ep = o.epoch;
+                        let _ = o.ack_quit_at(ep, last_quit_req_id, now);
+                    }
+                    _ => {
+                        let ep = o.epoch;
+                        if o.confirm_quit_at(ep, last_quit_req_id, &sink, now) {
+                            exit_started_sim = true;
+                        }
+                    }
                 }
-                // L6 check: if Terminated or Closed, guard and quit state are empty
                 if matches!(o.phase, LifecyclePhase::Terminated { .. } | LifecyclePhase::Closed) {
                     assert_eq!(o.guard_count(), 0);
                     assert!(o.quit_record.is_none());
@@ -5178,14 +5585,14 @@ mod tests {
                     assert!(o.pending.is_empty());
                 }
             }
-            // Drain/close to end cleanly
             {
                 let mut o = owner.lock().unwrap();
                 o.close_to_closed("exit", &sink);
             }
-            let evs = sink.events.lock().unwrap();
+            let evs = sink.engine_events.lock().unwrap();
             if !was_published {
                 assert!(evs.is_empty(), "L2 violated: unpublished epoch emitted!");
+                assert!(sink.quit_events.lock().unwrap().is_empty());
             } else {
                 let terminals: Vec<_> = evs
                     .iter()
@@ -5552,6 +5959,473 @@ mod tests {
         p2.join().unwrap();
         peer.join().unwrap();
         let _ = std::fs::remove_dir_all(&home2);
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn close_guard_t_l9_and_6_through_6e_prevent_only_for_admitted_turns() {
+        // (6a)-(6e) and (T-L9) over real socket peer
+        let tmp = std::env::temp_dir().join(format!("madc-tl9-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let listener = UnixListener::bind(&tmp).unwrap();
+        let (hold_req2_tx, hold_req2_rx) = mpsc::sync_channel::<()>(1);
+        let peer = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            let mut r = BufReader::new(s);
+            let mut buf = Vec::new();
+            // 1. initialize
+            let BoundedLine::Line(req) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+            let v: Value = serde_json::from_str(&req).unwrap();
+            writeln!(w, "{}", json!({"id":v["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
+            w.flush().unwrap();
+
+            // 2. turn/start A (gap: NO turn/started sent yet!) -> (6a)
+            let BoundedLine::Line(req1) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+            let v1: Value = serde_json::from_str(&req1).unwrap();
+            writeln!(w, "{}", json!({"id":v1["id"],"result":{"turn":{"id":"turn_A","threadId":"thr_1","status":"inProgress","items":[],"error":null,"startedAt":10,"completedAt":null}}})).unwrap();
+            w.flush().unwrap();
+
+            // 3. turn/start C (6b: answered ONLY after test checks pendingStarts > 0, returns RPC error -> 6c)
+            let BoundedLine::Line(req2) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+            let v2: Value = serde_json::from_str(&req2).unwrap();
+            let _ = hold_req2_rx.recv_timeout(Duration::from_secs(2));
+            writeln!(w, "{}", json!({"id":v2["id"],"error":{"code":-32004,"message":"turn already active"}})).unwrap();
+            w.flush().unwrap();
+
+            // 4. turn/start D that never replies before client timeout -> late reply sent after timeout -> (6e)
+            let BoundedLine::Line(req3) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+            let v3: Value = serde_json::from_str(&req3).unwrap();
+            thread::sleep(Duration::from_millis(220));
+            let _ = writeln!(w, "{}", json!({"id":v3["id"],"result":{"turn":{"id":"turn_late","threadId":"thr_1","status":"inProgress","items":[],"error":null,"startedAt":20,"completedAt":null}}}));
+            let _ = writeln!(w, "{}", json!({"method":"turn/started","params":{"turn":{"id":"turn_late","threadId":"thr_1","status":"inProgress","items":[],"error":null,"startedAt":20,"completedAt":null}}}));
+            let _ = w.flush();
+            thread::sleep(Duration::from_millis(120));
+        });
+
+        let sink = Arc::new(TestSink::default());
+        let client = SocketClient::connect_existing_with_sink(
+            tmp.to_str().unwrap(),
+            Arc::clone(&sink) as Arc<dyn EventSink>,
+        )
+        .unwrap();
+        let ctrl = DesktopController::new();
+        ctrl.set_client_for_test(client.clone());
+
+        // (6a) turn/start A succeeds with no turn/started sent -> guard == 1
+        let _ = ctrl
+            .rpc_request_blocking(
+                "turn/start",
+                json!({"threadId":"thr_1","input":[{"type":"text","text":"a"}]}),
+            )
+            .unwrap();
+        assert_eq!(client.inner.owner.lock().unwrap().guard_count(), 1);
+        let t0 = Instant::now();
+        let dec = ctrl.handle_close_or_exit_at(&*sink, t0);
+        assert!(matches!(dec, CloseDecision::PreventQuitRequested { .. }));
+        if let CloseDecision::PreventQuitRequested { epoch, request_id } = dec {
+            assert!(ctrl.ack_quit_at(epoch, request_id, t0).accepted);
+        }
+
+        // (6d) No double count when turn/started arrives for already-admitted turn_A; un-admitted turn_B ignored!
+        {
+            let mut o = client.inner.owner.lock().unwrap();
+            o.observe_turn_notification("turn/started", &json!({"turn":{"id":"turn_A","threadId":"thr_1","status":"inProgress","items":[],"error":null,"startedAt":10,"completedAt":null}}));
+            assert_eq!(o.guard_count(), 1, "6d: duplicate turn/started for admitted turn_A counts once");
+            o.observe_turn_notification("turn/started", &json!({"turn":{"id":"turn_B","threadId":"thr_1","status":"inProgress","items":[],"error":null,"startedAt":10,"completedAt":null}}));
+            assert_eq!(o.guard_count(), 1, "T-L9: un-admitted turn_B must not enter guard");
+            o.observe_turn_notification("turn/completed", &json!({"turn":{"id":"turn_B","threadId":"thr_1","status":"completed","items":[],"error":null,"startedAt":10,"completedAt":11}}));
+            assert_eq!(o.guard_count(), 1, "T-L9: turn/completed for B must not remove A");
+            o.observe_turn_notification("turn/completed", &json!({"turn":{"id":"turn_A","threadId":"thr_1","status":"completed","items":[],"error":null,"startedAt":10,"completedAt":11}}));
+            assert_eq!(o.guard_count(), 0, "6c/6d: turn/completed for A returns guard to zero");
+        }
+
+        // (6b) turn/start C in flight while close decision runs -> guard == 1; error returns guard to 0 (6c)
+        let client_bg = client.clone();
+        let rpc_jh = thread::spawn(move || {
+            client_bg.request("turn/start", json!({"threadId":"thr_1","input":[{"type":"text","text":"c"}]}))
+        });
+        while client.inner.owner.lock().unwrap().guard_count() == 0 {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(client.inner.owner.lock().unwrap().guard_count(), 1);
+        let _ = hold_req2_tx.send(());
+        assert!(rpc_jh.join().unwrap().is_err());
+        assert_eq!(client.inner.owner.lock().unwrap().guard_count(), 0, "6c: error leaves guard at 0");
+
+        // (6e) timed-out turn/start decrements pendingStarts; late reply + turn/started do not insert
+        let to_err = client
+            .request_with_deadline(
+                "turn/start",
+                json!({"threadId":"thr_1","input":[{"type":"text","text":"late"}]}),
+                Instant::now() + Duration::from_millis(80),
+            )
+            .unwrap_err();
+        assert!(to_err.contains("timed out"));
+        assert_eq!(client.inner.owner.lock().unwrap().guard_count(), 0);
+        thread::sleep(Duration::from_millis(260));
+        assert_eq!(client.inner.owner.lock().unwrap().guard_count(), 0, "6e: late reply/turn/started never admitted");
+
+        // Pre-response turn/started + turn/completed buffered for matching single pending start
+        {
+            let mut o = client.inner.owner.lock().unwrap();
+            *o.pending_starts.entry("thr_buf".to_string()).or_insert(0) += 1;
+            o.pending_starts_total += 1;
+            o.observe_turn_notification("turn/completed", &json!({"turn":{"id":"turn_fast","threadId":"thr_buf","status":"completed","items":[],"error":null,"startedAt":1,"completedAt":2}}));
+            assert_eq!(o.guard_count(), 1);
+            o.finish_pending_turn_start("thr_buf", Some("turn_fast"));
+            assert_eq!(o.guard_count(), 0, "buffered turn/completed must reconcile guard to 0 upon admission");
+        }
+
+        // 1,000-rep barrier race between finish_pending_turn_start (admitting reply) and close decision
+        for _ in 0..1000 {
+            let o_arc = Arc::new(Mutex::new(ClientOwner::new(1)));
+            {
+                let mut o = o_arc.lock().unwrap();
+                o.phase = LifecyclePhase::Open;
+                *o.pending_starts.entry("thr_r".to_string()).or_insert(0) += 1;
+                o.pending_starts_total += 1;
+            }
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let o1 = Arc::clone(&o_arc);
+            let b1 = Arc::clone(&barrier);
+            let t1 = thread::spawn(move || {
+                b1.wait();
+                o1.lock().unwrap().finish_pending_turn_start("thr_r", Some("turn_r"));
+            });
+            let o2 = Arc::clone(&o_arc);
+            let b2 = Arc::clone(&barrier);
+            let s2 = Arc::clone(&sink);
+            let t2 = thread::spawn(move || {
+                b2.wait();
+                o2.lock().unwrap().evaluate_close_request_at(false, &*s2, Instant::now())
+            });
+            barrier.wait();
+            t1.join().unwrap();
+            let d = t2.join().unwrap();
+            assert!(
+                matches!(d, CloseDecision::PreventQuitRequested { .. }),
+                "T-L9: close must NEVER see guard 0 across reply admission"
+            );
+        }
+
+        let _ = ctrl.disconnect_engine_blocking();
+        peer.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn quit_lifecycle_fake_clock_t_l10() {
+        #[derive(Default)]
+        struct FailQuitSink {
+            fail_quit: AtomicBool,
+            engine: Mutex<Vec<Value>>,
+            quits: Mutex<Vec<Value>>,
+        }
+        impl EventSink for FailQuitSink {
+            fn emit_engine_event(&self, payload: Value) -> Result<(), String> {
+                self.engine.lock().unwrap().push(payload);
+                Ok(())
+            }
+            fn emit_quit_requested(&self, payload: Value) -> Result<(), String> {
+                if self.fail_quit.load(Ordering::Acquire) {
+                    return Err("webview missing".to_string());
+                }
+                self.quits.lock().unwrap().push(payload);
+                Ok(())
+            }
+        }
+
+        let t0 = Instant::now();
+        let sink = FailQuitSink::default();
+        let mut o = ClientOwner::new(10);
+        o.phase = LifecyclePhase::Open;
+        o.in_flight_turn_ids.insert("turn_1".into(), "thr_1".into());
+
+        // 1. Guarded close -> { req1, Outstanding } + 1 emit
+        let CloseDecision::PreventQuitRequested { epoch: e1, request_id: r1 } =
+            o.evaluate_close_request_at(false, &sink, t0)
+        else {
+            panic!("expected PreventQuitRequested");
+        };
+        assert_eq!(e1, 10);
+        assert_eq!(sink.quits.lock().unwrap().len(), 1);
+
+        // 2. Second close while Outstanding emits nothing and does not exit
+        assert_eq!(
+            o.evaluate_close_request_at(false, &sink, t0 + Duration::from_secs(1)),
+            CloseDecision::PreventAlreadyPending
+        );
+        assert_eq!(sink.quits.lock().unwrap().len(), 1);
+
+        // 3. Stale/wrong epoch or wrong id rejected
+        assert!(!o.quit_dialog_shown_at(9, r1, t0 + Duration::from_secs(1)));
+        assert!(!o.quit_dialog_shown_at(10, r1 - 1, t0 + Duration::from_secs(1)));
+
+        // 4. 3s expiry settles request & sets fallback; late commands return accepted=false; next close exits
+        assert!(!o.quit_dialog_shown_at(10, r1, t0 + Duration::from_secs(3)));
+        assert!(!o.ack_quit_at(10, r1, t0 + Duration::from_secs(4)));
+        assert!(!o.confirm_quit_at(10, r1, &sink, t0 + Duration::from_secs(4)));
+        assert_eq!(
+            o.evaluate_close_request_at(false, &sink, t0 + Duration::from_secs(4)),
+            CloseDecision::AllowExit
+        );
+
+        // 5. Reset & test TTL > 30s creates new greater requestId instead of exiting
+        let mut o2 = ClientOwner::new(11);
+        o2.phase = LifecyclePhase::Open;
+        o2.in_flight_turn_ids.insert("turn_2".into(), "thr_1".into());
+        let CloseDecision::PreventQuitRequested { request_id: r2a, .. } =
+            o2.evaluate_close_request_at(false, &sink, t0)
+        else { panic!() };
+        // Expire at +3s -> fallback mark set at t0+3s
+        assert!(!o2.quit_dialog_shown_at(11, r2a, t0 + Duration::from_secs(3)));
+        // At t0 + 34s (31s after fallback set -> > QUIT_FALLBACK_TTL 30s) -> new dialog, NOT AllowExit!
+        let CloseDecision::PreventQuitRequested { request_id: r2b, .. } =
+            o2.evaluate_close_request_at(false, &sink, t0 + Duration::from_secs(34))
+        else {
+            panic!("after QUIT_FALLBACK_TTL, must show dialog again");
+        };
+        assert!(r2b > r2a);
+        // Accepting shown cancels 3s bound; second close refocuses same id; ack_quit settles -> greater id
+        assert!(o2.quit_dialog_shown_at(11, r2b, t0 + Duration::from_secs(35)));
+        assert!(o2.quit_dialog_shown_at(11, r2b, t0 + Duration::from_secs(40)));
+        assert_eq!(
+            o2.evaluate_close_request_at(false, &sink, t0 + Duration::from_secs(40)),
+            CloseDecision::PreventQuitRequested { epoch: 11, request_id: r2b }
+        );
+        assert!(o2.ack_quit_at(11, r2b, t0 + Duration::from_secs(41)));
+        let CloseDecision::PreventQuitRequested { request_id: r2c, .. } =
+            o2.evaluate_close_request_at(false, &sink, t0 + Duration::from_secs(42))
+        else { panic!() };
+        assert!(r2c > r2b);
+        assert!(o2.ack_quit_at(11, r2c, t0 + Duration::from_secs(42)));
+
+        // 6. Emit failure -> immediate expiry -> next close allows exit
+        sink.fail_quit.store(true, Ordering::Release);
+        let CloseDecision::PreventQuitRequested { request_id: r_fail, .. } =
+            o2.evaluate_close_request_at(false, &sink, t0 + Duration::from_secs(43))
+        else { panic!() };
+        assert!(!o2.quit_dialog_shown_at(11, r_fail, t0 + Duration::from_secs(43)));
+        assert_eq!(
+            o2.evaluate_close_request_at(false, &sink, t0 + Duration::from_secs(44)),
+            CloseDecision::AllowExit
+        );
+
+        // 7d: after transport-closed terminal, owner guard is 0 & close allows exit
+        let mut o3 = ClientOwner::new(12);
+        o3.phase = LifecyclePhase::Open;
+        o3.in_flight_turn_ids.insert("turn_z".into(), "thr_1".into());
+        assert!(o3.enter_terminated("eof"));
+        assert_eq!(o3.guard_count(), 0);
+        assert_eq!(o3.evaluate_close_request_at(false, &sink, t0), CloseDecision::AllowExit);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn bounded_exit_path_wedges_and_l7_thread_checks_t_l13() {
+        // 1. Pure order check: exit_started=true AND forced guard>0 still Coalesces (T-L13)
+        let sink = Arc::new(TestSink::default());
+        let mut o_pure = ClientOwner::new(1);
+        o_pure.phase = LifecyclePhase::Open;
+        o_pure.in_flight_turn_ids.insert("t_force".into(), "thr".into());
+        assert_eq!(
+            o_pure.evaluate_close_request_at(true, &*sink, Instant::now()),
+            CloseDecision::Coalesce,
+            "must check exit_started before guard"
+        );
+
+        // 2. Wedge test: holding BOTH client & owner lock > 2 s -> child killed within EXIT_BOUND (shared 2s wait)
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("trap '' TERM; cat >/dev/null; exec sleep 40")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut spawned = SpawnedServe {
+            child,
+            stdin: None,
+            stderr_buf: Arc::new(Mutex::new(String::new())),
+            stderr_done: None,
+            stderr_thread: None,
+            initialized: true,
+        };
+        // Short grace child? Wait: real EXIT_BOUND = 9 s, child ignores stdin EOF so kill hits at 9 s!
+        // Use a child that exits quickly on stdin EOF first for rapid Allow->Exit & confirm_quit tests,
+        // and test wedged lock here with an exit-on-EOF child taking 2.5s lock hold -> exits at ~2.0s!
+        drop(spawned.stdin.take());
+        let _ = spawned.child.kill();
+        let _ = spawned.child.wait();
+
+        // Real stdin-closing child that ignores stdin? Wait: let's spawn cat-sleep child cleanly with piped stdin:
+        let mut c_wedge = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat; exec sleep 40")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let wedge_pid = c_wedge.id();
+        let wedge_stdin = c_wedge.stdin.take();
+        let ctrl_w = Arc::new(DesktopController::new());
+        let stop_wedge = Arc::new(Mutex::new(StopState {
+            cancel_stream: None,
+            spawned: Some(SpawnedServe {
+                child: c_wedge,
+                stdin: wedge_stdin,
+                stderr_buf: Arc::new(Mutex::new(String::new())),
+                stderr_done: None,
+                stderr_thread: None,
+                initialized: true,
+            }),
+            in_flight: None,
+            reader_done: Arc::new(AtomicBool::new(true)),
+            hooks: None,
+        }));
+        *ctrl_w.stop_fallback.lock().unwrap() = Some(Arc::clone(&stop_wedge));
+
+        // Hold ctrl_w.client for 2.5 s while Exit starts -> Exit expires EXIT_LOCK_WAIT at 2s and stops via stop_fallback!
+        let hold_g = ctrl_w.client.lock().unwrap();
+        let t_exit0 = Instant::now();
+        ctrl_w.handle_run_event_exit(&*sink, t_exit0);
+        let elapsed_w = t_exit0.elapsed();
+        drop(hold_g);
+        assert!(
+            elapsed_w >= Duration::from_millis(8500) && elapsed_w <= Duration::from_millis(10_500),
+            "T-L13 wedge bound must finish within EXIT_BOUND (2s lock wait + 7s kill grace = 9s), got {elapsed_w:?}"
+        );
+        unsafe {
+            let mut st: libc::c_int = 0;
+            let _ = libc::waitpid(wedge_pid as libc::pid_t, &mut st, libc::WNOHANG);
+            let mut alive = libc::kill(wedge_pid as libc::pid_t, 0) == 0;
+            if alive {
+                thread::sleep(Duration::from_millis(50));
+                let _ = libc::waitpid(wedge_pid as libc::pid_t, &mut st, libc::WNOHANG);
+                alive = libc::kill(wedge_pid as libc::pid_t, 0) == 0;
+            }
+            assert!(!alive, "wedged child must be dead");
+        }
+        assert!(ctrl_w.shutting_down.load(Ordering::Acquire));
+        assert!(ctrl_w.exit_started.load(Ordering::Acquire));
+
+        // 3. Stalled L7 test: L7 runs on worker thread (distinct ThreadId), owner remains unlocked during L7,
+        //    and stalled L7 past EXIT_BOUND kills child at deadline.
+        let main_tid = thread::current().id();
+        let l7_tid_rec: Arc<Mutex<Option<thread::ThreadId>>> = Arc::new(Mutex::new(None));
+        let l7_tid_c = Arc::clone(&l7_tid_rec);
+        let owner_check = Arc::new(Mutex::new(ClientOwner::new(88)));
+        owner_check.lock().unwrap().phase = LifecyclePhase::Open;
+
+        let mut c_stall = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat; exec sleep 40")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let stall_pid = c_stall.id();
+        let stall_stdin = c_stall.stdin.take();
+        let stop_stall = Arc::new(Mutex::new(StopState {
+            cancel_stream: None,
+            spawned: Some(SpawnedServe {
+                child: c_stall,
+                stdin: stall_stdin,
+                stderr_buf: Arc::new(Mutex::new(String::new())),
+                stderr_done: None,
+                stderr_thread: None,
+                initialized: true,
+            }),
+            in_flight: None,
+            reader_done: Arc::new(AtomicBool::new(true)),
+            hooks: Some(Arc::new(TestStopHooks {
+                delay_l7: Some(Duration::from_secs(12)), // exceeds EXIT_BOUND
+                force_spawn_fail: false,
+                on_l7_thread: Some(Arc::new(move |tid| {
+                    *l7_tid_c.lock().unwrap() = Some(tid);
+                })),
+            })),
+        }));
+        let ctrl_s = DesktopController::new();
+        *ctrl_s.stop_fallback.lock().unwrap() = Some(Arc::clone(&stop_stall));
+        let t_s0 = Instant::now();
+        // Verify owner is NOT locked while stop_child runs (try_lock succeeds from main or concurrent thread)
+        assert!(owner_check.try_lock().is_ok());
+        ctrl_s.handle_run_event_exit(&*sink, t_s0 - Duration::from_secs(7)); // only 2s left in 9s bound
+        let elapsed_s = t_s0.elapsed();
+        assert!(elapsed_s >= Duration::from_millis(1800) && elapsed_s <= Duration::from_millis(2900), "got {elapsed_s:?}");
+        assert_ne!(*l7_tid_rec.lock().unwrap(), Some(main_tid), "T-L13: L7 must NOT run on CloseRequested/event-loop thread");
+        unsafe {
+            let mut st: libc::c_int = 0;
+            let deadline_reap = Instant::now() + Duration::from_millis(250);
+            let mut dead = false;
+            while Instant::now() < deadline_reap {
+                let w = libc::waitpid(stall_pid as libc::pid_t, &mut st, libc::WNOHANG);
+                if w == stall_pid as libc::pid_t || libc::kill(stall_pid as libc::pid_t, 0) != 0 {
+                    dead = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(dead, "stalled L7 expiry must SIGKILL child");
+        }
+        let _ = pid;
+
+        // 4. Spawn-fail inline fallback kills child on Allow, confirm_quit, and Exit; Allow->Exit & confirm_quit->Exit emit 1 terminal
+        let tmp = std::env::temp_dir().join(format!("madc-tl13-allow-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let l = UnixListener::bind(&tmp).unwrap();
+        let p = thread::spawn(move || {
+            for _ in 0..2 {
+                let (s, _) = l.accept().unwrap();
+                let mut w = s.try_clone().unwrap();
+                let mut r = BufReader::new(s);
+                let mut buf = Vec::new();
+                let BoundedLine::Line(req) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+                let v: Value = serde_json::from_str(&req).unwrap();
+                writeln!(w, "{}", json!({"id":v["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
+                w.flush().unwrap();
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
+
+        // Allow -> Exit
+        let sink_a = Arc::new(TestSink::default());
+        let cli_a = SocketClient::connect_existing_with_sink(tmp.to_str().unwrap(), Arc::clone(&sink_a) as Arc<dyn EventSink>).unwrap();
+        let ctrl_a = DesktopController::new();
+        ctrl_a.set_client_for_test(cli_a);
+        assert_eq!(ctrl_a.handle_close_or_exit_at(&*sink_a, Instant::now()), CloseDecision::AllowExit);
+        // Subsequent close coalesces; Exit joins with zero second terminal
+        assert_eq!(ctrl_a.handle_close_or_exit_at(&*sink_a, Instant::now()), CloseDecision::Coalesce);
+        ctrl_a.handle_run_event_exit(&*sink_a, Instant::now());
+        let evs_a = sink_a.engine_events.lock().unwrap();
+        let terms_a: Vec<_> = evs_a.iter().filter(|(_, v)| v["method"] == "madc/transport-closed").collect();
+        assert_eq!(terms_a.len(), 1);
+        assert_eq!(terms_a[0].1["params"]["reason"], "exit");
+
+        // confirm_quit -> Exit
+        let sink_q = Arc::new(TestSink::default());
+        let cli_q = SocketClient::connect_existing_with_sink(tmp.to_str().unwrap(), Arc::clone(&sink_q) as Arc<dyn EventSink>).unwrap();
+        cli_q.inner.owner.lock().unwrap().in_flight_turn_ids.insert("turn_q".into(), "thr_q".into());
+        let ctrl_q = DesktopController::new();
+        ctrl_q.set_client_for_test(cli_q);
+        let now_q = Instant::now();
+        let CloseDecision::PreventQuitRequested { epoch: eq, request_id: rq } =
+            ctrl_q.handle_close_or_exit_at(&*sink_q, now_q)
+        else { panic!() };
+        assert!(ctrl_q.confirm_quit_at(eq, rq, &*sink_q, now_q).accepted);
+        ctrl_q.handle_run_event_exit(&*sink_q, now_q);
+        let evs_q = sink_q.engine_events.lock().unwrap();
+        let terms_q: Vec<_> = evs_q.iter().filter(|(_, v)| v["method"] == "madc/transport-closed").collect();
+        assert_eq!(terms_q.len(), 1);
+        assert_eq!(terms_q[0].1["params"]["reason"], "exit");
+
+        p.join().unwrap();
         let _ = std::fs::remove_file(&tmp);
     }
 }
