@@ -32,6 +32,8 @@
 
 *r15 (2026-11-28, early AM ET): answers Copilot's review of `a0a70e7b` (review `6096456401`, four new High). The A4 `servedModel` receipt row no longer treats an F2 `session/read` as a rendered `✗ FAILED` (C15-1). Handshake notifications are accepted into the FIFO (not overflow) and emitted only after `Open`; overflow during `Handshake` is `Handshake → Closed` with no terminal (C15-2). The wired-registry test on `backing` stays a named gap, now pointed to from the `session.open` and `servedModel` rows (C15-3, C15-4). The PR body is not retried. Dispositions in §17.*
 
+*r16 (2026-11-28, early AM ET): answers Copilot's review of `0f1ddd5d` (review `6096502671`, one new High: `4726022151`). Terminal handling settles any in-flight quit candidate for that epoch and marks it dead (L11). After `quit_dialog_shown` returns `{ accepted: true }`, the UI opens the dialog only if the epoch is still `boundEpoch`, the state is still `CONNECTED`, and that `requestId` is still the active candidate; otherwise the result is dropped silently, with no dialog and no fallback mark (L12). Test (T-L12b). The PR body is not retried. Dispositions in §17.*
+
 **Authority:**
 
 - `docs/plan/PIN-madc-M3-desktop-protocol.md` (base; §2, §3, §4), blob `2c022f33…` at the base.
@@ -212,8 +214,8 @@ Only five transitions exist:
   - the 3 s bound, an emit failure (immediate expiry: it settles the request **and** sets the quit-fallback mark), `ack_quit`, `confirm_quit` and leaving `Open` each **settle** the request;
   - the quit-fallback mark expires after `QUIT_FALLBACK_TTL = 30 s` (**proposal**) or clears on the next accepted `quit_dialog_shown`, whichever comes first;
   - a settled or stale id is ignored for good, and opens or refocuses nothing.
-- **L11 UI terminal handling and the connect handoff.** Covered by §4.3. A terminal for the current epoch, or for the pending epoch during the connect handoff, is accepted regardless of the `CONNECTED` gate and handled at most once per epoch. No UI state needs an event to be left.
-- **L12 UI quit handling.** Covered by §6.1 item 3: `acceptQuitRequest`, and the dialog opens only after `quit_dialog_shown` returns `accepted: true`.
+- **L11 UI terminal handling and the connect handoff.** Covered by §4.3. A terminal for the current epoch, or for the pending epoch during the connect handoff, is accepted regardless of the `CONNECTED` gate and handled at most once per epoch. Handling a terminal for `boundEpoch` also **settles any in-flight or shown quit candidate for that epoch and marks it dead**, so a later `{ accepted: true }` cannot open a dialog (L12). No UI state needs an event to be left.
+- **L12 UI quit handling.** Covered by §6.1 item 3: `acceptQuitRequest` records an in-flight **candidate** before it invokes `quit_dialog_shown`. The dialog opens only if the command returns `{ accepted: true }` **and** all three still hold: `epoch === boundEpoch`, `connectionState === "CONNECTED"`, and that `requestId` is still the active candidate. Otherwise the result is dropped silently: no dialog, and no quit-fallback mark.
 - **L13 Exit goes through `Closed`.** `RunEvent::Exit`:
   1. sets `shutting_down` (§6 item 1);
   2. takes the L3 transition with `reason: "exit"`. **One** `EXIT_LOCK_WAIT = 2 s` deadline, counted from the moment Exit is observed, covers **both** the request-lock wait (§6 item 2) and the wait for the owner. The two waits share that deadline; they are not added, so the total stays within `EXIT_BOUND` (9 s);
@@ -409,7 +411,7 @@ Only `madc/transport-closed` changes connection state. The UI's states are the A
 5. **`CONNECTED`, `ev.epoch === boundEpoch`, `disconnectPending !== null`: the user's own Disconnect is in flight.** Set `terminalHandled`, and mark panes with an in-flight turn `ended (connection closed)`. There is no `FAILED` and no second `disconnect_engine`; the pending call's resolution moves the UI to `DISCONNECTED` as today.
 6. **Anything else**, for example `DISCONNECTED` or `FAILED` after this epoch, or an older epoch. If `ev.epoch === boundEpoch`, set `terminalHandled`. Nothing else changes. This covers a `disconnect_engine` whose result reaches the WebView before its own terminal: Tauri does not order command results relative to events.
 
-Whenever a terminal for `boundEpoch` is handled (rules 3–6), if a quit dialog is shown, the UI **dismisses** it and settles its `quitRecord`. A later `ack_quit` or `confirm_quit` for that request returns `{ accepted: false }` and changes nothing.
+Whenever a terminal for `boundEpoch` is handled (rules 3–6), the UI **settles any quit candidate for that epoch** — in-flight (`status === "candidate"`, `quit_dialog_shown` not yet returned) or shown — and marks it **dead**. If a dialog is shown, it is dismissed. A later `ack_quit` or `confirm_quit` for that request returns `{ accepted: false }` and changes nothing. A later `{ accepted: true }` for the in-flight command is dropped by L12: no dialog, no fallback mark.
 
 **The UI cannot be left stuck.** Only `connect_engine` resolving ends `CONNECTING`; its deadline is bounded by the A3 G-grammars. Only `disconnect_engine` resolving ends `disconnectPending`; it is bounded by §6 item 4 and L7. No UI state waits for a terminal to arrive. If the WebView never receives a terminal, the UI stays where it is, and the next RPC fails under A3 R4, as before amendment 2.
 
@@ -473,10 +475,10 @@ Verified at `870c1f7e`: `main.rs:109-120` builds the app with one managed state 
 
    `madc:quit-requested` is **not** a `madc:engine-event`. It has no `seq`, is not in the §3.2 forwarding set, does not go through `acceptEngineEvent` (§4.2), and does not use the §2.2 forward FIFO. So a full queue or a `seq` gap can never block it. It is delivered by the mechanism chosen in §3.5, on its own listener, and the §3.5 real-window smoke test must prove that **both** event names reach the WebView.
 
-   **UI (L12).** The UI handles the event with one pure function, `acceptQuitRequest(state, payload)`. It keeps one record per epoch, `quitRecord = { requestId, status }` with `status ∈ { shown, settled }`, and returns exactly one of:
-   - **candidate-open**, iff `payload.epoch === boundEpoch`, `connectionState === "CONNECTED"`, and either no record exists or `payload.requestId` is **greater than** the record's. The UI then invokes `quit_dialog_shown` with the payload's `{ epoch, requestId }` and opens the dialog **only if** the result is `{ accepted: true }`; it then sets the record to `{ requestId, shown }`. On `{ accepted: false }` it opens **nothing** and sets the record to `{ requestId, settled }`.
+   **UI (L12).** The UI handles the event with one pure function, `acceptQuitRequest(state, payload)`. It keeps one record per epoch, `quitRecord = { requestId, status }` with `status ∈ { candidate, shown, settled, dead }`, and returns exactly one of:
+   - **candidate-open**, iff `payload.epoch === boundEpoch`, `connectionState === "CONNECTED"`, and either no record exists or `payload.requestId` is **greater than** the record's (a `dead` or `settled` record of a lower id does not block a greater one). The UI **first** sets the record to `{ payload.requestId, candidate }`, then invokes `quit_dialog_shown` with the payload's `{ epoch, requestId }`. When that command returns, the UI opens the dialog **only if all three still hold**: `payload.epoch === boundEpoch`, `connectionState === "CONNECTED"`, and the record is still `{ payload.requestId, candidate }` (it is still the active candidate, not `dead`, `settled`, `shown`, or replaced). It then sets the record to `{ requestId, shown }`. On `{ accepted: false }`, if the record is not already `dead`, it is set to `{ requestId, settled }`; either way, **nothing** opens. If `{ accepted: true }` arrives but any of the three checks fail, the result is **dropped silently**: no dialog, no change to a `dead` record, and no quit-fallback mark (L11, I-C).
    - **refocus** the existing dialog (no second dialog, no command), iff the epoch matches, the state is `CONNECTED`, and `payload.requestId` **equals** the record's while it is `shown`.
-   - **ignore**, in every other case: another epoch, any other state, a `requestId` lower than the record's, or one equal to a `settled` record.
+   - **ignore**, in every other case: another epoch, any other state, a `requestId` lower than the record's, or one equal to a `settled` or `dead` record.
 
    The UI sets the record to `settled` before it invokes `ack_quit` or `confirm_quit`. If either command returns `{ accepted: false }`, the UI closes the dialog and does nothing else.
 
@@ -576,7 +578,7 @@ UI (`node --test` / `bun test`, fake `invokeFn`/listener, no DOM beyond the A3 h
 
 (13b) **Quit, UI (L12, §6.1 item 3; also T-L12):**
 - A guarded close delivers exactly one `madc:quit-requested { epoch, requestId }` on its own event name: never on `madc:engine-event`, and with no `seq`. It is handled even when the engine-event queue is full or has a `seq` gap.
-- On candidate-open, the UI invokes `quit_dialog_shown` once and opens the dialog only on `{ accepted: true }`. On `{ accepted: false }` (Rust's 3 s bound already settled the request) it opens **nothing** and settles its record.
+- On candidate-open, the UI sets the record to `{ requestId, candidate }` first, then invokes `quit_dialog_shown` once. It opens the dialog only if the result is `{ accepted: true }` **and** `epoch === boundEpoch`, the state is `CONNECTED`, and that `requestId` is still the active candidate. On `{ accepted: false }` (Rust's 3 s bound already settled the request) it opens **nothing** and, unless the record is already `dead`, settles it.
 - Stale request ids:
   - With A shown and acknowledged and B opened, a delayed event for A is ignored: no refocus, no reopen, no command.
   - A delayed event for A after A was acknowledged, before any B exists, is ignored.
@@ -587,6 +589,7 @@ UI (`node --test` / `bun test`, fake `invokeFn`/listener, no DOM beyond the A3 h
 - Killed mutations:
   - comparing the epoch only;
   - opening the dialog before `quit_dialog_shown` returns `accepted: true`;
+  - opening the dialog on `{ accepted: true }` without re-checking epoch, `CONNECTED`, and active candidate (see (T-L12b));
   - ignoring `accepted: false`;
   - not settling the record on `ack_quit` / `confirm_quit`;
   - delivering on `madc:engine-event`;
@@ -664,10 +667,13 @@ Killed mutations: discarding the reserved slot on `Terminated → Closed` (Copil
 - A duplicate terminal, or one for an older epoch: no-op.
 - An overflow gap, then the terminal: handled.
 - An `exit` terminal for N in `CONNECTED`: no `FAILED` and no `disconnect_engine`; `terminalHandled` is set; panes with an in-flight turn are marked `ended (connection closed)`; a shown quit dialog is dismissed and the UI `quitRecord` is settled.
-- A non-`exit` terminal for N in `CONNECTED` while a quit dialog is shown: the dialog is dismissed and the record settled, in addition to the failure path.
-- Killed mutations: gating the terminal on `CONNECTED` (Copilot `4725865947`); dropping `pendingTerminal`; handling a terminal twice; an `exit` terminal taking the failure path.
+- A non-`exit` terminal for N in `CONNECTED` while a quit dialog is shown: the dialog is dismissed and the record marked `dead`, in addition to the failure path.
+- A terminal for N in `CONNECTED` while a quit candidate is **in-flight** (`quit_dialog_shown` sent, result not yet delivered): the candidate is marked `dead`; no dialog is shown.
+- Killed mutations: gating the terminal on `CONNECTED` (Copilot `4725865947`); dropping `pendingTerminal`; handling a terminal twice; an `exit` terminal taking the failure path; settling only a shown dialog and leaving an in-flight candidate live.
 
 (T-L12) **UI quit (L12):** UI test (13b) above.
+
+(T-L12b) **In-flight candidate vs terminal (L11, L12; Copilot `4726022151`).** The UI has taken candidate-open and sent `quit_dialog_shown`. Rust has accepted the command (`{ accepted: true }` is in flight). A `madc/transport-closed` for that epoch is then delivered to the UI, then the `{ accepted: true }` result arrives. No dialog opens; the record is `dead`; no quit-fallback mark is set. The same if the terminal arrives after the command is sent and before Rust's result is delivered, whether the result is `{ accepted: true }` or `{ accepted: false }`. Killed mutations: opening the dialog on `{ accepted: true }` without re-checking `epoch === boundEpoch`, `CONNECTED`, and that the `requestId` is still the active candidate; `acceptTerminal` settling only a shown dialog and leaving an in-flight candidate live.
 
 (T-L13) **Exit (L13):**
 - `RunEvent::Exit` with a held request lock and a pending request: exactly one terminal `exit`, and the child is gone within `EXIT_BOUND` plus a small tolerance.
@@ -758,7 +764,7 @@ MADC Architect reviewed the protocol findings and agrees with the 8-method allow
 7. **Desktop presence (spec §14.7).** No detach rule is needed, and the keypress prompt cannot appear in A4. Every socket connection gets `ABSENT_TERMINAL` whatever terminal `serve` inherited, because `#terminalAccess` (`server.ts:2332-2336`) opens the system terminal only when `opts.input === process.stdin`, and the socket server builds each connection with `input: socket` (`socket.ts:345-352`). The desktop also never sends `mode: "interactive"` (§1.2; refused in Rust), so `#presencePhase` returns `absent` ("the turn is headless", `server.ts:2352`) before any probe, and `#turnStart` throws the `-32007` refusal (`server.ts:2210`) before the pending-presence path (`:2212-2216`) can run. `serve`'s stdin is a pipe (`launcher.rs:601`). The builder adds no `setsid`/TTY handling.
 
 
-## 17. Review dispositions (r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15)
+## 17. Review dispositions (r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16)
 
 ### r2
 
@@ -1021,3 +1027,11 @@ Copilot review `6096456401` of head `a0a70e7b0182d52aae8cf0cd6378edd92060fa3c` (
 | C15-2 (`4726001327`, High) | §2.3 / L2 stage handshake notifications in the FIFO, but §2.2 (i) / L4 refused any ordinary enqueue unless the state was `Open`, and treated that refusal as overflow | **Fixed.** Ordinary enqueue is accepted in `Handshake` and `Open`. Handshake events sit in the FIFO and are emitted only after `Open`. Overflow during `Handshake` takes `Handshake → Closed` with no terminal (L2). Tests (T-L2) |
 | C15-3 (`4726001337`, High) | `session.open.payload.backing` was a string, not `isWiredBacking` | **Documented, not tightened.** This is the existing named gap (`isWiredBacking` is not re-implemented in Rust). The `session.open` row and the named-gaps paragraph now say so explicitly, with the engine cites |
 | C15-4 (`4726001350`, High) | The `servedModel` event / item `backing` was likewise a string, not `isWiredBacking` | **Documented, not tightened.** Same named gap, now pointed to from the (f) `servedModel` row and the named-gaps paragraph (`session-store.ts:1318`, `:1352`, `:1410`) |
+
+### r16 — Copilot review of `0f1ddd5d` (2026-11-28, early AM ET)
+
+Copilot review `6096502671` of head `0f1ddd5da7090d97e1459205b906a1851c116f63` (2:27 AM ET) marked the four r15 threads resolved and opened one new High. The four outdated r12 threads (N13–N16) remain unreplied-as-resolved on GitHub. Docs only; sources not edited; this PR is not merged; the PR body is not retried. FDR-A4-6 is unchanged.
+
+| # | Finding | Disposition |
+| --- | --- | --- |
+| C16-1 (`4726022151`, High) | After `quit_dialog_shown` was accepted in Rust, a terminal could arrive in the UI before `{ accepted: true }` was delivered; the UI still opened the dialog, even though the connection was no longer `CONNECTED` | **Fixed, in the invariants.** L11 / §4.3: handling a terminal for `boundEpoch` settles any in-flight or shown quit candidate for that epoch and marks it `dead`. L12 / §6.1: the UI records a `candidate` before invoking `quit_dialog_shown`, and opens the dialog only if `{ accepted: true }` **and** `epoch === boundEpoch`, the state is `CONNECTED`, and that `requestId` is still the active candidate; otherwise the result is dropped silently (no dialog, no fallback mark). Test (T-L12b), killed mutations: opening on `{ accepted: true }` without the three re-checks; terminal handling that settles only a shown dialog and leaves an in-flight candidate live |
