@@ -391,6 +391,7 @@ test("M3-A2 DesktopEngineClient: connects with protocol check, dispatches typed 
         serverName: "madc-engine",
         serverVersion: "0.0.0",
         coldStartMs: 42,
+        connectionEpoch: 1,
       };
     },
     async request<TResult>(method: string, params: Record<string, unknown>): Promise<TResult> {

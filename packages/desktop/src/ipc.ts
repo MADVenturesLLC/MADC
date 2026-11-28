@@ -58,6 +58,7 @@ export type DesktopConnectionInfo = {
   readonly serverName: string;
   readonly serverVersion: string;
   readonly coldStartMs: number;
+  readonly connectionEpoch: number;
 };
 
 /**

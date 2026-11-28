@@ -8,12 +8,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::net::Shutdown;
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -30,8 +32,16 @@ pub const INITIALIZED_KILL_GRACE: Duration = Duration::from_secs(7);
 pub const STDERR_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 pub const MAX_STDERR_RETAINED_BYTES: usize = 64 * 1024;
 pub const INTERACTIVE_RPC_TIMEOUT: Duration = Duration::from_secs(10);
+pub const EXIT_LOCK_WAIT: Duration = Duration::from_secs(2);
+pub const DISCONNECT_STOP_BOUND: Duration = INITIALIZED_KILL_GRACE;
+pub const EXIT_BOUND: Duration = Duration::from_secs(9);
+pub const QUIT_SHOWN_ACK_BOUND: Duration = Duration::from_secs(3);
+pub const QUIT_FALLBACK_TTL: Duration = Duration::from_secs(30);
 pub const MAX_CWD_BYTES: usize = 4096;
 pub const MAX_TURN_INPUT_BYTES: usize = 65_536;
+
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+static NEXT_QUIT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
 /// M3-A4 desktop IPC method allowlist. Any method outside this set is refused in Rust before
 /// taking any lock or touching the engine socket. Refusal string keeps the A2/A3 prefix
@@ -1661,6 +1671,7 @@ pub struct ConnectionInfo {
     pub server_name: String,
     pub server_version: String,
     pub cold_start_ms: u64,
+    pub connection_epoch: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1878,17 +1889,35 @@ impl SpawnedServe {
         initialized_grace: Duration,
         uninitialized_grace: Duration,
     ) -> Option<ExitStatus> {
+        let kill_flag = Arc::new(AtomicBool::new(false));
+        self.stop_with_deadline_and_flag(
+            Instant::now()
+                + if self.initialized {
+                    initialized_grace
+                } else {
+                    uninitialized_grace
+                },
+            &kill_flag,
+        )
+    }
+
+    fn stop_with_deadline_and_flag(
+        &mut self,
+        deadline: Instant,
+        kill_issued: &AtomicBool,
+    ) -> Option<ExitStatus> {
         if self.initialized {
             // Close stdin (EOF) first (§5 & §4 Windows).
             drop(self.stdin.take());
-            let deadline = Instant::now() + initialized_grace;
             while Instant::now() < deadline {
                 if let Some(status) = self.try_wait_status() {
                     return Some(status);
                 }
                 thread::sleep(Duration::from_millis(20));
             }
-            let _ = self.child.kill();
+            if !kill_issued.swap(true, Ordering::AcqRel) {
+                let _ = self.child.kill();
+            }
             self.child.wait().ok()
         } else {
             #[cfg(not(unix))]
@@ -1897,7 +1926,6 @@ impl SpawnedServe {
             unsafe {
                 libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
             }
-            let deadline = Instant::now() + uninitialized_grace;
             while Instant::now() < deadline {
                 if let Some(status) = self.try_wait_status() {
                     drop(self.stdin.take());
@@ -1905,7 +1933,9 @@ impl SpawnedServe {
                 }
                 thread::sleep(Duration::from_millis(20));
             }
-            let _ = self.child.kill();
+            if !kill_issued.swap(true, Ordering::AcqRel) {
+                let _ = self.child.kill();
+            }
             let status = self.child.wait().ok();
             drop(self.stdin.take());
             status
@@ -1921,17 +1951,561 @@ impl Drop for SpawnedServe {
     }
 }
 
+pub trait EventSink: Send + Sync + 'static {
+    fn emit_engine_event(&self, payload: Value) -> Result<(), String>;
+    fn emit_quit_requested(&self, payload: Value) -> Result<(), String>;
+}
+
+#[derive(Default)]
+pub struct NullEventSink;
+
+impl EventSink for NullEventSink {
+    fn emit_engine_event(&self, _payload: Value) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn emit_quit_requested(&self, _payload: Value) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecyclePhase {
+    Handshake,
+    Open,
+    Terminated { reason: &'static str, seq: u64 },
+    Closed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuitPhase {
+    Outstanding,
+    Shown,
+    Settled,
+}
+
+#[derive(Debug, Clone)]
+pub struct QuitRecord {
+    pub request_id: u64,
+    pub phase: QuitPhase,
+    pub expires_at: Instant,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct QueuedEngineEvent {
+    pub epoch: u64,
+    pub seq: u64,
+    pub method: String,
+    pub params: Value,
+}
+
+struct PendingRpc {
+    method: String,
+    params: Value,
+    thread_id: Option<String>,
+    reply_tx: mpsc::SyncSender<Result<Value, String>>,
+}
+
+pub struct ClientOwner {
+    pub phase: LifecyclePhase,
+    pub epoch: u64,
+    pub next_seq: u64,
+    pub fifo: VecDeque<QueuedEngineEvent>,
+    pending: HashMap<u64, PendingRpc>,
+    pub late_reply_count: u64,
+    pub discarded_notification_count: u64,
+    pub emitted_event_count: u64,
+    drop_limiter: DropRateLimiter,
+    // AM2 §6.1 / L9 close guard (counts only turns admitted on this connection)
+    pub pending_starts: HashMap<String, usize>,
+    pub pending_starts_total: usize,
+    pub in_flight_turn_ids: HashMap<String, String>,
+    pub buffered_turn_events: HashMap<String, Vec<(String, &'static str)>>,
+    // AM2 §6.1 / L10 quit request & fallback mark
+    pub quit_record: Option<QuitRecord>,
+    pub quit_fallback_set_at: Option<Instant>,
+}
+
+impl ClientOwner {
+    pub fn new(epoch: u64) -> Self {
+        Self {
+            phase: LifecyclePhase::Handshake,
+            epoch,
+            next_seq: 1,
+            fifo: VecDeque::new(),
+            pending: HashMap::new(),
+            late_reply_count: 0,
+            discarded_notification_count: 0,
+            emitted_event_count: 0,
+            drop_limiter: DropRateLimiter::default(),
+            pending_starts: HashMap::new(),
+            pending_starts_total: 0,
+            in_flight_turn_ids: HashMap::new(),
+            buffered_turn_events: HashMap::new(),
+            quit_record: None,
+            quit_fallback_set_at: None,
+        }
+    }
+
+    pub fn guard_count(&self) -> usize {
+        self.pending_starts_total + self.in_flight_turn_ids.len()
+    }
+
+    fn fail_pending_and_reset_guard(&mut self) {
+        let pending = std::mem::take(&mut self.pending);
+        for (_, entry) in pending {
+            let _ = entry
+                .reply_tx
+                .send(Err("engine socket closed before response".to_string()));
+        }
+        self.pending_starts.clear();
+        self.pending_starts_total = 0;
+        self.in_flight_turn_ids.clear();
+        self.buffered_turn_events.clear();
+        self.quit_record = None;
+        self.quit_fallback_set_at = None;
+    }
+
+    /// Enqueue a validated §3.2 forwardable notification (`Handshake` or `Open`, `L2`/`L4`).
+    /// Returns `Ok(true)` if `Open -> Terminated(overflow)` occurred, `Err` if `Handshake` overflowed.
+    pub fn enqueue_forwardable(&mut self, method: String, params: Value) -> Result<bool, String> {
+        match self.phase {
+            LifecyclePhase::Handshake => {
+                if self.fifo.len() >= FORWARD_QUEUE_CAPACITY {
+                    self.fifo.clear();
+                    self.fail_pending_and_reset_guard();
+                    self.phase = LifecyclePhase::Closed;
+                    return Err("overflow: handshake notification queue full".to_string());
+                }
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                self.fifo.push_back(QueuedEngineEvent {
+                    epoch: self.epoch,
+                    seq,
+                    method,
+                    params,
+                });
+                Ok(false)
+            }
+            LifecyclePhase::Open => {
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                if self.fifo.len() >= FORWARD_QUEUE_CAPACITY {
+                    // Consumed seq leaves a visible gap before the terminal event (L4).
+                    self.enter_terminated("overflow");
+                    return Ok(true);
+                }
+                self.fifo.push_back(QueuedEngineEvent {
+                    epoch: self.epoch,
+                    seq,
+                    method,
+                    params,
+                });
+                Ok(false)
+            }
+            LifecyclePhase::Terminated { .. } | LifecyclePhase::Closed => Ok(false),
+        }
+    }
+
+    pub fn record_drop_and_maybe_enqueue(&mut self, reason: &str, now: Instant) -> Result<bool, String> {
+        if let Some((r, count)) = self.drop_limiter.record_drop(reason, now) {
+            return self.enqueue_forwardable(
+                "madc/events-dropped".to_string(),
+                json!({ "count": count, "reason": r }),
+            );
+        }
+        Ok(false)
+    }
+
+    pub fn flush_due_drops(&mut self, now: Instant) -> Result<bool, String> {
+        let due = self.drop_limiter.flush_due(now);
+        for (r, count) in due {
+            if self.enqueue_forwardable(
+                "madc/events-dropped".to_string(),
+                json!({ "count": count, "reason": r }),
+            )? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub fn enter_terminated(&mut self, reason: &'static str) -> bool {
+        if !matches!(self.phase, LifecyclePhase::Open) {
+            return false;
+        }
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.phase = LifecyclePhase::Terminated { reason, seq };
+        self.fail_pending_and_reset_guard();
+        true
+    }
+
+    /// Execute one drain step INSIDE the owner lock (`L1`, `L3`, `L4`, `L5`).
+    /// Returns `Some(true)` if work remains, `Some(false)` if idle-wait in Open, `None` if Closed.
+    pub fn drain_step(&mut self, sink: &dyn EventSink) -> Option<bool> {
+        match self.phase {
+            LifecyclePhase::Handshake => Some(false),
+            LifecyclePhase::Open => {
+                if let Some(ev) = self.fifo.pop_front() {
+                    let payload = json!({
+                        "epoch": ev.epoch,
+                        "seq": ev.seq,
+                        "method": ev.method,
+                        "params": ev.params,
+                    });
+                    let _ = sink.emit_engine_event(payload);
+                    self.emitted_event_count += 1;
+                    Some(!self.fifo.is_empty())
+                } else {
+                    Some(false)
+                }
+            }
+            LifecyclePhase::Terminated { reason, seq } => {
+                if let Some(ev) = self.fifo.pop_front() {
+                    let payload = json!({
+                        "epoch": ev.epoch,
+                        "seq": ev.seq,
+                        "method": ev.method,
+                        "params": ev.params,
+                    });
+                    let _ = sink.emit_engine_event(payload);
+                    self.emitted_event_count += 1;
+                    Some(true)
+                } else {
+                    // Emit reserved terminal BEFORE setting Closed so no emit starts in Closed (L3, L5).
+                    let payload = json!({
+                        "epoch": self.epoch,
+                        "seq": seq,
+                        "method": "madc/transport-closed",
+                        "params": { "reason": reason },
+                    });
+                    let _ = sink.emit_engine_event(payload);
+                    self.emitted_event_count += 1;
+                    self.phase = LifecyclePhase::Closed;
+                    None
+                }
+            }
+            LifecyclePhase::Closed => None,
+        }
+    }
+
+    /// Transition from `Handshake`, `Open`, or `Terminated` into `Closed` (`L2`, `L3`, `L4`, `L5`, `L6`).
+    /// Emits INSIDE this lock iff the epoch was published (`Open` or `Terminated`). Returns true if published.
+    pub fn close_to_closed(&mut self, desktop_reason: &'static str, sink: &dyn EventSink) -> bool {
+        match self.phase {
+            LifecyclePhase::Handshake => {
+                self.fifo.clear();
+                self.fail_pending_and_reset_guard();
+                self.phase = LifecyclePhase::Closed;
+                false
+            }
+            LifecyclePhase::Open => {
+                // Discard remaining ordinary frames; they keep their seq so UI sees a gap (L4).
+                self.fifo.clear();
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                self.fail_pending_and_reset_guard();
+                let payload = json!({
+                    "epoch": self.epoch,
+                    "seq": seq,
+                    "method": "madc/transport-closed",
+                    "params": { "reason": desktop_reason },
+                });
+                let _ = sink.emit_engine_event(payload);
+                self.emitted_event_count += 1;
+                self.phase = LifecyclePhase::Closed;
+                true
+            }
+            LifecyclePhase::Terminated { reason, seq } => {
+                // Desktop close mid-drain discards remaining ordinary frames and emits reserved terminal (L3, L4).
+                self.fifo.clear();
+                self.fail_pending_and_reset_guard();
+                let payload = json!({
+                    "epoch": self.epoch,
+                    "seq": seq,
+                    "method": "madc/transport-closed",
+                    "params": { "reason": reason },
+                });
+                let _ = sink.emit_engine_event(payload);
+                self.emitted_event_count += 1;
+                self.phase = LifecyclePhase::Closed;
+                true
+            }
+            LifecyclePhase::Closed => false,
+        }
+    }
+
+    /// Track `turn/started` or `turn/completed` notifications in close guard (`L9`, §6.1 item 1).
+    pub fn observe_turn_notification(&mut self, method: &str, params: &Value) {
+        if !matches!(self.phase, LifecyclePhase::Open) {
+            return;
+        }
+        let Some(turn) = params.get("turn").and_then(|v| v.as_object()) else {
+            return;
+        };
+        let Some(turn_id) = turn.get("id").and_then(|v| v.as_str()) else {
+            return;
+        };
+        let Some(thread_id) = turn.get("threadId").and_then(|v| v.as_str()) else {
+            return;
+        };
+        match method {
+            "turn/started" => {
+                if self.in_flight_turn_ids.contains_key(turn_id) {
+                    return;
+                }
+                if self.pending_starts.get(thread_id).copied().unwrap_or(0) == 1 {
+                    self.buffered_turn_events
+                        .entry(thread_id.to_string())
+                        .or_default()
+                        .push((turn_id.to_string(), "started"));
+                }
+            }
+            "turn/completed" => {
+                if self.in_flight_turn_ids.remove(turn_id).is_some() {
+                    return;
+                }
+                if self.pending_starts.get(thread_id).copied().unwrap_or(0) == 1 {
+                    self.buffered_turn_events
+                        .entry(thread_id.to_string())
+                        .or_default()
+                        .push((turn_id.to_string(), "completed"));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Complete admitting or rejecting a `turn/start` RPC response inside the owner (`L9`).
+    pub fn finish_pending_turn_start(&mut self, thread_id: &str, admitted_turn_id: Option<&str>) {
+        if let Some(cnt) = self.pending_starts.get_mut(thread_id) {
+            *cnt = cnt.saturating_sub(1);
+            if *cnt == 0 {
+                self.pending_starts.remove(thread_id);
+            }
+            self.pending_starts_total = self.pending_starts_total.saturating_sub(1);
+        }
+        let buffered = self
+            .buffered_turn_events
+            .remove(thread_id)
+            .unwrap_or_default();
+        if let Some(tid) = admitted_turn_id {
+            self.in_flight_turn_ids
+                .insert(tid.to_string(), thread_id.to_string());
+            for (ev_turn_id, kind) in buffered {
+                if ev_turn_id == tid && kind == "completed" {
+                    self.in_flight_turn_ids.remove(tid);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct TestStopHooks {
+    pub delay_l7: Option<Duration>,
+    pub force_spawn_fail: bool,
+    pub on_l7_thread: Option<Arc<dyn Fn(thread::ThreadId) + Send + Sync>>,
+}
+
 #[cfg(unix)]
-pub struct SocketClient {
+struct StopInFlight {
+    done: Arc<(Mutex<bool>, Condvar)>,
+    child_pid: Option<u32>,
+    kill_issued: Arc<AtomicBool>,
+}
+
+#[cfg(unix)]
+struct StopState {
+    cancel_stream: Option<UnixStream>,
+    spawned: Option<SpawnedServe>,
+    in_flight: Option<Arc<StopInFlight>>,
+    reader_done: Arc<AtomicBool>,
+    hooks: Option<Arc<TestStopHooks>>,
+}
+
+#[cfg(unix)]
+pub fn stop_child(stop_arc: &Arc<Mutex<StopState>>, deadline: Instant) {
+    let (in_flight, run_inline) = {
+        let mut g = match stop_arc.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(existing) = g.in_flight.clone() {
+            (existing, false)
+        } else {
+            let cancel = g.cancel_stream.take();
+            let spawned = g.spawned.take();
+            let child_pid = spawned.as_ref().map(|s| s.child.id());
+            let kill_issued = Arc::new(AtomicBool::new(false));
+            let done = Arc::new((Mutex::new(false), Condvar::new()));
+            let hooks = g.hooks.clone();
+            let force_spawn_fail = hooks.as_ref().is_some_and(|h| h.force_spawn_fail);
+            let record = Arc::new(StopInFlight {
+                done: Arc::clone(&done),
+                child_pid,
+                kill_issued: Arc::clone(&kill_issued),
+            });
+            g.in_flight = Some(Arc::clone(&record));
+
+            if force_spawn_fail {
+                drop(g);
+                run_l7_work(cancel, spawned, deadline, &kill_issued, &done, hooks.as_deref());
+                return;
+            }
+
+            let spawned_thread = thread::Builder::new()
+                .name("madc-l7-stop".to_string())
+                .spawn({
+                    let done_c = Arc::clone(&done);
+                    let kill_c = Arc::clone(&kill_issued);
+                    let hooks_c = hooks.clone();
+                    move || {
+                        run_l7_work(
+                            cancel,
+                            spawned,
+                            Instant::now() + DISCONNECT_STOP_BOUND,
+                            &kill_c,
+                            &done_c,
+                            hooks_c.as_deref(),
+                        );
+                    }
+                });
+
+            match spawned_thread {
+                Ok(_jh) => (record, false),
+                Err(_) => {
+                    drop(g);
+                    // Wait: on OS thread exhaustion, cancel/spawned were moved into closure,
+                    // kill pid directly and signal done so caller is never left waiting.
+                    if let Some(pid) = child_pid {
+                        if !kill_issued.swap(true, Ordering::AcqRel) {
+                            unsafe {
+                                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                            }
+                        }
+                    }
+                    let (lk, cv) = &*done;
+                    if let Ok(mut d) = lk.lock() {
+                        *d = true;
+                        cv.notify_all();
+                    }
+                    return;
+                }
+            }
+        }
+    };
+
+    if run_inline {
+        return;
+    }
+
+    let (lk, cv) = &*in_flight.done;
+    let mut finished = match lk.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    while !*finished {
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            if let Some(pid) = in_flight.child_pid {
+                if !in_flight.kill_issued.swap(true, Ordering::AcqRel) {
+                    unsafe {
+                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
+                    }
+                }
+            }
+            return;
+        }
+        let (next, _) = match cv.wait_timeout(finished, rem) {
+            Ok(v) => v,
+            Err(p) => p.into_inner(),
+        };
+        finished = next;
+    }
+}
+
+#[cfg(unix)]
+fn run_l7_work(
+    cancel: Option<UnixStream>,
+    mut spawned: Option<SpawnedServe>,
+    deadline: Instant,
+    kill_issued: &AtomicBool,
+    done: &(Mutex<bool>, Condvar),
+    hooks: Option<&TestStopHooks>,
+) {
+    if let Some(h) = hooks {
+        if let Some(cb) = &h.on_l7_thread {
+            cb(thread::current().id());
+        }
+    }
+    if let Some(stream) = cancel {
+        let _ = stream.shutdown(Shutdown::Both);
+        drop(stream);
+    }
+    if let Some(h) = hooks {
+        if let Some(d) = h.delay_l7 {
+            thread::sleep(d);
+        }
+    }
+    if let Some(ref mut child) = spawned {
+        let _ = child.stop_with_deadline_and_flag(deadline, kill_issued);
+    }
+    let (lk, cv) = done;
+    if let Ok(mut g) = lk.lock() {
+        *g = true;
+        cv.notify_all();
+    }
+}
+
+#[cfg(unix)]
+struct HandshakeClient {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
     next_id: u64,
-    spawned: Option<SpawnedServe>,
     line_buf: Vec<u8>,
-    pub staged_notifications: VecDeque<ForwardedNotification>,
-    pub late_reply_count: u64,
-    pub discarded_notification_count: u64,
-    drop_limiter: DropRateLimiter,
+    owner: Arc<Mutex<ClientOwner>>,
+    sink: Arc<dyn EventSink>,
+    info: ConnectionInfo,
+}
+
+#[cfg(unix)]
+impl Drop for HandshakeClient {
+    fn drop(&mut self) {
+        if let Ok(mut o) = self.owner.lock() {
+            if matches!(o.phase, LifecyclePhase::Handshake) {
+                o.close_to_closed("handshake-drop", &*self.sink);
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+struct SocketClientInner {
+    owner: Arc<Mutex<ClientOwner>>,
+    drain_cv: Arc<Condvar>,
+    write_half: Mutex<Option<UnixStream>>,
+    next_id: AtomicU64,
+    stop_state: Arc<Mutex<StopState>>,
+    sink: Arc<dyn EventSink>,
+}
+
+#[cfg(unix)]
+impl Drop for SocketClientInner {
+    fn drop(&mut self) {
+        if let Ok(mut o) = self.owner.lock() {
+            o.close_to_closed("disconnect", &*self.sink);
+        }
+        self.drain_cv.notify_all();
+        stop_child(&self.stop_state, Instant::now() + DISCONNECT_STOP_BOUND);
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone)]
+pub struct SocketClient {
+    inner: Arc<SocketClientInner>,
     pub info: ConnectionInfo,
 }
 
@@ -1952,8 +2526,6 @@ where
     let (tx, rx) = mpsc::sync_channel::<std::io::Result<UnixStream>>(1);
     thread::spawn(move || {
         let res = connector(&path_owned);
-        // If the caller already timed out and dropped `rx`, `send` fails and drops any late
-        // `UnixStream` cleanly rather than leaking the fd.
         let _ = tx.send(res);
     });
     match rx.recv_timeout(rem) {
@@ -1967,112 +2539,8 @@ where
 }
 
 #[cfg(unix)]
-impl SocketClient {
-    #[cfg(test)]
-    pub fn connect_existing_for_test(socket_path: &str) -> Result<Self, String> {
-        Self::connect_and_initialize(socket_path, Duration::from_secs(2), true, Instant::now())
-    }
-
-    /// Connect and run `initialize` within ONE total deadline (`timeout`), matching amendment 1
-    /// §2 line 47 ("within 1 s (connect plus reply)").
-    fn connect_and_initialize(
-        socket_path: &str,
-        timeout: Duration,
-        reused_existing: bool,
-        started_at: Instant,
-    ) -> Result<Self, String> {
-        Self::connect_and_initialize_with_connector(
-            socket_path,
-            timeout,
-            reused_existing,
-            started_at,
-            |p| UnixStream::connect(p),
-        )
-    }
-
-    fn connect_and_initialize_with_connector<F>(
-        socket_path: &str,
-        timeout: Duration,
-        reused_existing: bool,
-        started_at: Instant,
-        connector: F,
-    ) -> Result<Self, String>
-    where
-        F: FnOnce(&str) -> std::io::Result<UnixStream> + Send + 'static,
-    {
-        let deadline = Instant::now() + timeout;
-        let stream = connect_unix_with_deadline_using(socket_path, deadline, connector)?;
-
-        let rem = deadline.saturating_duration_since(Instant::now());
-        if rem.is_zero() {
-            return Err("initialize probe timed out after connect".to_string());
-        }
-        stream
-            .set_read_timeout(Some(rem))
-            .map_err(|e| format!("set_read_timeout failed: {e}"))?;
-        stream
-            .set_write_timeout(Some(rem))
-            .map_err(|e| format!("set_write_timeout failed: {e}"))?;
-
-        let writer = stream
-            .try_clone()
-            .map_err(|e| format!("socket clone failed: {e}"))?;
-        let mut client = Self {
-            reader: BufReader::new(stream),
-            writer,
-            next_id: 1,
-            spawned: None,
-            line_buf: Vec::new(),
-            staged_notifications: VecDeque::new(),
-            late_reply_count: 0,
-            discarded_notification_count: 0,
-            drop_limiter: DropRateLimiter::default(),
-            info: ConnectionInfo {
-                socket_path: socket_path.to_string(),
-                reused_existing,
-                protocol_version: String::new(),
-                server_name: String::new(),
-                server_version: String::new(),
-                cold_start_ms: 0,
-            },
-        };
-
-        let init_result = client.request_with_deadline(
-            "initialize",
-            json!({
-                "clientInfo": { "name": "madc-desktop", "version": "0.0.0" },
-                "capabilities": { "subscribeRoom": true }
-            }),
-            deadline,
-        )?;
-
-        let (protocol_version, server_name, server_version) =
-            validate_initialize_result(&init_result)?;
-
-        // Set interactive timeout for subsequent RPC calls.
-        let _ = client.writer.set_read_timeout(Some(INTERACTIVE_RPC_TIMEOUT));
-        let _ = client.writer.set_write_timeout(Some(INTERACTIVE_RPC_TIMEOUT));
-        let _ = client
-            .reader
-            .get_ref()
-            .set_read_timeout(Some(INTERACTIVE_RPC_TIMEOUT));
-
-        client.info = ConnectionInfo {
-            socket_path: socket_path.to_string(),
-            reused_existing,
-            protocol_version,
-            server_name,
-            server_version,
-            cold_start_ms: started_at.elapsed().as_millis() as u64,
-        };
-        Ok(client)
-    }
-
-    pub fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
-        self.request_with_deadline(method, params, Instant::now() + INTERACTIVE_RPC_TIMEOUT)
-    }
-
-    fn request_with_deadline(
+impl HandshakeClient {
+    fn handshake_request_with_deadline(
         &mut self,
         method: &str,
         params: Value,
@@ -2121,51 +2589,54 @@ impl SocketClient {
                     match classify_incoming_frame(&resp_line) {
                         FrameClass::ResponseError { id: resp_id, error } => {
                             if resp_id != id {
-                                self.late_reply_count += 1;
+                                if let Ok(mut o) = self.owner.lock() {
+                                    o.late_reply_count += 1;
+                                }
                                 continue;
                             }
                             return Err(format!("engine RPC error: {error}"));
                         }
                         FrameClass::ResponseOk { id: resp_id, result } => {
                             if resp_id != id {
-                                self.late_reply_count += 1;
+                                if let Ok(mut o) = self.owner.lock() {
+                                    o.late_reply_count += 1;
+                                }
                                 continue;
-                            }
-                            if method != "initialize" && !validate_rpc_result(method, &params, &result) {
-                                return Err(format!(
-                                    "invalid-frame: {method} result failed closed shape check"
-                                ));
                             }
                             return Ok(result);
                         }
-                        FrameClass::Notification(verdict) => match verdict {
-                            NotificationVerdict::Forwardable { method: m, params: p } => {
-                                if self.staged_notifications.len() >= FORWARD_QUEUE_CAPACITY {
-                                    return Err("overflow: notification queue full".to_string());
+                        FrameClass::Notification(verdict) => {
+                            let mut o = self
+                                .owner
+                                .lock()
+                                .map_err(|_| "owner lock poisoned".to_string())?;
+                            match verdict {
+                                NotificationVerdict::Forwardable { method: m, params: p } => {
+                                    o.enqueue_forwardable(m, p)?;
                                 }
-                                self.staged_notifications
-                                    .push_back(ForwardedNotification { method: m, params: p });
-                            }
-                            NotificationVerdict::Discard => {
-                                self.discarded_notification_count += 1;
-                            }
-                            NotificationVerdict::UnknownNotification => {
-                                let _ = self
-                                    .drop_limiter
-                                    .record_drop("unknown-notification", Instant::now());
-                            }
-                            NotificationVerdict::InvalidNotification { terminal } => {
-                                if terminal {
-                                    return Err(
-                                        "invalid-frame: malformed turn/completed notification"
-                                            .to_string(),
-                                    );
+                                NotificationVerdict::Discard => {
+                                    o.discarded_notification_count += 1;
                                 }
-                                let _ = self
-                                    .drop_limiter
-                                    .record_drop("invalid-notification", Instant::now());
+                                NotificationVerdict::UnknownNotification => {
+                                    o.record_drop_and_maybe_enqueue(
+                                        "unknown-notification",
+                                        Instant::now(),
+                                    )?;
+                                }
+                                NotificationVerdict::InvalidNotification { terminal } => {
+                                    if terminal {
+                                        return Err(
+                                            "invalid-frame: malformed turn/completed notification"
+                                                .to_string(),
+                                        );
+                                    }
+                                    o.record_drop_and_maybe_enqueue(
+                                        "invalid-notification",
+                                        Instant::now(),
+                                    )?;
+                                }
                             }
-                        },
+                        }
                         FrameClass::InvalidFrame(msg) => return Err(msg),
                     }
                 }
@@ -2185,17 +2656,608 @@ impl SocketClient {
         }
     }
 
-    pub fn disconnect(mut self) {
-        if let Some(mut s) = self.spawned.take() {
-            let _ = s.stop();
+    fn publish_open(
+        mut self,
+        spawned: Option<SpawnedServe>,
+        hooks: Option<Arc<TestStopHooks>>,
+    ) -> Result<SocketClient, String> {
+        // AM2 §2.2 (iii): clear read timeout once before reader starts; never re-arm SO_RCVTIMEO.
+        // Note: on macOS, if peer closed right after initialize, setsockopt returns EINVAL; reader immediately observes EOF.
+        let _ = self.reader.get_ref().set_read_timeout(None);
+        let _ = self.writer.set_write_timeout(Some(INTERACTIVE_RPC_TIMEOUT));
+        let cancel_stream = self
+            .reader
+            .get_ref()
+            .try_clone()
+            .map_err(|e| format!("socket clone for cancel handle failed: {e}"))?;
+
+        let reader = std::mem::replace(&mut self.reader, {
+            // dummy replaced below; move stream out cleanly using ManuallyDrop or take pattern?
+            // Wait: simpler cleanly via cloning/taking? Actually HandshakeClient doesn't need Drop once transferred!
+            BufReader::new(
+                cancel_stream
+                    .try_clone()
+                    .map_err(|e| format!("socket clone failed: {e}"))?,
+            )
+        });
+        let writer = self
+            .writer
+            .try_clone()
+            .map_err(|e| format!("writer clone failed: {e}"))?;
+        let line_buf = std::mem::take(&mut self.line_buf);
+        let owner = Arc::clone(&self.owner);
+        let sink = Arc::clone(&self.sink);
+        let info = self.info.clone();
+        let next_id = self.next_id;
+
+        {
+            let mut o = owner
+                .lock()
+                .map_err(|_| "owner lock poisoned".to_string())?;
+            if !matches!(o.phase, LifecyclePhase::Handshake) {
+                return Err("handshake already ended before Open".to_string());
+            }
+            o.phase = LifecyclePhase::Open;
+        }
+        // Defuse HandshakeClient Drop cleanly because phase is now Open.
+        std::mem::forget(self);
+
+        let drain_cv = Arc::new(Condvar::new());
+        let reader_done = Arc::new(AtomicBool::new(false));
+        let stop_state = Arc::new(Mutex::new(StopState {
+            cancel_stream: Some(cancel_stream),
+            spawned,
+            in_flight: None,
+            reader_done: Arc::clone(&reader_done),
+            hooks,
+        }));
+
+        let inner = Arc::new(SocketClientInner {
+            owner: Arc::clone(&owner),
+            drain_cv: Arc::clone(&drain_cv),
+            write_half: Mutex::new(Some(writer)),
+            next_id: AtomicU64::new(next_id),
+            stop_state: Arc::clone(&stop_state),
+            sink: Arc::clone(&sink),
+        });
+
+        // Spawn single emitter/drain thread (waits cleanly via Condvar on owner mutex).
+        thread::Builder::new()
+            .name("madc-drain".to_string())
+            .spawn({
+                let owner_d = Arc::clone(&owner);
+                let cv_d = Arc::clone(&drain_cv);
+                let sink_d = Arc::clone(&sink);
+                move || {
+                    drain_thread_loop(owner_d, cv_d, sink_d);
+                }
+            })
+            .map_err(|e| format!("failed to spawn drain thread: {e}"))?;
+
+        // Wake drain immediately if handshake staged any notifications (L2 / T-L2).
+        drain_cv.notify_all();
+
+        // Spawn dedicated reader thread (sole owner of read half).
+        thread::Builder::new()
+            .name("madc-reader".to_string())
+            .spawn({
+                let owner_r = Arc::clone(&owner);
+                let cv_r = Arc::clone(&drain_cv);
+                let done_r = Arc::clone(&reader_done);
+                move || {
+                    reader_thread_loop(reader, line_buf, owner_r, cv_r, done_r);
+                }
+            })
+            .map_err(|e| format!("failed to spawn reader thread: {e}"))?;
+
+        Ok(SocketClient { inner, info })
+    }
+}
+
+#[cfg(unix)]
+fn drain_thread_loop(
+    owner: Arc<Mutex<ClientOwner>>,
+    cv: Arc<Condvar>,
+    sink: Arc<dyn EventSink>,
+) {
+    let mut guard = match owner.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    loop {
+        match guard.drain_step(&*sink) {
+            None => return,
+            Some(true) => {
+                // Release lock briefly between items so desktop close / reader can interleave (L5).
+                drop(guard);
+                thread::yield_now();
+                guard = match owner.lock() {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+            }
+            Some(false) => {
+                guard = match cv.wait(guard) {
+                    Ok(g) => g,
+                    Err(p) => p.into_inner(),
+                };
+            }
         }
     }
 }
 
-/// Probe `$MADC_HOME/engine.sock` per amendment 1 §2, or spawn `madc-engine serve` per §1, §2, §5.
+#[cfg(unix)]
+fn reader_thread_loop(
+    mut reader: BufReader<UnixStream>,
+    mut line_buf: Vec<u8>,
+    owner: Arc<Mutex<ClientOwner>>,
+    cv: Arc<Condvar>,
+    reader_done: Arc<AtomicBool>,
+) {
+    loop {
+        let terminal_reason: Option<&'static str> = match read_bounded_line(&mut reader, &mut line_buf)
+        {
+            BoundedLine::Line(line) => {
+                if line.trim().is_empty() {
+                    let mut o = owner.lock().unwrap_or_else(|p| p.into_inner());
+                    let _ = o.flush_due_drops(Instant::now());
+                    cv.notify_all();
+                    continue;
+                }
+                match classify_incoming_frame(&line) {
+                    FrameClass::ResponseOk { id, result } => {
+                        let entry_opt = {
+                            let mut o = owner.lock().unwrap_or_else(|p| p.into_inner());
+                            let _ = o.flush_due_drops(Instant::now());
+                            if !matches!(o.phase, LifecyclePhase::Open) {
+                                break;
+                            }
+                            let popped = o.pending.remove(&id);
+                            if popped.is_none() {
+                                o.late_reply_count += 1;
+                                cv.notify_all();
+                            }
+                            popped
+                        };
+                        if let Some(entry) = entry_opt {
+                            // Closed shape validation OUTSIDE owner lock (L1).
+                            let valid = validate_rpc_result(&entry.method, &entry.params, &result);
+                            let mut o = owner.lock().unwrap_or_else(|p| p.into_inner());
+                            if !valid {
+                                if let Some(ref tid) = entry.thread_id {
+                                    if entry.method == "turn/start" {
+                                        o.finish_pending_turn_start(tid, None);
+                                    }
+                                }
+                                o.enter_terminated("invalid-frame");
+                                let _ = entry.reply_tx.send(Err(format!(
+                                    "invalid-frame: {} result failed closed shape check",
+                                    entry.method
+                                )));
+                                cv.notify_all();
+                                break;
+                            }
+                            if entry.method == "turn/start" {
+                                if let Some(ref tid) = entry.thread_id {
+                                    let turn_id = result["turn"]["id"].as_str();
+                                    o.finish_pending_turn_start(tid, turn_id);
+                                }
+                            }
+                            let _ = entry.reply_tx.send(Ok(result));
+                            cv.notify_all();
+                        }
+                        None
+                    }
+                    FrameClass::ResponseError { id, error } => {
+                        let mut o = owner.lock().unwrap_or_else(|p| p.into_inner());
+                        let _ = o.flush_due_drops(Instant::now());
+                        if let Some(entry) = o.pending.remove(&id) {
+                            if entry.method == "turn/start" {
+                                if let Some(ref tid) = entry.thread_id {
+                                    o.finish_pending_turn_start(tid, None);
+                                }
+                            }
+                            let _ = entry.reply_tx.send(Err(format!("engine RPC error: {error}")));
+                        } else {
+                            o.late_reply_count += 1;
+                        }
+                        cv.notify_all();
+                        None
+                    }
+                    FrameClass::Notification(verdict) => {
+                        let mut o = owner.lock().unwrap_or_else(|p| p.into_inner());
+                        if matches!(o.flush_due_drops(Instant::now()), Ok(true)) {
+                            cv.notify_all();
+                            break;
+                        }
+                        let mut overflowed = false;
+                        let mut term: Option<&'static str> = None;
+                        match verdict {
+                            NotificationVerdict::Forwardable { method, params } => {
+                                if method == "turn/started" || method == "turn/completed" {
+                                    o.observe_turn_notification(&method, &params);
+                                }
+                                if matches!(o.enqueue_forwardable(method, params), Ok(true)) {
+                                    overflowed = true;
+                                }
+                            }
+                            NotificationVerdict::Discard => {
+                                o.discarded_notification_count += 1;
+                            }
+                            NotificationVerdict::UnknownNotification => {
+                                if matches!(
+                                    o.record_drop_and_maybe_enqueue(
+                                        "unknown-notification",
+                                        Instant::now()
+                                    ),
+                                    Ok(true)
+                                ) {
+                                    overflowed = true;
+                                }
+                            }
+                            NotificationVerdict::InvalidNotification { terminal } => {
+                                if terminal {
+                                    term = Some("invalid-frame");
+                                } else if matches!(
+                                    o.record_drop_and_maybe_enqueue(
+                                        "invalid-notification",
+                                        Instant::now()
+                                    ),
+                                    Ok(true)
+                                ) {
+                                    overflowed = true;
+                                }
+                            }
+                        }
+                        if overflowed {
+                            cv.notify_all();
+                            break;
+                        }
+                        term
+                    }
+                    FrameClass::InvalidFrame(_) => Some("invalid-frame"),
+                }
+            }
+            BoundedLine::Eof => Some("eof"),
+            BoundedLine::Oversize => Some("oversize-frame"),
+            BoundedLine::InvalidUtf8 => Some("invalid-frame"),
+            BoundedLine::ReadError(_, _) => Some("read-error"),
+        };
+
+        if let Some(reason) = terminal_reason {
+            let mut o = owner.lock().unwrap_or_else(|p| p.into_inner());
+            o.enter_terminated(reason);
+            cv.notify_all();
+            break;
+        }
+    }
+    let _ = reader.get_ref().shutdown(Shutdown::Both);
+    reader_done.store(true, Ordering::Release);
+}
+
+#[cfg(unix)]
+impl SocketClient {
+    #[cfg(test)]
+    pub fn connect_existing_for_test(socket_path: &str) -> Result<Self, String> {
+        Self::connect_existing_with_sink(socket_path, Arc::new(NullEventSink))
+    }
+
+    #[cfg(test)]
+    pub fn connect_existing_with_sink(
+        socket_path: &str,
+        sink: Arc<dyn EventSink>,
+    ) -> Result<Self, String> {
+        let started_at = Instant::now();
+        let hs = Self::handshake_with_connector(
+            socket_path,
+            Duration::from_secs(2),
+            true,
+            started_at,
+            sink,
+            |p| UnixStream::connect(p),
+        )?;
+        hs.publish_open(None, None)
+    }
+
+    #[cfg(test)]
+    fn connect_and_initialize(
+        socket_path: &str,
+        timeout: Duration,
+        reused_existing: bool,
+        started_at: Instant,
+    ) -> Result<Self, String> {
+        Self::connect_and_initialize_with_connector(
+            socket_path,
+            timeout,
+            reused_existing,
+            started_at,
+            |p| UnixStream::connect(p),
+        )
+    }
+
+    #[cfg(test)]
+    fn connect_and_initialize_with_connector<F>(
+        socket_path: &str,
+        timeout: Duration,
+        reused_existing: bool,
+        started_at: Instant,
+        connector: F,
+    ) -> Result<Self, String>
+    where
+        F: FnOnce(&str) -> std::io::Result<UnixStream> + Send + 'static,
+    {
+        Self::handshake_with_connector(
+            socket_path,
+            timeout,
+            reused_existing,
+            started_at,
+            Arc::new(NullEventSink),
+            connector,
+        )?
+        .publish_open(None, None)
+    }
+
+    fn handshake_and_initialize(
+        socket_path: &str,
+        timeout: Duration,
+        reused_existing: bool,
+        started_at: Instant,
+        sink: Arc<dyn EventSink>,
+    ) -> Result<HandshakeClient, String> {
+        Self::handshake_with_connector(
+            socket_path,
+            timeout,
+            reused_existing,
+            started_at,
+            sink,
+            |p| UnixStream::connect(p),
+        )
+    }
+
+    fn handshake_with_connector<F>(
+        socket_path: &str,
+        timeout: Duration,
+        reused_existing: bool,
+        started_at: Instant,
+        sink: Arc<dyn EventSink>,
+        connector: F,
+    ) -> Result<HandshakeClient, String>
+    where
+        F: FnOnce(&str) -> std::io::Result<UnixStream> + Send + 'static,
+    {
+        let deadline = Instant::now() + timeout;
+        let stream = connect_unix_with_deadline_using(socket_path, deadline, connector)?;
+
+        let rem = deadline.saturating_duration_since(Instant::now());
+        if rem.is_zero() {
+            return Err("initialize probe timed out after connect".to_string());
+        }
+        stream
+            .set_read_timeout(Some(rem))
+            .map_err(|e| format!("set_read_timeout failed: {e}"))?;
+        stream
+            .set_write_timeout(Some(rem))
+            .map_err(|e| format!("set_write_timeout failed: {e}"))?;
+
+        let writer = stream
+            .try_clone()
+            .map_err(|e| format!("socket clone failed: {e}"))?;
+        let epoch = NEXT_EPOCH.fetch_add(1, Ordering::Relaxed);
+        let mut hs = HandshakeClient {
+            reader: BufReader::new(stream),
+            writer,
+            next_id: 1,
+            line_buf: Vec::new(),
+            owner: Arc::new(Mutex::new(ClientOwner::new(epoch))),
+            sink,
+            info: ConnectionInfo {
+                socket_path: socket_path.to_string(),
+                reused_existing,
+                protocol_version: String::new(),
+                server_name: String::new(),
+                server_version: String::new(),
+                cold_start_ms: 0,
+                connection_epoch: epoch,
+            },
+        };
+
+        let init_result = hs.handshake_request_with_deadline(
+            "initialize",
+            json!({
+                "clientInfo": { "name": "madc-desktop", "version": "0.0.0" },
+                "capabilities": { "subscribeRoom": true }
+            }),
+            deadline,
+        )?;
+
+        let (protocol_version, server_name, server_version) =
+            validate_initialize_result(&init_result)?;
+
+        hs.info = ConnectionInfo {
+            socket_path: socket_path.to_string(),
+            reused_existing,
+            protocol_version,
+            server_name,
+            server_version,
+            cold_start_ms: started_at.elapsed().as_millis() as u64,
+            connection_epoch: epoch,
+        };
+        Ok(hs)
+    }
+
+    pub fn is_open(&self) -> bool {
+        self.inner
+            .owner
+            .lock()
+            .map(|o| matches!(o.phase, LifecyclePhase::Open))
+            .unwrap_or(false)
+    }
+
+    pub fn reader_done(&self) -> bool {
+        self.inner
+            .stop_state
+            .lock()
+            .map(|s| s.reader_done.load(Ordering::Acquire))
+            .unwrap_or(true)
+    }
+
+    pub fn late_reply_count(&self) -> u64 {
+        self.inner
+            .owner
+            .lock()
+            .map(|o| o.late_reply_count)
+            .unwrap_or(0)
+    }
+
+    pub fn discarded_notification_count(&self) -> u64 {
+        self.inner
+            .owner
+            .lock()
+            .map(|o| o.discarded_notification_count)
+            .unwrap_or(0)
+    }
+
+    pub fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+        self.request_with_deadline(method, params, Instant::now() + INTERACTIVE_RPC_TIMEOUT)
+    }
+
+    fn request_with_deadline(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Instant,
+    ) -> Result<Value, String> {
+        let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
+        let payload = json!({
+            "id": id,
+            "method": method,
+            "params": params
+        });
+        let mut line = serde_json::to_string(&payload)
+            .map_err(|e| format!("failed to serialize request: {e}"))?;
+        line.push('\n');
+
+        let (reply_tx, reply_rx) = mpsc::sync_channel::<Result<Value, String>>(1);
+        let thread_id = if method == "turn/start" {
+            params
+                .get("threadId")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        {
+            let mut o = self
+                .inner
+                .owner
+                .lock()
+                .map_err(|_| "owner lock poisoned".to_string())?;
+            if !matches!(o.phase, LifecyclePhase::Open) {
+                return Err("engine socket closed before response".to_string());
+            }
+            if method == "turn/start" {
+                if let Some(ref tid) = thread_id {
+                    *o.pending_starts.entry(tid.clone()).or_insert(0) += 1;
+                    o.pending_starts_total += 1;
+                }
+            }
+            o.pending.insert(
+                id,
+                PendingRpc {
+                    method: method.to_string(),
+                    params,
+                    thread_id: thread_id.clone(),
+                    reply_tx,
+                },
+            );
+        }
+
+        let write_res = {
+            let write_rem = deadline.saturating_duration_since(Instant::now());
+            if write_rem.is_zero() {
+                Err(format!("RPC {method} timed out before write"))
+            } else {
+                let mut w_guard = self
+                    .inner
+                    .write_half
+                    .lock()
+                    .map_err(|_| "write lock poisoned".to_string())?;
+                match w_guard.as_mut() {
+                    None => Err("engine socket closed before response".to_string()),
+                    Some(stream) => {
+                        let _ = stream.set_write_timeout(Some(write_rem));
+                        stream
+                            .write_all(line.as_bytes())
+                            .map_err(|e| format!("socket write failed: {e}"))
+                            .and_then(|_| {
+                                stream
+                                    .flush()
+                                    .map_err(|e| format!("socket flush failed: {e}"))
+                            })
+                    }
+                }
+            }
+        };
+
+        if let Err(err_msg) = write_res {
+            let mut o = self.inner.owner.lock().unwrap_or_else(|p| p.into_inner());
+            if o.pending.remove(&id).is_some() && method == "turn/start" {
+                if let Some(ref tid) = thread_id {
+                    o.finish_pending_turn_start(tid, None);
+                }
+            }
+            return Err(err_msg);
+        }
+
+        let wait_rem = deadline.saturating_duration_since(Instant::now());
+        match reply_rx.recv_timeout(wait_rem) {
+            Ok(res) => res,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let mut o = self.inner.owner.lock().unwrap_or_else(|p| p.into_inner());
+                if o.pending.remove(&id).is_some() && method == "turn/start" {
+                    if let Some(ref tid) = thread_id {
+                        o.finish_pending_turn_start(tid, None);
+                    }
+                }
+                Err(format!("RPC {method} timed out waiting for reply"))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                Err("engine socket closed before response".to_string())
+            }
+        }
+    }
+
+    pub fn close_and_stop(&self, desktop_reason: &'static str, deadline: Instant) {
+        let published = {
+            let mut o = self.inner.owner.lock().unwrap_or_else(|p| p.into_inner());
+            o.close_to_closed(desktop_reason, &*self.inner.sink)
+        };
+        self.inner.drain_cv.notify_all();
+        if let Ok(mut wg) = self.inner.write_half.lock() {
+            let _ = wg.take();
+        }
+        if published {
+            stop_child(&self.inner.stop_state, deadline);
+        }
+    }
+
+    pub fn disconnect(self) {
+        self.close_and_stop("disconnect", Instant::now() + DISCONNECT_STOP_BOUND);
+    }
+}
+
 #[cfg(unix)]
 pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
-    connect_or_spawn_with_timeouts(config, PROBE_TIMEOUT, START_WINDOW)
+    connect_or_spawn_with_sink(config, Arc::new(NullEventSink))
+}
+
+#[cfg(unix)]
+pub fn connect_or_spawn_with_sink(
+    config: &LaunchConfig,
+    sink: Arc<dyn EventSink>,
+) -> Result<SocketClient, String> {
+    connect_or_spawn_with_timeouts(config, PROBE_TIMEOUT, START_WINDOW, sink)
 }
 
 #[cfg(all(unix, test))]
@@ -2203,7 +3265,12 @@ fn connect_or_spawn_with_window(
     config: &LaunchConfig,
     start_window: Duration,
 ) -> Result<SocketClient, String> {
-    connect_or_spawn_with_timeouts(config, PROBE_TIMEOUT, start_window)
+    connect_or_spawn_with_timeouts(
+        config,
+        PROBE_TIMEOUT,
+        start_window,
+        Arc::new(NullEventSink),
+    )
 }
 
 #[cfg(unix)]
@@ -2211,21 +3278,22 @@ fn connect_or_spawn_with_timeouts(
     config: &LaunchConfig,
     probe_timeout: Duration,
     start_window: Duration,
+    sink: Arc<dyn EventSink>,
 ) -> Result<SocketClient, String> {
     let started_at = Instant::now();
 
-    // §2: Probe existing listener within 1 s (connect + initialize). If home does not exist yet
-    // (Windows absent home, pin line 50), `try_engine_socket_path` returns Ok(None) and we spawn.
     if let Some(socket_path) = try_engine_socket_path(&config.home)? {
-        if let Ok(client) =
-            SocketClient::connect_and_initialize(&socket_path, probe_timeout, true, started_at)
-        {
-            return Ok(client);
+        if let Ok(hs) = SocketClient::handshake_and_initialize(
+            &socket_path,
+            probe_timeout,
+            true,
+            started_at,
+            Arc::clone(&sink),
+        ) {
+            return hs.publish_open(None, None);
         }
     }
 
-    // §1.3: Spawn `madc-engine serve` with piped stdin (held open), stdout null, piped stderr
-    // drained for the whole life of `serve` (retaining a bounded tail).
     let mut child = Command::new(&config.runtime_bin)
         .arg(&config.engine_entry)
         .arg("serve")
@@ -2271,14 +3339,12 @@ fn connect_or_spawn_with_timeouts(
         initialized: false,
     };
 
-    // §5: Wait up to `start_window` (5 s) for `initialize` to succeed over `engine.sock`.
     let deadline = Instant::now() + start_window;
     while Instant::now() < deadline {
         if let Some(status) = spawned.try_wait_status() {
             let code = status.code();
             let signal = status.signal();
             let class = classify_exit(code, signal, false);
-            // §2 & §5: On child exit 20 before initialize, re-probe once until the start window ends.
             if code == Some(20) {
                 while Instant::now() < deadline {
                     if let Ok(Some(socket_path)) = try_engine_socket_path(&config.home) {
@@ -2286,13 +3352,14 @@ fn connect_or_spawn_with_timeouts(
                             .saturating_duration_since(Instant::now())
                             .min(PROBE_TIMEOUT);
                         if !rem.is_zero() {
-                            if let Ok(client) = SocketClient::connect_and_initialize(
+                            if let Ok(hs) = SocketClient::handshake_and_initialize(
                                 &socket_path,
                                 rem,
                                 true,
                                 started_at,
+                                Arc::clone(&sink),
                             ) {
-                                return Ok(client);
+                                return hs.publish_open(None, None);
                             }
                         }
                     }
@@ -2319,23 +3386,21 @@ fn connect_or_spawn_with_timeouts(
                 .saturating_duration_since(Instant::now())
                 .min(PROBE_TIMEOUT);
             if !rem.is_zero() {
-                if let Ok(mut client) = SocketClient::connect_and_initialize(
+                if let Ok(hs) = SocketClient::handshake_and_initialize(
                     &socket_path,
                     rem,
                     false,
                     started_at,
+                    Arc::clone(&sink),
                 ) {
                     spawned.initialized = true;
-                    client.spawned = Some(spawned);
-                    return Ok(client);
+                    return hs.publish_open(Some(spawned), None);
                 }
             }
         }
         thread::sleep(Duration::from_millis(20));
     }
 
-    // §5: Deadline passed without initialize -> SIGTERM, then SIGKILL after 2 s.
-    // Report the child's exit status and drained stderr (pin §5 line 132).
     let status = spawned.stop();
     let code = status.and_then(|s| s.code());
     let signal = status.and_then(|s| s.signal());
@@ -2344,6 +3409,123 @@ fn connect_or_spawn_with_timeouts(
         "madc-engine serve did not complete initialize within {} ms (exit code={code:?}, signal={signal:?}).\nstderr:\n{stderr_text}",
         start_window.as_millis()
     ))
+}
+
+#[cfg(unix)]
+pub struct DesktopController {
+    pub exit_started: AtomicBool,
+    pub shutting_down: AtomicBool,
+    pub connect_mutex: Mutex<()>,
+    pub client: Mutex<Option<SocketClient>>,
+}
+
+#[cfg(unix)]
+impl Default for DesktopController {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(unix)]
+impl DesktopController {
+    pub fn new() -> Self {
+        Self {
+            exit_started: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+            connect_mutex: Mutex::new(()),
+            client: Mutex::new(None),
+        }
+    }
+
+    pub fn connect_engine_blocking(
+        &self,
+        config: &LaunchConfig,
+        sink: Arc<dyn EventSink>,
+    ) -> Result<ConnectionInfo, String> {
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("desktop shutting down".to_string());
+        }
+        let _connect_guard = self
+            .connect_mutex
+            .lock()
+            .map_err(|_| "connect lock poisoned".to_string())?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("desktop shutting down".to_string());
+        }
+
+        let stale = {
+            let mut guard = self
+                .client
+                .lock()
+                .map_err(|_| "engine state lock poisoned".to_string())?;
+            if let Some(existing) = guard.as_ref() {
+                if existing.is_open() {
+                    return Ok(existing.info.clone());
+                }
+            }
+            guard.take()
+        };
+
+        if let Some(stale_client) = stale {
+            stale_client.close_and_stop("disconnect", Instant::now() + DISCONNECT_STOP_BOUND);
+        }
+
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("desktop shutting down".to_string());
+        }
+
+        let new_client = connect_or_spawn_with_sink(config, sink)?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            new_client.close_and_stop("exit", Instant::now() + DISCONNECT_STOP_BOUND);
+            return Err("desktop shutting down".to_string());
+        }
+        if !new_client.is_open() {
+            new_client.close_and_stop("disconnect", Instant::now() + DISCONNECT_STOP_BOUND);
+            return Err("engine socket closed during connect".to_string());
+        }
+        let info = new_client.info.clone();
+        *self
+            .client
+            .lock()
+            .map_err(|_| "engine state lock poisoned".to_string())? = Some(new_client);
+        Ok(info)
+    }
+
+    pub fn rpc_request_blocking(&self, method: &str, params: Value) -> Result<Value, String> {
+        validate_rpc_method(method)?;
+        validate_rpc_params(method, &params)?;
+        if self.shutting_down.load(Ordering::Acquire) {
+            return Err("desktop shutting down".to_string());
+        }
+        let client_opt = {
+            let guard = self
+                .client
+                .lock()
+                .map_err(|_| "engine state lock poisoned".to_string())?;
+            guard.clone()
+        };
+        let Some(client) = client_opt else {
+            return Err("not connected to @madc/engine".to_string());
+        };
+        if !client.is_open() {
+            return Err("engine socket closed before response".to_string());
+        }
+        client.request(method, params)
+    }
+
+    pub fn disconnect_engine_blocking(&self) -> Result<(), String> {
+        let taken = {
+            let mut guard = self
+                .client
+                .lock()
+                .map_err(|_| "engine state lock poisoned".to_string())?;
+            guard.take()
+        };
+        if let Some(client) = taken {
+            client.close_and_stop("disconnect", Instant::now() + DISCONNECT_STOP_BOUND);
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2959,7 +4141,7 @@ mod tests {
         };
 
         // 1. Cold start from fresh empty $MADC_HOME: spawns serve, initializes madc-m1/1.
-        let mut c1 = connect_or_spawn(&cfg).expect("cold-start connect_or_spawn");
+        let c1 = connect_or_spawn(&cfg).expect("cold-start connect_or_spawn");
         assert!(!c1.info.reused_existing, "first launch must spawn serve");
         assert_eq!(c1.info.protocol_version, PROTOCOL_VERSION);
         assert!(c1.info.cold_start_ms < 5000, "cold start within 5 s window");
@@ -2972,7 +4154,7 @@ mod tests {
         assert!(room.get("room").is_some());
 
         // 2. Second launcher reuses the live listener without spawning.
-        let mut c2 = connect_or_spawn(&cfg).expect("second launcher reuse");
+        let c2 = connect_or_spawn(&cfg).expect("second launcher reuse");
         assert!(c2.info.reused_existing, "second launch must reuse live listener");
         let room2 = c2.request("room/inspect", json!({})).expect("room/inspect 2");
         assert!(room2.get("room").is_some());
@@ -3109,6 +4291,7 @@ mod tests {
             &cfg,
             Duration::from_millis(200),
             Duration::from_millis(200),
+            Arc::new(NullEventSink),
         ) {
             Ok(_) => panic!("expected fake serve exit 2 after stalled 200 ms probe"),
             Err(e) => e,
@@ -3488,19 +4671,32 @@ mod tests {
             thread::sleep(Duration::from_millis(350));
         });
 
-        let mut client = SocketClient::connect_existing_for_test(tmp.to_str().unwrap())
-            .expect("connect must succeed with staged notification");
-        assert_eq!(client.staged_notifications.len(), 1);
-        assert_eq!(client.staged_notifications[0].method, "room/updated");
+        #[derive(Default)]
+        struct CaptureSink {
+            events: Mutex<Vec<Value>>,
+        }
+        impl EventSink for CaptureSink {
+            fn emit_engine_event(&self, payload: Value) -> Result<(), String> {
+                self.events.lock().unwrap().push(payload);
+                Ok(())
+            }
+            fn emit_quit_requested(&self, _payload: Value) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let sink = Arc::new(CaptureSink::default());
+        let client = SocketClient::connect_existing_with_sink(
+            tmp.to_str().unwrap(),
+            Arc::clone(&sink) as Arc<dyn EventSink>,
+        )
+        .expect("connect must succeed with staged notification");
 
         let res = client
             .request("seat/list", json!({}))
             .expect("seat/list succeeds");
         assert_eq!(res, json!({"data": []}));
-        assert_eq!(client.late_reply_count, 1);
-        assert_eq!(client.discarded_notification_count, 1);
-        assert_eq!(client.staged_notifications.len(), 2);
-        assert_eq!(client.staged_notifications[1].method, "turn/started");
+        assert_eq!(client.late_reply_count(), 1);
+        assert_eq!(client.discarded_notification_count(), 1);
 
         let timeout_err = client
             .request_with_deadline(
@@ -3513,11 +4709,29 @@ mod tests {
             timeout_err.contains("timed out") || timeout_err.contains("failed"),
             "got: {timeout_err}"
         );
-        assert_eq!(
-            client.staged_notifications.len(),
-            3,
-            "notification before timeout must NOT be dropped"
+        let wait_deadline = Instant::now() + Duration::from_millis(500);
+        while Instant::now() < wait_deadline {
+            if sink.events.lock().unwrap().len() >= 3 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let evs = sink.events.lock().unwrap();
+        assert!(
+            evs.len() >= 3 && evs.len() <= 4,
+            "staged + in-flight + pre-timeout notifications (plus optional trailing eof) must emit, got {evs:?}"
         );
+        assert_eq!(evs[0]["method"], "room/updated");
+        assert_eq!(evs[0]["seq"], 1);
+        assert_eq!(evs[1]["method"], "turn/started");
+        assert_eq!(evs[1]["seq"], 2);
+        assert_eq!(evs[2]["method"], "room/updated");
+        assert_eq!(evs[2]["seq"], 3);
+        if evs.len() == 4 {
+            assert_eq!(evs[3]["method"], "madc/transport-closed");
+            assert_eq!(evs[3]["seq"], 4);
+        }
+        drop(evs);
         peer.join().unwrap();
         let _ = std::fs::remove_file(&tmp);
     }
@@ -3818,5 +5032,526 @@ mod tests {
         }
         assert!(saw_failed_item_completed, "fixture must include #finishTurn item/completed status=failed");
         assert!(saw_discarded, "fixture must include discarded item/started or delta");
+    }
+
+    #[derive(Default)]
+    struct TestSink {
+        engine_events: Mutex<Vec<(Option<LifecyclePhase>, Value)>>,
+        quit_events: Mutex<Vec<Value>>,
+        assert_owner_locked: Mutex<Option<Arc<Mutex<ClientOwner>>>>,
+        stall_once: Mutex<Option<(mpsc::SyncSender<()>, mpsc::Receiver<()>)>>,
+    }
+
+    impl EventSink for TestSink {
+        fn emit_engine_event(&self, payload: Value) -> Result<(), String> {
+            let phase_snap = self.assert_owner_locked.lock().unwrap().as_ref().map(|arc| {
+                // Verify owner mutex is held by caller (non-reentrant try_lock must fail).
+                assert!(arc.try_lock().is_err(), "L1 violation: emit started without holding owner!");
+                // Return current phase sentinel for L5 check via payload inspection fallback
+                LifecyclePhase::Open
+            });
+            if let Some((tx, rx)) = self.stall_once.lock().unwrap().take() {
+                let _ = tx.send(());
+                let _ = rx.recv_timeout(Duration::from_secs(2));
+            }
+            self.engine_events.lock().unwrap().push((phase_snap, payload));
+            Ok(())
+        }
+        fn emit_quit_requested(&self, payload: Value) -> Result<(), String> {
+            self.quit_events.lock().unwrap().push(payload);
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn connection_info_serializes_connection_epoch_and_events_match_epoch_s3_5() {
+        let info = ConnectionInfo {
+            socket_path: "/tmp/s.sock".to_string(),
+            reused_existing: false,
+            protocol_version: PROTOCOL_VERSION.to_string(),
+            server_name: "madc-engine".to_string(),
+            server_version: "0.0.0".to_string(),
+            cold_start_ms: 10,
+            connection_epoch: 42,
+        };
+        let v = serde_json::to_value(&info).unwrap();
+        let obj = v.as_object().unwrap();
+        assert_eq!(obj.get("connectionEpoch").and_then(|x| x.as_u64()), Some(42));
+        assert!(!obj.contains_key("connection_epoch"), "must not emit snake_case key");
+
+        let e1 = ClientOwner::new(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)).epoch;
+        let e2 = ClientOwner::new(NEXT_EPOCH.fetch_add(1, Ordering::Relaxed)).epoch;
+        assert!(e2 > e1, "sequential epochs must increase");
+    }
+
+    #[test]
+    fn owner_randomized_10k_schedule_preserves_l1_l3_l4_l5_l6_t_l1() {
+        // T-L1: 10,000-seed randomized interleaving over ClientOwner operations checking L3-L6 + L1.
+        struct L1CheckSink {
+            owner: Arc<Mutex<ClientOwner>>,
+            events: Mutex<Vec<Value>>,
+        }
+        impl EventSink for L1CheckSink {
+            fn emit_engine_event(&self, payload: Value) -> Result<(), String> {
+                assert!(
+                    self.owner.try_lock().is_err(),
+                    "T-L1 killed mutation: emit started outside owner!"
+                );
+                self.events.lock().unwrap().push(payload);
+                Ok(())
+            }
+            fn emit_quit_requested(&self, payload: Value) -> Result<(), String> {
+                assert!(self.owner.try_lock().is_err());
+                self.events.lock().unwrap().push(payload);
+                Ok(())
+            }
+        }
+
+        for seed in 0u64..10_000 {
+            let mut rng = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            let mut next_u32 = || {
+                rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (rng >> 32) as u32
+            };
+
+            let owner = Arc::new(Mutex::new(ClientOwner::new(seed + 1)));
+            let sink = L1CheckSink {
+                owner: Arc::clone(&owner),
+                events: Mutex::new(Vec::new()),
+            };
+            let mut was_published = false;
+            let mut turn_counter = 0u64;
+
+            for _step in 0..16 {
+                let op = next_u32() % 7;
+                let mut o = owner.lock().unwrap();
+                match op {
+                    0 => {
+                        if matches!(o.phase, LifecyclePhase::Handshake) {
+                            o.phase = LifecyclePhase::Open;
+                            was_published = true;
+                        }
+                    }
+                    1 => {
+                        let _ = o.enqueue_forwardable(
+                            "room/updated".to_string(),
+                            json!({"reason":"thread","threadId":"thr_1"}),
+                        );
+                    }
+                    2 => {
+                        let _ = o.drain_step(&sink);
+                    }
+                    3 => {
+                        let _ = o.enter_terminated("eof");
+                    }
+                    4 => {
+                        let _ = o.close_to_closed("disconnect", &sink);
+                    }
+                    5 => {
+                        if matches!(o.phase, LifecyclePhase::Open) {
+                            turn_counter += 1;
+                            *o.pending_starts.entry("thr_1".to_string()).or_insert(0) += 1;
+                            o.pending_starts_total += 1;
+                            let tid = format!("turn_{turn_counter}");
+                            o.observe_turn_notification(
+                                "turn/started",
+                                &json!({"turn":{"id":tid,"threadId":"thr_1","status":"inProgress","items":[],"error":null,"startedAt":1,"completedAt":null}}),
+                            );
+                            o.finish_pending_turn_start("thr_1", Some(&tid));
+                        }
+                    }
+                    _ => {
+                        if matches!(o.phase, LifecyclePhase::Open) {
+                            o.observe_turn_notification(
+                                "turn/completed",
+                                &json!({"turn":{"id":format!("turn_{turn_counter}"),"threadId":"thr_1","status":"completed","items":[],"error":null,"startedAt":1,"completedAt":2}}),
+                            );
+                        }
+                    }
+                }
+                // L6 check: if Terminated or Closed, guard and quit state are empty
+                if matches!(o.phase, LifecyclePhase::Terminated { .. } | LifecyclePhase::Closed) {
+                    assert_eq!(o.guard_count(), 0);
+                    assert!(o.quit_record.is_none());
+                    assert!(o.quit_fallback_set_at.is_none());
+                    assert!(o.pending.is_empty());
+                }
+            }
+            // Drain/close to end cleanly
+            {
+                let mut o = owner.lock().unwrap();
+                o.close_to_closed("exit", &sink);
+            }
+            let evs = sink.events.lock().unwrap();
+            if !was_published {
+                assert!(evs.is_empty(), "L2 violated: unpublished epoch emitted!");
+            } else {
+                let terminals: Vec<_> = evs
+                    .iter()
+                    .filter(|e| e["method"] == "madc/transport-closed")
+                    .collect();
+                assert_eq!(terminals.len(), 1, "L3 violated on seed {seed}: {evs:?}");
+                assert_eq!(evs.last().unwrap()["method"], "madc/transport-closed", "L4 terminal must be last");
+                let mut last_seq = 0u64;
+                for e in evs.iter() {
+                    let s = e["seq"].as_u64().unwrap();
+                    assert!(s > last_seq, "L4 seq must strictly increase");
+                    assert_eq!(e["epoch"].as_u64().unwrap(), seed + 1);
+                    last_seq = s;
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_epochs_and_handshake_failure_overflow_match_t_l2() {
+        // 1. Handshake failure (protocol mismatch) emits zero events.
+        let tmp = std::env::temp_dir().join(format!("madc-tl2-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let listener = UnixListener::bind(&tmp).unwrap();
+        let peer = thread::spawn(move || {
+            let (s1, _) = listener.accept().unwrap();
+            let mut w1 = s1.try_clone().unwrap();
+            let mut r1 = BufReader::new(s1);
+            let mut buf = Vec::new();
+            let BoundedLine::Line(line) = read_bounded_line(&mut r1, &mut buf) else { panic!() };
+            let req: Value = serde_json::from_str(&line).unwrap();
+            writeln!(w1, "{}", json!({"id":req["id"],"result":{"protocolVersion":"madc-m0/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
+            let _ = w1.flush();
+
+            // Connection 2: sends 4097 notifications during handshake -> overflow & Closed with zero emits!
+            let (s2, _) = listener.accept().unwrap();
+            let mut w2 = s2.try_clone().unwrap();
+            let mut r2 = BufReader::new(s2);
+            let BoundedLine::Line(_) = read_bounded_line(&mut r2, &mut buf) else { panic!() };
+            for i in 0..4097 {
+                if writeln!(w2, "{}", json!({"method":"room/updated","params":{"reason":"thread","threadId":format!("thr_{i}")}})).is_err() {
+                    break;
+                }
+            }
+            let _ = w2.flush();
+        });
+
+        let sink = Arc::new(TestSink::default());
+        let err1 = SocketClient::connect_existing_with_sink(
+            tmp.to_str().unwrap(),
+            Arc::clone(&sink) as Arc<dyn EventSink>,
+        )
+        .err()
+        .expect("mismatch must fail handshake");
+        assert!(err1.contains("protocol version mismatch"));
+        assert!(sink.engine_events.lock().unwrap().is_empty(), "F11 emits nothing");
+
+        let err2 = SocketClient::connect_existing_with_sink(
+            tmp.to_str().unwrap(),
+            Arc::clone(&sink) as Arc<dyn EventSink>,
+        )
+        .err()
+        .expect("4097 notifications during handshake must fail");
+        assert!(err2.contains("overflow"), "got: {err2}");
+        assert!(sink.engine_events.lock().unwrap().is_empty(), "Handshake overflow emits nothing (L2)");
+
+        peer.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[test]
+    fn terminal_once_ordering_l3_l4_l5_and_1000_rep_barrier_race() {
+        // 1000-rep barrier race between reader enter_terminated("eof") and disconnect close_to_closed
+        for rep in 0..1000u64 {
+            let owner = Arc::new(Mutex::new(ClientOwner::new(rep + 1)));
+            {
+                let mut o = owner.lock().unwrap();
+                o.phase = LifecyclePhase::Open;
+                let _ = o.enqueue_forwardable("room/updated".into(), json!({"reason":"thread","threadId":"thr_r"}));
+            }
+            let sink = Arc::new(TestSink::default());
+            *sink.assert_owner_locked.lock().unwrap() = Some(Arc::clone(&owner));
+
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let o1 = Arc::clone(&owner);
+            let b1 = Arc::clone(&barrier);
+            let s1 = Arc::clone(&sink);
+            let t1 = thread::spawn(move || {
+                b1.wait();
+                let mut o = o1.lock().unwrap();
+                o.enter_terminated("eof");
+                while o.drain_step(&*s1).is_some() {}
+            });
+
+            let o2 = Arc::clone(&owner);
+            let b2 = Arc::clone(&barrier);
+            let s2 = Arc::clone(&sink);
+            let t2 = thread::spawn(move || {
+                b2.wait();
+                let mut o = o2.lock().unwrap();
+                o.close_to_closed("disconnect", &*s2);
+            });
+
+            barrier.wait();
+            t1.join().unwrap();
+            t2.join().unwrap();
+
+            let evs = sink.engine_events.lock().unwrap();
+            let terms: Vec<_> = evs.iter().filter(|(_, p)| p["method"] == "madc/transport-closed").collect();
+            assert_eq!(terms.len(), 1, "T-L3 race rep {rep}: expected exactly 1 terminal, got {evs:?}");
+            assert_eq!(evs.last().unwrap().1["method"], "madc/transport-closed");
+            let count_before = evs.len();
+            drop(evs);
+            // Second close emits nothing (L3)
+            owner.lock().unwrap().close_to_closed("disconnect", &*sink);
+            assert_eq!(sink.engine_events.lock().unwrap().len(), count_before);
+        }
+
+        // L4 overflow gap + reserved reason preserved on mid-drain disconnect (Copilot 4725865918)
+        let owner = Arc::new(Mutex::new(ClientOwner::new(77)));
+        let sink = Arc::new(TestSink::default());
+        {
+            let mut o = owner.lock().unwrap();
+            o.phase = LifecyclePhase::Open;
+            for i in 0..FORWARD_QUEUE_CAPACITY {
+                assert_eq!(
+                    o.enqueue_forwardable("room/updated".into(), json!({"reason":"thread","threadId":format!("thr_{i}")})).unwrap(),
+                    false
+                );
+            }
+            // 4097th -> consumes seq 4097 (gap) and reserves seq 4098 terminal overflow
+            assert_eq!(
+                o.enqueue_forwardable("room/updated".into(), json!({"reason":"thread","threadId":"thr_overflow"})).unwrap(),
+                true
+            );
+            assert_eq!(o.phase, LifecyclePhase::Terminated { reason: "overflow", seq: 4098 });
+            // Drain 1 ordinary event then close mid-drain with disconnect
+            assert_eq!(o.drain_step(&*sink), Some(true));
+            o.close_to_closed("disconnect", &*sink);
+        }
+        let evs = sink.engine_events.lock().unwrap();
+        assert_eq!(evs.len(), 2);
+        assert_eq!(evs[0].1["seq"], 1);
+        assert_eq!(evs[1].1["method"], "madc/transport-closed");
+        assert_eq!(evs[1].1["params"]["reason"], "overflow", "must emit reserved overflow reason, not disconnect");
+        assert_eq!(evs[1].1["seq"], 4098);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cancellation_wakes_silent_reader_within_2s_and_kills_slow_child_t_l7() {
+        let tmp = std::env::temp_dir().join(format!("madc-tl7-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let listener = UnixListener::bind(&tmp).unwrap();
+        let hold_tx = Arc::new(Mutex::new(None));
+        let hold_c = Arc::clone(&hold_tx);
+        let _peer = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            let mut r = BufReader::new(s);
+            let mut buf = Vec::new();
+            let BoundedLine::Line(req) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+            let v: Value = serde_json::from_str(&req).unwrap();
+            writeln!(w, "{}", json!({"id":v["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
+            let _ = w.flush();
+            // Keep server end open silently forever until test ends
+            *hold_c.lock().unwrap() = Some((w, r));
+        });
+
+        let sink = Arc::new(TestSink::default());
+        let client = SocketClient::connect_existing_with_sink(
+            tmp.to_str().unwrap(),
+            Arc::clone(&sink) as Arc<dyn EventSink>,
+        )
+        .expect("connect");
+
+        let client_ref = client.clone();
+        client.disconnect();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && !client_ref.reader_done() {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(client_ref.reader_done(), "T-L7: shutdown(Shutdown::Both) must wake blocked reader within 2 s");
+        // Verify new RPC fails cleanly without touching socket
+        assert_eq!(
+            client_ref.request("room/inspect", json!({})).unwrap_err(),
+            "engine socket closed before response"
+        );
+        let evs = sink.engine_events.lock().unwrap();
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].1["method"], "madc/transport-closed");
+        assert_eq!(evs[0].1["params"]["reason"], "disconnect");
+        drop(hold_tx);
+        let _ = std::fs::remove_file(&tmp);
+
+        // Inline spawn_fail fallback stops/kills child cleanly
+        let child = Command::new("/bin/sh").arg("-c").arg("exec sleep 30").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        let child_pid = child.id();
+        let spawned = SpawnedServe {
+            child,
+            stdin: None,
+            stderr_buf: Arc::new(Mutex::new(String::new())),
+            stderr_done: None,
+            stderr_thread: None,
+            initialized: true,
+        };
+        let stop_arc = Arc::new(Mutex::new(StopState {
+            cancel_stream: None,
+            spawned: Some(spawned),
+            in_flight: None,
+            reader_done: Arc::new(AtomicBool::new(true)),
+            hooks: Some(Arc::new(TestStopHooks {
+                delay_l7: None,
+                force_spawn_fail: true,
+                on_l7_thread: None,
+            })),
+        }));
+        stop_child(&stop_arc, Instant::now() + Duration::from_millis(150));
+        unsafe {
+            // Either already reaped (ESRCH) or dead shortly
+            let rc = libc::kill(child_pid as libc::pid_t, 0);
+            assert!(rc != 0, "spawn_fail inline fallback must kill child");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_reader_survives_over_10s_without_timeout_and_still_answers_t_l8_7b() {
+        let tmp = std::env::temp_dir().join(format!("madc-tl8-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let listener = UnixListener::bind(&tmp).unwrap();
+        let peer = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            let mut r = BufReader::new(s);
+            let mut buf = Vec::new();
+            let BoundedLine::Line(req1) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+            let v1: Value = serde_json::from_str(&req1).unwrap();
+            writeln!(w, "{}", json!({"id":v1["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
+            let _ = w.flush();
+
+            // Wait cleanly for room/inspect (arrives after > 10.5s idle)
+            let BoundedLine::Line(req2) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+            let v2: Value = serde_json::from_str(&req2).unwrap();
+            writeln!(w, "{}", json!({"id":v2["id"],"result":{"room":{"home":"/h","threads":[],"counts":{"threads":0,"pass":0,"warn":0,"fail":0,"openDecisions":0}}}})).unwrap();
+            let _ = w.flush();
+        });
+
+        let sink = Arc::new(TestSink::default());
+        let client = SocketClient::connect_existing_with_sink(
+            tmp.to_str().unwrap(),
+            Arc::clone(&sink) as Arc<dyn EventSink>,
+        )
+        .expect("connect");
+
+        thread::sleep(Duration::from_millis(10_500));
+        assert!(sink.engine_events.lock().unwrap().is_empty(), "idle connection must emit zero events");
+        assert!(client.is_open(), "idle connection > 10s must remain Open (L8)");
+        let res = client.request("room/inspect", json!({})).expect("room/inspect succeeds after 10.5s idle");
+        assert_eq!(res["room"]["counts"]["threads"], 0);
+        client.disconnect();
+        peer.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+
+        // Static source check: reader_thread_loop, stop_child, and post-handshake SocketClient methods never re-arm SO_RCVTIMEO.
+        let src = include_str!("launcher.rs");
+        let after_handshake = src.find("pub fn is_open(&self)").unwrap();
+        let tests_start = src.find("#[cfg(test)]\nmod tests").unwrap();
+        let reader_start = src.find("fn reader_thread_loop(").unwrap();
+        let reader_end = src[reader_start..].find("\n#[cfg(unix)]\nimpl SocketClient").unwrap() + reader_start;
+        assert!(
+            !src[reader_start..reader_end].contains("set_read_timeout(Some("),
+            "L8 violation: reader_thread_loop must NEVER call set_read_timeout(Some(..))"
+        );
+        assert!(
+            !src[after_handshake..tests_start].contains("set_read_timeout(Some("),
+            "L8 violation: post-handshake SocketClient/DesktopController must NEVER call set_read_timeout(Some(..))"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn desktop_controller_l14_never_returns_stale_or_post_shutdown_client_t_l14() {
+        let ctrl = DesktopController::new();
+        ctrl.shutting_down.store(true, Ordering::Release);
+        let dummy_cfg = LaunchConfig {
+            home: PathBuf::from("/tmp/nonexistent-madc-l14"),
+            runtime_bin: "node".to_string(),
+            engine_entry: PathBuf::from("none"),
+        };
+        assert_eq!(
+            ctrl.connect_engine_blocking(&dummy_cfg, Arc::new(NullEventSink)).unwrap_err(),
+            "desktop shutting down"
+        );
+        assert_eq!(
+            ctrl.rpc_request_blocking("room/inspect", json!({})).unwrap_err(),
+            "desktop shutting down"
+        );
+
+        // Stale Terminated client cached in controller is closed and replaced on next connect
+        let tmp = std::env::temp_dir().join(format!("madc-tl14-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let listener = UnixListener::bind(&tmp).unwrap();
+        let peer = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            let mut r = BufReader::new(s);
+            let mut buf = Vec::new();
+            let BoundedLine::Line(req) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+            let v: Value = serde_json::from_str(&req).unwrap();
+            writeln!(w, "{}", json!({"id":v["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
+            let _ = w.flush();
+            // Immediately drop peer -> Terminated/Closed
+        });
+
+        let ctrl2 = DesktopController::new();
+        let sink = Arc::new(TestSink::default());
+        let c1 = SocketClient::connect_existing_with_sink(
+            tmp.to_str().unwrap(),
+            Arc::clone(&sink) as Arc<dyn EventSink>,
+        )
+        .unwrap();
+        let ep1 = c1.info.connection_epoch;
+        *ctrl2.client.lock().unwrap() = Some(c1);
+        thread::sleep(Duration::from_millis(80)); // wait for first peer EOF
+
+        // Home dir empty but we point MADC_HOME to tmp's parent? Instead put sock at $home/engine.sock:
+        let home = std::env::temp_dir().join(format!("madc-tl14-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        std::os::unix::fs::symlink(&tmp, home.join("engine.sock")).unwrap();
+        // Actually engine_socket_path points to home/engine.sock (direct file): wait try_engine_socket_path checks plain join on unix
+        drop(home);
+
+        // Verify direct stale check via connect_or_spawn reusing a real socket path
+        let home2 = PathBuf::from(format!("/tmp/madc-tl14h-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home2);
+        std::fs::create_dir_all(&home2).unwrap();
+        let sock2 = home2.join("engine.sock");
+        let l2 = UnixListener::bind(&sock2).unwrap();
+        let p2 = thread::spawn(move || {
+            let (s, _) = l2.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            let mut r = BufReader::new(s);
+            let mut buf = Vec::new();
+            let BoundedLine::Line(req) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+            let v: Value = serde_json::from_str(&req).unwrap();
+            writeln!(w, "{}", json!({"id":v["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
+            let _ = w.flush();
+            thread::sleep(Duration::from_millis(250));
+        });
+        let cfg2 = LaunchConfig {
+            home: home2.clone(),
+            runtime_bin: "node".to_string(),
+            engine_entry: PathBuf::from("unused"),
+        };
+        let info2 = ctrl2
+            .connect_engine_blocking(&cfg2, Arc::clone(&sink) as Arc<dyn EventSink>)
+            .expect("stale client replaced by live client");
+        assert!(info2.connection_epoch > ep1);
+        assert!(ctrl2.client.lock().unwrap().as_ref().unwrap().is_open());
+        let _ = ctrl2.disconnect_engine_blocking();
+        p2.join().unwrap();
+        peer.join().unwrap();
+        let _ = std::fs::remove_dir_all(&home2);
+        let _ = std::fs::remove_file(&tmp);
     }
 }
