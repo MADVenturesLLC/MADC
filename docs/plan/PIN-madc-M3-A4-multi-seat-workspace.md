@@ -184,15 +184,15 @@ The only tone source is `evidenceTone(receipt, hint)` (`shell.js:190-195`): `fai
 
 Rows in spec §6.2's fixed order: method-error rows, `servedModel`, `lane`, `worktree.topLevel`, `head@open`, `hash`.
 
-**`servedModel` row.** Source: the **last** `servedModel` event in `session/read` `events[]` whose `payload.turnId` is the pane's latest turn (`session-store.ts:94-108`; `search.ts:158-172`); live: `item/completed` with `item.kind === "servedModel"` (`types.ts:129-143`; persisted before it is notified, `server.ts:2572-2584`).
+**`servedModel` row.** Source: the **last** `servedModel` event in `session/read` `events[]` whose `payload.turnId` is the pane's latest turn (`session-store.ts:94-108`; `search.ts:158-172`); live: `item/completed` with `item.kind === "servedModel"` (`types.ts:129-143`; persisted before it is notified, `server.ts:2572-2584`). **The read-back is the only source that can verify; the streamed item is optional.** A streamed item, when one was seen, is used only (1) to show the interim `○ NO RECEIPT` row and (2) as a consistency check against the read-back. A missed, dropped or never-sent live notification (including a connection that ended and a later user-run read) does **not** block verification: the read-back alone resolves the row, and the "equal to a streamed item" comparison is skipped when no streamed item exists.
 
 | Condition (in order) | Hint → tone | Pill | Chips / note |
 | --- | --- | --- | --- |
 | No turn yet, or the turn ended without a `servedModel` item (e.g. refused `-32007`) | `neutral` | `○ NO RECEIPT` | `servedModel —` |
 | Streamed item seen, no read-back yet | `neutral` (**FDR-A4-2** default; spec: `warn`) | `○ NO RECEIPT` (spec: `▲ UNVERIFIED`) | `servedModel ‹value›`, `vendorReported ‹bool›`; note `streamed · confirmed by session/read after turn/completed` |
-| Read-back `chainOk === true`, matching event, `vendorReported === true`, and equal to any streamed item | `evidenceTone({kind:"servedModel", servedModel, vendorReported}, …)` → `verified` | `✓ VERIFIED` | `servedModel`, `vendorReported true`, `fallbackFrom` when non-null |
-| Same, `vendorReported === false` | `warn` (D-718) | `▲ UNVERIFIED` | as above with `vendorReported false` |
-| Read-back `chainOk !== true` after a streamed item, or streamed value ≠ chain value, or `session/read` rejected | `fail` | `✗ FAILED` | note `live value not confirmed by chain` / `live value differs from chain` / `session/read: ‹code› ‹message›`; cached read discarded (A3 pin §4.3 B) |
+| Read-back `chainOk === true`, a matching event, `vendorReported === true`, and (**only if a streamed item was seen**) equal to it | `evidenceTone({kind:"servedModel", servedModel, vendorReported}, …)` → `verified` | `✓ VERIFIED` | `servedModel`, `vendorReported true`, `fallbackFrom` when non-null |
+| Same, `vendorReported === false` (streamed item optional as above) | `warn` (D-718) | `▲ UNVERIFIED` | as above with `vendorReported false` |
+| Read-back `chainOk !== true` (with or without a streamed item), or a streamed item was seen and its value ≠ the chain value, or `session/read` rejected | `fail` | `✗ FAILED` | note `chain not confirmed` (no stream) / `live value not confirmed by chain` / `live value differs from chain` / `session/read: ‹code› ‹message›`; cached read discarded (A3 pin §4.3 B) |
 
 **`lane` and `worktree.topLevel` rows (D-719).** Field rows: no pill, note `field · not a receipt`. `lane` from the same `servedModel` event (`ServedModelPayload.lane`). `topLevel` from `worktree.open.topLevel` (§4.4 sources); start-truncated with the full path in `title` (spec §6.4). The typed `cwd` is **never** shown as `topLevel`: `topLevel` is the engine's realpath.
 
