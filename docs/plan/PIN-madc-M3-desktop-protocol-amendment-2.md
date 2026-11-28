@@ -34,6 +34,8 @@
 
 *r16 (2026-11-28, early AM ET): answers Copilot's review of `0f1ddd5d` (review `6096502671`, one new High: `4726022151`). Terminal handling settles any in-flight quit candidate for that epoch and marks it dead (L11). After `quit_dialog_shown` returns `{ accepted: true }`, the UI opens the dialog only if the epoch is still `boundEpoch`, the state is still `CONNECTED`, and that `requestId` is still the active candidate; otherwise the result is dropped silently, with no dialog and no fallback mark (L12). Test (T-L12b). The PR body is not retried. Dispositions in §17.*
 
+*r17 (2026-11-28, early AM ET): answers Copilot's review of `64ddca19` (review `6096566183`, one new Medium: `4726046456`). The A4 `servedModel` `✓ VERIFIED` row now requires a non-empty `servedModel`, matching `isVerifiedReceipt`. An empty-string read-back is `neutral`, never green. The PR body is not retried. Dispositions in §17.*
+
 **Authority:**
 
 - `docs/plan/PIN-madc-M3-desktop-protocol.md` (base; §2, §3, §4), blob `2c022f33…` at the base.
@@ -764,7 +766,7 @@ MADC Architect reviewed the protocol findings and agrees with the 8-method allow
 7. **Desktop presence (spec §14.7).** No detach rule is needed, and the keypress prompt cannot appear in A4. Every socket connection gets `ABSENT_TERMINAL` whatever terminal `serve` inherited, because `#terminalAccess` (`server.ts:2332-2336`) opens the system terminal only when `opts.input === process.stdin`, and the socket server builds each connection with `input: socket` (`socket.ts:345-352`). The desktop also never sends `mode: "interactive"` (§1.2; refused in Rust), so `#presencePhase` returns `absent` ("the turn is headless", `server.ts:2352`) before any probe, and `#turnStart` throws the `-32007` refusal (`server.ts:2210`) before the pending-presence path (`:2212-2216`) can run. `serve`'s stdin is a pipe (`launcher.rs:601`). The builder adds no `setsid`/TTY handling.
 
 
-## 17. Review dispositions (r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16)
+## 17. Review dispositions (r2, r3, r4, r5, r6, r7, r8, r9, r10, r11, r12, r13, r14, r15, r16, r17)
 
 ### r2
 
@@ -1035,3 +1037,11 @@ Copilot review `6096502671` of head `0f1ddd5da7090d97e1459205b906a1851c116f63` (
 | # | Finding | Disposition |
 | --- | --- | --- |
 | C16-1 (`4726022151`, High) | After `quit_dialog_shown` was accepted in Rust, a terminal could arrive in the UI before `{ accepted: true }` was delivered; the UI still opened the dialog, even though the connection was no longer `CONNECTED` | **Fixed, in the invariants.** L11 / §4.3: handling a terminal for `boundEpoch` settles any in-flight or shown quit candidate for that epoch and marks it `dead`. L12 / §6.1: the UI records a `candidate` before invoking `quit_dialog_shown`, and opens the dialog only if `{ accepted: true }` **and** `epoch === boundEpoch`, the state is `CONNECTED`, and that `requestId` is still the active candidate; otherwise the result is dropped silently (no dialog, no fallback mark). Test (T-L12b), killed mutations: opening on `{ accepted: true }` without the three re-checks; terminal handling that settles only a shown dialog and leaves an in-flight candidate live |
+
+### r17 — Copilot review of `64ddca19` (2026-11-28, early AM ET)
+
+Copilot review `6096566183` of head `64ddca19fb68e7e275760ae69f2961bebdbf2161` (2:36 AM ET) marked the r16 thread (`4726022151`) resolved and opened one new Medium. The four outdated r12 threads (N13–N16) remain unreplied-as-resolved on GitHub. Docs only; sources not edited; this PR is not merged; the PR body is not retried. FDR-A4-6 is unchanged.
+
+| # | Finding | Disposition |
+| --- | --- | --- |
+| C17-1 (`4726046456`, Medium) | The A4 `servedModel` `✓ VERIFIED` row omitted the non-empty requirement that `isVerifiedReceipt` (`shell.js:164-184`) imposes, so an empty-string `servedModel` with `vendorReported === true` could be shown as verified, while `evidenceTone` returns `neutral` | **Fixed.** The verified row now requires a **non-empty** `servedModel`. A new preceding row covers a valid `chainOk === true` read-back whose `servedModel` is empty: `evidenceTone` → `neutral`, pill `○`, note `servedModel empty`, never green |
