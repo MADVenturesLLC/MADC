@@ -10,15 +10,85 @@
 import {
   type InitializeParams,
   type InitializeResult,
+  type Item,
+  type ItemNotificationParams,
   PROTOCOL_VERSION,
   type RoomReport,
+  type SeatListParams,
+  type SeatListResult,
+  type SeatSummary,
+  type ServedModelItem,
+  type ServerNotifications,
+  type Thread,
+  type ThreadStartParams,
+  type ThreadStartResult,
+  type Turn,
+  type TurnInterruptParams,
+  type TurnInterruptResult,
+  type TurnStartParams,
+  type TurnStartResult,
+  type TurnStatus,
 } from "@madc/engine/client";
+
+export type {
+  Item,
+  ItemNotificationParams,
+  SeatListParams,
+  SeatListResult,
+  SeatSummary,
+  ServedModelItem,
+  ServerNotifications,
+  Thread,
+  ThreadStartParams,
+  ThreadStartResult,
+  Turn,
+  TurnInterruptParams,
+  TurnInterruptResult,
+  TurnStartParams,
+  TurnStartResult,
+  TurnStatus,
+};
 
 export type RoomUpdateReason = "thread" | "turn" | "handoff" | "decision";
 
 export type RoomUpdatedEvent = {
   readonly reason: RoomUpdateReason;
   readonly threadId: string;
+};
+
+export type TransportClosedReason =
+  | "eof"
+  | "read-error"
+  | "invalid-frame"
+  | "oversize-frame"
+  | "overflow"
+  | "disconnect"
+  | "exit";
+
+export type EventsDroppedReason = "unknown-notification" | "invalid-notification";
+
+export type ForwardedEngineEventMethod =
+  | "room/updated"
+  | "thread/started"
+  | "turn/started"
+  | "turn/completed"
+  | "item/completed"
+  | "madc/events-dropped";
+
+export type DesktopEngineEventEnvelope = {
+  readonly epoch: number;
+  readonly seq: number;
+  readonly method: string;
+  readonly params: Record<string, unknown>;
+};
+
+export type QuitRequestedPayload = {
+  readonly epoch: number;
+  readonly requestId: number;
+};
+
+export type QuitCommandAck = {
+  readonly accepted: boolean;
 };
 
 export type SessionSearchParams = {
@@ -212,6 +282,37 @@ export class DesktopEngineClient {
   async sessionRead(params: SessionReadParams): Promise<SessionReadResult> {
     return this.#transport.request<SessionReadResult>(
       "session/read",
+      params as unknown as Record<string, unknown>,
+    );
+  }
+
+  async seatList(params: SeatListParams = {}): Promise<SeatListResult> {
+    return this.#transport.request<SeatListResult>(
+      "seat/list",
+      params as unknown as Record<string, unknown>,
+    );
+  }
+
+  async threadStart(params: ThreadStartParams): Promise<ThreadStartResult> {
+    const payload: Record<string, unknown> = {};
+    if (params.seatId !== undefined) payload.seatId = params.seatId;
+    if (params.cwd !== undefined) payload.cwd = params.cwd;
+    return this.#transport.request<ThreadStartResult>("thread/start", payload);
+  }
+
+  async turnStart(params: {
+    readonly threadId: string;
+    readonly input: TurnStartParams["input"];
+  }): Promise<TurnStartResult> {
+    return this.#transport.request<TurnStartResult>("turn/start", {
+      threadId: params.threadId,
+      input: params.input,
+    });
+  }
+
+  async turnInterrupt(params: TurnInterruptParams): Promise<TurnInterruptResult> {
+    return this.#transport.request<TurnInterruptResult>(
+      "turn/interrupt",
       params as unknown as Record<string, unknown>,
     );
   }

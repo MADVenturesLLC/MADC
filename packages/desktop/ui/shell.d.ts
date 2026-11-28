@@ -1,8 +1,18 @@
 import type { EvidenceReceipt, EvidenceTone, PillLabel } from "../src/evidence.ts";
 import type { FocusBarItem, FocusBarItemId, FocusBarKey, FocusBarState } from "../src/focus-bar.ts";
-import type { LockOwnerGuidance, ServeExitClassification } from "../src/ipc.ts";
+import type {
+  DesktopEngineEventEnvelope,
+  LockOwnerGuidance,
+  QuitCommandAck,
+  QuitRequestedPayload,
+  SeatSummary,
+  ServeExitClassification,
+  TransportClosedReason,
+} from "../src/ipc.ts";
 
 export const EXPECTED_PROTOCOL_VERSION: "madc-m1/1";
+
+export const FORWARDED_ENGINE_EVENTS: ReadonlySet<string>;
 
 export const DEFAULT_FOCUS_BAR_ITEMS: readonly FocusBarItem[];
 
@@ -71,6 +81,8 @@ export type ConnectErrorClassification =
 
 export type RpcErrorClassification =
   | { readonly kind: "allowlist"; readonly message: string }
+  | { readonly kind: "params"; readonly message: string }
+  | { readonly kind: "shutting-down"; readonly message: string }
   | { readonly kind: "not-connected"; readonly message: string }
   | {
       readonly kind: "rpc";
@@ -80,6 +92,115 @@ export type RpcErrorClassification =
       readonly message: string;
     }
   | { readonly kind: "transport"; readonly message: string };
+
+export type EngineEventAcceptanceState = {
+  readonly boundEpoch: number | null;
+  readonly connectionState: DesktopConnectionState;
+  readonly disconnectPending: boolean;
+  readonly lastAcceptedSeq: number | null;
+};
+
+export type EngineEventAcceptanceResult = {
+  readonly outcome: "accept" | "drop";
+  readonly streamGap: boolean;
+  readonly nextSeq: number | null;
+};
+
+export type PendingTerminal = {
+  readonly epoch: number;
+  readonly reason: TransportClosedReason;
+};
+
+export type TerminalAcceptanceState = {
+  readonly connectionState: DesktopConnectionState;
+  readonly disconnectPending: boolean;
+  readonly boundEpoch: number | null;
+  readonly terminalHandled: number;
+  readonly pendingTerminal: PendingTerminal | null;
+};
+
+export type TerminalAcceptanceResult = {
+  readonly action:
+    | "ignore"
+    | "pending-connecting"
+    | "exit"
+    | "fail"
+    | "disconnecting"
+    | "mark-handled";
+  readonly nextState: TerminalAcceptanceState;
+  readonly settleQuit: boolean;
+  readonly markEnded: boolean;
+  readonly nextConnectionState: DesktopConnectionState;
+  readonly startDisconnect: boolean;
+};
+
+export type ConnectTerminalResolution = {
+  readonly matched: boolean;
+  readonly reason: TransportClosedReason | null;
+  readonly nextState: TerminalAcceptanceState;
+  readonly markEnded: boolean;
+  readonly settleQuit: boolean;
+  readonly startDisconnect: boolean;
+};
+
+export type QuitRecordStatus = "candidate" | "shown" | "settled";
+
+export type QuitRecord = {
+  readonly requestId: number;
+  readonly status: QuitRecordStatus;
+};
+
+export type QuitRequestAcceptanceState = {
+  readonly boundEpoch: number | null;
+  readonly connectionState: DesktopConnectionState;
+  readonly quitRecord: QuitRecord | null;
+};
+
+export type QuitRequestDecision = {
+  readonly action: "candidate-open" | "refocus" | "ignore";
+  readonly nextRecord: QuitRecord | null;
+};
+
+export type DesktopViewMode = "panes" | "table";
+
+export type PaneLifecycleState =
+  | "draft"
+  | "starting-thread"
+  | "start-failed"
+  | "idle"
+  | "starting-turn"
+  | "running"
+  | "interrupt-pending"
+  | "completed"
+  | "interrupted"
+  | "failed"
+  | "refused"
+  | "history";
+
+export type DesktopPaneSnapshot = {
+  readonly paneId: string;
+  readonly seatId: string;
+  readonly boundEpoch: number;
+  readonly state: PaneLifecycleState;
+  readonly threadId: string | null;
+  readonly turnId: string | null;
+  readonly startedAt: number | null;
+  readonly cwdText: string;
+  readonly cwdBaseline: string;
+  readonly cwdSent: string | null;
+  readonly threadCwd: string | null;
+  readonly visible: boolean;
+  readonly hasReadYet: boolean;
+  readonly footerReason: string | null;
+};
+
+export type DesktopQuitStateSnapshot = {
+  readonly quitRecord: QuitRecord | null;
+  readonly dialogOpen: boolean;
+  readonly boundEpoch: number | null;
+  readonly terminalHandled: number;
+  readonly exitStarted: boolean;
+};
 
 export type DesktopConnectionState =
   | "IDLE"
@@ -123,6 +244,34 @@ export function classifyConnectError(
 ): ConnectErrorClassification;
 
 export function classifyRpcError(errOrMessage: unknown): RpcErrorClassification;
+
+export function acceptEngineEvent(
+  state: EngineEventAcceptanceState,
+  ev: DesktopEngineEventEnvelope | unknown,
+): EngineEventAcceptanceResult;
+
+export function acceptTerminal(
+  state: TerminalAcceptanceState,
+  ev:
+    | {
+        readonly epoch?: unknown;
+        readonly params?: { readonly reason?: unknown };
+        readonly reason?: unknown;
+      }
+    | unknown,
+): TerminalAcceptanceResult;
+
+export function resolveConnectTerminal(
+  state: TerminalAcceptanceState,
+  resolvedEpoch: number | null | undefined,
+): ConnectTerminalResolution;
+
+export function acceptQuitRequest(
+  state: QuitRequestAcceptanceState,
+  payload: QuitRequestedPayload | unknown,
+): QuitRequestDecision;
+
+export function cwdCheck(text: string): { readonly ok: boolean; readonly reason: string };
 
 export function renderPill(doc: ShellDocument, input: PillInput): ShellElement;
 
@@ -191,4 +340,27 @@ export function bindDesktopShell(
   readonly openPalette: () => void;
   readonly closePalette: (restoreFocus?: boolean) => void;
   readonly handleKeydown: (ev: unknown) => void;
+  readonly handleEngineEvent: (payload: unknown) => void;
+  readonly handleQuitRequested: (payload: unknown) => Promise<void>;
+  readonly ackQuit: () => Promise<QuitCommandAck>;
+  readonly confirmQuit: () => Promise<QuitCommandAck>;
+  readonly loadSeats: () => Promise<readonly SeatSummary[]>;
+  readonly createDraftPane: (seatId: string) => DesktopPaneSnapshot;
+  readonly setPaneCwdText: (paneId: string, text: string) => void;
+  readonly startThread: (paneId: string) => Promise<void>;
+  readonly startTurn: (text: string, targetPaneIds?: readonly string[]) => Promise<void>;
+  readonly interruptTurn: (paneId: string) => Promise<void>;
+  readonly dismissPane: (paneId: string) => boolean;
+  readonly hidePane: (paneId: string) => boolean;
+  readonly showPane: (paneId: string) => boolean;
+  readonly focusPane: (paneId: string) => boolean;
+  readonly toggleComposerTarget: (paneId: string) => boolean;
+  readonly setViewMode: (mode: DesktopViewMode) => void;
+  readonly getViewMode: () => DesktopViewMode;
+  readonly getPanes: () => readonly DesktopPaneSnapshot[];
+  readonly getSeats: () => readonly SeatSummary[];
+  readonly getQuitState: () => DesktopQuitStateSnapshot;
+  readonly getQuitTurns: () => readonly DesktopPaneSnapshot[];
+  readonly isTableStale: () => boolean;
+  readonly isStreamGap: () => boolean;
 };

@@ -21,10 +21,34 @@ const CONNECT_TIMEOUT_RE =
   /^madc-engine serve did not complete initialize within (\d+) ms \(exit code=(None|Some\((-?\d+)\)), signal=(None|Some\((\d+)\))\)/;
 const WINDOWS_UNVERIFIED_MSG = "Windows named-pipe desktop transport is unverified in M3-A2";
 const RPC_ALLOWLIST_PREFIX = "RPC method not allowed by M3-A2 desktop shell: ";
+const RPC_PARAMS_PREFIX = "RPC params refused by desktop shell for ";
 const RPC_NOT_CONNECTED_MSG = "not connected to @madc/engine";
+const RPC_SHUTTING_DOWN_MSG = "desktop shutting down";
 const RPC_ENGINE_ERROR_PREFIX = "engine RPC error: ";
+const UTF8_ENCODER = new TextEncoder();
 
 export const EXPECTED_PROTOCOL_VERSION = "madc-m1/1";
+
+export const FORWARDED_ENGINE_EVENTS = Object.freeze(
+  new Set([
+    "room/updated",
+    "thread/started",
+    "turn/started",
+    "turn/completed",
+    "item/completed",
+    "madc/events-dropped",
+  ]),
+);
+
+const TERMINAL_CLOSED_REASONS = new Set([
+  "eof",
+  "read-error",
+  "invalid-frame",
+  "oversize-frame",
+  "overflow",
+  "disconnect",
+  "exit",
+]);
 
 export const DEFAULT_FOCUS_BAR_ITEMS = Object.freeze([
   Object.freeze({ id: "connection", label: "Engine" }),
@@ -334,6 +358,14 @@ export function classifyRpcError(errOrMessage) {
     return { kind: "allowlist", message };
   }
 
+  if (message.startsWith(RPC_PARAMS_PREFIX)) {
+    return { kind: "params", message };
+  }
+
+  if (message === RPC_SHUTTING_DOWN_MSG) {
+    return { kind: "shutting-down", message };
+  }
+
   if (message === RPC_NOT_CONNECTED_MSG) {
     return { kind: "not-connected", message };
   }
@@ -362,6 +394,268 @@ export function classifyRpcError(errOrMessage) {
   }
 
   return { kind: "transport", message };
+}
+
+/**
+ * Pure event-acceptance gate per amendment 2 §4.2.
+ * `madc/transport-closed` is NEVER decided here (always handled by `acceptTerminal`).
+ */
+export function acceptEngineEvent(state, ev) {
+  if (ev === null || typeof ev !== "object" || Array.isArray(ev)) {
+    return { outcome: "drop", streamGap: false, nextSeq: state?.lastAcceptedSeq ?? null };
+  }
+  const boundEpoch = state?.boundEpoch ?? null;
+  const epochOk =
+    typeof ev.epoch === "number" &&
+    Number.isInteger(ev.epoch) &&
+    boundEpoch !== null &&
+    ev.epoch === boundEpoch;
+
+  if (!epochOk || ev.method === "madc/transport-closed") {
+    return { outcome: "drop", streamGap: false, nextSeq: state?.lastAcceptedSeq ?? null };
+  }
+
+  const seq = ev.seq;
+  const seqOk = typeof seq === "number" && Number.isInteger(seq) && seq >= 1;
+  const lastSeq = state?.lastAcceptedSeq ?? null;
+  const connectedOk = state?.connectionState === "CONNECTED" && !state?.disconnectPending;
+  const methodOk = typeof ev.method === "string" && FORWARDED_ENGINE_EVENTS.has(ev.method);
+
+  if (seqOk && lastSeq !== null && seq <= lastSeq) {
+    return { outcome: "drop", streamGap: true, nextSeq: lastSeq };
+  }
+
+  if (!connectedOk || !methodOk || !seqOk) {
+    return { outcome: "drop", streamGap: false, nextSeq: lastSeq };
+  }
+
+  const gap = (lastSeq !== null && seq > lastSeq + 1) || ev.method === "madc/events-dropped";
+  return { outcome: "accept", streamGap: gap, nextSeq: seq };
+}
+
+/**
+ * Pure terminal-event state machine per amendment 2 §4.3.
+ */
+export function acceptTerminal(state, ev) {
+  const evEpoch = ev?.epoch;
+  if (typeof evEpoch !== "number" || !Number.isInteger(evEpoch) || evEpoch < 1) {
+    return {
+      action: "ignore",
+      nextState: state,
+      settleQuit: false,
+      markEnded: false,
+      nextConnectionState: state.connectionState,
+      startDisconnect: false,
+    };
+  }
+  const rawReason = ev?.params?.reason ?? ev?.reason;
+  const reason =
+    typeof rawReason === "string" && TERMINAL_CLOSED_REASONS.has(rawReason)
+      ? rawReason
+      : "read-error";
+
+  // Rule 1: At most once per epoch.
+  if (evEpoch <= (state.terminalHandled ?? 0)) {
+    return {
+      action: "ignore",
+      nextState: state,
+      settleQuit: false,
+      markEnded: false,
+      nextConnectionState: state.connectionState,
+      startDisconnect: false,
+    };
+  }
+
+  // Rule 2: CONNECTING handoff — latch highest non-stale terminal without binding early.
+  if (state.connectionState === "CONNECTING") {
+    if (state.boundEpoch === null || evEpoch >= state.boundEpoch) {
+      const existing = state.pendingTerminal ?? null;
+      const pendingTerminal =
+        existing !== null && existing.epoch > evEpoch ? existing : { epoch: evEpoch, reason };
+      return {
+        action: "pending-connecting",
+        nextState: { ...state, pendingTerminal },
+        settleQuit: false,
+        markEnded: false,
+        nextConnectionState: "CONNECTING",
+        startDisconnect: false,
+      };
+    }
+    return {
+      action: "ignore",
+      nextState: state,
+      settleQuit: false,
+      markEnded: false,
+      nextConnectionState: state.connectionState,
+      startDisconnect: false,
+    };
+  }
+
+  // Rule 3: ev.epoch === boundEpoch and reason === "exit" -> exit path (no FAILED, no disconnect).
+  if (state.boundEpoch !== null && evEpoch === state.boundEpoch && reason === "exit") {
+    return {
+      action: "exit",
+      nextState: { ...state, terminalHandled: evEpoch },
+      settleQuit: true,
+      markEnded: true,
+      nextConnectionState: state.connectionState,
+      startDisconnect: false,
+    };
+  }
+
+  // Rule 4: CONNECTED, ev.epoch === boundEpoch, disconnectPending === null -> FAILED + single disconnect_engine.
+  if (
+    state.connectionState === "CONNECTED" &&
+    state.boundEpoch !== null &&
+    evEpoch === state.boundEpoch &&
+    !state.disconnectPending
+  ) {
+    return {
+      action: "fail",
+      nextState: { ...state, connectionState: "FAILED", terminalHandled: evEpoch },
+      settleQuit: true,
+      markEnded: true,
+      nextConnectionState: "FAILED",
+      startDisconnect: true,
+    };
+  }
+
+  // Rule 5: CONNECTED, ev.epoch === boundEpoch, disconnectPending !== null -> user disconnect in flight.
+  if (
+    state.connectionState === "CONNECTED" &&
+    state.boundEpoch !== null &&
+    evEpoch === state.boundEpoch &&
+    state.disconnectPending
+  ) {
+    return {
+      action: "disconnecting",
+      nextState: { ...state, terminalHandled: evEpoch },
+      settleQuit: true,
+      markEnded: true,
+      nextConnectionState: state.connectionState,
+      startDisconnect: false,
+    };
+  }
+
+  // Rule 6: DISCONNECTED / FAILED after boundEpoch, or older epoch.
+  if (state.boundEpoch !== null && evEpoch === state.boundEpoch) {
+    return {
+      action: "mark-handled",
+      nextState: { ...state, terminalHandled: evEpoch },
+      settleQuit: true,
+      markEnded: false,
+      nextConnectionState: state.connectionState,
+      startDisconnect: false,
+    };
+  }
+
+  return {
+    action: "ignore",
+    nextState: state,
+    settleQuit: false,
+    markEnded: false,
+    nextConnectionState: state.connectionState,
+    startDisconnect: false,
+  };
+}
+
+/**
+ * Pure connect resolution helper for `acceptTerminal` Rule 2 (`Ok(N)`).
+ */
+export function resolveConnectTerminal(state, resolvedEpoch) {
+  const term = state?.pendingTerminal ?? null;
+  if (typeof resolvedEpoch === "number" && term !== null && term.epoch === resolvedEpoch) {
+    const isExit = term.reason === "exit";
+    return {
+      matched: true,
+      reason: term.reason,
+      nextState: {
+        ...state,
+        boundEpoch: resolvedEpoch,
+        terminalHandled: resolvedEpoch,
+        pendingTerminal: null,
+        connectionState: isExit ? state.connectionState : "FAILED",
+      },
+      markEnded: true,
+      settleQuit: true,
+      startDisconnect: !isExit,
+    };
+  }
+  return {
+    matched: false,
+    reason: null,
+    nextState: {
+      ...state,
+      boundEpoch: typeof resolvedEpoch === "number" ? resolvedEpoch : (state.boundEpoch ?? null),
+      pendingTerminal: null,
+      connectionState: "CONNECTED",
+    },
+    markEnded: false,
+    settleQuit: false,
+    startDisconnect: false,
+  };
+}
+
+/**
+ * Pure quit-request decision rule per amendment 2 §6.1 L12.
+ */
+export function acceptQuitRequest(state, payload) {
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return { action: "ignore", nextRecord: state?.quitRecord ?? null };
+  }
+  const { epoch, requestId } = payload;
+  if (
+    typeof epoch !== "number" ||
+    !Number.isInteger(epoch) ||
+    typeof requestId !== "number" ||
+    !Number.isInteger(requestId) ||
+    requestId < 1
+  ) {
+    return { action: "ignore", nextRecord: state?.quitRecord ?? null };
+  }
+  if (
+    state?.boundEpoch === null ||
+    state?.boundEpoch === undefined ||
+    epoch !== state.boundEpoch ||
+    state?.connectionState !== "CONNECTED"
+  ) {
+    return { action: "ignore", nextRecord: state?.quitRecord ?? null };
+  }
+
+  const rec = state?.quitRecord ?? null;
+  if (rec === null || requestId > rec.requestId) {
+    return {
+      action: "candidate-open",
+      nextRecord: { requestId, status: "candidate" },
+    };
+  }
+  if (rec.status === "shown" && requestId === rec.requestId) {
+    return { action: "refocus", nextRecord: rec };
+  }
+  return { action: "ignore", nextRecord: rec };
+}
+
+/**
+ * Pure local POSIX cwd validator per addendum §6A.5 (no trim, UTF-8 byte cap 4096).
+ */
+export function cwdCheck(text) {
+  const raw = String(text ?? "");
+  if (raw === "") {
+    return { ok: true, reason: "optional · Enter starts without a cwd (worktree —)" };
+  }
+  if (raw.includes("\u0000")) {
+    return { ok: false, reason: "contains a NUL character" };
+  }
+  if (UTF8_ENCODER.encode(raw).length > 4096) {
+    return { ok: false, reason: "longer than 4096 bytes" };
+  }
+  if (raw.startsWith("~")) {
+    return { ok: false, reason: "~ is not expanded · type the full path" };
+  }
+  if (!raw.startsWith("/")) {
+    return { ok: false, reason: "not absolute · must start with /" };
+  }
+  return { ok: true, reason: "syntax ok · engine not asked · Enter starts" };
 }
 
 function validatePillInput(tone, label) {
@@ -698,6 +992,19 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
   const paletteListEl = doc.getElementById("palette-list");
   const paletteLiveEl = doc.getElementById("palette-live");
   const paletteKeycapEl = doc.getElementById("palette-keycap");
+  const optionalEl = (id) => {
+    try {
+      return doc.getElementById(id);
+    } catch {
+      return null;
+    }
+  };
+  const roomStaleNoteEl = optionalEl("room-stale-note");
+  const quitDialogEl = optionalEl("quit-dialog");
+  const quitTitleEl = optionalEl("quit-dialog-title");
+  const quitListEl = optionalEl("quit-dialog-list");
+  const quitKeepBtnEl = optionalEl("quit-keep-btn");
+  const quitConfirmBtnEl = optionalEl("quit-confirm-btn");
 
   paletteKeycapEl.textContent = isMac ? "⌘K" : "Ctrl K";
 
@@ -707,11 +1014,30 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
   let connectPending = null;
   let disconnectPending = null;
   let lastConnectionInfo = null;
+  let boundEpoch = null;
+  let terminalHandled = 0;
+  let pendingTerminal = null;
+  let lastAcceptedSeq = null;
+  let streamGap = false;
+  let exitStartedSeen = false;
+  let tableStale = false;
+  let quitRecord = null;
+  let quitDialogOpen = false;
+  let quitPriorFocusEl = null;
+  let seatSummaries = [];
+  let seatsLoading = false;
+  let nextPaneSeq = 0;
+  const panes = [];
+  let focusedPaneId = null;
+  const selectedTargets = new Set();
+  let viewMode = "table";
+  let lastSentCwd = "";
   let currentRoom = null;
   let selectedThreadId = null;
   let roomInspectErrorNote = null;
   const sessionReadCache = new Map();
   const inFlightReads = new Set();
+  const pendingFollowUpReads = new Set();
   const sessionReceipts = [];
   let paletteOpen = false;
   let paletteQuery = "";
@@ -1023,11 +1349,111 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     roomRowsEl.replaceChildren(...rowNodes);
   }
 
+  function paneSnapshot(pane) {
+    return {
+      paneId: pane.paneId,
+      seatId: pane.seatId,
+      boundEpoch: pane.boundEpoch,
+      state: pane.state,
+      threadId: pane.threadId,
+      turnId: pane.turnId,
+      startedAt: pane.startedAt,
+      cwdText: pane.cwdText,
+      cwdBaseline: pane.cwdBaseline,
+      cwdSent: pane.cwdSent,
+      threadCwd: pane.threadCwd,
+      visible: pane.visible,
+      hasReadYet: pane.hasReadYet,
+      footerReason: pane.footerReason,
+    };
+  }
+
+  function closeQuitDialogUi(restoreFocus = true) {
+    if (!quitDialogOpen) return;
+    quitDialogOpen = false;
+    if (quitDialogEl) quitDialogEl.hidden = true;
+    bar.inert = false;
+    mainEl.inert = false;
+    statusEl.inert = false;
+    if (restoreFocus && quitPriorFocusEl && typeof quitPriorFocusEl.focus === "function") {
+      quitPriorFocusEl.focus();
+    }
+    quitPriorFocusEl = null;
+  }
+
+  function openQuitDialogUi() {
+    if (!quitDialogOpen) {
+      quitPriorFocusEl = doc.activeElement ?? null;
+    }
+    quitDialogOpen = true;
+    if (quitDialogEl) quitDialogEl.hidden = false;
+    const turns = getQuitTurnsInternal();
+    if (quitTitleEl) {
+      quitTitleEl.textContent = `Quit MADC Desktop with ${turns.length} turn(s) running?`;
+    }
+    if (quitConfirmBtnEl) {
+      quitConfirmBtnEl.textContent = `QUIT AND INTERRUPT ${turns.length} TURN(S)`;
+    }
+    if (quitListEl) {
+      const rows = turns.map((p) => {
+        const row = doc.createElement("div");
+        row.className = "quit-row";
+        const seatEl = doc.createElement("span");
+        seatEl.textContent = p.visible ? p.seatId : `${p.seatId} (hidden)`;
+        const metaEl = doc.createElement("span");
+        metaEl.textContent = `${p.threadId ?? "—"} · ${p.turnId ?? "pending"}`;
+        row.appendChild(seatEl);
+        row.appendChild(metaEl);
+        return row;
+      });
+      quitListEl.replaceChildren(...rows);
+    }
+    bar.inert = true;
+    mainEl.inert = true;
+    statusEl.inert = true;
+    quitKeepBtnEl?.focus?.();
+  }
+
+  function settleQuitState() {
+    if (quitRecord !== null) {
+      quitRecord = { requestId: quitRecord.requestId, status: "settled" };
+    }
+    closeQuitDialogUi(false);
+  }
+
+  function markEpochEndedOnPanes() {
+    pendingFollowUpReads.clear();
+    seatSummaries = [];
+    for (const pane of panes) {
+      if (pane.state === "starting-thread") {
+        pane.state = "draft";
+        pane.cwdLostConnection = true;
+        pane.footerReason = "no thread loaded";
+        selectedTargets.delete(pane.paneId);
+      } else if (pane.state === "draft" || pane.state === "start-failed") {
+        // Holds no thread; keep draft/refused text and stay editable.
+        selectedTargets.delete(pane.paneId);
+      } else {
+        // Started pane becomes History (spec §6.3, A4 §6.1).
+        pane.state = "history";
+        pane.footerReason = "connection ended · history only";
+        pane.turnPendingInterrupt = false;
+        pane.streamedServedModel = null;
+        if (pane.threadId) {
+          sessionReadCache.delete(pane.threadId);
+        }
+        selectedTargets.delete(pane.paneId);
+      }
+    }
+  }
+
   function startDisconnect(targetStateAfterResolve) {
     if (disconnectPending !== null) {
       return disconnectPending;
     }
     epoch += 1;
+    markEpochEndedOnPanes();
+    settleQuitState();
 
     let settle = null;
     disconnectPending = new Promise((resolve) => {
@@ -1055,9 +1481,65 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     return disconnectPending;
   }
 
+  function applyTerminalResult(ev) {
+    const decision = acceptTerminal(
+      {
+        connectionState,
+        disconnectPending: disconnectPending !== null,
+        boundEpoch,
+        terminalHandled,
+        pendingTerminal,
+      },
+      ev,
+    );
+    terminalHandled = decision.nextState.terminalHandled;
+    pendingTerminal = decision.nextState.pendingTerminal;
+    if (decision.action === "ignore" || decision.action === "pending-connecting") {
+      return decision;
+    }
+    if (decision.action === "exit") {
+      exitStartedSeen = true;
+    }
+    if (decision.settleQuit) {
+      settleQuitState();
+    }
+    if (decision.markEnded) {
+      markEpochEndedOnPanes();
+    }
+    if (decision.action === "fail") {
+      connectionState = "FAILED";
+      const reason = ev?.params?.reason ?? ev?.reason ?? "transport-closed";
+      outputEl.textContent = sanitizeEngineText(`engine connection closed: ${reason}`);
+      renderConnectionChrome();
+      if (decision.startDisconnect) {
+        void startDisconnect("FAILED");
+      }
+    } else if (decision.action === "exit") {
+      renderConnectionChrome();
+    }
+    if (paletteOpen) renderPalette();
+    return decision;
+  }
+
+  function applySynthesizedExitTerminal(reqEpoch) {
+    exitStartedSeen = true;
+    const ep = typeof reqEpoch === "number" && reqEpoch >= 1 ? reqEpoch : boundEpoch;
+    if (ep !== null) {
+      applyTerminalResult({
+        epoch: ep,
+        method: "madc/transport-closed",
+        params: { reason: "exit" },
+      });
+    } else {
+      settleQuitState();
+      markEpochEndedOnPanes();
+    }
+  }
+
   async function runRoomInspect() {
     if (connectionState !== "CONNECTED" || disconnectPending !== null) return;
     const reqEpoch = epoch;
+    const reqBoundEpoch = boundEpoch;
     try {
       const roomRes = await invokeFn("rpc_request", { method: "room/inspect", params: {} });
       if (reqEpoch !== epoch || disconnectPending !== null || connectionState !== "CONNECTED") {
@@ -1066,6 +1548,11 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       inspectGeneration += 1;
       sessionReadCache.clear();
       inFlightReads.clear();
+      tableStale = false;
+      if (roomStaleNoteEl) {
+        roomStaleNoteEl.hidden = true;
+        roomStaleNoteEl.textContent = "";
+      }
       roomInspectErrorNote = null;
       currentRoom = roomRes?.room ?? { counts: { threads: 0, openDecisions: 0 }, threads: [] };
       outputEl.textContent = sanitizeEngineText(
@@ -1078,18 +1565,18 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         return;
       }
       const cls = classifyRpcError(err);
+      if (cls.kind === "shutting-down") {
+        applySynthesizedExitTerminal(reqBoundEpoch);
+        return;
+      }
       outputEl.textContent = sanitizeEngineText(cls.message);
       inspectGeneration += 1;
       sessionReadCache.clear();
       inFlightReads.clear();
 
-      if (cls.kind === "rpc") {
-        roomInspectErrorNote = `room/inspect: ${cls.code} ${cls.rpcMessage}`;
-        renderRoomTable();
-        return;
-      }
-      if (cls.kind === "allowlist") {
-        roomInspectErrorNote = cls.message;
+      if (cls.kind === "rpc" || cls.kind === "params" || cls.kind === "allowlist") {
+        roomInspectErrorNote =
+          cls.kind === "rpc" ? `room/inspect: ${cls.code} ${cls.rpcMessage}` : cls.message;
         renderRoomTable();
         return;
       }
@@ -1099,12 +1586,17 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         if (reqEpoch === epoch && disconnectPending === null) {
           lastConnectionInfo = null;
           connectionState = "DISCONNECTED";
+          markEpochEndedOnPanes();
+          settleQuitState();
           renderConnectionChrome();
         }
         return;
       }
 
       // R4: transport loss, timeout, or unparseable RPC error
+      if (exitStartedSeen || (reqBoundEpoch !== null && reqBoundEpoch <= terminalHandled)) {
+        return;
+      }
       roomInspectErrorNote = cls.message;
       renderRoomTable();
       if (reqEpoch === epoch && disconnectPending === null) {
@@ -1115,18 +1607,29 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     }
   }
 
-  async function selectThread(threadId) {
+  async function triggerSessionRead(threadId, trigger = "selection") {
     if (connectionState !== "CONNECTED" || disconnectPending !== null) {
       return;
     }
-    selectedThreadId = threadId;
-    renderRoomTable();
     if (inFlightReads.has(threadId)) {
+      if (trigger === "turn-completed") {
+        const pane = panes.find(
+          (p) => p.threadId === threadId && p.boundEpoch === (boundEpoch ?? epoch),
+        );
+        if (pane) {
+          if (pane.visible) {
+            pendingFollowUpReads.add(threadId);
+          } else {
+            pane.needsTurnRead = true;
+          }
+        }
+      }
       return;
     }
 
     inFlightReads.add(threadId);
     const reqEpoch = epoch;
+    const reqBoundEpoch = boundEpoch;
     const reqGen = inspectGeneration;
 
     try {
@@ -1134,18 +1637,32 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         method: "session/read",
         params: { threadId },
       });
-      if (reqEpoch !== epoch || reqGen !== inspectGeneration || connectionState !== "CONNECTED") {
+      if (
+        reqEpoch !== epoch ||
+        (trigger === "selection" && reqGen !== inspectGeneration) ||
+        connectionState !== "CONNECTED"
+      ) {
         return;
       }
       sessionReadCache.delete(threadId);
       sessionReadCache.set(threadId, { ok: true, result: res });
+      for (const pane of panes) {
+        if (pane.threadId === threadId && pane.boundEpoch === (boundEpoch ?? epoch)) {
+          pane.hasReadYet = true;
+          pane.needsTurnRead = false;
+        }
+      }
       renderRoomTable();
       if (paletteOpen) renderPalette();
     } catch (err) {
-      if (reqEpoch !== epoch || reqGen !== inspectGeneration) {
+      if (reqEpoch !== epoch || (trigger === "selection" && reqGen !== inspectGeneration)) {
         return;
       }
       const cls = classifyRpcError(err);
+      if (cls.kind === "shutting-down") {
+        applySynthesizedExitTerminal(reqBoundEpoch);
+        return;
+      }
       outputEl.textContent = sanitizeEngineText(cls.message);
       const note = cls.kind === "rpc" ? `session/read: ${cls.code} ${cls.rpcMessage}` : cls.message;
       sessionReadCache.set(threadId, { ok: false, note });
@@ -1155,10 +1672,16 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         if (disconnectPending === null) {
           lastConnectionInfo = null;
           connectionState = "DISCONNECTED";
+          markEpochEndedOnPanes();
+          settleQuitState();
           renderConnectionChrome();
         }
       } else if (cls.kind === "transport") {
-        if (disconnectPending === null) {
+        if (
+          disconnectPending === null &&
+          !exitStartedSeen &&
+          !(reqBoundEpoch !== null && reqBoundEpoch <= terminalHandled)
+        ) {
           connectionState = "FAILED";
           renderConnectionChrome();
           await startDisconnect("FAILED");
@@ -1167,7 +1690,42 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       if (paletteOpen) renderPalette();
     } finally {
       inFlightReads.delete(threadId);
+      if (pendingFollowUpReads.has(threadId)) {
+        pendingFollowUpReads.delete(threadId);
+        const epochAlive =
+          reqEpoch === epoch &&
+          (reqBoundEpoch === null ||
+            (reqBoundEpoch === boundEpoch && terminalHandled < reqBoundEpoch)) &&
+          connectionState === "CONNECTED" &&
+          disconnectPending === null &&
+          !exitStartedSeen;
+        const paneForFollowUp = panes.find(
+          (p) =>
+            p.threadId === threadId &&
+            p.boundEpoch === (boundEpoch ?? epoch) &&
+            p.state !== "draft" &&
+            p.state !== "starting-thread" &&
+            p.state !== "start-failed" &&
+            p.state !== "history",
+        );
+        if (epochAlive && paneForFollowUp) {
+          if (paneForFollowUp.visible) {
+            void triggerSessionRead(threadId, "turn-completed");
+          } else {
+            paneForFollowUp.needsTurnRead = true;
+          }
+        }
+      }
     }
+  }
+
+  async function selectThread(threadId) {
+    if (connectionState !== "CONNECTED" || disconnectPending !== null) {
+      return;
+    }
+    selectedThreadId = threadId;
+    renderRoomTable();
+    await triggerSessionRead(threadId, "selection");
   }
 
   function recordServeExitReceipt(classified) {
@@ -1222,6 +1780,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       return disconnectPending;
     }
     connectionState = "CONNECTING";
+    pendingTerminal = null;
     renderConnectionChrome();
     if (paletteOpen) renderPalette();
 
@@ -1231,6 +1790,10 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         epoch += 1;
         if (info?.protocolVersion !== EXPECTED_PROTOCOL_VERSION) {
           lastConnectionInfo = info ?? null;
+          if (typeof info?.connectionEpoch === "number") {
+            boundEpoch = info.connectionEpoch;
+          }
+          pendingTerminal = null;
           connectionState = "FAILED";
           const got = String(info?.protocolVersion ?? "unknown");
           const msg = `protocol version mismatch: expected ${EXPECTED_PROTOCOL_VERSION}, got ${got}`;
@@ -1251,11 +1814,58 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
           return;
         }
 
+        const resolvedEpoch =
+          typeof info?.connectionEpoch === "number" ? info.connectionEpoch : null;
+        const handoff = resolveConnectTerminal(
+          {
+            connectionState,
+            disconnectPending: false,
+            boundEpoch,
+            terminalHandled,
+            pendingTerminal,
+          },
+          resolvedEpoch,
+        );
+        boundEpoch = handoff.nextState.boundEpoch;
+        terminalHandled = handoff.nextState.terminalHandled;
+        pendingTerminal = null;
+
+        if (handoff.matched) {
+          lastConnectionInfo = info;
+          settleQuitState();
+          markEpochEndedOnPanes();
+          if (handoff.reason === "exit") {
+            exitStartedSeen = true;
+            renderConnectionChrome();
+            return;
+          }
+          connectionState = "FAILED";
+          outputEl.textContent = sanitizeEngineText(
+            `engine connection closed: ${handoff.reason ?? "transport-closed"}`,
+          );
+          renderConnectionChrome();
+          await startDisconnect("FAILED");
+          return;
+        }
+
         lastConnectionInfo = info;
+        lastAcceptedSeq = null;
+        streamGap = false;
+        quitRecord = null;
         connectionState = "CONNECTED";
+        for (const pane of panes) {
+          if (
+            pane.state === "draft" ||
+            pane.state === "start-failed" ||
+            pane.state === "starting-thread"
+          ) {
+            pane.boundEpoch = boundEpoch ?? epoch;
+          }
+        }
         renderConnectionChrome();
         await runRoomInspect();
       } catch (err) {
+        pendingTerminal = null;
         const classified = classifyConnectError(err, platform);
         outputEl.textContent = sanitizeEngineText(classified.raw);
         if (classified.phase === "serve-exit") {
@@ -1470,12 +2080,714 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     paletteListEl.replaceChildren(...listNodes);
   }
 
+  function getQuitTurnsInternal() {
+    const activeEpoch = boundEpoch ?? epoch;
+    return panes.filter(
+      (p) =>
+        p.boundEpoch === activeEpoch &&
+        (p.state === "starting-turn" || p.state === "running" || p.state === "interrupt-pending"),
+    );
+  }
+
+  async function loadSeats() {
+    if (connectionState !== "CONNECTED" || disconnectPending !== null || seatsLoading) {
+      return seatSummaries;
+    }
+    seatsLoading = true;
+    const reqEpoch = epoch;
+    const reqBoundEpoch = boundEpoch;
+    try {
+      const res = await invokeFn("rpc_request", { method: "seat/list", params: {} });
+      if (reqEpoch !== epoch || connectionState !== "CONNECTED") return seatSummaries;
+      if (Array.isArray(res?.data)) {
+        seatSummaries = res.data;
+        if (paletteOpen) renderPalette();
+      }
+      return seatSummaries;
+    } catch (err) {
+      if (reqEpoch !== epoch) return seatSummaries;
+      const cls = classifyRpcError(err);
+      if (cls.kind === "shutting-down") {
+        applySynthesizedExitTerminal(reqBoundEpoch);
+      } else if (
+        cls.kind === "transport" &&
+        disconnectPending === null &&
+        !exitStartedSeen &&
+        !(reqBoundEpoch !== null && reqBoundEpoch <= terminalHandled)
+      ) {
+        connectionState = "FAILED";
+        renderConnectionChrome();
+        await startDisconnect("FAILED");
+      }
+      return seatSummaries;
+    } finally {
+      seatsLoading = false;
+    }
+  }
+
+  function createDraftPane(seatId) {
+    nextPaneSeq += 1;
+    const activeEpoch = boundEpoch ?? epoch;
+    const visibleCount = panes.filter((p) => p.visible).length;
+    const pane = {
+      paneId: `pane_${nextPaneSeq}`,
+      seatId: String(seatId),
+      boundEpoch: activeEpoch,
+      state: "draft",
+      threadId: null,
+      turnId: null,
+      startedAt: null,
+      cwdText: lastSentCwd,
+      cwdBaseline: lastSentCwd,
+      cwdSent: null,
+      threadCwd: null,
+      cwdRefusal: null,
+      cwdLostConnection: false,
+      seatUnavailable: false,
+      visible: true,
+      streamedServedModel: null,
+      methodError: null,
+      turnError: null,
+      interruptError: null,
+      refused32007: null,
+      needsTurnRead: false,
+      hasReadYet: false,
+      hashMovedOnTurnStart: false,
+      turnPendingInterrupt: false,
+      lastCompletedTurnState: null,
+      completedTurnId: null,
+      footerReason: "no thread loaded",
+    };
+    const maxCols = 4;
+    if (visibleCount >= maxCols) {
+      const visiblePanes = panes.filter((p) => p.visible);
+      const rightmost = visiblePanes[visiblePanes.length - 1];
+      if (rightmost) rightmost.visible = false;
+    }
+    panes.push(pane);
+    focusedPaneId = pane.paneId;
+    return paneSnapshot(pane);
+  }
+
+  function setPaneCwdText(paneId, text) {
+    const pane = panes.find((p) => p.paneId === paneId);
+    if (!pane) return;
+    if (pane.state !== "draft" && pane.state !== "start-failed") return;
+    pane.cwdText = String(text ?? "");
+    pane.cwdRefusal = null;
+    pane.cwdLostConnection = false;
+    if (pane.state === "start-failed") {
+      pane.state = "draft";
+    }
+  }
+
+  async function startThread(paneId) {
+    const pane = panes.find((p) => p.paneId === paneId);
+    if (!pane) return;
+    if (connectionState !== "CONNECTED" || disconnectPending !== null) return;
+    if (pane.state !== "draft" && pane.state !== "start-failed") return;
+
+    const check = cwdCheck(pane.cwdText);
+    if (!check.ok) {
+      pane.state = "draft";
+      return;
+    }
+
+    const reqEpoch = epoch;
+    const reqBoundEpoch = boundEpoch;
+    const exactCwd = pane.cwdText;
+    const params =
+      exactCwd === "" ? { seatId: pane.seatId } : { seatId: pane.seatId, cwd: exactCwd };
+    if (exactCwd !== "") {
+      lastSentCwd = exactCwd;
+    }
+    pane.cwdBaseline = exactCwd;
+    pane.cwdSent = exactCwd === "" ? null : exactCwd;
+    pane.cwdRefusal = null;
+    pane.cwdLostConnection = false;
+    pane.state = "starting-thread";
+    pane.footerReason = "thread/start pending";
+
+    try {
+      const res = await invokeFn("rpc_request", { method: "thread/start", params });
+      if (
+        reqEpoch !== epoch ||
+        (reqBoundEpoch !== null && reqBoundEpoch !== boundEpoch) ||
+        connectionState !== "CONNECTED"
+      ) {
+        if (pane.state === "starting-thread") {
+          pane.state = "draft";
+          pane.cwdLostConnection = true;
+          pane.footerReason = "no thread loaded";
+        }
+        return;
+      }
+      const thread = res?.thread;
+      if (!thread || typeof thread.id !== "string") return;
+      pane.state = "idle";
+      pane.threadId = thread.id;
+      pane.seatId = typeof thread.seatId === "string" ? thread.seatId : pane.seatId;
+      pane.threadCwd = thread.cwd ?? null;
+      pane.boundEpoch = boundEpoch ?? epoch;
+      pane.hasReadYet = false;
+      pane.cwdRefusal = null;
+      pane.footerReason = null;
+      if (focusedPaneId === pane.paneId) {
+        selectedTargets.add(pane.paneId);
+      }
+      void triggerSessionRead(thread.id, "post-start");
+    } catch (err) {
+      if (reqEpoch !== epoch || (reqBoundEpoch !== null && reqBoundEpoch !== boundEpoch)) {
+        if (pane.state === "starting-thread") {
+          pane.state = "draft";
+          pane.cwdLostConnection = true;
+          pane.footerReason = "no thread loaded";
+        }
+        return;
+      }
+      const cls = classifyRpcError(err);
+      if (cls.kind === "shutting-down") {
+        applySynthesizedExitTerminal(reqBoundEpoch);
+        return;
+      }
+      outputEl.textContent = sanitizeEngineText(cls.message);
+      if (cls.kind === "not-connected") {
+        pane.state = "draft";
+        pane.cwdLostConnection = true;
+        pane.footerReason = "no thread loaded";
+        if (disconnectPending === null) {
+          lastConnectionInfo = null;
+          connectionState = "DISCONNECTED";
+          markEpochEndedOnPanes();
+          settleQuitState();
+          renderConnectionChrome();
+        }
+        return;
+      }
+      if (cls.kind === "transport") {
+        pane.state = "draft";
+        pane.cwdLostConnection = true;
+        pane.footerReason = "no thread loaded";
+        if (
+          disconnectPending === null &&
+          !exitStartedSeen &&
+          !(reqBoundEpoch !== null && reqBoundEpoch <= terminalHandled)
+        ) {
+          connectionState = "FAILED";
+          renderConnectionChrome();
+          await startDisconnect("FAILED");
+        }
+        return;
+      }
+      // R5 / R1 / R3 refusal on thread/start stays in Start failed (cwd block) and never reads.
+      pane.state = "start-failed";
+      pane.footerReason = "no thread loaded";
+      if (cls.kind === "rpc") {
+        pane.cwdRefusal = {
+          kind: "rpc",
+          code: cls.code,
+          rpcMessage: cls.rpcMessage,
+          data: cls.data,
+          message: cls.message,
+          issues: Array.isArray(cls.data?.issues) ? cls.data.issues.map(String) : [],
+        };
+        if (cls.code === -32005 || cls.code === -32006) {
+          pane.seatUnavailable = true;
+        }
+      } else {
+        pane.cwdRefusal = { kind: cls.kind, message: cls.message, issues: [] };
+      }
+    }
+  }
+
+  function isPaneStartEligible(pane) {
+    if (!pane || pane.boundEpoch !== (boundEpoch ?? epoch)) return false;
+    return (
+      pane.state === "idle" ||
+      pane.state === "completed" ||
+      pane.state === "interrupted" ||
+      pane.state === "failed"
+    );
+  }
+
+  async function startTurn(text, targetPaneIds = null) {
+    if (connectionState !== "CONNECTED" || disconnectPending !== null) return;
+    const raw = String(text ?? "");
+    if (raw.trim().length === 0) return;
+
+    const chosenIds =
+      targetPaneIds !== null
+        ? new Set(targetPaneIds)
+        : selectedTargets.size > 0
+          ? selectedTargets
+          : focusedPaneId
+            ? new Set([focusedPaneId])
+            : new Set();
+
+    const targets = panes.filter((p) => chosenIds.has(p.paneId) && isPaneStartEligible(p));
+    if (targets.length === 0) return;
+
+    const reqEpoch = epoch;
+    const reqBoundEpoch = boundEpoch;
+
+    await Promise.all(
+      targets.map(async (pane) => {
+        if (!isPaneStartEligible(pane) || !pane.threadId) return;
+        const prevTerminalState = pane.state;
+        pane.state = "starting-turn";
+        pane.footerReason = "starting turn";
+        selectedTargets.delete(pane.paneId);
+        try {
+          const res = await invokeFn("rpc_request", {
+            method: "turn/start",
+            params: {
+              threadId: pane.threadId,
+              input: [{ type: "text", text: raw }],
+            },
+          });
+          if (
+            reqEpoch !== epoch ||
+            (reqBoundEpoch !== null && reqBoundEpoch !== boundEpoch) ||
+            connectionState !== "CONNECTED"
+          ) {
+            return;
+          }
+          if (pane.methodError?.method === "turn/start") {
+            pane.methodError = null;
+          }
+          const turn = res?.turn;
+          if (turn && typeof turn.id === "string") {
+            if (pane.state === "starting-turn") {
+              pane.turnId = turn.id;
+              pane.startedAt = typeof turn.startedAt === "number" ? turn.startedAt : Date.now();
+              pane.state = "running";
+              pane.turnError = null;
+              pane.turnPendingInterrupt = false;
+              pane.streamedServedModel = null;
+              pane.hashMovedOnTurnStart = true;
+              pane.footerReason = "manual · sent once";
+            }
+          }
+        } catch (err) {
+          if (reqEpoch !== epoch || (reqBoundEpoch !== null && reqBoundEpoch !== boundEpoch)) {
+            return;
+          }
+          const cls = classifyRpcError(err);
+          if (cls.kind === "shutting-down") {
+            applySynthesizedExitTerminal(reqBoundEpoch);
+            return;
+          }
+          outputEl.textContent = sanitizeEngineText(cls.message);
+          if (cls.kind === "params" || cls.kind === "allowlist") {
+            pane.state = prevTerminalState;
+            pane.footerReason = cls.message;
+            return;
+          }
+          if (cls.kind === "rpc") {
+            pane.methodError = {
+              method: "turn/start",
+              code: cls.code,
+              rpcMessage: cls.rpcMessage,
+              data: cls.data,
+            };
+            if (cls.code === -32007) {
+              pane.state = "refused";
+              pane.refused32007 = {
+                code: -32007,
+                reason: String(cls.data?.reason ?? cls.rpcMessage),
+                providerId: String(cls.data?.providerId ?? ""),
+                status: String(cls.data?.status ?? ""),
+                data: cls.data,
+              };
+              pane.footerReason = "refused · no network";
+            } else if (cls.code === -32004 && typeof cls.data?.activeTurnId === "string") {
+              pane.state = "running";
+              pane.turnId = cls.data.activeTurnId;
+              pane.footerReason = cls.rpcMessage;
+            } else {
+              pane.state = prevTerminalState;
+              pane.footerReason = cls.rpcMessage;
+            }
+            return;
+          }
+          if (cls.kind === "not-connected") {
+            if (disconnectPending === null) {
+              lastConnectionInfo = null;
+              connectionState = "DISCONNECTED";
+              markEpochEndedOnPanes();
+              settleQuitState();
+              renderConnectionChrome();
+            }
+            return;
+          }
+          if (
+            disconnectPending === null &&
+            !exitStartedSeen &&
+            !(reqBoundEpoch !== null && reqBoundEpoch <= terminalHandled)
+          ) {
+            connectionState = "FAILED";
+            renderConnectionChrome();
+            await startDisconnect("FAILED");
+          }
+        }
+      }),
+    );
+  }
+
+  async function interruptTurn(paneId) {
+    if (connectionState !== "CONNECTED" || disconnectPending !== null) return;
+    const pane = panes.find((p) => p.paneId === paneId);
+    if (!pane || pane.boundEpoch !== (boundEpoch ?? epoch)) return;
+    if (pane.state !== "running" || !pane.threadId || !pane.turnId || pane.turnPendingInterrupt) {
+      return;
+    }
+
+    const reqEpoch = epoch;
+    const reqBoundEpoch = boundEpoch;
+    const targetTurnId = pane.turnId;
+    pane.turnPendingInterrupt = true;
+    pane.state = "interrupt-pending";
+    pane.footerReason = "turn/interrupt sent";
+
+    try {
+      await invokeFn("rpc_request", {
+        method: "turn/interrupt",
+        params: { threadId: pane.threadId, turnId: targetTurnId },
+      });
+      if (
+        reqEpoch !== epoch ||
+        (reqBoundEpoch !== null && reqBoundEpoch !== boundEpoch) ||
+        connectionState !== "CONNECTED"
+      ) {
+        return;
+      }
+      if (pane.methodError?.method === "turn/interrupt") {
+        pane.methodError = null;
+      }
+      // Result `{}` changes nothing; state settles only on `turn/completed`.
+    } catch (err) {
+      if (reqEpoch !== epoch || (reqBoundEpoch !== null && reqBoundEpoch !== boundEpoch)) {
+        return;
+      }
+      pane.turnPendingInterrupt = false;
+      const cls = classifyRpcError(err);
+      if (cls.kind === "shutting-down") {
+        applySynthesizedExitTerminal(reqBoundEpoch);
+        return;
+      }
+      outputEl.textContent = sanitizeEngineText(cls.message);
+      if (cls.kind === "params" || cls.kind === "allowlist") {
+        if (pane.state === "interrupt-pending" && pane.turnId === targetTurnId) {
+          pane.state = "running";
+          pane.footerReason = cls.message;
+        }
+        return;
+      }
+      if (cls.kind === "rpc") {
+        pane.methodError = {
+          method: "turn/interrupt",
+          code: cls.code,
+          rpcMessage: cls.rpcMessage,
+          data: cls.data,
+        };
+        if (pane.state === "interrupt-pending" && pane.turnId === targetTurnId) {
+          pane.state = "running";
+          pane.footerReason = cls.rpcMessage;
+        }
+        return;
+      }
+      if (cls.kind === "not-connected") {
+        if (disconnectPending === null) {
+          lastConnectionInfo = null;
+          connectionState = "DISCONNECTED";
+          markEpochEndedOnPanes();
+          settleQuitState();
+          renderConnectionChrome();
+        }
+        return;
+      }
+      if (
+        disconnectPending === null &&
+        !exitStartedSeen &&
+        !(reqBoundEpoch !== null && reqBoundEpoch <= terminalHandled)
+      ) {
+        connectionState = "FAILED";
+        renderConnectionChrome();
+        await startDisconnect("FAILED");
+      }
+    }
+  }
+
+  function dismissPane(paneId) {
+    const idx = panes.findIndex((p) => p.paneId === paneId);
+    if (idx === -1) return false;
+    const pane = panes[idx];
+    if (pane.state !== "draft" && pane.state !== "start-failed") return false;
+    panes.splice(idx, 1);
+    selectedTargets.delete(paneId);
+    if (focusedPaneId === paneId) {
+      focusedPaneId = panes.find((p) => p.visible)?.paneId ?? panes[0]?.paneId ?? null;
+    }
+    return true;
+  }
+
+  function hidePane(paneId) {
+    if (panes.length <= 1) return false;
+    const pane = panes.find((p) => p.paneId === paneId);
+    if (!pane?.visible) return false;
+    pane.visible = false;
+    if (focusedPaneId === paneId) {
+      focusedPaneId = panes.find((p) => p.visible)?.paneId ?? null;
+    }
+    return true;
+  }
+
+  function showPane(paneId) {
+    const pane = panes.find((p) => p.paneId === paneId);
+    if (!pane) return false;
+    if (!pane.visible) {
+      const visiblePanes = panes.filter((p) => p.visible);
+      if (visiblePanes.length >= 4) {
+        const rightmost = visiblePanes[visiblePanes.length - 1];
+        if (rightmost) rightmost.visible = false;
+      }
+      pane.visible = true;
+    }
+    focusedPaneId = pane.paneId;
+    if (
+      pane.needsTurnRead &&
+      pane.threadId &&
+      pane.boundEpoch === (boundEpoch ?? epoch) &&
+      connectionState === "CONNECTED" &&
+      disconnectPending === null
+    ) {
+      pane.needsTurnRead = false;
+      void triggerSessionRead(pane.threadId, "turn-completed");
+    }
+    return true;
+  }
+
+  function focusPane(paneId) {
+    const pane = panes.find((p) => p.paneId === paneId);
+    if (!pane) return false;
+    if (!pane.visible) {
+      return showPane(paneId);
+    }
+    focusedPaneId = pane.paneId;
+    return true;
+  }
+
+  function toggleComposerTarget(paneId) {
+    const pane = panes.find((p) => p.paneId === paneId);
+    if (!pane || !isPaneStartEligible(pane) || connectionState !== "CONNECTED") {
+      return false;
+    }
+    if (selectedTargets.has(paneId)) {
+      selectedTargets.delete(paneId);
+    } else {
+      selectedTargets.add(paneId);
+    }
+    return true;
+  }
+
+  function handleEngineEvent(payload) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) return;
+
+    if (payload.method === "madc/transport-closed") {
+      applyTerminalResult(payload);
+      return;
+    }
+
+    const decision = acceptEngineEvent(
+      {
+        boundEpoch,
+        connectionState,
+        disconnectPending: disconnectPending !== null,
+        lastAcceptedSeq,
+      },
+      payload,
+    );
+    if (decision.streamGap) {
+      streamGap = true;
+    }
+    if (decision.outcome !== "accept") {
+      return;
+    }
+    lastAcceptedSeq = decision.nextSeq;
+
+    const method = payload.method;
+    const params = payload.params;
+    if (!params || typeof params !== "object") return;
+
+    if (method === "room/updated") {
+      tableStale = true;
+      if (roomStaleNoteEl) {
+        roomStaleNoteEl.hidden = false;
+        roomStaleNoteEl.textContent = "room changed · Inspect room to refresh";
+      }
+      return;
+    }
+
+    if (method === "madc/events-dropped") {
+      streamGap = true;
+      return;
+    }
+
+    const activeEpoch = boundEpoch ?? epoch;
+    if (method === "turn/started") {
+      const turn = params.turn;
+      if (!turn || typeof turn.threadId !== "string") return;
+      for (const pane of panes) {
+        if (pane.threadId === turn.threadId && pane.boundEpoch === activeEpoch) {
+          pane.turnId = typeof turn.id === "string" ? turn.id : pane.turnId;
+          pane.startedAt = typeof turn.startedAt === "number" ? turn.startedAt : Date.now();
+          pane.state = "running";
+          pane.turnError = null;
+          pane.turnPendingInterrupt = false;
+          pane.streamedServedModel = null;
+          pane.hashMovedOnTurnStart = true;
+          pane.footerReason = "manual · sent once";
+          selectedTargets.delete(pane.paneId);
+        }
+      }
+      return;
+    }
+
+    if (method === "item/completed") {
+      const item = params.item;
+      if (item?.kind !== "servedModel" || typeof params.threadId !== "string") return;
+      if (item.status !== "completed") return;
+      for (const pane of panes) {
+        if (
+          pane.threadId === params.threadId &&
+          pane.boundEpoch === activeEpoch &&
+          (pane.turnId === null || pane.turnId === params.turnId)
+        ) {
+          pane.streamedServedModel = item;
+        }
+      }
+      return;
+    }
+
+    if (method === "turn/completed") {
+      const turn = params.turn;
+      if (!turn || typeof turn.threadId !== "string" || typeof turn.id !== "string") return;
+      for (const pane of panes) {
+        if (pane.threadId !== turn.threadId || pane.boundEpoch !== activeEpoch) continue;
+        if (pane.turnId !== null && pane.turnId !== turn.id) continue;
+        pane.turnPendingInterrupt = false;
+        pane.completedTurnId = turn.id;
+        if (turn.status === "completed") {
+          pane.state = "completed";
+          pane.turnError = null;
+        } else if (turn.status === "interrupted") {
+          pane.state = "interrupted";
+          pane.turnError = null;
+          pane.footerReason = "turn ended · interrupted";
+        } else if (turn.status === "failed") {
+          pane.state = "failed";
+          pane.turnError = turn.error ?? null;
+        } else {
+          continue;
+        }
+        pane.lastCompletedTurnState = pane.state;
+        if (pane.visible) {
+          void triggerSessionRead(pane.threadId, "turn-completed");
+        } else {
+          pane.needsTurnRead = true;
+        }
+      }
+    }
+  }
+
+  async function handleQuitRequested(payload) {
+    const decision = acceptQuitRequest({ boundEpoch, connectionState, quitRecord }, payload);
+    if (decision.action === "ignore") {
+      return;
+    }
+    if (decision.action === "refocus") {
+      quitKeepBtnEl?.focus?.();
+      return;
+    }
+    const requestEpoch = payload.epoch;
+    const requestId = payload.requestId;
+    quitRecord = decision.nextRecord;
+
+    let res;
+    try {
+      res = await invokeFn("quit_dialog_shown", { epoch: requestEpoch, requestId });
+    } catch {
+      res = { accepted: false };
+    }
+
+    if (
+      requestEpoch !== boundEpoch ||
+      connectionState !== "CONNECTED" ||
+      quitRecord === null ||
+      quitRecord.requestId !== requestId ||
+      quitRecord.status !== "candidate"
+    ) {
+      return;
+    }
+
+    if (res?.accepted === true) {
+      quitRecord = { requestId, status: "shown" };
+      openQuitDialogUi();
+      return;
+    }
+
+    quitRecord = { requestId, status: "settled" };
+  }
+
+  async function ackQuit() {
+    const rec = quitRecord;
+    const reqEpoch = boundEpoch;
+    if (rec === null || rec.status === "settled" || reqEpoch === null) {
+      closeQuitDialogUi(true);
+      return { accepted: false };
+    }
+    const requestId = rec.requestId;
+    quitRecord = { requestId, status: "settled" };
+    closeQuitDialogUi(true);
+    try {
+      const res = await invokeFn("ack_quit", { epoch: reqEpoch, requestId });
+      return { accepted: Boolean(res?.accepted) };
+    } catch {
+      return { accepted: false };
+    }
+  }
+
+  async function confirmQuit() {
+    const rec = quitRecord;
+    const reqEpoch = boundEpoch;
+    if (rec === null || rec.status === "settled" || reqEpoch === null) {
+      closeQuitDialogUi(false);
+      return { accepted: false };
+    }
+    const requestId = rec.requestId;
+    quitRecord = { requestId, status: "settled" };
+    closeQuitDialogUi(false);
+    try {
+      const res = await invokeFn("confirm_quit", { epoch: reqEpoch, requestId });
+      return { accepted: Boolean(res?.accepted) };
+    } catch {
+      return { accepted: false };
+    }
+  }
+
   function openPalette() {
     if (paletteOpen) return;
     priorFocusEl = doc.activeElement ?? null;
     paletteOpen = true;
     paletteQuery = "";
     paletteActiveId = null;
+    if (
+      connectionState === "CONNECTED" &&
+      disconnectPending === null &&
+      seatSummaries.length === 0
+    ) {
+      void loadSeats();
+    }
     renderPalette();
     paletteInputEl.focus();
   }
@@ -1602,5 +2914,36 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     openPalette,
     closePalette,
     handleKeydown: handleGlobalKeydown,
+    handleEngineEvent,
+    handleQuitRequested,
+    ackQuit,
+    confirmQuit,
+    loadSeats,
+    createDraftPane,
+    setPaneCwdText,
+    startThread,
+    startTurn,
+    interruptTurn,
+    dismissPane,
+    hidePane,
+    showPane,
+    focusPane,
+    toggleComposerTarget,
+    setViewMode: (mode) => {
+      viewMode = mode === "panes" ? "panes" : "table";
+    },
+    getViewMode: () => viewMode,
+    getPanes: () => panes.map(paneSnapshot),
+    getSeats: () => seatSummaries,
+    getQuitState: () => ({
+      quitRecord,
+      dialogOpen: quitDialogOpen,
+      boundEpoch,
+      terminalHandled,
+      exitStarted: exitStartedSeen,
+    }),
+    getQuitTurns: () => getQuitTurnsInternal().map(paneSnapshot),
+    isTableStale: () => tableStale,
+    isStreamGap: () => streamGap,
   };
 }
