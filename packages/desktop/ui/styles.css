@@ -1675,6 +1675,14 @@ kbd {
     grid-template-columns: 1fr;
   }
 
+  .room-thead,
+  .room-row {
+    grid-template-columns: 148px 100px 48px minmax(0, 1fr);
+    /* The 960-1199px band above also matches here, so the frame's gap is restated;
+       D-693 keeps .cell-seat folded into column 2 row 2 rather than hidden. */
+    gap: var(--madc-space-3);
+  }
+
   .hidden-summary-names {
     max-width: 230px;
   }

@@ -442,6 +442,7 @@ export function bindDesktopShell(
   readonly handleKeydown: (ev: unknown) => void;
   readonly handleEngineEvent: (payload: unknown) => void;
   readonly handleQuitRequested: (payload: unknown) => Promise<void>;
+  readonly reportEventBridgeFailure: (message: string) => void;
   readonly ackQuit: () => Promise<QuitCommandAck>;
   readonly confirmQuit: () => Promise<QuitCommandAck>;
   readonly loadSeats: () => Promise<readonly SeatSummary[]>;

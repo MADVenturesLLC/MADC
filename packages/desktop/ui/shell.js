@@ -883,12 +883,14 @@ export function receiptRowsForPane(pane, readEntry = null, roomRow = null) {
   const openEvent = events.find((e) => e?.type === "session.open") ?? null;
   const targetTurnId = pane?.turnId ?? pane?.completedTurnId ?? null;
   let readServed = null;
-  for (let i = events.length - 1; i >= 0; i -= 1) {
-    const ev = events[i];
-    if (ev?.type === "servedModel" && ev.payload && typeof ev.payload === "object") {
-      if (targetTurnId === null || ev.payload.turnId === targetTurnId) {
-        readServed = ev.payload;
-        break;
+  if (targetTurnId !== null) {
+    for (let i = events.length - 1; i >= 0; i -= 1) {
+      const ev = events[i];
+      if (ev?.type === "servedModel" && ev.payload && typeof ev.payload === "object") {
+        if (ev.payload.turnId === targetTurnId) {
+          readServed = ev.payload;
+          break;
+        }
       }
     }
   }
@@ -4042,7 +4044,8 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         if (
           pane.threadId === params.threadId &&
           pane.boundEpoch === activeEpoch &&
-          (pane.turnId === null || pane.turnId === params.turnId)
+          ((pane.turnId === null && pane.state === "starting-turn") ||
+            pane.turnId === params.turnId)
         ) {
           pane.streamedServedModel = item;
         }
@@ -4465,6 +4468,24 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     }
   };
 
+  function reportEventBridgeFailure(message) {
+    const text = sanitizeEngineText(String(message ?? "Tauri event bridge unavailable"));
+    sessionReceipts.splice(0, sessionReceipts.length, {
+      label: "event bridge",
+      tone: evidenceTone(null, "fail"),
+      pillLabel: "FAILED",
+      context: "Tauri global event API missing",
+      chips: [{ key: "api", value: "__TAURI__.event.listen" }],
+      note: text,
+    });
+    connectionState = "FAILED";
+    outputEl.textContent = text;
+    renderConnectionChrome();
+    renderReceiptsWell();
+    announceLive(`Engine FAILED: ${text}`);
+    if (paletteOpen) renderPalette();
+  }
+
   renderConnectionChrome();
   renderReceiptsWell();
   renderWorkspace();
@@ -4483,6 +4504,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     handleKeydown: handleGlobalKeydown,
     handleEngineEvent,
     handleQuitRequested,
+    reportEventBridgeFailure,
     ackQuit,
     confirmQuit,
     loadSeats,

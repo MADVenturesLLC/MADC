@@ -2052,6 +2052,19 @@ test("M3-A3 spec §5.4 / A4 §5.2 D-693 breakpoints: right column 360-440px, Roo
     tracksAt(1200).declarations["grid-template-columns"],
     "148px 100px 108px 48px minmax(0, 1fr)",
   );
+  // M-5: Below the pinned minimum: the single-column guard keeps its own tracks and restores the
+  // frame's 12px gap, while D-693 keeps .cell-seat visible folded into column 2 row 2.
+  const guard = tracksAt(959);
+  assert.equal(guard.maxWidth, 959);
+  assert.equal(guard.declarations["grid-template-columns"], "148px 100px 48px minmax(0, 1fr)");
+  assert.equal(lastRule(rules, ".room-thead", "gap", 959).declarations.gap, "var(--madc-space-3)");
+  const seatHideAt959 = rules.filter(
+    (rule) =>
+      rule.selectors.includes(".cell-seat") &&
+      (rule.maxWidth === null || rule.maxWidth >= 959) &&
+      rule.declarations.display === "none",
+  );
+  assert.equal(seatHideAt959.length, 0, "D-693: .cell-seat must never be display:none at 959px");
 
   // Empty-state row outranks .room-row rules at every width.
   const weight = (selector: string): number =>
@@ -2398,6 +2411,146 @@ test("M3-A4 Slice 5 (T-L11): acceptTerminal pure table + connect handoff + deskt
     params: { reason: "exit" },
   });
   assert.equal(disconnectCalls, 0);
+
+  // L-3: End-to-end "desktop shutting down" refusal across ALL 6 RPC sites:
+  // room/inspect (:2750), session/read (:2845), seat/list (:3438),
+  // thread/start (:3583), turn/start (:3724), turn/interrupt (:3835).
+  for (const site of [
+    "room/inspect",
+    "session/read",
+    "seat/list",
+    "thread/start",
+    "turn/start",
+    "turn/interrupt",
+  ] as const) {
+    const { doc: sDoc } = createShellHarness();
+    let sDisconnects = 0;
+    let triggerReject: ((e: unknown) => void) | null = null;
+    let armReject = false;
+    const sCtrl = bindDesktopShell(sDoc, (cmd, args) => {
+      if (cmd === "connect_engine") {
+        return Promise.resolve({
+          socketPath: "/tmp/e.sock",
+          reusedExisting: false,
+          protocolVersion: PROTOCOL_VERSION,
+          serverName: "madc-engine",
+          serverVersion: "0.0.0",
+          coldStartMs: 4,
+          connectionEpoch: 21,
+        });
+      }
+      if (cmd === "disconnect_engine") {
+        sDisconnects += 1;
+        return Promise.resolve();
+      }
+      if (cmd === "rpc_request") {
+        if (armReject && args?.method === site) {
+          return new Promise((_, rej) => {
+            triggerReject = rej;
+          });
+        }
+        if (args?.method === "room/inspect") {
+          return Promise.resolve({
+            room: {
+              home: "/h",
+              counts: { threads: 1, pass: 0, warn: 0, fail: 0, openDecisions: 0 },
+              threads: [
+                {
+                  threadId: "thr_s",
+                  seatId: "madc-default",
+                  eventCount: 1,
+                  chainOk: true,
+                  headHash: "a".repeat(64),
+                  worktree: null,
+                },
+              ],
+            },
+          });
+        }
+        if (args?.method === "seat/list") {
+          return Promise.resolve({ data: [] });
+        }
+        if (args?.method === "thread/start") {
+          return Promise.resolve({
+            thread: {
+              id: "thr_s",
+              seatId: "madc-default",
+              cwd: null,
+              createdAt: 1,
+              updatedAt: 1,
+              status: "idle",
+              preview: "",
+            },
+          });
+        }
+        if (args?.method === "session/read") {
+          return Promise.resolve({ threadId: "thr_s", chainOk: true, events: [] });
+        }
+        if (args?.method === "turn/start") {
+          return Promise.resolve({
+            turn: {
+              id: "turn_s",
+              threadId: "thr_s",
+              status: "inProgress",
+              items: [],
+              error: null,
+              startedAt: 10,
+              completedAt: null,
+            },
+          });
+        }
+      }
+      return Promise.resolve({});
+    });
+    await sCtrl.connect();
+    const sp = sCtrl.createDraftPane("madc-default");
+    let pendingOp: Promise<unknown>;
+    if (site === "room/inspect") {
+      await sCtrl.startThread(sp.paneId);
+      armReject = true;
+      pendingOp = sCtrl.inspectRoom();
+    } else if (site === "session/read") {
+      await sCtrl.startThread(sp.paneId);
+      armReject = true;
+      pendingOp = sCtrl.selectThread("thr_s");
+    } else if (site === "seat/list") {
+      await sCtrl.startThread(sp.paneId);
+      armReject = true;
+      pendingOp = sCtrl.loadSeats();
+    } else if (site === "thread/start") {
+      armReject = true;
+      pendingOp = sCtrl.startThread(sp.paneId);
+    } else if (site === "turn/start") {
+      await sCtrl.startThread(sp.paneId);
+      armReject = true;
+      pendingOp = sCtrl.startTurn("hi", [sp.paneId]);
+    } else {
+      await sCtrl.startThread(sp.paneId);
+      await sCtrl.startTurn("hi", [sp.paneId]);
+      armReject = true;
+      pendingOp = sCtrl.interruptTurn(sp.paneId);
+    }
+    assert.ok(triggerReject !== null, `L-3 (${site}): expected armed rpc_request`);
+    (triggerReject as (e: unknown) => void)("desktop shutting down");
+    await pendingOp;
+    assert.equal(
+      sCtrl.getConnectionState(),
+      "CONNECTED",
+      `L-3 (${site}): shutting down must NOT transition to FAILED`,
+    );
+    assert.equal(sDisconnects, 0, `L-3 (${site}): shutting down must NOT call disconnect_engine`);
+    assert.equal(sCtrl.getQuitState().exitStarted, true, `L-3 (${site}): exitStarted must be true`);
+    assert.equal(
+      sCtrl.getQuitState().terminalHandled,
+      21,
+      `L-3 (${site}): terminalHandled must record epoch`,
+    );
+    if (site === "thread/start") {
+      assert.equal(sCtrl.getPanes()[0]?.state, "draft");
+    } else {
+      assert.equal(sCtrl.getPanes()[0]?.state, "history");
+    }
+  }
 });
 
 test("M3-A4 Slice 5 (T-L12 / T-L12b / 13b): quit candidate, shown-ack race, stale requestIds, and confirm_quit", async () => {
@@ -3016,6 +3169,43 @@ test("M3-A4 §9 items 1–7, 20–21: pill vocabulary, turn pills, servedModel, 
   assert.equal(headRow?.tone, "verified");
   assert.equal(headRow?.note, "worktree missing on disk");
 
+  // L-8: When a pane has NO turn (turnId: null, completedTurnId: null), the servedModel row MUST
+  // stay ○ NO RECEIPT (`servedModel —`, neutral), even if session/read events[] contains a
+  // servedModel entry (A4 §4.3:194, :198).
+  const noTurnRows = receiptRowsForPane(
+    {
+      ...basePane,
+      turnId: null,
+      completedTurnId: null,
+      state: "idle",
+      streamedServedModel: null,
+    },
+    {
+      ok: true,
+      result: {
+        threadId: "thr_1",
+        chainOk: true,
+        events: [
+          {
+            type: "servedModel",
+            payload: {
+              turnId: "turn_other",
+              servedModel: "claude-4",
+              vendorReported: true,
+              lane: "allowed-direct",
+              fallbackFrom: null,
+            },
+          },
+        ],
+      },
+    },
+    null,
+  );
+  const noTurnSm = noTurnRows.find((r) => r.kind === "servedModel");
+  assert.equal(noTurnSm?.tone, "neutral");
+  assert.equal(noTurnSm?.pillLabel, "NO RECEIPT");
+  assert.deepEqual(noTurnSm?.chips, [{ key: "servedModel", value: "—", muted: true }]);
+
   // Item 7: lane and worktree.topLevel have no pill and contain `field · not a receipt`.
   const laneRow = readVerified.find((r) => r.kind === "lane");
   const topRow = readVerified.find((r) => r.kind === "worktree.topLevel");
@@ -3023,6 +3213,156 @@ test("M3-A4 §9 items 1–7, 20–21: pill vocabulary, turn pills, servedModel, 
   assert.match(laneRow?.note ?? "", /field · not a receipt/);
   assert.equal(topRow?.pillLabel, null);
   assert.match(topRow?.note ?? "", /field · not a receipt/);
+});
+
+test("M3-A4 M-6 (J6) & L-9: failed streamed servedModel stays NO RECEIPT end-to-end; missing global event API renders visible failure", async () => {
+  // M-6 (J6): Drive item/completed with kind:"servedModel", status:"failed" (vendorReported:true)
+  // and status:"inProgress" through handleEngineEvent on a live running pane and verify the
+  // rendered pane DOM keeps ○ NO RECEIPT (never ▲ UNVERIFIED or ✓ VERIFIED / green).
+  const { doc } = createShellHarness();
+  const ctrl = bindDesktopShell(doc, (cmd, args) => {
+    if (cmd === "connect_engine") {
+      return Promise.resolve({
+        socketPath: "/tmp/e.sock",
+        reusedExisting: false,
+        protocolVersion: PROTOCOL_VERSION,
+        serverName: "madc-engine",
+        serverVersion: "0.0.0",
+        coldStartMs: 3,
+        connectionEpoch: 30,
+      });
+    }
+    if (cmd === "rpc_request") {
+      if (args?.method === "room/inspect") {
+        return Promise.resolve({
+          room: {
+            home: "/h",
+            counts: { threads: 0, pass: 0, warn: 0, fail: 0, openDecisions: 0 },
+            threads: [],
+          },
+        });
+      }
+      if (args?.method === "thread/start") {
+        return Promise.resolve({
+          thread: {
+            id: "thr_j6",
+            seatId: "daedalus",
+            cwd: null,
+            createdAt: 1,
+            updatedAt: 1,
+            status: "idle",
+            preview: "",
+          },
+        });
+      }
+      if (args?.method === "session/read") {
+        return Promise.resolve({ threadId: "thr_j6", chainOk: true, events: [] });
+      }
+      if (args?.method === "turn/start") {
+        return Promise.resolve({
+          turn: {
+            id: "turn_j6",
+            threadId: "thr_j6",
+            status: "inProgress",
+            items: [],
+            error: null,
+            startedAt: 100,
+            completedAt: null,
+          },
+        });
+      }
+    }
+    return Promise.resolve({});
+  });
+  await ctrl.connect();
+  const pane = ctrl.createDraftPane("daedalus");
+  await ctrl.startThread(pane.paneId);
+  await ctrl.startTurn("test prompt", [pane.paneId]);
+
+  for (const [idx, badStatus] of (["failed", "inProgress"] as const).entries()) {
+    ctrl.handleEngineEvent({
+      epoch: 30,
+      seq: idx + 1,
+      method: "item/completed",
+      params: {
+        threadId: "thr_j6",
+        turnId: "turn_j6",
+        item: {
+          id: `it_${badStatus}`,
+          kind: "servedModel",
+          status: badStatus,
+          requestedModel: "m",
+          servedModel: "claude-4",
+          backing: "anthropic",
+          providerId: "anthropic",
+          lane: "allowed-direct",
+          mode: "headless",
+          fallbackFrom: null,
+          vendorReported: true,
+        },
+      },
+    });
+    const gridText = doc.getElementById("panes-grid").textContent ?? "";
+    assert.match(gridText, /servedModel/, `J6 (${badStatus}): servedModel row rendered`);
+    assert.match(gridText, /NO RECEIPT/, `J6 (${badStatus}): must stay NO RECEIPT`);
+    assert.doesNotMatch(
+      gridText,
+      /UNVERIFIED|VERIFIED|claude-4/,
+      `J6 (${badStatus}): non-completed servedModel must NEVER open UNVERIFIED or VERIFIED`,
+    );
+  }
+
+  // L-9: app.js must render a visible failure if window.__TAURI__.event.listen is missing
+  // (or rejects), instead of silently skipping listeners.
+  const appModuleUrl = new URL("../ui/app.js", import.meta.url).href;
+  const appMod = (await import(appModuleUrl)) as {
+    attachDesktopEvents: (controller: ReturnType<typeof bindDesktopShell>, win: unknown) => boolean;
+    bootDesktopApp: (doc: unknown, win: unknown) => ReturnType<typeof bindDesktopShell>;
+  };
+
+  // Missing global event API -> visible FAILED receipt, status strip data-tone="fail", output text.
+  const { doc: missingDoc } = createShellHarness();
+  const missingCtrl = appMod.bootDesktopApp(missingDoc, {});
+  assert.equal(missingCtrl.getConnectionState(), "FAILED");
+  assert.equal(missingDoc.getElementById("connection-status").getAttribute("data-tone"), "fail");
+  assert.match(missingDoc.getElementById("receipt-rows").textContent ?? "", /FAILED/);
+  assert.match(
+    missingDoc.getElementById("receipt-rows").textContent ?? "",
+    /__TAURI__\.event\.listen/,
+  );
+  assert.match(missingDoc.getElementById("output").textContent ?? "", /event API/i);
+
+  // Present global event API -> attaches both listeners and forwards events cleanly.
+  const { doc: okDoc } = createShellHarness();
+  const attached: Record<string, (ev: { payload: unknown }) => void> = {};
+  const okCtrl = appMod.bootDesktopApp(okDoc, {
+    __TAURI__: {
+      event: {
+        listen(name: string, cb: (ev: { payload: unknown }) => void) {
+          attached[name] = cb;
+          return Promise.resolve(() => {});
+        },
+      },
+    },
+  });
+  assert.equal(okCtrl.getConnectionState(), "IDLE");
+  assert.equal(typeof attached["madc:engine-event"], "function");
+  assert.equal(typeof attached["madc:quit-requested"], "function");
+
+  // Rejecting listen() -> renders visible failure as well.
+  const { doc: rejDoc } = createShellHarness();
+  const rejCtrl = appMod.bootDesktopApp(rejDoc, {
+    __TAURI__: {
+      event: {
+        listen() {
+          return Promise.reject(new Error("bridge permission denied"));
+        },
+      },
+    },
+  });
+  await new Promise((r) => setTimeout(r, 10));
+  assert.equal(rejCtrl.getConnectionState(), "FAILED");
+  assert.match(rejDoc.getElementById("output").textContent ?? "", /bridge permission denied/);
 });
 
 test("M3-A4 §9 item 25 (C1–C17): cwdCheck, cwdFieldState, static CSS, and interactive cwd flow", async () => {

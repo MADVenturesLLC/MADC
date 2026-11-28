@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::Shutdown;
@@ -35,10 +35,14 @@ pub const INTERACTIVE_RPC_TIMEOUT: Duration = Duration::from_secs(10);
 pub const EXIT_LOCK_WAIT: Duration = Duration::from_secs(2);
 pub const DISCONNECT_STOP_BOUND: Duration = INITIALIZED_KILL_GRACE;
 pub const EXIT_BOUND: Duration = Duration::from_secs(9);
+/// 3 s shown-ack window: builder default under AM2 §6.1, not a Founder ruling, not covered by D-731.
 pub const QUIT_SHOWN_ACK_BOUND: Duration = Duration::from_secs(3);
 pub const QUIT_FALLBACK_TTL: Duration = Duration::from_secs(30);
 pub const MAX_CWD_BYTES: usize = 4096;
 pub const MAX_TURN_INPUT_BYTES: usize = 65_536;
+/// Maximum distinct `(turn_id, kind)` notifications buffered per thread while a single `turn/start`
+/// reply is pending (`AM2 §6.1` / C2). Newest distinct entries past this cap are dropped and counted.
+pub const MAX_BUFFERED_TURN_EVENTS_PER_START: usize = 16;
 
 static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
 static NEXT_QUIT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -1837,8 +1841,113 @@ impl LaunchConfig {
     }
 }
 
-struct SpawnedServe {
+struct SharedChildInner {
     child: Child,
+    reaped: bool,
+    exit_status: Option<ExitStatus>,
+    kill_issued: bool,
+    #[cfg(test)]
+    kill_count: u64,
+}
+
+/// Lock-guarded `Child` handle shared between the L7 stop worker and the deadline expiry path
+/// (`AM2 §6`, C6/C8). The worker acquires the lock only per `try_wait` poll and NEVER holds it
+/// across sleep; `kill_once()` goes through `Child::kill()` strictly once and never after reap.
+#[derive(Clone)]
+struct SharedChild(Arc<Mutex<SharedChildInner>>);
+
+impl SharedChild {
+    fn new(child: Child) -> Self {
+        Self(Arc::new(Mutex::new(SharedChildInner {
+            child,
+            reaped: false,
+            exit_status: None,
+            kill_issued: false,
+            #[cfg(test)]
+            kill_count: 0,
+        })))
+    }
+
+    fn try_wait(&self) -> Option<ExitStatus> {
+        let mut g = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if g.reaped {
+            return g.exit_status;
+        }
+        if let Ok(Some(status)) = g.child.try_wait() {
+            g.reaped = true;
+            g.exit_status = Some(status);
+            return Some(status);
+        }
+        None
+    }
+
+    #[cfg(unix)]
+    fn send_sigterm_if_alive(&self) {
+        let mut g = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if g.reaped {
+            return;
+        }
+        if let Ok(Some(status)) = g.child.try_wait() {
+            g.reaped = true;
+            g.exit_status = Some(status);
+            return;
+        }
+        let pid = g.child.id();
+        unsafe {
+            libc::kill(pid as libc::pid_t, libc::SIGTERM);
+        }
+    }
+
+    /// Kill through the lock-guarded `Child` handle at most once, never after reap.
+    fn kill_once(&self) -> bool {
+        let mut g = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if g.reaped || g.kill_issued {
+            return false;
+        }
+        if let Ok(Some(status)) = g.child.try_wait() {
+            g.reaped = true;
+            g.exit_status = Some(status);
+            return false;
+        }
+        g.kill_issued = true;
+        #[cfg(test)]
+        {
+            g.kill_count += 1;
+        }
+        let _ = g.child.kill();
+        true
+    }
+
+    /// Poll `try_wait` briefly (releasing the lock across sleeps) to reap a killed child.
+    fn reap_bounded(&self, max_wait: Duration) -> Option<ExitStatus> {
+        let end = Instant::now() + max_wait;
+        loop {
+            if let Some(status) = self.try_wait() {
+                return Some(status);
+            }
+            if Instant::now() >= end {
+                return None;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(test)]
+    fn kill_count(&self) -> u64 {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .kill_count
+    }
+
+    #[cfg(test)]
+    fn is_reaped(&self) -> bool {
+        self.0.lock().unwrap_or_else(|p| p.into_inner()).reaped
+    }
+}
+
+struct SpawnedServe {
+    child: SharedChild,
     stdin: Option<ChildStdin>,
     stderr_buf: Arc<Mutex<String>>,
     stderr_done: Option<mpsc::Receiver<()>>,
@@ -1867,7 +1976,7 @@ impl SpawnedServe {
     }
 
     fn try_wait_status(&mut self) -> Option<ExitStatus> {
-        self.child.try_wait().ok().flatten()
+        self.child.try_wait()
     }
 
     /// Stop `serve` per amendment 1 §5 and return its exit status once reaped:
@@ -1883,54 +1992,46 @@ impl SpawnedServe {
         initialized_grace: Duration,
         uninitialized_grace: Duration,
     ) -> Option<ExitStatus> {
-        let kill_flag = Arc::new(AtomicBool::new(false));
-        self.stop_with_deadline_and_flag(
-            Instant::now()
-                + if self.initialized {
-                    initialized_grace
-                } else {
-                    uninitialized_grace
-                },
-            &kill_flag,
-        )
+        let grace = if self.initialized {
+            initialized_grace
+        } else {
+            uninitialized_grace
+        };
+        self.stop_with_deadline(Instant::now() + grace)
     }
 
-    fn stop_with_deadline_and_flag(
-        &mut self,
-        deadline: Instant,
-        kill_issued: &AtomicBool,
-    ) -> Option<ExitStatus> {
+    fn stop_with_deadline(&mut self, deadline: Instant) -> Option<ExitStatus> {
+        let grace = if self.initialized {
+            INITIALIZED_KILL_GRACE
+        } else {
+            UNINITIALIZED_KILL_GRACE
+        };
+        let effective_deadline = deadline.min(Instant::now() + grace);
         if self.initialized {
             // Close stdin (EOF) first (§5 & §4 Windows).
             drop(self.stdin.take());
-            while Instant::now() < deadline {
-                if let Some(status) = self.try_wait_status() {
+            while Instant::now() < effective_deadline {
+                if let Some(status) = self.child.try_wait() {
                     return Some(status);
                 }
                 thread::sleep(Duration::from_millis(20));
             }
-            if !kill_issued.swap(true, Ordering::AcqRel) {
-                let _ = self.child.kill();
-            }
-            self.child.wait().ok()
+            self.child.kill_once();
+            self.child.reap_bounded(Duration::from_secs(2))
         } else {
             #[cfg(not(unix))]
             drop(self.stdin.take());
             #[cfg(unix)]
-            unsafe {
-                libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM);
-            }
-            while Instant::now() < deadline {
-                if let Some(status) = self.try_wait_status() {
+            self.child.send_sigterm_if_alive();
+            while Instant::now() < effective_deadline {
+                if let Some(status) = self.child.try_wait() {
                     drop(self.stdin.take());
                     return Some(status);
                 }
                 thread::sleep(Duration::from_millis(20));
             }
-            if !kill_issued.swap(true, Ordering::AcqRel) {
-                let _ = self.child.kill();
-            }
-            let status = self.child.wait().ok();
+            self.child.kill_once();
+            let status = self.child.reap_bounded(Duration::from_secs(2));
             drop(self.stdin.take());
             status
         }
@@ -2016,7 +2117,9 @@ pub struct ClientOwner {
     pub pending_starts: HashMap<String, usize>,
     pub pending_starts_total: usize,
     pub in_flight_turn_ids: HashMap<String, String>,
+    pub admitted_turn_ids: HashSet<String>,
     pub buffered_turn_events: HashMap<String, Vec<(String, &'static str)>>,
+    pub dropped_buffered_turn_events: u64,
     // AM2 §6.1 / L10 quit request & fallback mark
     pub quit_record: Option<QuitRecord>,
     pub quit_fallback_set_at: Option<Instant>,
@@ -2037,7 +2140,9 @@ impl ClientOwner {
             pending_starts: HashMap::new(),
             pending_starts_total: 0,
             in_flight_turn_ids: HashMap::new(),
+            admitted_turn_ids: HashSet::new(),
             buffered_turn_events: HashMap::new(),
+            dropped_buffered_turn_events: 0,
             quit_record: None,
             quit_fallback_set_at: None,
         }
@@ -2057,6 +2162,7 @@ impl ClientOwner {
         self.pending_starts.clear();
         self.pending_starts_total = 0;
         self.in_flight_turn_ids.clear();
+        self.admitted_turn_ids.clear();
         self.buffered_turn_events.clear();
         self.quit_record = None;
         self.quit_fallback_set_at = None;
@@ -2232,7 +2338,7 @@ impl ClientOwner {
         }
     }
 
-    /// Track `turn/started` or `turn/completed` notifications in close guard (`L9`, §6.1 item 1).
+    /// Track `turn/started` or `turn/completed` notifications in close guard (`L9`, §6.1 item 1, C2).
     pub fn observe_turn_notification(&mut self, method: &str, params: &Value) {
         if !matches!(self.phase, LifecyclePhase::Open) {
             return;
@@ -2252,10 +2358,18 @@ impl ClientOwner {
                     return;
                 }
                 if self.pending_starts.get(thread_id).copied().unwrap_or(0) == 1 {
-                    self.buffered_turn_events
+                    let buf = self
+                        .buffered_turn_events
                         .entry(thread_id.to_string())
-                        .or_default()
-                        .push((turn_id.to_string(), "started"));
+                        .or_default();
+                    let entry = (turn_id.to_string(), "started");
+                    if !buf.contains(&entry) {
+                        if buf.len() >= MAX_BUFFERED_TURN_EVENTS_PER_START {
+                            self.dropped_buffered_turn_events += 1;
+                        } else {
+                            buf.push(entry);
+                        }
+                    }
                 }
             }
             "turn/completed" => {
@@ -2263,18 +2377,31 @@ impl ClientOwner {
                     return;
                 }
                 if self.pending_starts.get(thread_id).copied().unwrap_or(0) == 1 {
-                    self.buffered_turn_events
+                    let buf = self
+                        .buffered_turn_events
                         .entry(thread_id.to_string())
-                        .or_default()
-                        .push((turn_id.to_string(), "completed"));
+                        .or_default();
+                    let entry = (turn_id.to_string(), "completed");
+                    if !buf.contains(&entry) {
+                        if buf.len() >= MAX_BUFFERED_TURN_EVENTS_PER_START {
+                            self.dropped_buffered_turn_events += 1;
+                        } else {
+                            buf.push(entry);
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
 
-    /// Complete admitting or rejecting a `turn/start` RPC response inside the owner (`L9`).
-    pub fn finish_pending_turn_start(&mut self, thread_id: &str, admitted_turn_id: Option<&str>) {
+    /// Complete admitting or rejecting a `turn/start` RPC response inside the owner (`L9`, C2).
+    /// Returns `Err` (F2 `invalid-frame`) if `admitted_turn_id` was already admitted on this connection.
+    pub fn finish_pending_turn_start(
+        &mut self,
+        thread_id: &str,
+        admitted_turn_id: Option<&str>,
+    ) -> Result<(), String> {
         if let Some(cnt) = self.pending_starts.get_mut(thread_id) {
             *cnt = cnt.saturating_sub(1);
             if *cnt == 0 {
@@ -2287,6 +2414,10 @@ impl ClientOwner {
             .remove(thread_id)
             .unwrap_or_default();
         if let Some(tid) = admitted_turn_id {
+            if self.in_flight_turn_ids.contains_key(tid) || self.admitted_turn_ids.contains(tid) {
+                return Err(format!("invalid-frame: duplicate turn/start turn id {tid}"));
+            }
+            self.admitted_turn_ids.insert(tid.to_string());
             self.in_flight_turn_ids
                 .insert(tid.to_string(), thread_id.to_string());
             for (ev_turn_id, kind) in buffered {
@@ -2295,6 +2426,7 @@ impl ClientOwner {
                 }
             }
         }
+        Ok(())
     }
 
     fn expire_outstanding_if_due(&mut self, now: Instant) {
@@ -2442,18 +2574,25 @@ pub enum CloseDecision {
     Coalesce,
 }
 
+pub type StopWorkerSpawner = Arc<
+    dyn Fn(Box<dyn FnOnce() + Send + 'static>) -> std::io::Result<thread::JoinHandle<()>>
+        + Send
+        + Sync,
+>;
+
 #[derive(Clone, Default)]
 pub struct TestStopHooks {
     pub delay_l7: Option<Duration>,
-    pub force_spawn_fail: bool,
+    pub spawner: Option<StopWorkerSpawner>,
     pub on_l7_thread: Option<Arc<dyn Fn(thread::ThreadId) + Send + Sync>>,
+    pub on_inline_fallback: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub on_before_response_relock: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 #[cfg(unix)]
 struct StopInFlight {
     done: Arc<(Mutex<bool>, Condvar)>,
-    child_pid: Option<u32>,
-    kill_issued: Arc<AtomicBool>,
+    shared_child: Option<SharedChild>,
 }
 
 #[cfg(unix)]
@@ -2466,71 +2605,97 @@ pub(crate) struct StopState {
     hooks: Option<Arc<TestStopHooks>>,
 }
 
+/// Start (or join) bounded L7 stop work and wait up to `deadline`, issuing a single lock-guarded
+/// `Child::kill()` on expiry (`AM2 §6` Expiry / C6 / C8). Used by waiting callers (`RunEvent::Exit`,
+/// `disconnect_engine`, `confirm_quit`, R4 cleanup, `Drop`).
 #[cfg(unix)]
 pub(crate) fn stop_child(stop_arc: &Arc<Mutex<StopState>>, deadline: Instant) {
-    let (in_flight, run_inline) = {
+    stop_child_inner(stop_arc, deadline, true);
+}
+
+/// Hand off L7 stop work to the worker thread and return immediately without blocking the Tauri
+/// event loop (`AM2 §6`, C1/M-1). The only exception is worker thread spawn failure, which runs the
+/// bounded inline fallback on the caller's thread outside `stop_state` and `owner`.
+#[cfg(unix)]
+pub(crate) fn stop_child_async(stop_arc: &Arc<Mutex<StopState>>, deadline: Instant) {
+    stop_child_inner(stop_arc, deadline, false);
+}
+
+#[cfg(unix)]
+fn stop_child_inner(
+    stop_arc: &Arc<Mutex<StopState>>,
+    deadline: Instant,
+    wait_for_done: bool,
+) {
+    let existing_or_start = {
         let mut g = match stop_arc.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
         if let Some(existing) = g.in_flight.clone() {
-            (existing, false)
+            Err(existing)
         } else {
             let cancel = g.cancel_stream.take();
             let spawned = g.spawned.take();
-            let child_pid = spawned.as_ref().map(|s| s.child.id());
-            let kill_issued = Arc::new(AtomicBool::new(false));
+            let shared_child = spawned.as_ref().map(|s| s.child.clone());
             let done = Arc::new((Mutex::new(false), Condvar::new()));
             let hooks = g.hooks.clone();
-            let force_spawn_fail = hooks.as_ref().is_some_and(|h| h.force_spawn_fail);
             let record = Arc::new(StopInFlight {
                 done: Arc::clone(&done),
-                child_pid,
-                kill_issued: Arc::clone(&kill_issued),
+                shared_child,
             });
             g.in_flight = Some(Arc::clone(&record));
+            Ok((record, cancel, spawned, done, hooks))
+        }
+    };
+    // `stop_state` guard is dropped before thread spawn or inline fallback.
 
-            if force_spawn_fail {
-                drop(g);
-                run_l7_work(cancel, spawned, deadline, &kill_issued, &done, hooks.as_deref());
-                return;
-            }
+    let in_flight = match existing_or_start {
+        Err(existing) => existing,
+        Ok((record, cancel, spawned, done, hooks)) => {
+            // Keep `(cancel, spawned)` in a shared slot so if thread spawn fails (`Err`),
+            // ownership is returned to the caller for the real inline fallback (`AM2 §6` Spawn failure).
+            let work_slot: Arc<Mutex<Option<(Option<UnixStream>, Option<SpawnedServe>)>>> =
+                Arc::new(Mutex::new(Some((cancel, spawned))));
+            let slot_for_worker = Arc::clone(&work_slot);
+            let done_for_worker = Arc::clone(&done);
+            let hooks_for_worker = hooks.clone();
 
-            let spawned_thread = thread::Builder::new()
-                .name("madc-l7-stop".to_string())
-                .spawn({
-                    let done_c = Arc::clone(&done);
-                    let kill_c = Arc::clone(&kill_issued);
-                    let hooks_c = hooks.clone();
-                    move || {
-                        run_l7_work(
-                            cancel,
-                            spawned,
-                            Instant::now() + DISCONNECT_STOP_BOUND,
-                            &kill_c,
-                            &done_c,
-                            hooks_c.as_deref(),
-                        );
-                    }
-                });
+            let worker_fn: Box<dyn FnOnce() + Send + 'static> = Box::new(move || {
+                let work = slot_for_worker
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .take();
+                if let Some((c, s)) = work {
+                    run_l7_work(c, s, deadline, &done_for_worker, hooks_for_worker.as_deref());
+                }
+            });
 
-            match spawned_thread {
-                Ok(_jh) => (record, false),
+            let spawn_res = if let Some(spawner) = hooks.as_ref().and_then(|h| h.spawner.as_ref()) {
+                spawner(worker_fn)
+            } else {
+                thread::Builder::new()
+                    .name("madc-l7-stop".to_string())
+                    .spawn(worker_fn)
+            };
+
+            match spawn_res {
+                Ok(_jh) => record,
                 Err(_) => {
-                    drop(g);
-                    // Wait: on OS thread exhaustion, cancel/spawned were moved into closure,
-                    // kill pid directly and signal done so caller is never left waiting.
-                    if let Some(pid) = child_pid {
-                        if !kill_issued.swap(true, Ordering::AcqRel) {
-                            unsafe {
-                                libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                            }
-                        }
+                    // Real spawn-failure path (`AM2 §6` Spawn failure, H-2): runs inline on the
+                    // caller's thread with `stop_state` unlocked and never inside `owner`.
+                    if let Some(cb) = hooks.as_ref().and_then(|h| h.on_inline_fallback.as_ref()) {
+                        cb();
                     }
-                    let (lk, cv) = &*done;
-                    if let Ok(mut d) = lk.lock() {
-                        *d = true;
-                        cv.notify_all();
+                    let work = work_slot.lock().unwrap_or_else(|p| p.into_inner()).take();
+                    if let Some((c, s)) = work {
+                        run_l7_work(c, s, deadline, &done, hooks.as_deref());
+                    } else {
+                        let (lk, cv) = &*done;
+                        if let Ok(mut d) = lk.lock() {
+                            *d = true;
+                            cv.notify_all();
+                        }
                     }
                     return;
                 }
@@ -2538,7 +2703,7 @@ pub(crate) fn stop_child(stop_arc: &Arc<Mutex<StopState>>, deadline: Instant) {
         }
     };
 
-    if run_inline {
+    if !wait_for_done {
         return;
     }
 
@@ -2550,12 +2715,9 @@ pub(crate) fn stop_child(stop_arc: &Arc<Mutex<StopState>>, deadline: Instant) {
     while !*finished {
         let rem = deadline.saturating_duration_since(Instant::now());
         if rem.is_zero() {
-            if let Some(pid) = in_flight.child_pid {
-                if !in_flight.kill_issued.swap(true, Ordering::AcqRel) {
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGKILL);
-                    }
-                }
+            if let Some(ref shared_child) = in_flight.shared_child {
+                shared_child.kill_once();
+                let _ = shared_child.reap_bounded(Duration::from_millis(100));
             }
             return;
         }
@@ -2572,7 +2734,6 @@ fn run_l7_work(
     cancel: Option<UnixStream>,
     mut spawned: Option<SpawnedServe>,
     deadline: Instant,
-    kill_issued: &AtomicBool,
     done: &(Mutex<bool>, Condvar),
     hooks: Option<&TestStopHooks>,
 ) {
@@ -2591,7 +2752,7 @@ fn run_l7_work(
         }
     }
     if let Some(ref mut child) = spawned {
-        let _ = child.stop_with_deadline_and_flag(deadline, kill_issued);
+        let _ = child.stop_with_deadline(deadline);
     }
     let (lk, cv) = done;
     if let Ok(mut g) = lk.lock() {
@@ -2843,6 +3004,9 @@ impl HandshakeClient {
         // Defuse HandshakeClient Drop cleanly because phase is now Open.
         std::mem::forget(self);
 
+        let before_relock = hooks
+            .as_ref()
+            .and_then(|h| h.on_before_response_relock.clone());
         let drain_cv = Arc::new(Condvar::new());
         let reader_done = Arc::new(AtomicBool::new(false));
         let stop_state = Arc::new(Mutex::new(StopState {
@@ -2886,7 +3050,7 @@ impl HandshakeClient {
                 let cv_r = Arc::clone(&drain_cv);
                 let done_r = Arc::clone(&reader_done);
                 move || {
-                    reader_thread_loop(reader, line_buf, owner_r, cv_r, done_r);
+                    reader_thread_loop(reader, line_buf, owner_r, cv_r, done_r, before_relock);
                 }
             })
             .map_err(|e| format!("failed to spawn reader thread: {e}"))?;
@@ -2934,6 +3098,7 @@ fn reader_thread_loop(
     owner: Arc<Mutex<ClientOwner>>,
     cv: Arc<Condvar>,
     reader_done: Arc<AtomicBool>,
+    before_response_relock: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     loop {
         let terminal_reason: Option<&'static str> = match read_bounded_line(&mut reader, &mut line_buf)
@@ -2963,11 +3128,23 @@ fn reader_thread_loop(
                         if let Some(entry) = entry_opt {
                             // Closed shape validation OUTSIDE owner lock (L1).
                             let valid = validate_rpc_result(&entry.method, &entry.params, &result);
+                            if let Some(ref hook) = before_response_relock {
+                                hook();
+                            }
                             let mut o = owner.lock().unwrap_or_else(|p| p.into_inner());
+                            // L-4: Re-check phase after relocking; if no longer Open, fail waiter
+                            // with the exact L6 string and do not admit any turn or deliver success.
+                            if !matches!(o.phase, LifecyclePhase::Open) {
+                                let _ = entry.reply_tx.send(Err(
+                                    "engine socket closed before response".to_string(),
+                                ));
+                                cv.notify_all();
+                                break;
+                            }
                             if !valid {
                                 if let Some(ref tid) = entry.thread_id {
                                     if entry.method == "turn/start" {
-                                        o.finish_pending_turn_start(tid, None);
+                                        let _ = o.finish_pending_turn_start(tid, None);
                                     }
                                 }
                                 o.enter_terminated("invalid-frame");
@@ -2981,7 +3158,14 @@ fn reader_thread_loop(
                             if entry.method == "turn/start" {
                                 if let Some(ref tid) = entry.thread_id {
                                     let turn_id = result["turn"]["id"].as_str();
-                                    o.finish_pending_turn_start(tid, turn_id);
+                                    if let Err(dup_err) = o.finish_pending_turn_start(tid, turn_id)
+                                    {
+                                        // M-2 (C2): Duplicate admitted turn.id -> F2 invalid-frame.
+                                        o.enter_terminated("invalid-frame");
+                                        let _ = entry.reply_tx.send(Err(dup_err));
+                                        cv.notify_all();
+                                        break;
+                                    }
                                 }
                             }
                             let _ = entry.reply_tx.send(Ok(result));
@@ -2992,10 +3176,13 @@ fn reader_thread_loop(
                     FrameClass::ResponseError { id, error } => {
                         let mut o = owner.lock().unwrap_or_else(|p| p.into_inner());
                         let _ = o.flush_due_drops(Instant::now());
+                        if !matches!(o.phase, LifecyclePhase::Open) {
+                            break;
+                        }
                         if let Some(entry) = o.pending.remove(&id) {
                             if entry.method == "turn/start" {
                                 if let Some(ref tid) = entry.thread_id {
-                                    o.finish_pending_turn_start(tid, None);
+                                    let _ = o.finish_pending_turn_start(tid, None);
                                 }
                             }
                             let _ = entry.reply_tx.send(Err(format!("engine RPC error: {error}")));
@@ -3088,16 +3275,26 @@ impl SocketClient {
         socket_path: &str,
         sink: Arc<dyn EventSink>,
     ) -> Result<Self, String> {
+        Self::connect_existing_with_sink_and_hooks(socket_path, sink, None, None)
+    }
+
+    #[cfg(test)]
+    fn connect_existing_with_sink_and_hooks(
+        socket_path: &str,
+        sink: Arc<dyn EventSink>,
+        spawned: Option<SpawnedServe>,
+        hooks: Option<Arc<TestStopHooks>>,
+    ) -> Result<Self, String> {
         let started_at = Instant::now();
         let hs = Self::handshake_with_connector(
             socket_path,
             Duration::from_secs(2),
-            true,
+            spawned.is_none(),
             started_at,
             sink,
             |p| UnixStream::connect(p),
         )?;
-        hs.publish_open(None, None)
+        hs.publish_open(spawned, hooks)
     }
 
     #[cfg(test)]
@@ -3318,27 +3515,29 @@ impl SocketClient {
         }
 
         let write_res = {
-            let write_rem = deadline.saturating_duration_since(Instant::now());
-            if write_rem.is_zero() {
-                Err(format!("RPC {method} timed out before write"))
-            } else {
-                let mut w_guard = self
-                    .inner
-                    .write_half
-                    .lock()
-                    .map_err(|_| "write lock poisoned".to_string())?;
-                match w_guard.as_mut() {
-                    None => Err("engine socket closed before response".to_string()),
-                    Some(stream) => {
-                        let _ = stream.set_write_timeout(Some(write_rem));
-                        stream
-                            .write_all(line.as_bytes())
-                            .map_err(|e| format!("socket write failed: {e}"))
-                            .and_then(|_| {
+            match lock_with_deadline(&self.inner.write_half, deadline) {
+                None => Err(format!("RPC {method} timed out before write")),
+                Some(mut w_guard) => {
+                    // H-1: compute remaining write timeout AFTER acquiring write_half so a queued
+                    // writer never exceeds the request deadline.
+                    let write_rem = deadline.saturating_duration_since(Instant::now());
+                    if write_rem.is_zero() {
+                        Err(format!("RPC {method} timed out before write"))
+                    } else {
+                        match w_guard.as_mut() {
+                            None => Err("engine socket closed before response".to_string()),
+                            Some(stream) => {
+                                let _ = stream.set_write_timeout(Some(write_rem));
                                 stream
-                                    .flush()
-                                    .map_err(|e| format!("socket flush failed: {e}"))
-                            })
+                                    .write_all(line.as_bytes())
+                                    .map_err(|e| format!("socket write failed: {e}"))
+                                    .and_then(|_| {
+                                        stream
+                                            .flush()
+                                            .map_err(|e| format!("socket flush failed: {e}"))
+                                    })
+                            }
+                        }
                     }
                 }
             }
@@ -3348,7 +3547,7 @@ impl SocketClient {
             let mut o = self.inner.owner.lock().unwrap_or_else(|p| p.into_inner());
             if o.pending.remove(&id).is_some() && method == "turn/start" {
                 if let Some(ref tid) = thread_id {
-                    o.finish_pending_turn_start(tid, None);
+                    let _ = o.finish_pending_turn_start(tid, None);
                 }
             }
             return Err(err_msg);
@@ -3361,7 +3560,7 @@ impl SocketClient {
                 let mut o = self.inner.owner.lock().unwrap_or_else(|p| p.into_inner());
                 if o.pending.remove(&id).is_some() && method == "turn/start" {
                     if let Some(ref tid) = thread_id {
-                        o.finish_pending_turn_start(tid, None);
+                        let _ = o.finish_pending_turn_start(tid, None);
                     }
                 }
                 Err(format!("RPC {method} timed out waiting for reply"))
@@ -3373,17 +3572,17 @@ impl SocketClient {
     }
 
     pub fn close_and_stop(&self, desktop_reason: &'static str, deadline: Instant) {
-        let published = {
+        let _published = {
             let mut o = self.inner.owner.lock().unwrap_or_else(|p| p.into_inner());
             o.close_to_closed(desktop_reason, &*self.inner.sink)
         };
         self.inner.drain_cv.notify_all();
-        if let Ok(mut wg) = self.inner.write_half.lock() {
+        // H-1: never wait on write_half without a deadline; on expiry proceed to stop_child.
+        let write_lock_deadline = deadline.min(Instant::now() + EXIT_LOCK_WAIT);
+        if let Some(mut wg) = lock_with_deadline(&self.inner.write_half, write_lock_deadline) {
             let _ = wg.take();
         }
-        if published {
-            stop_child(&self.inner.stop_state, deadline);
-        }
+        stop_child(&self.inner.stop_state, deadline);
     }
 
     #[cfg(test)]
@@ -3472,7 +3671,7 @@ fn connect_or_spawn_with_timeouts(
     });
 
     let mut spawned = SpawnedServe {
-        child,
+        child: SharedChild::new(child),
         stdin,
         stderr_buf,
         stderr_done: if stderr_thread.is_some() {
@@ -3612,6 +3811,13 @@ impl DesktopController {
         *self.client.lock().unwrap_or_else(|p| p.into_inner()) = Some(client);
     }
 
+    fn peek_first_starter(&self) -> Option<Instant> {
+        *self
+            .first_starter_at
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     fn record_or_get_first_starter(&self, now: Instant) -> Instant {
         let mut g = self
             .first_starter_at
@@ -3718,17 +3924,18 @@ impl DesktopController {
         Ok(())
     }
 
-    /// Close/exit request decision (`CloseRequested` or `ExitRequested`). Runs bounded L7 `stop_child`
-    /// ONLY on `AllowExit` (outside owner lock on L7 worker thread, never on `Prevent*` / `Coalesce`).
+    /// Close/exit request decision (`CloseRequested` or `ExitRequested` on the Tauri event loop).
+    /// Hands L7 stop work to the worker thread and returns without waiting on `AllowExit` (`M-1`/C1);
+    /// shares one `EXIT_LOCK_WAIT` deadline across `client`, `owner`, and `write_half` (`H-1`).
     pub fn handle_close_or_exit_at(&self, sink: &dyn EventSink, now: Instant) -> CloseDecision {
         if self.exit_started.load(Ordering::Acquire) {
             return CloseDecision::Coalesce;
         }
-        let lock_deadline = now + EXIT_LOCK_WAIT;
+        let lock_deadline = self.peek_first_starter().unwrap_or(now) + EXIT_LOCK_WAIT;
         let client_opt = match lock_with_deadline(&self.client, lock_deadline) {
             Some(g) => g.clone(),
             None => {
-                // Wedged past EXIT_LOCK_WAIT: allow close & stop fallback child within EXIT_BOUND.
+                // Wedged past EXIT_LOCK_WAIT: allow close & hand off fallback stop within EXIT_BOUND.
                 let first_seen = self.record_or_get_first_starter(now);
                 self.shutting_down.store(true, Ordering::Release);
                 self.exit_started.store(true, Ordering::Release);
@@ -3738,7 +3945,7 @@ impl DesktopController {
                     .unwrap_or_else(|p| p.into_inner())
                     .clone()
                 {
-                    stop_child(&fb, first_seen + EXIT_BOUND);
+                    stop_child_async(&fb, first_seen + EXIT_BOUND);
                 }
                 return CloseDecision::AllowExit;
             }
@@ -3754,7 +3961,7 @@ impl DesktopController {
                 .unwrap_or_else(|p| p.into_inner())
                 .clone()
             {
-                stop_child(&fb, first_seen + EXIT_BOUND);
+                stop_child_async(&fb, first_seen + EXIT_BOUND);
             }
             return CloseDecision::AllowExit;
         };
@@ -3766,7 +3973,7 @@ impl DesktopController {
                 self.exit_started.store(true, Ordering::Release);
                 let stop_arc = Arc::clone(&client.inner.stop_state);
                 drop(client);
-                stop_child(&stop_arc, first_seen + EXIT_BOUND);
+                stop_child_async(&stop_arc, first_seen + EXIT_BOUND);
                 return CloseDecision::AllowExit;
             };
             let already_exiting = self.exit_started.load(Ordering::Acquire);
@@ -3781,11 +3988,14 @@ impl DesktopController {
 
         if decision == CloseDecision::AllowExit {
             client.inner.drain_cv.notify_all();
-            if let Ok(mut wg) = client.inner.write_half.lock() {
+            let first_seen = self.record_or_get_first_starter(now);
+            let shared_lock_deadline = first_seen + EXIT_LOCK_WAIT;
+            if let Some(mut wg) =
+                lock_with_deadline(&client.inner.write_half, shared_lock_deadline)
+            {
                 let _ = wg.take();
             }
-            let first_seen = self.record_or_get_first_starter(now);
-            stop_child(&client.inner.stop_state, first_seen + EXIT_BOUND);
+            stop_child_async(&client.inner.stop_state, first_seen + EXIT_BOUND);
         }
         decision
     }
@@ -3841,7 +4051,7 @@ impl DesktopController {
         if self.exit_started.load(Ordering::Acquire) {
             return QuitCommandResult { accepted: false };
         }
-        let lock_deadline = now + EXIT_LOCK_WAIT;
+        let lock_deadline = self.peek_first_starter().unwrap_or(now) + EXIT_LOCK_WAIT;
         let Some(client) = lock_with_deadline(&self.client, lock_deadline).and_then(|g| g.clone())
         else {
             return QuitCommandResult { accepted: false };
@@ -3863,17 +4073,21 @@ impl DesktopController {
         };
         if accepted {
             client.inner.drain_cv.notify_all();
-            if let Ok(mut wg) = client.inner.write_half.lock() {
+            let first_seen = self.record_or_get_first_starter(now);
+            let shared_lock_deadline = first_seen + EXIT_LOCK_WAIT;
+            if let Some(mut wg) =
+                lock_with_deadline(&client.inner.write_half, shared_lock_deadline)
+            {
                 let _ = wg.take();
             }
-            let first_seen = self.record_or_get_first_starter(now);
             stop_child(&client.inner.stop_state, first_seen + EXIT_BOUND);
         }
         QuitCommandResult { accepted }
     }
 
     /// `RunEvent::Exit`: NEVER dropped (`AM2 §6`, `L13`). Shares one `EXIT_LOCK_WAIT` (2 s) across
-    /// request/client/owner locks; falls back to `stop_fallback` if wedged; never extends `EXIT_BOUND` (9 s).
+    /// `client`, `owner`, and `write_half` (`H-1`); falls back to `stop_fallback` if wedged; never
+    /// extends `EXIT_BOUND` (9 s).
     pub fn handle_run_event_exit(&self, sink: &dyn EventSink, now: Instant) {
         let first_seen = self.record_or_get_first_starter(now);
         let lock_deadline = first_seen + EXIT_LOCK_WAIT;
@@ -3900,7 +4114,7 @@ impl DesktopController {
                 }
             }
             client.inner.drain_cv.notify_all();
-            if let Ok(mut wg) = client.inner.write_half.lock() {
+            if let Some(mut wg) = lock_with_deadline(&client.inner.write_half, lock_deadline) {
                 let _ = wg.take();
             }
         } else {
@@ -4451,7 +4665,7 @@ mod tests {
         });
         let _ = child.wait();
         let mut spawned = SpawnedServe {
-            child,
+            child: SharedChild::new(child),
             stdin,
             stderr_buf,
             stderr_done: Some(done_rx),
@@ -4714,7 +4928,7 @@ mod tests {
                 .expect("spawn clean-after-eof child");
             let stdin = child.stdin.take();
             let mut spawned = SpawnedServe {
-                child,
+                child: SharedChild::new(child),
                 stdin,
                 stderr_buf: Arc::new(Mutex::new(String::new())),
                 stderr_done: None,
@@ -4747,7 +4961,7 @@ mod tests {
                 .expect("spawn stuck-after-eof child");
             let stdin = child.stdin.take();
             let mut spawned = SpawnedServe {
-                child,
+                child: SharedChild::new(child),
                 stdin,
                 stderr_buf: Arc::new(Mutex::new(String::new())),
                 stderr_done: None,
@@ -4844,7 +5058,7 @@ mod tests {
         }
 
         let mut spawned = SpawnedServe {
-            child,
+            child: SharedChild::new(child),
             stdin,
             stderr_buf: Arc::new(Mutex::new(String::new())),
             stderr_done: None,
@@ -4884,7 +5098,7 @@ mod tests {
 
         let stdin = child.stdin.take();
         let mut spawned = SpawnedServe {
-            child,
+            child: SharedChild::new(child),
             stdin,
             stderr_buf: Arc::new(Mutex::new(String::new())),
             stderr_done: None,
@@ -4909,26 +5123,32 @@ mod tests {
 
     #[test]
     fn bounded_line_reader_enforces_8_mib_cap_and_handles_64_mib_unterminated_s2_4() {
+        // M-6 (R2): pin literal 8_388_608 (8 MiB) accept and 8_388_609 Oversize so raising MAX_LINE_BYTES fails.
+        assert_eq!(MAX_LINE_BYTES, 8_388_608);
+
         // Exact 8_388_608 bytes + \n passes.
-        let mut exact = vec![b'a'; MAX_LINE_BYTES];
+        let mut exact = vec![b'a'; 8_388_608];
         exact.push(b'\n');
         let mut r_exact = BufReader::new(std::io::Cursor::new(exact));
         let mut buf = Vec::new();
         match read_bounded_line(&mut r_exact, &mut buf) {
-            BoundedLine::Line(s) => assert_eq!(s.len(), MAX_LINE_BYTES),
-            other => panic!("expected Line for exact 8 MiB, got {other:?}"),
+            BoundedLine::Line(s) => assert_eq!(s.len(), 8_388_608),
+            other => panic!("expected Line for exact 8_388_608 bytes, got {other:?}"),
         }
-        assert!(buf.capacity() <= MAX_LINE_BYTES + 1);
+        assert!(buf.capacity() <= 8_388_608 + 1);
 
         // 8_388_609 bytes + \n fails immediately as Oversize.
-        let mut over = vec![b'b'; MAX_LINE_BYTES + 1];
+        let mut over = vec![b'b'; 8_388_609];
         over.push(b'\n');
         let mut r_over = BufReader::new(std::io::Cursor::new(over));
         buf.clear();
-        assert_eq!(read_bounded_line(&mut r_over, &mut buf), BoundedLine::Oversize);
-        assert!(buf.capacity() <= MAX_LINE_BYTES + 1);
+        assert_eq!(
+            read_bounded_line(&mut r_over, &mut buf),
+            BoundedLine::Oversize
+        );
+        assert!(buf.capacity() <= 8_388_608 + 1);
 
-        // Unterminated 64 MiB stream stops near MAX_LINE_BYTES + 1 without reading the rest.
+        // Unterminated 64 MiB stream stops near 8_388_609 without reading the rest.
         struct HugeZeroReader {
             remaining: usize,
             total_read: usize,
@@ -4958,12 +5178,12 @@ mod tests {
             BoundedLine::Oversize
         );
         assert!(
-            br.get_ref().total_read <= MAX_LINE_BYTES + 1 + 8192,
+            br.get_ref().total_read <= 8_388_609 + 8192,
             "reader consumed too much: {}",
             br.get_ref().total_read
         );
         assert!(
-            fresh_buf.capacity() <= MAX_LINE_BYTES + 1,
+            fresh_buf.capacity() <= 8_388_609,
             "buffer capacity exceeded bound: {}",
             fresh_buf.capacity()
         );
@@ -5551,7 +5771,7 @@ mod tests {
                                 "turn/started",
                                 &json!({"turn":{"id":tid,"threadId":"thr_1","status":"inProgress","items":[],"error":null,"startedAt":1,"completedAt":null}}),
                             );
-                            o.finish_pending_turn_start("thr_1", Some(&tid));
+                            let _ = o.finish_pending_turn_start("thr_1", Some(&tid));
                         }
                     }
                     6 => {
@@ -5800,31 +6020,51 @@ mod tests {
         drop(hold_tx);
         let _ = std::fs::remove_file(&tmp);
 
-        // Inline spawn_fail fallback stops/kills child cleanly
-        let child = Command::new("/bin/sh").arg("-c").arg("exec sleep 30").stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().unwrap();
+        // Real spawn-failure fallback stops/kills child cleanly within caller's deadline
+        let child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
         let child_pid = child.id();
+        let shared = SharedChild::new(child);
         let spawned = SpawnedServe {
-            child,
+            child: shared.clone(),
             stdin: None,
             stderr_buf: Arc::new(Mutex::new(String::new())),
             stderr_done: None,
             stderr_thread: None,
             initialized: true,
         };
+        let fail_spawner: StopWorkerSpawner = Arc::new(|_| {
+            Err(std::io::Error::new(
+                ErrorKind::WouldBlock,
+                "injected spawn failure",
+            ))
+        });
         let stop_arc = Arc::new(Mutex::new(StopState {
             cancel_stream: None,
             spawned: Some(spawned),
             in_flight: None,
             reader_done: Arc::new(AtomicBool::new(true)),
             hooks: Some(Arc::new(TestStopHooks {
-                delay_l7: None,
-                force_spawn_fail: true,
-                on_l7_thread: None,
+                spawner: Some(fail_spawner),
+                ..Default::default()
             })),
         }));
-        stop_child(&stop_arc, Instant::now() + Duration::from_millis(150));
+        let t_sf0 = Instant::now();
+        stop_child(&stop_arc, t_sf0 + Duration::from_millis(150));
+        let sf_elapsed = t_sf0.elapsed();
+        assert!(
+            sf_elapsed < Duration::from_secs(2),
+            "real spawn-failure inline fallback must honor short caller deadline, got {sf_elapsed:?}"
+        );
+        assert!(shared.is_reaped(), "spawn_fail inline fallback must reap child");
+        assert_eq!(shared.kill_count(), 1, "must issue exactly one kill through SharedChild");
         unsafe {
-            // Either already reaped (ESRCH) or dead shortly
             let rc = libc::kill(child_pid as libc::pid_t, 0);
             assert!(rc != 0, "spawn_fail inline fallback must kill child");
         }
@@ -5945,6 +6185,7 @@ mod tests {
         std::fs::create_dir_all(&home2).unwrap();
         let sock2 = home2.join("engine.sock");
         let l2 = UnixListener::bind(&sock2).unwrap();
+        let (p2_done_tx, p2_done_rx) = mpsc::sync_channel::<()>(1);
         let p2 = thread::spawn(move || {
             let (s, _) = l2.accept().unwrap();
             let mut w = s.try_clone().unwrap();
@@ -5954,7 +6195,7 @@ mod tests {
             let v: Value = serde_json::from_str(&req).unwrap();
             writeln!(w, "{}", json!({"id":v["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
             let _ = w.flush();
-            thread::sleep(Duration::from_millis(250));
+            let _ = p2_done_rx.recv_timeout(Duration::from_secs(5));
         });
         let cfg2 = LaunchConfig {
             home: home2.clone(),
@@ -5967,6 +6208,7 @@ mod tests {
         assert!(info2.connection_epoch > ep1);
         assert!(ctrl2.client.lock().unwrap().as_ref().unwrap().is_open());
         let _ = ctrl2.disconnect_engine_blocking();
+        let _ = p2_done_tx.send(());
         p2.join().unwrap();
         peer.join().unwrap();
         let _ = std::fs::remove_dir_all(&home2);
@@ -5981,6 +6223,7 @@ mod tests {
         let _ = std::fs::remove_file(&tmp);
         let listener = UnixListener::bind(&tmp).unwrap();
         let (hold_req2_tx, hold_req2_rx) = mpsc::sync_channel::<()>(1);
+        let (peer_done_tx, peer_done_rx) = mpsc::sync_channel::<()>(1);
         let peer = thread::spawn(move || {
             let (s, _) = listener.accept().unwrap();
             let mut w = s.try_clone().unwrap();
@@ -6012,7 +6255,8 @@ mod tests {
             let _ = writeln!(w, "{}", json!({"id":v3["id"],"result":{"turn":{"id":"turn_late","threadId":"thr_1","status":"inProgress","items":[],"error":null,"startedAt":20,"completedAt":null}}}));
             let _ = writeln!(w, "{}", json!({"method":"turn/started","params":{"turn":{"id":"turn_late","threadId":"thr_1","status":"inProgress","items":[],"error":null,"startedAt":20,"completedAt":null}}}));
             let _ = w.flush();
-            thread::sleep(Duration::from_millis(120));
+            // H-3: keep peer socket open until the test explicitly signals completion (no EOF race).
+            let _ = peer_done_rx.recv_timeout(Duration::from_secs(10));
         });
 
         let sink = Arc::new(TestSink::default());
@@ -6085,7 +6329,8 @@ mod tests {
             o.pending_starts_total += 1;
             o.observe_turn_notification("turn/completed", &json!({"turn":{"id":"turn_fast","threadId":"thr_buf","status":"completed","items":[],"error":null,"startedAt":1,"completedAt":2}}));
             assert_eq!(o.guard_count(), 1);
-            o.finish_pending_turn_start("thr_buf", Some("turn_fast"));
+            o.finish_pending_turn_start("thr_buf", Some("turn_fast"))
+                .expect("fresh turn_fast admitted");
             assert_eq!(o.guard_count(), 0, "buffered turn/completed must reconcile guard to 0 upon admission");
         }
 
@@ -6103,7 +6348,7 @@ mod tests {
             let b1 = Arc::clone(&barrier);
             let t1 = thread::spawn(move || {
                 b1.wait();
-                o1.lock().unwrap().finish_pending_turn_start("thr_r", Some("turn_r"));
+                let _ = o1.lock().unwrap().finish_pending_turn_start("thr_r", Some("turn_r"));
             });
             let o2 = Arc::clone(&o_arc);
             let b2 = Arc::clone(&barrier);
@@ -6122,6 +6367,7 @@ mod tests {
         }
 
         let _ = ctrl.disconnect_engine_blocking();
+        let _ = peer_done_tx.send(());
         peer.join().unwrap();
         let _ = std::fs::remove_file(&tmp);
     }
@@ -6247,32 +6493,8 @@ mod tests {
             "must check exit_started before guard"
         );
 
-        // 2. Wedge test: holding BOTH client & owner lock > 2 s -> child killed within EXIT_BOUND (shared 2s wait)
-        let child = Command::new("/bin/sh")
-            .arg("-c")
-            .arg("trap '' TERM; cat >/dev/null; exec sleep 40")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let mut spawned = SpawnedServe {
-            child,
-            stdin: None,
-            stderr_buf: Arc::new(Mutex::new(String::new())),
-            stderr_done: None,
-            stderr_thread: None,
-            initialized: true,
-        };
-        // Short grace child? Wait: real EXIT_BOUND = 9 s, child ignores stdin EOF so kill hits at 9 s!
-        // Use a child that exits quickly on stdin EOF first for rapid Allow->Exit & confirm_quit tests,
-        // and test wedged lock here with an exit-on-EOF child taking 2.5s lock hold -> exits at ~2.0s!
-        drop(spawned.stdin.take());
-        let _ = spawned.child.kill();
-        let _ = spawned.child.wait();
-
-        // Real stdin-closing child that ignores stdin? Wait: let's spawn cat-sleep child cleanly with piped stdin:
+        // 2. Wedge test: holding client lock > 2 s -> Exit expires EXIT_LOCK_WAIT at 2 s and stops
+        //    the EOF-ignoring child via stop_fallback within EXIT_BOUND (2 s wait + 7 s grace = 9 s).
         let mut c_wedge = Command::new("/bin/sh")
             .arg("-c")
             .arg("cat; exec sleep 40")
@@ -6287,7 +6509,7 @@ mod tests {
         let stop_wedge = Arc::new(Mutex::new(StopState {
             cancel_stream: None,
             spawned: Some(SpawnedServe {
-                child: c_wedge,
+                child: SharedChild::new(c_wedge),
                 stdin: wedge_stdin,
                 stderr_buf: Arc::new(Mutex::new(String::new())),
                 stderr_done: None,
@@ -6325,7 +6547,7 @@ mod tests {
         assert!(ctrl_w.exit_started.load(Ordering::Acquire));
 
         // 3. Stalled L7 test: L7 runs on worker thread (distinct ThreadId), owner remains unlocked during L7,
-        //    and stalled L7 past EXIT_BOUND kills child at deadline.
+        //    and stalled L7 past EXIT_BOUND kills child via SharedChild at deadline.
         let main_tid = thread::current().id();
         let l7_tid_rec: Arc<Mutex<Option<thread::ThreadId>>> = Arc::new(Mutex::new(None));
         let l7_tid_c = Arc::clone(&l7_tid_rec);
@@ -6342,10 +6564,11 @@ mod tests {
             .unwrap();
         let stall_pid = c_stall.id();
         let stall_stdin = c_stall.stdin.take();
+        let stall_shared = SharedChild::new(c_stall);
         let stop_stall = Arc::new(Mutex::new(StopState {
             cancel_stream: None,
             spawned: Some(SpawnedServe {
-                child: c_stall,
+                child: stall_shared.clone(),
                 stdin: stall_stdin,
                 stderr_buf: Arc::new(Mutex::new(String::new())),
                 stderr_done: None,
@@ -6356,21 +6579,21 @@ mod tests {
             reader_done: Arc::new(AtomicBool::new(true)),
             hooks: Some(Arc::new(TestStopHooks {
                 delay_l7: Some(Duration::from_secs(12)), // exceeds EXIT_BOUND
-                force_spawn_fail: false,
                 on_l7_thread: Some(Arc::new(move |tid| {
                     *l7_tid_c.lock().unwrap() = Some(tid);
                 })),
+                ..Default::default()
             })),
         }));
         let ctrl_s = DesktopController::new();
         *ctrl_s.stop_fallback.lock().unwrap() = Some(Arc::clone(&stop_stall));
         let t_s0 = Instant::now();
-        // Verify owner is NOT locked while stop_child runs (try_lock succeeds from main or concurrent thread)
         assert!(owner_check.try_lock().is_ok());
         ctrl_s.handle_run_event_exit(&*sink, t_s0 - Duration::from_secs(7)); // only 2s left in 9s bound
         let elapsed_s = t_s0.elapsed();
         assert!(elapsed_s >= Duration::from_millis(1800) && elapsed_s <= Duration::from_millis(2900), "got {elapsed_s:?}");
         assert_ne!(*l7_tid_rec.lock().unwrap(), Some(main_tid), "T-L13: L7 must NOT run on CloseRequested/event-loop thread");
+        assert_eq!(stall_shared.kill_count(), 1, "stalled L7 expiry must kill exactly once through SharedChild");
         unsafe {
             let mut st: libc::c_int = 0;
             let deadline_reap = Instant::now() + Duration::from_millis(250);
@@ -6385,13 +6608,14 @@ mod tests {
             }
             assert!(dead, "stalled L7 expiry must SIGKILL child");
         }
-        let _ = pid;
 
-        // 4. Spawn-fail inline fallback kills child on Allow, confirm_quit, and Exit; Allow->Exit & confirm_quit->Exit emit 1 terminal
+        // 4. Allow -> Exit and confirm_quit -> Exit coalesce and emit exactly 1 terminal
         let tmp = std::env::temp_dir().join(format!("madc-tl13-allow-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let l = UnixListener::bind(&tmp).unwrap();
+        let (p_done_tx, p_done_rx) = mpsc::sync_channel::<()>(1);
         let p = thread::spawn(move || {
+            let mut held = Vec::new();
             for _ in 0..2 {
                 let (s, _) = l.accept().unwrap();
                 let mut w = s.try_clone().unwrap();
@@ -6401,8 +6625,9 @@ mod tests {
                 let v: Value = serde_json::from_str(&req).unwrap();
                 writeln!(w, "{}", json!({"id":v["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
                 w.flush().unwrap();
-                thread::sleep(Duration::from_millis(200));
+                held.push((r, w));
             }
+            let _ = p_done_rx.recv_timeout(Duration::from_secs(5));
         });
 
         // Allow -> Exit
@@ -6436,7 +6661,1103 @@ mod tests {
         assert_eq!(terms_q.len(), 1);
         assert_eq!(terms_q[0].1["params"]["reason"], "exit");
 
+        let _ = p_done_tx.send(());
         p.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exit_paths_bound_write_half_under_40_blocked_writers_h1() {
+        // Helper: run one exit path (`exit`, `allow`, or `confirm_quit`) against a peer that
+        // never reads after `initialize`, with 40 concurrent 60 KB `turn/start` writers saturating
+        // the Unix socket send buffer and holding `write_half`.
+        fn run_blocked_writers_scenario(mode: &'static str) {
+            let tmp = std::env::temp_dir().join(format!(
+                "madc-h1-{mode}-{}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&tmp);
+            let listener = UnixListener::bind(&tmp).unwrap();
+            let (peer_done_tx, peer_done_rx) = mpsc::sync_channel::<()>(1);
+            let peer = thread::spawn(move || {
+                let (s, _) = listener.accept().unwrap();
+                let mut w = s.try_clone().unwrap();
+                let mut r = BufReader::new(s);
+                let mut buf = Vec::new();
+                let BoundedLine::Line(req) = read_bounded_line(&mut r, &mut buf) else {
+                    panic!("expected initialize");
+                };
+                let v: Value = serde_json::from_str(&req).unwrap();
+                writeln!(
+                    w,
+                    "{}",
+                    json!({
+                        "id": v["id"],
+                        "result": {
+                            "protocolVersion": "madc-m1/1",
+                            "serverInfo": { "name": "madc-engine", "version": "0.0.0" }
+                        }
+                    })
+                )
+                .unwrap();
+                w.flush().unwrap();
+                // NEVER read another byte from `r` until test finishes!
+                let _ = peer_done_rx.recv_timeout(Duration::from_secs(20));
+                drop((r, w));
+            });
+
+            let mut child = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("cat >/dev/null; exit 0")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let child_stdin = child.stdin.take();
+            let shared = SharedChild::new(child);
+            let spawned = SpawnedServe {
+                child: shared.clone(),
+                stdin: child_stdin,
+                stderr_buf: Arc::new(Mutex::new(String::new())),
+                stderr_done: None,
+                stderr_thread: None,
+                initialized: true,
+            };
+
+            let sink = Arc::new(TestSink::default());
+            let client = SocketClient::connect_existing_with_sink_and_hooks(
+                tmp.to_str().unwrap(),
+                Arc::clone(&sink) as Arc<dyn EventSink>,
+                Some(spawned),
+                None,
+            )
+            .expect("connect");
+            let ctrl = Arc::new(DesktopController::new());
+            ctrl.set_client_for_test(client.clone());
+
+            let big_text = "x".repeat(60 * 1024);
+            let mut writers = Vec::with_capacity(40);
+            for _ in 0..40 {
+                let c = client.clone();
+                let txt = big_text.clone();
+                writers.push(thread::spawn(move || {
+                    let _ = c.request(
+                        "turn/start",
+                        json!({
+                            "threadId": "thr_h1",
+                            "input": [{ "type": "text", "text": txt }]
+                        }),
+                    );
+                }));
+            }
+
+            // Wait deterministically until a writer is holding `write_half` inside `write_all`.
+            let wait_lock = Instant::now() + Duration::from_secs(3);
+            let mut contended = false;
+            while Instant::now() < wait_lock {
+                if client.inner.write_half.try_lock().is_err() {
+                    contended = true;
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                contended,
+                "H-1 ({mode}): expected >= 1 of 40 60 KB writers to block holding write_half"
+            );
+
+            // Also verify a queued writer with a short deadline (250 ms) never exceeds its
+            // deadline waiting for write_half or writing (H-1 post-lock write timeout).
+            if mode == "exit" {
+                let t_q = Instant::now();
+                let q_err = client
+                    .request_with_deadline(
+                        "room/inspect",
+                        json!({}),
+                        t_q + Duration::from_millis(250),
+                    )
+                    .unwrap_err();
+                let q_elapsed = t_q.elapsed();
+                assert!(q_err.contains("timed out"), "unexpected queued err: {q_err}");
+                assert!(
+                    q_elapsed < Duration::from_millis(1200),
+                    "H-1 queued writer exceeded its 250ms deadline: {q_elapsed:?}"
+                );
+            }
+
+            let t0 = Instant::now();
+            match mode {
+                "exit" => {
+                    ctrl.handle_run_event_exit(&*sink, t0);
+                }
+                "allow" => {
+                    // Mark fallback live so `handle_close_or_exit_at` takes the real AllowExit
+                    // branch even with 40 pending `turn/start` writers on `write_half`.
+                    client.inner.owner.lock().unwrap().quit_fallback_set_at = Some(t0);
+                    assert_eq!(
+                        ctrl.handle_close_or_exit_at(&*sink, t0),
+                        CloseDecision::AllowExit
+                    );
+                }
+                "confirm_quit" => {
+                    let CloseDecision::PreventQuitRequested { epoch, request_id } =
+                        ctrl.handle_close_or_exit_at(&*sink, t0)
+                    else {
+                        panic!("expected PreventQuitRequested with 40 pending turn/start writers");
+                    };
+                    let res = ctrl.confirm_quit_at(epoch, request_id, &*sink, t0);
+                    assert!(res.accepted, "confirm_quit must be accepted");
+                }
+                _ => unreachable!(),
+            }
+            let call_elapsed = t0.elapsed();
+            assert!(
+                call_elapsed <= EXIT_BOUND + Duration::from_millis(500),
+                "H-1 ({mode}): exit path exceeded EXIT_BOUND ({EXIT_BOUND:?}): {call_elapsed:?}"
+            );
+
+            // Wait (within EXIT_BOUND + 500ms from t0) for both child reap and reader wake.
+            let done_by = t0 + EXIT_BOUND + Duration::from_millis(500);
+            while Instant::now() < done_by && (!shared.is_reaped() || !client.reader_done()) {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                shared.is_reaped(),
+                "H-1 ({mode}): child must be stopped/reaped within EXIT_BOUND"
+            );
+            assert!(
+                client.reader_done(),
+                "H-1 ({mode}): reader/socket must be stopped within EXIT_BOUND"
+            );
+
+            let _ = peer_done_tx.send(());
+            for w in writers {
+                let _ = w.join();
+            }
+            peer.join().unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        // Run all 3 paths concurrently so wall-clock time stays ~2.3 s.
+        let h_exit = thread::spawn(|| run_blocked_writers_scenario("exit"));
+        let h_allow = thread::spawn(|| run_blocked_writers_scenario("allow"));
+        let h_confirm = thread::spawn(|| run_blocked_writers_scenario("confirm_quit"));
+        h_exit.join().unwrap();
+        h_allow.join().unwrap();
+        h_confirm.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_spawn_failure_fallback_covers_all_callers_and_respects_deadline_h2() {
+        fn run_spawn_fail_caller(caller: &'static str) {
+            let tmp = std::env::temp_dir().join(format!(
+                "madc-h2-{caller}-{}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&tmp);
+            let listener = UnixListener::bind(&tmp).unwrap();
+            let (peer_done_tx, peer_done_rx) = mpsc::sync_channel::<()>(1);
+            let peer = thread::spawn(move || {
+                let (s, _) = listener.accept().unwrap();
+                let mut w = s.try_clone().unwrap();
+                let mut r = BufReader::new(s);
+                let mut buf = Vec::new();
+                let BoundedLine::Line(req) = read_bounded_line(&mut r, &mut buf) else {
+                    panic!();
+                };
+                let v: Value = serde_json::from_str(&req).unwrap();
+                writeln!(
+                    w,
+                    "{}",
+                    json!({
+                        "id": v["id"],
+                        "result": {
+                            "protocolVersion": "madc-m1/1",
+                            "serverInfo": { "name": "madc-engine", "version": "0.0.0" }
+                        }
+                    })
+                )
+                .unwrap();
+                w.flush().unwrap();
+                let _ = peer_done_rx.recv_timeout(Duration::from_secs(10));
+            });
+
+            // EOF-ignoring child: if fallback ignored caller's deadline and used 7 s grace, this
+            // test would take >= 7 s and fail the deadline assertion.
+            let mut child = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("cat >/dev/null; exec sleep 40")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let child_pid = child.id();
+            let child_stdin = child.stdin.take();
+            let shared = SharedChild::new(child);
+            let spawned = SpawnedServe {
+                child: shared.clone(),
+                stdin: child_stdin,
+                stderr_buf: Arc::new(Mutex::new(String::new())),
+                stderr_done: None,
+                stderr_thread: None,
+                initialized: true,
+            };
+
+            let fallback_ran = Arc::new(AtomicBool::new(false));
+            let locks_free_in_fallback = Arc::new(AtomicBool::new(false));
+            let stop_arc_holder: Arc<Mutex<Option<Arc<Mutex<StopState>>>>> =
+                Arc::new(Mutex::new(None));
+            let owner_arc_holder: Arc<Mutex<Option<Arc<Mutex<ClientOwner>>>>> =
+                Arc::new(Mutex::new(None));
+
+            let fallback_ran_c = Arc::clone(&fallback_ran);
+            let locks_free_c = Arc::clone(&locks_free_in_fallback);
+            let stop_h = Arc::clone(&stop_arc_holder);
+            let owner_h = Arc::clone(&owner_arc_holder);
+            let fail_spawner: StopWorkerSpawner = Arc::new(|_| {
+                Err(std::io::Error::new(
+                    ErrorKind::WouldBlock,
+                    "injected OS thread spawn failure",
+                ))
+            });
+            let caller_tid = thread::current().id();
+            let ran_on_caller = Arc::new(AtomicBool::new(false));
+            let ran_on_caller_c = Arc::clone(&ran_on_caller);
+
+            let hooks = Arc::new(TestStopHooks {
+                spawner: Some(fail_spawner),
+                on_l7_thread: Some(Arc::new(move |tid| {
+                    if tid == caller_tid {
+                        ran_on_caller_c.store(true, Ordering::Release);
+                    }
+                })),
+                on_inline_fallback: Some(Arc::new(move || {
+                    fallback_ran_c.store(true, Ordering::Release);
+                    let dl = Instant::now() + Duration::from_millis(50);
+                    let stop_ok = stop_h
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|s| lock_with_deadline(s, dl).is_some());
+                    let owner_ok = owner_h
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|o| lock_with_deadline(o, dl).is_some());
+                    if stop_ok && owner_ok {
+                        locks_free_c.store(true, Ordering::Release);
+                    }
+                })),
+                ..Default::default()
+            });
+
+            let sink = Arc::new(TestSink::default());
+            let client = SocketClient::connect_existing_with_sink_and_hooks(
+                tmp.to_str().unwrap(),
+                Arc::clone(&sink) as Arc<dyn EventSink>,
+                Some(spawned),
+                Some(hooks),
+            )
+            .expect("connect");
+            *stop_arc_holder.lock().unwrap() = Some(Arc::clone(&client.inner.stop_state));
+            *owner_arc_holder.lock().unwrap() = Some(Arc::clone(&client.inner.owner));
+
+            let ctrl = DesktopController::new();
+            ctrl.set_client_for_test(client.clone());
+
+            // Use a short remaining deadline (~350 ms) so fixed 7 s grace fails immediately.
+            let t0 = Instant::now();
+            match caller {
+                "allow_only" => {
+                    let dec = ctrl
+                        .handle_close_or_exit_at(&*sink, t0 - (EXIT_BOUND - Duration::from_millis(350)));
+                    assert_eq!(dec, CloseDecision::AllowExit);
+                }
+                "confirm_quit_only" => {
+                    client
+                        .inner
+                        .owner
+                        .lock()
+                        .unwrap()
+                        .in_flight_turn_ids
+                        .insert("turn_h2".into(), "thr_h2".into());
+                    let req_now = t0 - (EXIT_BOUND - Duration::from_millis(350));
+                    let CloseDecision::PreventQuitRequested { epoch, request_id } =
+                        ctrl.handle_close_or_exit_at(&*sink, req_now)
+                    else {
+                        panic!("expected PreventQuitRequested");
+                    };
+                    assert!(ctrl.confirm_quit_at(epoch, request_id, &*sink, req_now).accepted);
+                }
+                "disconnect_engine" => {
+                    client.close_and_stop("disconnect", t0 + Duration::from_millis(350));
+                }
+                "exit" => {
+                    ctrl.handle_run_event_exit(&*sink, t0 - (EXIT_BOUND - Duration::from_millis(350)));
+                }
+                _ => unreachable!(),
+            }
+            let elapsed = t0.elapsed();
+
+            assert!(
+                fallback_ran.load(Ordering::Acquire),
+                "H-2 ({caller}): real Err spawn-failure branch must execute"
+            );
+            assert!(
+                ran_on_caller.load(Ordering::Acquire),
+                "H-2 ({caller}): fallback must run inline on caller's thread"
+            );
+            assert!(
+                locks_free_in_fallback.load(Ordering::Acquire),
+                "H-2 ({caller}): stop_state and owner locks must NOT be held during inline fallback"
+            );
+            assert!(
+                elapsed < Duration::from_secs(2),
+                "H-2 ({caller}): must honor caller's 350ms deadline (not fixed 7 s grace), got {elapsed:?}"
+            );
+            assert!(
+                shared.is_reaped(),
+                "H-2 ({caller}): child must be killed and reaped"
+            );
+            assert_eq!(
+                shared.kill_count(),
+                1,
+                "H-2 ({caller}): kill must be issued exactly once"
+            );
+            // Calling kill_once again after reap must be a no-op (no signal after reap).
+            assert!(!shared.kill_once(), "H-2 ({caller}): must never signal after reap");
+            assert_eq!(shared.kill_count(), 1);
+            unsafe {
+                assert_ne!(
+                    libc::kill(child_pid as libc::pid_t, 0),
+                    0,
+                    "H-2 ({caller}): child pid must be dead"
+                );
+            }
+
+            let wait_reader = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < wait_reader && !client.reader_done() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            assert!(
+                client.reader_done(),
+                "H-2 ({caller}): shutdown(Shutdown::Both) must wake blocked reader"
+            );
+
+            let _ = peer_done_tx.send(());
+            peer.join().unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        }
+
+        for caller in ["allow_only", "confirm_quit_only", "disconnect_engine", "exit"] {
+            run_spawn_fail_caller(caller);
+        }
+
+        // Already-exited child must NOT receive SIGKILL in spawn-failure fallback.
+        let mut quick = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let quick_stdin = quick.stdin.take();
+        let quick_shared = SharedChild::new(quick);
+        // Wait until process exits and is reaped BEFORE fallback runs.
+        assert!(quick_shared.reap_bounded(Duration::from_secs(2)).is_some());
+        let fail_spawner: StopWorkerSpawner = Arc::new(|_| {
+            Err(std::io::Error::new(ErrorKind::WouldBlock, "spawn fail"))
+        });
+        let stop_arc = Arc::new(Mutex::new(StopState {
+            cancel_stream: None,
+            spawned: Some(SpawnedServe {
+                child: quick_shared.clone(),
+                stdin: quick_stdin,
+                stderr_buf: Arc::new(Mutex::new(String::new())),
+                stderr_done: None,
+                stderr_thread: None,
+                initialized: true,
+            }),
+            in_flight: None,
+            reader_done: Arc::new(AtomicBool::new(true)),
+            hooks: Some(Arc::new(TestStopHooks {
+                spawner: Some(fail_spawner),
+                ..Default::default()
+            })),
+        }));
+        stop_child(&stop_arc, Instant::now() + Duration::from_millis(100));
+        assert_eq!(
+            quick_shared.kill_count(),
+            0,
+            "H-2: already-reaped child must NEVER be signalled"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn allow_starter_hands_off_without_blocking_event_loop_m1() {
+        let tmp = std::env::temp_dir().join(format!("madc-m1-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let listener = UnixListener::bind(&tmp).unwrap();
+        let (peer_done_tx, peer_done_rx) = mpsc::sync_channel::<()>(1);
+        let peer = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            let mut r = BufReader::new(s);
+            let mut buf = Vec::new();
+            let BoundedLine::Line(req) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+            let v: Value = serde_json::from_str(&req).unwrap();
+            writeln!(w, "{}", json!({"id":v["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
+            w.flush().unwrap();
+            let _ = peer_done_rx.recv_timeout(Duration::from_secs(10));
+        });
+
+        let mut child = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat >/dev/null; exit 0")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let child_stdin = child.stdin.take();
+        let shared = SharedChild::new(child);
+        let spawned = SpawnedServe {
+            child: shared.clone(),
+            stdin: child_stdin,
+            stderr_buf: Arc::new(Mutex::new(String::new())),
+            stderr_done: None,
+            stderr_thread: None,
+            initialized: true,
+        };
+        let hooks = Arc::new(TestStopHooks {
+            delay_l7: Some(Duration::from_millis(1200)),
+            ..Default::default()
+        });
+        let sink = Arc::new(TestSink::default());
+        let client = SocketClient::connect_existing_with_sink_and_hooks(
+            tmp.to_str().unwrap(),
+            Arc::clone(&sink) as Arc<dyn EventSink>,
+            Some(spawned),
+            Some(hooks),
+        )
+        .unwrap();
+        let ctrl = DesktopController::new();
+        ctrl.set_client_for_test(client.clone());
+
+        let t0 = Instant::now();
+        let dec = ctrl.handle_close_or_exit_at(&*sink, t0);
+        let elapsed = t0.elapsed();
+        assert_eq!(dec, CloseDecision::AllowExit);
+        assert!(
+            elapsed < Duration::from_millis(350),
+            "M-1: allow starter on event loop must hand off without waiting for stalled L7 worker (1200ms), got {elapsed:?}"
+        );
+
+        // Background L7 worker still finishes stopping the child and waking reader.
+        let wait_by = Instant::now() + Duration::from_secs(4);
+        while Instant::now() < wait_by && (!shared.is_reaped() || !client.reader_done()) {
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(shared.is_reaped(), "M-1: background L7 worker must finish stopping child");
+        assert!(client.reader_done(), "M-1: background L7 worker must wake reader");
+
+        let _ = peer_done_tx.send(());
+        peer.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn buffered_turn_events_bounded_cleared_and_duplicate_turn_id_f2_m2() {
+        // 1. Bound: MAX_BUFFERED_TURN_EVENTS_PER_START (16) distinct (turn_id, kind) entries,
+        //    deduplicated, dropping newest + counting drops on overflow.
+        assert_eq!(MAX_BUFFERED_TURN_EVENTS_PER_START, 16);
+        let mut o = ClientOwner::new(1);
+        o.phase = LifecyclePhase::Open;
+        *o.pending_starts.entry("thr_b".to_string()).or_insert(0) += 1;
+        o.pending_starts_total += 1;
+        for i in 0..25 {
+            o.observe_turn_notification(
+                "turn/started",
+                &json!({"turn":{"id":format!("t_{i}"),"threadId":"thr_b","status":"inProgress","items":[],"error":null,"startedAt":1,"completedAt":null}}),
+            );
+        }
+        // Duplicate of an already-buffered entry must not count as overflow drop or duplicate.
+        o.observe_turn_notification(
+            "turn/started",
+            &json!({"turn":{"id":"t_0","threadId":"thr_b","status":"inProgress","items":[],"error":null,"startedAt":1,"completedAt":null}}),
+        );
+        let buf = o.buffered_turn_events.get("thr_b").unwrap();
+        assert_eq!(buf.len(), MAX_BUFFERED_TURN_EVENTS_PER_START);
+        assert_eq!(buf[0], ("t_0".to_string(), "started"));
+        assert_eq!(buf[15], ("t_15".to_string(), "started"));
+        assert_eq!(o.dropped_buffered_turn_events, 9);
+
+        // Clear on refusal/error/admission/leaving Open.
+        assert!(o.finish_pending_turn_start("thr_b", None).is_ok());
+        assert!(o.buffered_turn_events.is_empty());
+
+        *o.pending_starts.entry("thr_b".to_string()).or_insert(0) += 1;
+        o.pending_starts_total += 1;
+        o.observe_turn_notification(
+            "turn/started",
+            &json!({"turn":{"id":"t_ok","threadId":"thr_b","status":"inProgress","items":[],"error":null,"startedAt":1,"completedAt":null}}),
+        );
+        assert!(o.finish_pending_turn_start("thr_b", Some("t_ok")).is_ok());
+        assert!(o.buffered_turn_events.is_empty());
+
+        // Clear on leaving Open (Terminated).
+        *o.pending_starts.entry("thr_c".to_string()).or_insert(0) += 1;
+        o.pending_starts_total += 1;
+        o.observe_turn_notification(
+            "turn/started",
+            &json!({"turn":{"id":"t_c","threadId":"thr_c","status":"inProgress","items":[],"error":null,"startedAt":1,"completedAt":null}}),
+        );
+        assert!(!o.buffered_turn_events.is_empty());
+        assert!(o.enter_terminated("eof"));
+        assert!(o.buffered_turn_events.is_empty());
+
+        // 2. Live socket: timeout clears buffered_turn_events; duplicate admitted turn.id is
+        //    refused as F2 (`invalid-frame`), not delivered as success.
+        let tmp = std::env::temp_dir().join(format!("madc-m2-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let listener = UnixListener::bind(&tmp).unwrap();
+        let (peer_done_tx, peer_done_rx) = mpsc::sync_channel::<()>(1);
+        let peer = thread::spawn(move || {
+            for case in 0..2 {
+                let (s, _) = listener.accept().unwrap();
+                let mut w = s.try_clone().unwrap();
+                let mut r = BufReader::new(s);
+                let mut buf = Vec::new();
+                // initialize
+                let BoundedLine::Line(req) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+                let v: Value = serde_json::from_str(&req).unwrap();
+                writeln!(w, "{}", json!({"id":v["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
+                w.flush().unwrap();
+
+                if case == 0 {
+                    // Req 1: send pre-reply turn/started, then do NOT reply (client times out).
+                    let BoundedLine::Line(_) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+                    writeln!(w, "{}", json!({"method":"turn/started","params":{"turn":{"id":"turn_to","threadId":"thr_to","status":"inProgress","items":[],"error":null,"startedAt":1,"completedAt":null}}})).unwrap();
+                    w.flush().unwrap();
+
+                    // Req 2: admit turn_dup
+                    let BoundedLine::Line(req2) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+                    let v2: Value = serde_json::from_str(&req2).unwrap();
+                    writeln!(w, "{}", json!({"id":v2["id"],"result":{"turn":{"id":"turn_dup","threadId":"thr_1","status":"inProgress","items":[],"error":null,"startedAt":10,"completedAt":null}}})).unwrap();
+                    w.flush().unwrap();
+
+                    // Req 3: second turn/start returns the SAME already-admitted turn_dup -> F2!
+                    let BoundedLine::Line(req3) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+                    let v3: Value = serde_json::from_str(&req3).unwrap();
+                    writeln!(w, "{}", json!({"id":v3["id"],"result":{"turn":{"id":"turn_dup","threadId":"thr_2","status":"inProgress","items":[],"error":null,"startedAt":11,"completedAt":null}}})).unwrap();
+                    w.flush().unwrap();
+                } else {
+                    // Case 1: admit turn_done, complete it, then return turn_done AGAIN -> F2!
+                    let BoundedLine::Line(req1) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+                    let v1: Value = serde_json::from_str(&req1).unwrap();
+                    writeln!(w, "{}", json!({"id":v1["id"],"result":{"turn":{"id":"turn_done","threadId":"thr_1","status":"inProgress","items":[],"error":null,"startedAt":10,"completedAt":null}}})).unwrap();
+                    writeln!(w, "{}", json!({"method":"turn/completed","params":{"turn":{"id":"turn_done","threadId":"thr_1","status":"completed","items":[],"error":null,"startedAt":10,"completedAt":12}}})).unwrap();
+                    w.flush().unwrap();
+
+                    let BoundedLine::Line(req2) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+                    let v2: Value = serde_json::from_str(&req2).unwrap();
+                    writeln!(w, "{}", json!({"id":v2["id"],"result":{"turn":{"id":"turn_done","threadId":"thr_1","status":"inProgress","items":[],"error":null,"startedAt":13,"completedAt":null}}})).unwrap();
+                    w.flush().unwrap();
+                }
+                let _ = peer_done_rx.recv_timeout(Duration::from_secs(5));
+            }
+        });
+
+        let sink1 = Arc::new(TestSink::default());
+        let c1 = SocketClient::connect_existing_with_sink(
+            tmp.to_str().unwrap(),
+            Arc::clone(&sink1) as Arc<dyn EventSink>,
+        )
+        .unwrap();
+        // Timeout must clear buffered_turn_events.
+        let to_err = c1
+            .request_with_deadline(
+                "turn/start",
+                json!({"threadId":"thr_to","input":[{"type":"text","text":"to"}]}),
+                Instant::now() + Duration::from_millis(120),
+            )
+            .unwrap_err();
+        assert!(to_err.contains("timed out"));
+        assert!(
+            c1.inner.owner.lock().unwrap().buffered_turn_events.is_empty(),
+            "M-2: buffered_turn_events must be cleared on turn/start timeout"
+        );
+
+        // First admission of turn_dup succeeds.
+        assert!(c1
+            .request(
+                "turn/start",
+                json!({"threadId":"thr_1","input":[{"type":"text","text":"1"}]})
+            )
+            .is_ok());
+        assert_eq!(c1.inner.owner.lock().unwrap().guard_count(), 1);
+
+        // Second admission of turn_dup fails as F2 invalid-frame (NOT Ok!).
+        let dup_err = c1
+            .request(
+                "turn/start",
+                json!({"threadId":"thr_2","input":[{"type":"text","text":"2"}]})
+            )
+            .expect_err("M-2: duplicate admitted turn.id must be refused as F2 invalid-frame");
+        assert!(
+            dup_err.contains("invalid-frame"),
+            "expected invalid-frame, got: {dup_err}"
+        );
+        let wait_term = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < wait_term
+            && !sink1
+                .engine_events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, v)| v["method"] == "madc/transport-closed")
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            sink1.engine_events.lock().unwrap().iter().any(|(_, v)| {
+                v["method"] == "madc/transport-closed" && v["params"]["reason"] == "invalid-frame"
+            }),
+            "M-2: duplicate turn.id must emit madc/transport-closed(invalid-frame)"
+        );
+        assert_eq!(c1.inner.owner.lock().unwrap().guard_count(), 0);
+        c1.disconnect();
+        let _ = peer_done_tx.send(());
+
+        // Case 1: already-completed turn.id reused on same connection is ALSO refused as F2.
+        let sink2 = Arc::new(TestSink::default());
+        let c2 = SocketClient::connect_existing_with_sink(
+            tmp.to_str().unwrap(),
+            Arc::clone(&sink2) as Arc<dyn EventSink>,
+        )
+        .unwrap();
+        assert!(c2
+            .request(
+                "turn/start",
+                json!({"threadId":"thr_1","input":[{"type":"text","text":"a"}]})
+            )
+            .is_ok());
+        let wait_zero = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < wait_zero && c2.inner.owner.lock().unwrap().guard_count() != 0 {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(c2.inner.owner.lock().unwrap().guard_count(), 0);
+        let dup_after_done = c2
+            .request(
+                "turn/start",
+                json!({"threadId":"thr_1","input":[{"type":"text","text":"b"}]})
+            )
+            .expect_err("M-2: previously admitted turn.id reused on same connection must be F2");
+        assert!(dup_after_done.contains("invalid-frame"), "got: {dup_after_done}");
+        c2.disconnect();
+        let _ = peer_done_tx.send(());
+
+        peer.join().unwrap();
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_child_kill_semantics_worker_deadline_and_no_later_exit_m3() {
+        // 1. SharedChild: never kills after reap; never kills twice.
+        let c_fast = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let sc_fast = SharedChild::new(c_fast);
+        assert!(sc_fast.reap_bounded(Duration::from_secs(2)).is_some());
+        assert!(!sc_fast.kill_once(), "M-3: must never kill after reap");
+        assert_eq!(sc_fast.kill_count(), 0);
+
+        let c_slow = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exec sleep 30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let sc_slow = SharedChild::new(c_slow);
+        assert!(sc_slow.kill_once(), "first kill_once must issue kill");
+        assert!(!sc_slow.kill_once(), "second kill_once must be a no-op");
+        assert_eq!(sc_slow.kill_count(), 1);
+        assert!(sc_slow.reap_bounded(Duration::from_secs(2)).is_some());
+
+        // 2. Worker honors caller's short deadline (kills R11 mutation where worker used a fresh
+        //    DISCONNECT_STOP_BOUND = 7 s instead of caller's deadline).
+        let mut c_r11 = Command::new("/bin/sh")
+            .arg("-c")
+            .arg("cat >/dev/null; exec sleep 30")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let r11_stdin = c_r11.stdin.take();
+        let r11_shared = SharedChild::new(c_r11);
+        let r11_stop = Arc::new(Mutex::new(StopState {
+            cancel_stream: None,
+            spawned: Some(SpawnedServe {
+                child: r11_shared.clone(),
+                stdin: r11_stdin,
+                stderr_buf: Arc::new(Mutex::new(String::new())),
+                stderr_done: None,
+                stderr_thread: None,
+                initialized: true,
+            }),
+            in_flight: None,
+            reader_done: Arc::new(AtomicBool::new(true)),
+            hooks: None,
+        }));
+        let t_r11 = Instant::now();
+        // Use stop_child_async so ONLY the worker (not caller expiry) enforces the 300 ms deadline!
+        stop_child_async(&r11_stop, t_r11 + Duration::from_millis(300));
+        let deadline_r11 = t_r11 + Duration::from_secs(2);
+        while Instant::now() < deadline_r11 && !r11_shared.is_reaped() {
+            thread::sleep(Duration::from_millis(15));
+        }
+        let r11_elapsed = t_r11.elapsed();
+        assert!(
+            r11_shared.is_reaped() && r11_elapsed < Duration::from_secs(2),
+            "M-3 (R11): worker must honor caller's 300 ms deadline (not fresh 7 s DISCONNECT_STOP_BOUND), elapsed={r11_elapsed:?}"
+        );
+        assert_eq!(r11_shared.kill_count(), 1);
+
+        // 3. T-L7 stall past DISCONNECT_STOP_BOUND (expiry kills once through SharedChild) AND
+        //    "no later Exit" cases (allow-only and confirm_quit-only with NO handle_run_event_exit)
+        //    all run concurrently to keep wall-clock time within 8 s.
+        let h_tl7 = thread::spawn(|| {
+            let mut c = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("cat >/dev/null; exec sleep 40")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let stdin = c.stdin.take();
+            let shared = SharedChild::new(c);
+            let stop_arc = Arc::new(Mutex::new(StopState {
+                cancel_stream: None,
+                spawned: Some(SpawnedServe {
+                    child: shared.clone(),
+                    stdin,
+                    stderr_buf: Arc::new(Mutex::new(String::new())),
+                    stderr_done: None,
+                    stderr_thread: None,
+                    initialized: true,
+                }),
+                in_flight: None,
+                reader_done: Arc::new(AtomicBool::new(true)),
+                hooks: Some(Arc::new(TestStopHooks {
+                    delay_l7: Some(Duration::from_secs(12)), // stalls past DISCONNECT_STOP_BOUND
+                    ..Default::default()
+                })),
+            }));
+            let t0 = Instant::now();
+            stop_child(&stop_arc, t0 + DISCONNECT_STOP_BOUND);
+            let elapsed = t0.elapsed();
+            assert!(
+                elapsed >= Duration::from_millis(6500) && elapsed <= Duration::from_millis(8500),
+                "T-L7 stall past DISCONNECT_STOP_BOUND must expire at ~7 s, got {elapsed:?}"
+            );
+            assert!(shared.is_reaped(), "T-L7 expiry must kill and reap child");
+            assert_eq!(shared.kill_count(), 1, "T-L7 expiry must kill strictly once");
+        });
+
+        let h_no_exit_allow = thread::spawn(|| {
+            let tmp = std::env::temp_dir().join(format!(
+                "madc-m3-allow-only-{}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&tmp);
+            let l = UnixListener::bind(&tmp).unwrap();
+            let (tx, rx) = mpsc::sync_channel::<()>(1);
+            let p = thread::spawn(move || {
+                let (s, _) = l.accept().unwrap();
+                let mut w = s.try_clone().unwrap();
+                let mut r = BufReader::new(s);
+                let mut buf = Vec::new();
+                let BoundedLine::Line(req) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+                let v: Value = serde_json::from_str(&req).unwrap();
+                writeln!(w, "{}", json!({"id":v["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
+                w.flush().unwrap();
+                let _ = rx.recv_timeout(Duration::from_secs(12));
+            });
+            let mut c = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("cat >/dev/null; exec sleep 40")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let stdin = c.stdin.take();
+            let shared = SharedChild::new(c);
+            let sink = Arc::new(TestSink::default());
+            let cli = SocketClient::connect_existing_with_sink_and_hooks(
+                tmp.to_str().unwrap(),
+                Arc::clone(&sink) as Arc<dyn EventSink>,
+                Some(SpawnedServe {
+                    child: shared.clone(),
+                    stdin,
+                    stderr_buf: Arc::new(Mutex::new(String::new())),
+                    stderr_done: None,
+                    stderr_thread: None,
+                    initialized: true,
+                }),
+                None,
+            )
+            .unwrap();
+            let ctrl = DesktopController::new();
+            ctrl.set_client_for_test(cli);
+
+            let t0 = Instant::now();
+            // Allow-only: NO handle_run_event_exit call!
+            assert_eq!(ctrl.handle_close_or_exit_at(&*sink, t0), CloseDecision::AllowExit);
+            let wait_by = t0 + EXIT_BOUND;
+            while Instant::now() < wait_by && !shared.is_reaped() {
+                thread::sleep(Duration::from_millis(25));
+            }
+            assert!(
+                shared.is_reaped(),
+                "M-3: allow-only (no later Exit) must stop/kill child within EXIT_BOUND"
+            );
+            assert_eq!(shared.kill_count(), 1);
+            let _ = tx.send(());
+            p.join().unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+
+        let h_no_exit_confirm = thread::spawn(|| {
+            let tmp = std::env::temp_dir().join(format!(
+                "madc-m3-confirm-only-{}.sock",
+                std::process::id()
+            ));
+            let _ = std::fs::remove_file(&tmp);
+            let l = UnixListener::bind(&tmp).unwrap();
+            let (tx, rx) = mpsc::sync_channel::<()>(1);
+            let p = thread::spawn(move || {
+                let (s, _) = l.accept().unwrap();
+                let mut w = s.try_clone().unwrap();
+                let mut r = BufReader::new(s);
+                let mut buf = Vec::new();
+                let BoundedLine::Line(req) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+                let v: Value = serde_json::from_str(&req).unwrap();
+                writeln!(w, "{}", json!({"id":v["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
+                w.flush().unwrap();
+                let _ = rx.recv_timeout(Duration::from_secs(12));
+            });
+            let mut c = Command::new("/bin/sh")
+                .arg("-c")
+                .arg("cat >/dev/null; exec sleep 40")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            let stdin = c.stdin.take();
+            let shared = SharedChild::new(c);
+            let sink = Arc::new(TestSink::default());
+            let cli = SocketClient::connect_existing_with_sink_and_hooks(
+                tmp.to_str().unwrap(),
+                Arc::clone(&sink) as Arc<dyn EventSink>,
+                Some(SpawnedServe {
+                    child: shared.clone(),
+                    stdin,
+                    stderr_buf: Arc::new(Mutex::new(String::new())),
+                    stderr_done: None,
+                    stderr_thread: None,
+                    initialized: true,
+                }),
+                None,
+            )
+            .unwrap();
+            cli.inner
+                .owner
+                .lock()
+                .unwrap()
+                .in_flight_turn_ids
+                .insert("turn_c_only".into(), "thr_c".into());
+            let ctrl = DesktopController::new();
+            ctrl.set_client_for_test(cli);
+
+            let t0 = Instant::now();
+            let CloseDecision::PreventQuitRequested { epoch, request_id } =
+                ctrl.handle_close_or_exit_at(&*sink, t0)
+            else {
+                panic!();
+            };
+            // confirm_quit-only: NO handle_run_event_exit call!
+            assert!(ctrl.confirm_quit_at(epoch, request_id, &*sink, t0).accepted);
+            assert!(
+                t0.elapsed() <= EXIT_BOUND + Duration::from_millis(500),
+                "M-3: confirm_quit-only must finish within EXIT_BOUND"
+            );
+            assert!(
+                shared.is_reaped(),
+                "M-3: confirm_quit-only (no later Exit) must stop/kill child within EXIT_BOUND"
+            );
+            assert_eq!(shared.kill_count(), 1);
+            let _ = tx.send(());
+            p.join().unwrap();
+            let _ = std::fs::remove_file(&tmp);
+        });
+
+        h_tl7.join().unwrap();
+        h_no_exit_allow.join().unwrap();
+        h_no_exit_confirm.join().unwrap();
+
+        // Static guard (M-3): production launcher.rs must NEVER issue raw-pid SIGKILL; all kills
+        // must go strictly through SharedChild::kill_once() -> Child::kill().
+        let src = include_str!("launcher.rs");
+        let tests_start = src.find("#[cfg(test)]\nmod tests").unwrap();
+        assert!(
+            !src[..tests_start].contains("libc::SIGKILL"),
+            "M-3 violation: production launcher.rs must never use raw-pid libc::SIGKILL"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn id_length_bounds_and_l6_error_and_reader_relock_phase_l1_l2_l4() {
+        // L-1: id length 128 accepted / 129 refused (direct + via validate_rpc_params).
+        let id_128 = "a".repeat(128);
+        let id_129 = "a".repeat(129);
+        assert!(is_valid_id(&id_128), "L-1: 128-char id must be accepted");
+        assert!(!is_valid_id(&id_129), "L-1: 129-char id must be refused");
+        assert!(validate_rpc_params("thread/start", &json!({ "seatId": id_128 })).is_ok());
+        assert!(validate_rpc_params("thread/start", &json!({ "seatId": id_129 })).is_err());
+
+        // L-2: exact L6 string "engine socket closed before response" on leaving Open.
+        let sink = TestSink::default();
+        for close_kind in ["terminated", "closed"] {
+            let mut o = ClientOwner::new(42);
+            o.phase = LifecyclePhase::Open;
+            let (tx, rx) = mpsc::sync_channel::<Result<Value, String>>(1);
+            o.pending.insert(
+                7,
+                PendingRpc {
+                    method: "room/inspect".to_string(),
+                    params: json!({}),
+                    thread_id: None,
+                    reply_tx: tx,
+                },
+            );
+            if close_kind == "terminated" {
+                assert!(o.enter_terminated("eof"));
+            } else {
+                assert!(o.close_to_closed("disconnect", &sink));
+            }
+            let err = rx
+                .recv_timeout(Duration::from_millis(200))
+                .expect("waiter must be notified")
+                .expect_err("waiter must fail on leaving Open");
+            assert_eq!(
+                err, "engine socket closed before response",
+                "L-2 ({close_kind}): must use exact L6 string"
+            );
+        }
+
+        // L-4: reader re-checks phase after relocking following validate_rpc_result.
+        // Close the owner deterministically inside `on_before_response_relock` and assert the
+        // waiter gets exact L6 string (NOT Ok) and guard_count stays 0.
+        let tmp = std::env::temp_dir().join(format!("madc-l4-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&tmp);
+        let listener = UnixListener::bind(&tmp).unwrap();
+        let (peer_done_tx, peer_done_rx) = mpsc::sync_channel::<()>(1);
+        let peer = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            let mut w = s.try_clone().unwrap();
+            let mut r = BufReader::new(s);
+            let mut buf = Vec::new();
+            let BoundedLine::Line(req1) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+            let v1: Value = serde_json::from_str(&req1).unwrap();
+            writeln!(w, "{}", json!({"id":v1["id"],"result":{"protocolVersion":"madc-m1/1","serverInfo":{"name":"madc-engine","version":"0.0.0"}}})).unwrap();
+            w.flush().unwrap();
+
+            let BoundedLine::Line(req2) = read_bounded_line(&mut r, &mut buf) else { panic!() };
+            let v2: Value = serde_json::from_str(&req2).unwrap();
+            writeln!(
+                w,
+                "{}",
+                json!({
+                    "id": v2["id"],
+                    "result": {
+                        "turn": {
+                            "id": "turn_l4",
+                            "threadId": "thr_l4",
+                            "status": "inProgress",
+                            "items": [],
+                            "error": null,
+                            "startedAt": 100,
+                            "completedAt": null
+                        }
+                    }
+                })
+            )
+            .unwrap();
+            w.flush().unwrap();
+            let _ = peer_done_rx.recv_timeout(Duration::from_secs(5));
+        });
+
+        let sink_l4 = Arc::new(TestSink::default());
+        let owner_holder: Arc<Mutex<Option<Arc<Mutex<ClientOwner>>>>> = Arc::new(Mutex::new(None));
+        let owner_h = Arc::clone(&owner_holder);
+        let sink_h = Arc::clone(&sink_l4);
+        let hooks = Arc::new(TestStopHooks {
+            on_before_response_relock: Some(Arc::new(move || {
+                if let Some(o_arc) = owner_h.lock().unwrap().as_ref() {
+                    let mut o = o_arc.lock().unwrap();
+                    o.close_to_closed("disconnect", &*sink_h);
+                }
+            })),
+            ..Default::default()
+        });
+        let client = SocketClient::connect_existing_with_sink_and_hooks(
+            tmp.to_str().unwrap(),
+            Arc::clone(&sink_l4) as Arc<dyn EventSink>,
+            None,
+            Some(hooks),
+        )
+        .unwrap();
+        *owner_holder.lock().unwrap() = Some(Arc::clone(&client.inner.owner));
+
+        let err = client
+            .request(
+                "turn/start",
+                json!({"threadId":"thr_l4","input":[{"type":"text","text":"hi"}]}),
+            )
+            .expect_err("L-4: closing between validation and relock must fail waiter, not return Ok");
+        assert_eq!(
+            err, "engine socket closed before response",
+            "L-4: waiter must receive exact L6 error string"
+        );
+        assert_eq!(
+            client.inner.owner.lock().unwrap().guard_count(),
+            0,
+            "L-4: closed owner must NOT admit turn into guard"
+        );
+
+        let _ = peer_done_tx.send(());
+        client.disconnect();
+        peer.join().unwrap();
         let _ = std::fs::remove_file(&tmp);
     }
 }
