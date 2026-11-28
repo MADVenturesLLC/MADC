@@ -2,16 +2,17 @@
 
 - **Status:** **DRAFT**. Not binding until the Founder merges a PR naming this pin's exact head SHA.
 - **Author:** Surface Architect
-- **Date:** 2026-11-27 (r1)
+- **Date:** 2026-11-27 (r5)
+- **Revisions:** r1 10:49 PM ET; r2 10:58 PM ET (Copilot 3 High); r3 11:12 PM ET (Copilot 4 High + 1 Medium + self-review); r4 11:19 PM ET (Copilot 4 High, including the §4.3 read-back rows); r5 (same night): FDR-A4-1..4 ruled at 11:33 PM ET (D-723..D-727); FDR-A4-5 ruled at 11:50 PM ET (chips may wrap, never clip; with D-723, D-693 closes on merge); post-start `session/read` ruled at 11:51 PM ET (further narrows D-682); Iris cwd addendum and frame updates folded in; Argus r1 L1–L5 and Architect r1 M1–M2, L1–L7 answered. All times ET, 2026-11-27, relayed by MADC Architect.
 - **Milestone / Act:** M3 / Act M3-A4 ("Multi-seat side-by-side workspace", `PLAN-madc-M3-build-plan.md:27`: "Live side-by-side seat panes, model/lane/worktree receipts (`servedModel`, `worktree.topLevel` + `head`), and interactive turn start / interrupt from the desktop window").
 - **Gate:** the Founder approved this pin gate on 2026-11-27 at 7:36 PM ET (relayed by MADC Architect): Iris spec, then this Surface pin PR, then Argus review, then Founder merge. The builder (Gemini-4-Neon) builds M3-A4 **only after this pin and its companion amendment merge**.
-- **Decisions addressed:** fulfills **D-189** (design spec pinned before UI build) for A4 (Clio **D-705** spec gate, **D-706** this pin); applies Founder rulings **FDR-1..FDR-8** (Clio **D-708..D-715**) and the A4 visual rulings **D-716..D-721**, plus **C53 / D-722** (keys vs D-680); preserves **D-626** (evidence-bound UI rule); narrows **D-682** (A3 Q4) per FDR-4(c); folds in **D-660 / D-666** and **D-665** through amendment 2; carries **D-693** (layout limits, closes only on a Founder ruling, §1.1 FDR-A4-1) and **D-699** (Safari < 18 opaque fallback, which superseded D-694); keeps **D-654, D-661, D-663, D-664** open. All Clio ids D-705..D-722 are `needs-confirmation` (relayed by MADC Architect, not posted on GitHub).
+- **Decisions addressed:** fulfills **D-189** (design spec pinned before UI build) for A4 (Clio **D-705** spec gate, **D-706** this pin); applies Founder rulings **FDR-1..FDR-8** (Clio **D-708..D-715**) and the A4 visual rulings **D-716..D-721**, plus **C53 / D-722** (keys vs D-680); preserves **D-626** (evidence-bound UI rule); narrows **D-682** (A3 Q4) per FDR-4(c) and further by the 11:51 PM ET post-start `session/read` ruling; folds in **D-660 / D-666** and **D-665** through amendment 2; folds in **D-693** (**FDR-A4-1** / **D-723** seat visible and folded below 1200px, plus **FDR-A4-5** chip wrap, both ruled; **D-693 closes on this merge**); carries **D-699** (Safari < 18 opaque fallback, which superseded D-694); keeps **D-654, D-661, D-663, D-664** open. Applies the 11:33 PM ET rulings **FDR-A4-1..FDR-A4-4** (Clio **D-723..D-727**, `needs-confirmation`), **FDR-A4-5** (11:50 PM ET), and the 11:51 PM ET post-start read. All Clio ids D-705..D-727 are `needs-confirmation` (relayed by MADC Architect, not posted on GitHub).
 - **Repo paths (this PR):**
   - Pin: `docs/plan/PIN-madc-M3-A4-multi-seat-workspace.md` (this file)
   - Companion protocol amendment: `docs/plan/PIN-madc-M3-desktop-protocol-amendment-2.md` ("amendment 2")
   - Verbatim Iris spec: `docs/plan/sources/DESIGN-SPEC-m3-a4-equal-columns.md` (cited below as "spec"; never edited)
   - Frames: recorded by sha256 below, not committed (A3 convention, A3 pin:25; spec §0: "Frames and reference files are box-only and not in the repo")
-  - Pointer edits: one `Amended by` line under the status line of `PIN-madc-M3-desktop-protocol-amendment-1.md`; one under the existing pointer block of `PIN-madc-M3-desktop-protocol.md`; on the A3 design pin, one `Amended by` line under its status line **and** an `Amended by` marker on the D-680 text (Q2 row) (§2.6); index rows in `docs/plan/README.md`.
+  - Pointer edits: one `Amended by` line under the status line of `PIN-madc-M3-desktop-protocol-amendment-1.md`; one under the existing pointer block of `PIN-madc-M3-desktop-protocol.md`; on the A3 design pin, one `Amended by` line under its status line, which also carries the D-680 / C53 supersession (the Q2 cell is not edited; §2.6); index rows in `docs/plan/README.md`.
   - **Docs only. No code, no `packages/**` change in this PR.** The builder's code scope is §2.4.
 
 ## Verified Base & Source Identities
@@ -31,20 +32,25 @@
   - `packages/desktop/src/evidence.ts`: `3ae16638010b2c5fdaafdbf7ba6cbd51d5cc19c8`
   - `packages/engine/src/server.ts`: `9f43d5ee13a67db11f167d8600bf2969acb7e125`
   - `packages/engine/src/protocol/types.ts`: `eb233ca7dc39dd58d18f8ae5b0330ce84199dd69`
-- **Approved Iris design artifacts** (Michael Daley chose Direction A, Equal Columns, with the Panes/Table toggle on 2026-11-27, relayed 10:22 PM ET, D-716; spec status line: "rulings approved by Mike 2026-11-27 (via MADC Architect); D-693 seat visibility pending"):
-  - Spec: `sources/DESIGN-SPEC-m3-a4-equal-columns.md`, sha256 **`545825360d535b7ec55114e7e16edeaf8f396ac1e66d3328d0d905bd8e429aea`** (repo blob `151e0a8fd683d09b368cc4bd10b918c4a0f8caa4`), 549 lines, stored byte-identical to Iris's handoff file.
-  - Frames (visual source of truth; box-only at `/workspace/iris-madc-m3a4/`, sha256 re-computed at PR time and equal to spec §0):
+- **Approved Iris design artifacts** (Michael Daley chose Direction A, Equal Columns, with the Panes/Table toggle on 2026-11-27, relayed 10:22 PM ET, D-716; spec r1 status line, preserved verbatim and never edited: "rulings approved by Mike 2026-11-27 (via MADC Architect); D-693 seat visibility pending". **This pin rules D-693 in full** (FDR-A4-1 / D-723 at 11:33 PM ET; FDR-A4-5 at 11:50 PM ET; closes on merge). Iris spec r2 and the cwd addendum are stored as additional source files; r1 is kept intact):
+  - Spec r1 (preserved, never edited): `sources/DESIGN-SPEC-m3-a4-equal-columns.md`, sha256 **`545825360d535b7ec55114e7e16edeaf8f396ac1e66d3328d0d905bd8e429aea`** (repo blob `151e0a8fd683d09b368cc4bd10b918c4a0f8caa4`), 549 lines.
+  - Spec r2 (supersedes r1 for §6A and the 11:33 PM ET rulings; r1 is kept intact): `sources/DESIGN-SPEC-m3-a4-equal-columns-r2.md`, sha256 **`b4c4e5ec8ff2223c1c4d15bb6af88f4fd8c2b2490b8d66f72775235989f07a1a`**, 730 lines, stored byte-identical to Iris's r2 handoff. Where r1 and r2 differ on §6A or the cwd frames, r2 and the addendum govern; this pin still wins over both (spec §1 / pin §0).
+  - Cwd-field addendum (verbatim Iris §6A, byte-identical): `sources/DESIGN-SPEC-m3-a4-cwd-field-addendum.md`, sha256 **`1caa2a9e1b8497a0f0527580c9150be190139cd2c1d5697bc59be20a0378e00e`**. Cited below as "addendum".
+  - Frames (visual source of truth; box-only at `/workspace/iris-madc-m3a4/`, sha256 re-computed at r5 from those files and equal to addendum / spec r2 §0):
 
     | Frame | Pixels (@2x) | sha256 |
     | --- | --- | --- |
-    | `direction-a-final.png` (Panes, 1440×900) | 2976×2020 | `4003282132432a197f2fbd967dc26496f315b638966d879241a10c96877a1105` |
-    | `direction-a-final-1200.png` (Panes, 1200×800) | 2496×1820 | `8de9a0397801d7a216dda75915a2f859fc5c3d2b7e3cc030fbac2c036366e46c` |
-    | `direction-a-final-960.png` (Panes, 960×640) | 2016×1500 | `ff94e5922d606a401e973d6bf99ece919b5b1d59a2bfb1ba9a111f159a4a9c73` |
-    | `direction-a-final-table.png` (Table, 1200×800) | 2496×1820 | `e9958f514259faa51ddea3e91589da81670e2f565c00616c455b63adccb01a28` |
-    | `direction-a-final-table-960.png` (Table, 960×640) | 2016×1500 | `8530abfda78cc144704a337e05d2fa89dc47ea777c176ee1c4750aa0c6e49e43` |
-    | `quit-confirm.png` (quit dialog, 960×640) | 2016×1500 | `b757a19b9ee8bcabc0e4732d9162de50c85dcc036861ecead352d6d037617811` |
+    | `direction-a-final.png` (Panes, 1440×900; re-rendered r2) | 2976×2020 | `541103c9aef88ea6737c2444998aacd8ff25bbe86d245799bfc596d44eaa4580` |
+    | `direction-a-final-1200.png` (Panes, 1200×800; re-rendered r2) | 2496×1820 | `e6eb788f6fdb6c74f884e907679bf9a222a335be61c393d630950e214afde0f4` |
+    | `direction-a-final-960.png` (Panes, 960×640; re-rendered r2) | 2016×1500 | `22ab2adb0dba1dbc3fdaf77cf08543f8927b9b7f8075c5b358782d1cbf95dc02` |
+    | `direction-a-final-table.png` (Table, 1200×800; unchanged in r2) | 2496×1820 | `e9958f514259faa51ddea3e91589da81670e2f565c00616c455b63adccb01a28` |
+    | `direction-a-final-table-960.png` (Table, 960×640; unchanged in r2) | 2016×1500 | `8530abfda78cc144704a337e05d2fa89dc47ea777c176ee1c4750aa0c6e49e43` |
+    | `quit-confirm.png` (quit dialog, 960×640; re-rendered r2) | 2016×1500 | `8e6b247868406ad3460d5ef70da94b50d3ca5b1448937fc0d1fb2ee1d97efe0b` |
+    | `cwd-field-1440.png` (Panes cwd field, 1440×900; new) | 2976×2020 | `3d338e9ade257d4729922f4f74bf403b302391d4eb0ec6b57b4749c8ea1abd65` |
+    | `cwd-field-960.png` (Panes cwd field, 960×640; new) | 2016×1500 | `57296131bef8fb1995fa7e91695ab377b62390e569aa579de174950ed4171ceb` |
+    | `cwd-field-states.png` (six cwd field states; new) | 2162×1880 | `2b6d0567af12488297461292c3cd3c9c31e9c35f9a8f9fc1b82b74a24c4e5ba2` |
 
-  - Reference CSS / markup (box-only, not in the repo, mock-up not shipping code; spec §0): `base.css` `6a16377c9b04b4cd1ceb3f1f48edab886e7b9916c089618bb8098b1117e14e09`, `final.css` `cfd19eb0fbd1f96586dd7e7121d88bec793a030315f164e6f689c3836d0ccf6e`, `build_final.py` `07729346ec0bc92bee8f227fab65f0c67d183e40ae45aebc56b2d62de081841a`.
+  - Reference CSS / markup (box-only, not in the repo, mock-up not shipping code; spec r2 §0): `base.css` `6a16377c9b04b4cd1ceb3f1f48edab886e7b9916c089618bb8098b1117e14e09` (unchanged), `final.css` `684b198e37919fea2e0359926443d959c232b5e47aed1b009f58a2898f496c07`, `build_final.py` `25eb178ed807168ec71669efde58cb1393adf2e543e16d8b5061c9fa6f08d2c3`.
   - Frames convention: as for A3 (A3 pin:25), the frames are pinned by sha256 and pixel size, not committed. A reviewer verifies a frame by hashing the copy Iris hands over.
 
 ---
@@ -66,33 +72,34 @@ All rulings below are Mike's, made on 2026-11-27 and relayed by MADC Architect; 
 
 | Item | Topic | Disposition | Ruling & where pinned |
 | --- | --- | --- | --- |
-| **R1 / D-716** (FDR-6(a)) | Layout | **ACCEPT** (10:22 PM ET) | Direction A, Equal Columns, with the Panes/Table toggle (spec §5). Seat visibility below 1200px is **FDR-A4-1** (open). |
-| **R2 / D-717** | Turn pills | **ACCEPT** (10:22 PM ET) | `RUNNING`, `COMPLETED` neutral `○`; `INTERRUPTED` **fail `✗`** (red, not warn). §4.2. Iris's earlier mock used warn; the ruling and the final spec agree on fail. |
-| **R3 / D-718** | Unconfirmed vendor model | **ACCEPT** (10:22 PM ET) | `vendorReported: false` read back from `session/read` → `▲ UNVERIFIED`. §4.3. |
-| **R4 / D-719** | Lane and path | **ACCEPT** (10:22 PM ET) | `lane` and `worktree.topLevel` are fields, no pill, note `field · not a receipt`. §4.3. |
-| **R5 / D-720** | Worktree head | **ACCEPT** (10:22 PM ET) | `head@open` verified on a valid 40-hex SHA alone, no `chainOk` requirement. **Narrows FDR-4(b)'s** recommended "chain ok and 40-hex". §4.4. |
-| **R6 / D-721** | Keys | **ACCEPT** (10:22 PM ET) | `Cmd/Ctrl+Enter` start turn; `Cmd/Ctrl+1–4` focus pane; Interrupt by button or palette only; reserved future key `Cmd/Ctrl+Shift+.` behind a confirm, never `Esc`; no `Ctrl/Cmd+F`. §5.6. |
-| **C53 / D-722** | Keys vs D-680 | **RULED** (10:36 PM ET) | The R6 keys **supersede D-680 for those keys only**; D-680 (A3 pin Q2, "No other global shortcut is added") still governs every other shortcut. Recorded by an `Amended by` marker on the D-680 text (§2.6). |
+| **V1 / D-716** (FDR-6(a)) | Layout | **ACCEPT** (10:22 PM ET) | Direction A, Equal Columns, with the Panes/Table toggle (spec §5). Seat visibility below 1200px is **FDR-A4-1** / **D-723** (ruled 11:33 PM ET). Chip wrap is **FDR-A4-5** (ruled 11:50 PM ET). D-693 closes on this merge. |
+| **V2 / D-717** | Turn pills | **ACCEPT** (10:22 PM ET) | `RUNNING`, `COMPLETED` neutral `○`; `INTERRUPTED` **fail `✗`** (red, not warn). §4.2. Iris's earlier mock used warn; the ruling and the final spec agree on fail. |
+| **V3 / D-718** | Unconfirmed vendor model | **ACCEPT** (10:22 PM ET) | `vendorReported: false` read back from `session/read` → `▲ UNVERIFIED`. §4.3. |
+| **V4 / D-719** | Lane and path | **ACCEPT** (10:22 PM ET) | `lane` and `worktree.topLevel` are fields, no pill, note `field · not a receipt`. §4.3. |
+| **V5 / D-720** | Worktree head | **ACCEPT** (10:22 PM ET) | `head@open` verified on a valid 40-hex SHA alone, no `chainOk` requirement. **Narrows FDR-4(b)'s** recommended "chain ok and 40-hex". §4.4. |
+| **V6 / D-721** | Keys | **ACCEPT** (10:22 PM ET) | `Cmd/Ctrl+Enter` start turn; `Cmd/Ctrl+1–4` focus pane; Interrupt by button or palette only; reserved future key `Cmd/Ctrl+Shift+.` behind a confirm, never `Esc`; no `Ctrl/Cmd+F`. §5.6. |
+| **C53 / D-722** | Keys vs D-680 | **RULED** (10:36 PM ET) | The V6 keys **supersede D-680 for those keys only**; D-680 (A3 pin Q2, "No other global shortcut is added") still governs every other shortcut. Recorded on the A3 pin's header `Amended by` pointer (the Q2 cell is not edited; §2.6). |
 | **FDR-1 / D-708** | Desktop methods | **ACCEPT** (9:26 PM ET, "Accept all eight recommended defaults") | Allow `seat/list`, `thread/start`, `turn/start`, `turn/interrupt`; **defer `thread/resume`**. The spec asks for `thread/resume` (spec §1, §6.3, §7.2, §8.2, §14.1); **the ruling wins** (§1.3 D2). Amendment 2 §1. |
-| **FDR-2 / D-709** | `cwd` source | **ACCEPT** | Typed absolute path field in A4 (§5.3; the spec has no `cwd` surface, §1.3 D3). |
+| **FDR-2 / D-709** | `cwd` source | **ACCEPT** | Typed absolute path field in A4. Surface ruled by **FDR-A4-4** / **D-727** (11:33 PM ET): a field in the pane header, not a palette field (§5.3 / addendum §6A; the r1 spec had no `cwd` surface, §1.3 D3). |
 | **FDR-3 / D-710** | Presence-gated lanes | **ACCEPT** | MiniMax Token Plan, Alibaba Coding Plan and `ollama-cloud` (so the seeded `surface-architect` seat) are unreachable from the desktop; the pane shows the engine's refusal verbatim (spec §6.3 "Refused"). Amendment 2 §16.7. |
-| **FDR-4 / D-711** | Live evidence | **ACCEPT** | (a) a streamed `servedModel` is verified only after `session/read` confirms it (§4.3; tone conflict with the spec is **FDR-A4-2**); (b) the head label is `head@open`, never "current" (verification narrowed by D-720); (c) one automatic `session/read` per completed turn on a visible pane, **narrowing D-682** (A3 Q4) and nothing else (§4.5). |
+| **FDR-4 / D-711** | Live evidence | **ACCEPT** | (a) a streamed `servedModel` is verified only after `session/read` confirms it; until then it shows `▲ UNVERIFIED`, never green (**FDR-A4-2** / **D-724**, §4.3); (b) the head label is `head@open`, never "current" (verification narrowed by D-720); (c) one automatic `session/read` per completed turn on a visible pane, **narrowing D-682** (A3 Q4); **further narrowed** (11:51 PM ET, relayed by MADC Architect): exactly one automatic `session/read` after a successful `thread/start`, so `worktree.topLevel` and `head@open` show straight away (§4.5). |
 | **FDR-5 / D-712** | Quit with running turns | **ACCEPT** | Quitting interrupts running turns and the quit flow says so (spec §10; amendment 2 §6.1). |
 | **FDR-6(b) / D-713** | Safari < 18 | **ACCEPT** | The opaque fallback under the verbatim `@supports not (backdrop-filter: blur(1px))` block is accepted as-is (**D-699**). §5.2. |
 | **FDR-7 / D-714** | Carried debt | **ACCEPT** | (a) Mike to confirm D-660, D-661, D-654 on GitHub; (b) the D-663 amendment stays a separate file. |
 | **FDR-8 / D-715** | R4 blast radius | **ACCEPT** | R4 cleanup interrupts every pane's running turn; consequence recorded (amendment 2 §1.3; §6.4). |
-| **FDR-A4-1** | D-693 seat visibility below 1200px | **FOUNDER_DECISION_REQUIRED** | Default (spec §15 recommendation): seat visible at every width (§5.2). Alternative: hide `seat` below 1200px. |
-| **FDR-A4-2** | Tone of a streamed-only `servedModel` | **FOUNDER_DECISION_REQUIRED** | Default (FDR-4(a)'s accepted text): `○ NO RECEIPT` (neutral) until read back. The spec and frames show `▲ UNVERIFIED`. §4.3. |
-| **FDR-A4-3** | Iris additions not covered by a ruling | **FOUNDER_DECISION_REQUIRED** (six yes/no items) | §11. Defaults: accept (a), (c), (d), (e), (f); defer (b) "Reopen pane" with `thread/resume`. |
-| **FDR-A4-4** | `cwd` entry surface | **FOUNDER_DECISION_REQUIRED** (visual only) | Default: the two-step palette field in §5.3 (Iris may restyle without a new ruling). |
+| **FDR-A4-1** / **D-723** | D-693 seat visibility below 1200px | **RULED** (11:33 PM ET, relayed by MADC Architect) | Seat stays visible at every width; below 1200px it folds into the thread cell as a second line (`THREAD · SEAT`). Hide-seat is a rejected alternative (§11, §5.2). Chip wrap is **FDR-A4-5** (ruled 11:50 PM ET). Together these close **D-693 on this merge**. |
+| **FDR-A4-2** / **D-724** | Tone of a streamed-only `servedModel` | **RULED** (11:33 PM ET, relayed by MADC Architect) | Streamed-only `servedModel` (before `session/read` confirms) shows `▲ UNVERIFIED` (warn), never green. Verified only after `session/read`. Reconciles FDR-4(a)'s earlier `○ NO RECEIPT` recommendation. §4.3. |
+| **FDR-A4-3** / **D-725**, **D-726** | Iris additions not covered by an earlier ruling | **RULED** (11:33 PM ET, relayed by MADC Architect) | Accept (a) Dismiss pane, (c) hidden-pane tabs with summary chip, (d) reshown pane takes the rightmost slot, (e) Esc on the quit dialog = Keep running, (f) Table stale note instead of automatic `room/inspect` (**D-725**). Defer (b) Reopen pane (**D-726**, carried debt, depends on D-708 / `thread/resume`). §11. |
+| **FDR-A4-4** / **D-727** | `cwd` entry surface | **RULED** (11:33 PM ET, relayed by MADC Architect) | Typed absolute `cwd` is entered in a field in the **pane header**, not a palette field. Specified in §5.3 and the cwd addendum. Iris's r2 frames now draw it (`cwd-field-1440.png`, `cwd-field-960.png`, `cwd-field-states.png`). |
+| **FDR-A4-5** | Chip wrap (the §5.4 / D5 amendment) | **RULED** (11:50 PM ET, relayed by MADC Architect) | Amend §5.4 to "receipt chips may wrap onto further lines inside their track; they never clip." Together with D-723, **D-693 closes on this merge**. §5.2, §11. |
 
 ### 1.2 Text-over-Frame Precedence
 
 Spec §0's five text-over-frame points are adopted unchanged (A3 points still hold; OS-drawn title bar; the Table frames omit `#output` and `#connect-btn` for space; the 960 Panes receipts well is scrolled, not clipped; mock values are illustrative). This pin adds three, forced by rulings:
 
 6. The 1440 Panes frame shows a `prometheus · read-only` composer target and spec §6.3 describes a read-only pane. **Not built in A4** (it is reached only through `thread/resume`, deferred by FDR-1; §1.3 D2).
-7. The frames show a streamed-only `servedModel` row as `▲ UNVERIFIED` (daedalus pane, 1440 frame). Under the default of FDR-A4-2 it renders `○ NO RECEIPT` with the same note. The `vendorReported: false` read-back row (hephaestus pane) is `▲ UNVERIFIED` as drawn (D-718).
-8. The frames show no `cwd` entry. §5.3 adds one (FDR-2).
+7. The frames show a streamed-only `servedModel` row as `▲ UNVERIFIED` (daedalus pane, 1440 frame). **The pin matches the frames** (FDR-A4-2 / D-724): streamed-only is `▲ UNVERIFIED`, never green. The `vendorReported: false` read-back row (hephaestus pane) is `▲ UNVERIFIED` as drawn (D-718).
+8. The r1 frames showed no `cwd` entry. The r2 / addendum frames (`cwd-field-1440.png`, `cwd-field-960.png`, `cwd-field-states.png`, and the pane headers in the re-rendered `direction-a-final*.png`) draw the header field. §5.3 adopts addendum §6A; the pin wins where they differ.
 
 ### 1.3 Pin deviations from the approved spec (closed list)
 
@@ -101,12 +108,11 @@ Spec §0's five text-over-frame points are adopted unchanged (A3 points still ho
 | D1 | Spec §6.1 "No other word exists" with A3's closed vocabulary extended by `RUNNING`, `COMPLETED`, `INTERRUPTED` | Adopted; this pin is the A3 pin §4.2 amendment that re-closes the list (§4.2) | D-717; A3 pin §4.2 calls the list closed |
 | D2 | `thread/resume` throughout: spec §1 ("the window only sends `thread/start`, `thread/resume`, …"), §6.3 starting-thread banner variant, "Read-only (loaded by another client)" state, "Disconnected → `Reopen pane` (sends `thread/resume`)", §6.6 and §6.2 method-error rows for `thread/resume`, §7.2 `read-only` target reason, §8.2 `Open selected thread in pane` (`cmd-pane-open-thread`), §12.2 item 9, §14.1 | **None of these is built in A4.** The window sends only `seat/list`, `thread/start`, `turn/start`, `turn/interrupt` plus the A3 reads. No read-only pane, no `Reopen pane`, no `cmd-pane-open-thread`, no `thread/resume` row. A pane whose connection ended is history only (amendment 2 §4.4): footer `connection ended · history only`, composer target disabled `not connected` | FDR-1 / D-708 defers `thread/resume`. A thread loaded by another client cannot be loaded or interrupted from the desktop (`server.ts:2171-2172`) |
 | D3 | Spec §8.2 `New pane on seat ‹seatId›` → `thread/start {seatId}` (no `cwd`) | `thread/start {seatId, cwd?}` with `cwd` from the §5.3 field | FDR-2 / D-709. Without `cwd` the engine records `worktree: null`, so `worktree.topLevel` and `head@open` would always be `—` |
-| D4 | Spec §6.4 / §9 / §12.2 item 5: a streamed-only `servedModel` → hint `"warn"` → `▲ UNVERIFIED` | `○ NO RECEIPT` (neutral) with note `streamed · confirmed by session/read after turn/completed` (**FDR-A4-2** default) | FDR-4(a)'s accepted recommendation reads "stays `neutral`/`NO RECEIPT` until a `session/read` returns `chainOk:true` containing that `servedModel` event". If the Founder picks the spec's form, D4 is dropped and spec §6.4 applies |
 | D5 | A3 spec §5.4 960–1199 row: "chips never wrap or clip" (A3 spec line 292; A3 pin D9) | **Amended (§5.2):** receipt chips **may wrap** onto further lines inside their track; they **never clip** | D-693; D-716 (Layout A with the wrap fix). The seat-visibility half is FDR-A4-1 |
 | D6 | A3 pin §5.5 / spec §7.3 closed nine-command list; A3 §9 "no command IDs outside §7.3" | Re-closed at A3's nine plus §5.5 below (spec §8.2 minus `cmd-pane-open-thread`, D2) | spec §8.2; A3 pin:222-241 |
 | D7 | Spec §9: deltas not rendered | Adopted; amendment 2 §3.2 additionally discards `item/started` and `item/agentMessage/delta` in Rust (no WebView buffer) | spec §9, §14.2 |
 
-Nothing else in this pin deviates from the spec.
+D4 (a streamed-only `servedModel` shown as `○ NO RECEIPT`) was **withdrawn in r5**: FDR-A4-2 / D-724 picked the spec's form, so the pin matches spec §6.4 and the D4 number is kept unused so D5–D7 cites stay stable. Nothing else in this pin deviates from the spec.
 
 ---
 
@@ -117,18 +123,18 @@ Nothing else in this pin deviates from the spec.
 - A3 pin §6.5 / pin:315-317 (engine death detected only at the next RPC) → amendment 2 §3.3 (`madc/transport-closed`).
 - A3 pin §6.4 R1 "UI only ever sends `room/inspect` and `session/read`" (pin:310) → amendment 2 §1.1; new R5 (amendment 2 §1.2).
 - A3 pin §6.1 `disconnect_engine` waits behind in-flight RPCs (pin:263) → amendment 2 §6 item 4.
-- A3 Q4 / D-682 "never automatically" (pin:53, 211-216) → **narrowed** by §4.5 (FDR-4(c)); selection-triggered reads and D7's "no Read command" stand.
+- A3 Q4 / D-682 "never automatically" (pin:53, 211-216) → **narrowed** by §4.5 (FDR-4(c), and further by the 11:51 PM ET post-start `session/read`); selection-triggered reads and D7's "no Read command" stand.
 - A3 pin §7 deferrals (pin:321-326) for `ALLOWED_RPC_METHODS`, `launcher.rs` / `main.rs` edits, live `room/updated`, multi-seat composer → this pin and amendment 2.
 - A3 pin §5.5 / spec §7.3 closed nine-command list (pin:222-241) → §5.5 below.
 - A3 pin §4.2 closed pill vocabulary → §4.2 below (D-717).
 - A3 spec §5.4 "chips never wrap or clip" (A3 spec line 292) and A3 pin D9's deferral of the two clipping limits → §5.2 below (D5).
-- A3 pin Q2 / D-680 "No other global shortcut is added" (pin:51) → superseded **for the R6 keys only** (C53 / D-722, §2.6, §5.6).
+- A3 pin Q2 / D-680 "No other global shortcut is added" (pin:51) → superseded **for the V6 keys only** (C53 / D-722, §2.6, §5.6).
 - A3 pin D5 "`src/ipc.ts` stays unchanged" → `connectionEpoch` and typed A4 methods (amendment 2 §4.1).
 
 ### 2.2 Unchanged and still binding
 
 - Base protocol pin §1-§4 and amendment 1 (socket, `serve`, `engine.lock`, no auto-retry, exit codes), as amended by amendment 2 where it says so.
-- A3 pin §3 tokens/typography, §4.1 evidence gate, §4.3 Room-row mapping, §6.1-§6.4 (except as superseded), D1-D9 (D9's 960–1199 right-column clamp and 140px evidence track stay; its Room tracks are replaced by spec §6.5 (a)3 under FDR-A4-1's default).
+- A3 pin §3 tokens/typography, §4.1 evidence gate, §4.3 Room-row mapping, §6.1-§6.4 (except as superseded), D1-D9 (D9's 960–1199 right-column clamp and 140px evidence track stay; its Room tracks are replaced by spec §6.5 (a)3 under FDR-A4-1 / D-723).
 - `evidenceTone` stays the only tone source; no caller passes a "verified" boolean.
 - `chore/desktop-webview-harness` (D-688) is independent; it must not block, or be blocked by, A4.
 
@@ -148,12 +154,11 @@ Every existing `desktop.test.ts` assertion keeps passing **except**: (1) the A3 
 
 ### 2.6 Pointer edits this PR makes (README edit rule, `docs/plan/README.md:3-11`)
 
-- **A3 design pin** (status line says DRAFT, so README lines 8-9 permit an in-place edit by a Founder-merged PR that says so; this PR says so):
-  - one `Amended by` line directly under its status line (pin:3);
-  - an `Amended by` marker appended to the D-680 text in the Q2 row (pin:51), reading in substance: the M3-A4 keys `Cmd/Ctrl+Enter`, `Cmd/Ctrl+1`–`4`, and the reserved `Cmd/Ctrl+Shift+.` (behind a confirm, never `Esc`) supersede "No other global shortcut is added" **for those keys only** (C53, D-722, ruled 2026-11-27 10:36 PM ET); D-680 still governs every other shortcut. No other word of the A3 pin changes.
+- **A3 design pin** (status line is left as **DRAFT**, for the Founder; this PR does not change it):
+  - one `Amended by` line directly under its status line (pin:3). That pointer also carries the D-680 / C53 supersession: the M3-A4 keys `Cmd/Ctrl+Enter`, `Cmd/Ctrl+1`–`4`, and the reserved `Cmd/Ctrl+Shift+.` (behind a confirm, never `Esc`) supersede "No other global shortcut is added" **for those keys only** (C53, D-722, ruled 2026-11-27 10:36 PM ET); D-680 still governs every other shortcut. The Q2 cell itself is **not** edited (Architect r1 L6).
 - **Amendment 1:** one `Amended by` line under its status line (amendment 2 §10).
 - **Base protocol pin:** one `Amended by` line after the existing two (amendment 2 §10).
-- **README:** index rows for this pin, amendment 2 and the spec.
+- **README:** index rows for this pin, amendment 2, spec r1 (preserved), spec r2, and the cwd addendum.
 
 ---
 
@@ -180,21 +185,21 @@ The only tone source is `evidenceTone(receipt, hint)` (`shell.js:190-195`): `fai
 
 `ALLOWED_PILL_LABELS` (`shell.js:109-113`) and `PillLabel` (`src/evidence.ts`) equal this table exactly. Geometry is A3's (spec §6.1). Chips never carry tone colour (A3 pin §4.2). Chip keys added in A4: `servedModel`, `vendorReported`, `fallbackFrom`, `lane`, `topLevel`, `sha`, `events`, `code`, and the verbatim `data` keys of a method error (`reason`, `activeTurnId`, `threadId`, `turnId`, `providerId`, `status`, `issues`).
 
-### 4.3 Pane receipt rows (spec §6.4 adopted, with D4)
+### 4.3 Pane receipt rows (spec §6.4 adopted)
 
 Rows in spec §6.2's fixed order: method-error rows, `servedModel`, `lane`, `worktree.topLevel`, `head@open`, `hash`.
 
-**`servedModel` row.** Source: the **last** `servedModel` event in `session/read` `events[]` whose `payload.turnId` is the pane's latest turn (`session-store.ts:94-108`; `search.ts:158-172`); live: `item/completed` with `item.kind === "servedModel"` (`types.ts:129-143`; persisted before it is notified, `server.ts:2572-2584`). **The read-back is the only source that can verify; the streamed item is optional.** A streamed item, when one was seen, is used only (1) to show the interim `○ NO RECEIPT` row and (2) as a consistency check against the read-back. A missed, dropped or never-sent live notification (including a connection that ended and a later user-run read) does **not** block verification: the read-back alone resolves the row, and the "equal to a streamed item" comparison is skipped when no streamed item exists.
+**`servedModel` row.** Source: the **last** `servedModel` event in `session/read` `events[]` whose `payload.turnId` is the pane's latest turn (`session-store.ts:94-108`; `search.ts:158-172`); live: `item/completed` with `item.kind === "servedModel"` (`types.ts:129-143`; persisted before it is notified, `server.ts:2572-2584`). **The read-back is the only source that can verify; the streamed item is optional.** A streamed item, when one was seen, is used only (1) to show the interim `▲ UNVERIFIED` row (FDR-A4-2 / D-724; never green) and (2) as a consistency check against the read-back. A missed, dropped or never-sent live notification (including a connection that ended and a later user-run read) does **not** block verification: the read-back alone resolves the row, and the "equal to a streamed item" comparison is skipped when no streamed item exists.
 
 | Condition (in order) | Hint → tone | Pill | Chips / note |
 | --- | --- | --- | --- |
 | No turn yet, or the turn ended without a `servedModel` item (e.g. refused `-32007`) | `neutral` | `○ NO RECEIPT` | `servedModel —` |
-| Streamed item seen, no read-back yet | `neutral` (**FDR-A4-2** default; spec: `warn`) | `○ NO RECEIPT` (spec: `▲ UNVERIFIED`) | `servedModel ‹value›`, `vendorReported ‹bool›`; note `streamed · confirmed by session/read after turn/completed` |
+| Streamed item seen, no read-back yet | `warn` (FDR-A4-2 / D-724) | `▲ UNVERIFIED` | `servedModel ‹value›`, `vendorReported ‹bool›`; note `streamed · confirmed by session/read after turn/completed`. Never green, even if `vendorReported === true`. |
 | Read-back `chainOk === true`, a matching event, `vendorReported === true`, and (**only if a streamed item was seen**) equal to it | `evidenceTone({kind:"servedModel", servedModel, vendorReported}, …)` → `verified` | `✓ VERIFIED` | `servedModel`, `vendorReported true`, `fallbackFrom` when non-null |
 | Same, `vendorReported === false` (streamed item optional as above) | `warn` (D-718) | `▲ UNVERIFIED` | as above with `vendorReported false` |
 | Read-back `chainOk !== true` (with or without a streamed item), or a streamed item was seen and its value ≠ the chain value, or `session/read` rejected | `fail` | `✗ FAILED` | note `chain not confirmed` (no stream) / `live value not confirmed by chain` / `live value differs from chain` / `session/read: ‹code› ‹message›`; cached read discarded (A3 pin §4.3 B) |
 
-**`lane` and `worktree.topLevel` rows (D-719).** Field rows: no pill, note `field · not a receipt`. `lane` from the same `servedModel` event (`ServedModelPayload.lane`). `topLevel` from `worktree.open.topLevel` (§4.4 sources); start-truncated with the full path in `title` (spec §6.4). The typed `cwd` is **never** shown as `topLevel`: `topLevel` is the engine's realpath.
+**`lane` and `worktree.topLevel` rows (D-719).** Field rows: no pill, note `field · not a receipt`. `lane` from the same `servedModel` event (`ServedModelPayload.lane`). `topLevel` from `worktree.open.topLevel` (§4.4 sources); start-truncated with the full path in `title` (spec §6.4). The typed `cwd` is **never** shown as `topLevel`: `topLevel` is the engine's realpath. After a successful `thread/start` and **until the post-start `session/read` (§4.5) or a user-run `Inspect room` returns**, `topLevel` is `—` with the note `not read yet`. After a read with `worktree: null`, it is `—` with the note `no git work tree recorded`.
 
 **`hash` row.** Exactly A3 pin §4.3 B plus the `events` chip; reset to `—` with note `chain head moved · read after turn/completed` on `turn/started` for that thread (spec §6.3).
 
@@ -202,19 +207,23 @@ Rows in spec §6.2's fixed order: method-error rows, `servedModel`, `lane`, `wor
 
 ### 4.4 `head@open` row (D-720; narrows FDR-4(b))
 
-Source, in this order within the current epoch: the seq-0 `session.open` `payload.worktree` from the pane's last `session/read` (`session-store.ts:56-68`), or `RoomThreadRow.worktree.open` from a user-run `Inspect room` (`inspect.ts:147-151,246-249`). Both are the same recorded value. The engine emits **no live HEAD** (`inspect.ts` has no `git` call; `session.close` re-reads HEAD only at clean shutdown, `server.ts:567-599`).
+Source, in this order within the current epoch: the seq-0 `session.open` `payload.worktree` from the pane's last `session/read` (`session-store.ts:56-68`), or `RoomThreadRow.worktree.open` from a user-run `Inspect room` (`inspect.ts:147-151,246-249`). Both are the same recorded value. The engine exposes **no live HEAD** on the row: `RoomThreadRow.worktree` is the recorded `open`/`close` only (`inspect.ts:147-151`). `inspectRoom` does call `inspectSessionV2` (`inspect.ts:236`); for a seat worktree under `$MADC_HOME/worktrees` that path calls `rereadWorktreeIdentity` (`handoff.ts:636-638`), which runs `git` (`worktree.ts:139-152`) and can set `worktree.missing` (`inspect.ts:290`). That live `missing` probe applies **only** to seat worktrees under `$MADC_HOME/worktrees`; a typed `cwd` elsewhere never reports missing. `session.close` re-reads `worktree.head` only at clean shutdown (`server.ts:567-599`).
 
 | Condition | Tone | Pill | Chips / note |
 | --- | --- | --- | --- |
-| `worktree` null (no `cwd`, or a v1 session) or `head` null (unborn branch) | `neutral` | `○ NO RECEIPT` | `sha —` |
+| After a successful `thread/start`, before the post-start `session/read` (§4.5) or a user-run `Inspect room` has returned | `neutral` | `○ NO RECEIPT` | `sha —`; note `not read yet` |
+| `worktree` null (no `cwd`, or a v1 session) or `head` null (unborn branch), once a read has returned | `neutral` | `○ NO RECEIPT` | `sha —` |
 | `head` matches `/^[0-9a-f]{40}$/` | `evidenceTone({kind:"sha", sha: head})` → `verified` | `✓ VERIFIED` | `sha ‹12 hex›` (full 40 in `title` and accessible name) |
-| Same, `worktree.missing === true` | as above (bound to the recorded SHA) | `✓ VERIFIED` | adds note `worktree missing on disk` (spec §6.4) |
+| Same, `worktree.missing === true` | as above (bound to the recorded SHA) | `✓ VERIFIED` | adds note `worktree missing on disk` (spec §6.4). This `missing` flag is a live probe **only** for seat worktrees under `$MADC_HOME/worktrees` (see sources above); a typed `cwd` elsewhere never reports missing. |
 
 No `chainOk` requirement (D-720). The label is always the literal `head@open`; never "head" or "current" (FDR-4(b)).
 
-### 4.5 Automatic `session/read` (FDR-4(c); narrows D-682)
+### 4.5 Automatic `session/read` (FDR-4(c), further narrowed 11:51 PM ET)
 
-Exactly one `session/read {threadId}` per `turn/completed` for an own-connection pane that is visible, single-flight per thread, A3 pin §4.3 B dedupe and stale-drop. A turn that completed while its pane was hidden gets that same single read when the pane is shown. Never on `room/updated`, never on a timer, never bulk, never on connect. Selection reads (A3 Q4) are unchanged. There is still no "Read thread" command (D7).
+Two automatic reads, both single-flight per thread, A3 pin §4.3 B dedupe and stale-drop. Neither is a poll, a timer, a bulk read, a connect-time read, or a `room/updated` trigger. Selection reads (A3 Q4) are unchanged. There is still no "Read thread" command (D7).
+
+1. **After a successful `thread/start`** (ruled 2026-11-27 11:51 PM ET, relayed by MADC Architect; a further narrowing of D-682 on top of FDR-4(c)): exactly **one** `session/read {threadId}` once the `{thread}` result is accepted, so `worktree.topLevel` and `head@open` can show straight away. **None** is sent before `thread/start` succeeds, and **none** is sent after a failed start (R3 / R5 / F2). The note `not read yet` applies only during the gap between a successful start and this read returning (or a user-run `Inspect room` arriving first). A late or stale-epoch result changes nothing (§6.1).
+2. **After `turn/completed`** (FDR-4(c) / D-711): exactly one `session/read {threadId}` for an own-connection pane that is visible. A turn that completed while its pane was hidden gets that same single read when the pane is shown.
 
 ### 4.6 Status strip model slot and copy commands
 
@@ -227,22 +236,41 @@ Exactly one `session/read {threadId}` per `turn/completed` for an own-connection
 
 ### 5.1 Regions and views
 
-Spec §5.1-§5.3 adopted: focus bar (52px) → `<main>` → status strip (34px); the Panes/Table segmented toggle (`role="radiogroup"`, roving tabindex); default view Panes when a pane exists, else Table; `Focus Engine` switches to Table; switching views sends no request and discards nothing. The Table view is the A3 Room screen as shipped plus the toggle, the §5.2 layout fix and the stale note (§11 FDR-A4-3(f)).
+Spec §5.1-§5.3 adopted: focus bar (52px) → `<main>` → status strip (34px); the Panes/Table segmented toggle (`role="radiogroup"`, roving tabindex); default view Panes when a pane exists, else Table; `Focus Engine` switches to Table; switching views sends no request and discards nothing. The Table view is the A3 Room screen as shipped plus the toggle, the §5.2 layout fix and the stale note (FDR-A4-3(f) / D-725).
 
 ### 5.2 Panes grid, D-693 and D-699
 
 - **Panes grid:** spec §5.4 adopted: `paneColumns(W)` = 4 at W ≥ 1440, 2 at 960–1439; equal columns `repeat(N, minmax(0,1fr))`, gap 14px, `<main>` padding `20px 28px`; wide row form iff pane width ≥ 520px. Below 960×640 the A3 guard rows apply (Q5 `minWidth`/`minHeight` unchanged).
-- **Hidden panes:** spec §5.5 adopted (hidden, never closed; a hidden pane keeps its thread and lock, amendment 2 §16.4). The tab form at ≥ 1440, the rightmost-slot rule and `Dismiss pane` are FDR-A4-3 items.
+- **Hidden panes (FDR-A4-3 / D-725, ruled 11:33 PM ET):** spec §5.5 adopted (hidden, never closed; a hidden pane that holds a thread keeps its thread and lock, amendment 2 §16.4). At ≥ 1440 each hidden pane is a tab (seat plus the pane's header pill at `.pill--sm`); below 1440 one summary chip `N hidden · names` (activating it opens the palette pre-filtered to `Show pane`). Showing a hidden pane puts it in the rightmost visible slot; the pane that was there becomes hidden. `Dismiss pane` removes only a pane that holds no thread (Draft, or Start failed). Reopen pane is deferred (FDR-A4-3(b) / D-726; needs `thread/resume`).
 - **Scroll:** spec §5.6 adopted (Panes: `<main>` does not scroll; each pane's receipts well is its only scroll region. Table: A3 rules).
-- **§5.4 amendment (D5; D-693):** A3 spec §5.4's "chips never wrap or clip" is amended for the M3 desktop to **"receipt chips may wrap onto further lines inside their track; they never clip."** `.cell-receipt` and `.receipt-chips` get `flex-wrap: wrap; row-gap: 6px`; rows grow to fit; notes wrap on their own line; no rule may hide overflow in a way that cuts a chip; full values stay in `title`. Below 1200px the Receipts-well row becomes two lines (`112px minmax(0,1fr)`), so the `exit 20` `pid` chip and the `manualFix` note fit at 960 (spec §6.5 (b); frame `direction-a-final-table-960.png`).
-- **Seat visibility below 1200px: FOUNDER_DECISION_REQUIRED (FDR-A4-1).** **Default, the spec §15 recommendation:** the seat stays visible at every width. At ≥ 1200px A3's five Room tracks stay; at 960–1199px the seat folds into the thread cell as a second line (`THREAD · SEAT`), tracks `140px minmax(96px, 0.62fr) 48px minmax(168px, 1.9fr)`, gap 8px, replacing D9's Room tracks while D9's right-column `clamp(360px, 37.5vw, 440px)` stays (spec §6.5 (a)). **Alternative:** hide the `seat` column below 1200px and wrap chips (A3 pin D9's proposal). **D-693 closes only when the Founder rules FDR-A4-1 and this PR merges**; until then it stays open, and the builder implements the default.
+- **§5.4 amendment (D5; FDR-A4-5, ruled 2026-11-27 11:50 PM ET, relayed by MADC Architect):** A3 spec §5.4's "chips never wrap or clip" is amended for the M3 desktop to **"receipt chips may wrap onto further lines inside their track; they never clip."** `.cell-receipt` and `.receipt-chips` get `flex-wrap: wrap; row-gap: 6px`; rows grow to fit; notes wrap on their own line; no rule may hide overflow in a way that cuts a chip; full values stay in `title`. Below 1200px the Receipts-well row becomes two lines (`112px minmax(0,1fr)`), so the `exit 20` `pid` chip and the `manualFix` note fit at 960 (spec §6.5 (b); frame `direction-a-final-table-960.png`). Together with D-723, **D-693 closes on this merge.**
+- **Seat visibility below 1200px (FDR-A4-1 / D-723, ruled 2026-11-27 11:33 PM ET, relayed by MADC Architect):** the seat stays visible at every width. At ≥ 1200px A3's five Room tracks stay; at 960–1199px the seat folds into the thread cell as a second line (`THREAD · SEAT`), tracks `140px minmax(96px, 0.62fr) 48px minmax(168px, 1.9fr)`, gap 8px, replacing D9's Room tracks while D9's right-column `clamp(360px, 37.5vw, 440px)` stays (spec §6.5 (a)). **Rejected alternative:** hide the `seat` column below 1200px (A3 pin D9's proposal).
 - **D-699 (FDR-6(b) confirmed):** Safari < 18 paints the glass opaque under the verbatim `@supports not (backdrop-filter: blur(1px))` block and that is accepted as-is (no A3 spec §3.4 amendment, no prefix-aware `@supports`). The quit dialog shares the palette's rule and fallback (spec §3, §11). Pane bodies are tier 1/tier 0 (no `backdrop-filter`); no element depends on glass for legibility.
 
-### 5.3 Starting a pane, and the `cwd` field (FDR-2; D3; FDR-A4-4)
+### 5.3 Starting a pane, and the `cwd` field (FDR-2; D3; FDR-A4-4 / D-727)
 
-- `New pane on seat ‹seatId›` (one palette row per `seat/list` entry; `ok:false` rows disabled with `seat load failed ‹code›`) opens a **second palette step**: the palette input is replaced by one text field labelled `cwd` (micro-label `CWD · absolute path · optional`), prefilled with the last `cwd` used in this window (none on first use). `Enter` confirms; `Esc` returns to the command list (A3 Q2 `Esc` role unchanged).
-- Empty → `thread/start {seatId}` (engine records `worktree: null`; `topLevel` and `head@open` stay `—`). Non-empty → must be absolute; the UI checks `startsWith("/")` and Rust enforces amendment 2 §1.2 (absolute, ≤ 4096 bytes, no NUL); a refusal is R5 (defect guard, never `disconnect_engine`). Existence and repo resolution are the engine's (`-32602` / worktree identity).
-- On confirm a starting-thread pane appears (spec §6.3 "Starting thread", `thread/start` variant only). The visual of the `cwd` step is FDR-A4-4 (Iris may restyle it within A3 palette tokens without a new ruling).
+This section **adopts addendum §6A** (`sources/DESIGN-SPEC-m3-a4-cwd-field-addendum.md`, sha256 `1caa2a9e…378e00e`; also Iris spec r2 §6A). The addendum is the visual and interaction source of truth for placement, typography, keys, the local check and accessibility. The contracts below are binding; where this pin and the addendum differ, this pin wins.
+
+- `New pane on seat ‹seatId›` (one palette row per `seat/list` entry; `ok:false` rows disabled with `seat load failed ‹code›`) creates a **Draft** pane immediately, closes the palette, takes the rightmost visible slot if N visible panes already exist, and focuses the header `cwd` field with the prefill selected. **Nothing is sent** until `Enter` or `START THREAD`. There is **no palette cwd step** (rejected alternative, §11). No new palette command is added.
+- **Where the field sits (addendum §6A.2).** In the pane header, as a cwd block under the top row (position + seat + thread line `no thread yet` at the left; turn pill `○ IDLE` at the right). The block is: row 1, key `cwd` and the input; row 2, the field state at the left and a `START THREAD` button at the right; row 3, the reason line (and, for `REFUSED`, chips then issues). Same markup at 960, 1200 and 1440; only the input width changes. Input is a tier-0 well, placeholder `/absolute/path · optional`. Fail states use a `--madc-red` border. A started pane replaces rows 1–3 with a 22px started row: `cwd` key | read-only value | `○ STARTED`. Until `thread/start` returns, the receipts well is replaced by one muted line, `No thread yet. Receipts appear after thread/start returns.` (spec r2 §6.2).
+- **When it is editable (addendum §6A.3).** Editable only before a successful start, including after a failed start (Draft and Start failed). It locks (`readonly`, 65% opacity) while Starting thread, and is a plain read-only value (no input chrome) after a successful start, including after the connection ends. To use another path, open another pane. The started value is `Thread.cwd` from the result (`—` muted when `null`); if that differs from the typed text (a `worktree: true` seat), a second line reads `engine path · typed ‹sent path›`. The typed `cwd` is **never** shown as `topLevel`.
+- **Six field states (addendum §6A.4).** The field state is status text (glyph + word), **not a pill**, and is not in `ALLOWED_PILL_LABELS`. Tone is only `neutral` or `fail`; it can never be `verified` or `warn`. Nothing about a path ever goes green. `STARTED` means only that the engine returned a thread.
+
+  | # | State | Glyph + word | When | Request |
+  | --- | --- | --- | --- | --- |
+  | 1 | Empty | `○ NO CWD` | text is `""` | none |
+  | 2 | Typed, not yet checked | `○ UNCHECKED` | non-empty, passes `cwdCheck` | none |
+  | 3 | Client-side reject | `✗ REJECTED` | non-empty, fails `cwdCheck` | none (Enter sends nothing) |
+  | 4 | Engine reject | `✗ REFUSED` | `thread/start` returned an error or R5 | already sent; not re-sent automatically |
+  | 5 | Thread starting | `○ STARTING` | `thread/start` in flight | pending, single-flight |
+  | 6 | Started | `○ STARTED` | `{thread}` returned | none |
+
+  State 4 clears only when the text is edited or the next `thread/start` on this pane succeeds, never by a timer (C15).
+- **Local check (addendum §6A.5).** `cwdCheck(text)` is a pure function, no I/O. The text is **never trimmed or normalised**; the value sent is the exact typed string. `""` is ok (state 1). Reject (state 3) if the text contains NUL, is longer than 4096 UTF-8 bytes, starts with `~`, or does not start with `/` (POSIX; Windows is out of scope). `/` alone, internal spaces and a trailing `/` are ok. `REJECTED` disables `START THREAD`. This matches amendment 2 §1.2 on POSIX, so a passing text can only fail at the engine. An R5 is then a defect guard: reason verbatim, no chips, connection stays `CONNECTED`, `disconnect_engine` is never called.
+- **Keys (addendum §6A.6).** `Enter` in the field (no modifiers) starts the thread in states 1, 2 and 4, only while `CONNECTED`; in state 3 it sends nothing; in state 5 it is ignored. `Esc` **reverts** to the baseline text (the prefill at creation, or the last text sent) and does not dismiss the pane, send a request, or interrupt; if the text is already the baseline, focus moves to the pane. `Cmd/Ctrl+Enter` in this field starts neither a thread nor a turn (those keys start a turn only from the composer). Prefill is the last `cwd` sent in this window (none on first use).
+- **Request (addendum §6A.7).** Exactly the keys `seatId` and, only when the text is non-empty, `cwd` (unchanged). One request per Enter or click. Empty → `thread/start {seatId}` (engine records `worktree: null`). Existence and repo resolution are the engine's. After a successful start, exactly one automatic `session/read` runs (§4.5); none before success and none on a failed start. During the gap before that read returns, `topLevel` and `head@open` show `not read yet`.
+- **Long paths (addendum §6A.8).** Unfocused or read-only values truncate from the **start** with a leading `…` (`direction: rtl`, `text-align: left`, `text-overflow: ellipsis`, text in `<bdi>`). Truncation is presentation only; the stored value is unaltered; the full path is in `title` and the accessible name.
+- **Frames.** `cwd-field-1440.png`, `cwd-field-960.png`, `cwd-field-states.png`, and the pane headers in the re-rendered `direction-a-final*.png` (hashes in the artifacts table).
 
 ### 5.4 Composer, start and interrupt
 
@@ -260,10 +288,10 @@ A3's nine commands (A3 pin §5.5, D4 rules unchanged; `Focus Engine` also switch
 | Evidence | `Copy head@open` (`cmd-copy-head-open`) |
 | Panes | `Show Panes view` (`cmd-view-panes`), `Show Table view` (`cmd-view-table`) |
 | Panes | `Focus pane 1–4` (`cmd-pane-focus-1` … `cmd-pane-focus-4`) |
-| Panes | `New pane on seat ‹seatId›` (`cmd-pane-new:‹seatId›`), opens the §5.3 `cwd` step |
+| Panes | `New pane on seat ‹seatId›` (`cmd-pane-new:‹seatId›`), creates the pane and focuses the header `cwd` field (§5.3) |
 | Panes | `Show pane ‹seat›` (`cmd-pane-show:‹paneId›`) |
 | Panes | `Hide pane ‹seat›` (`cmd-pane-hide`) |
-| Panes | `Dismiss pane ‹seat›` (`cmd-pane-dismiss`), only for a pane whose `thread/start` failed (FDR-A4-3(a)) |
+| Panes | `Dismiss pane ‹seat›` (`cmd-pane-dismiss`), only for a pane that holds no thread: Draft, or `thread/start` failed (FDR-A4-3(a) / D-725) |
 | Turn | `Start turn` (`cmd-turn-start`) |
 | Turn | `Interrupt turn on ‹seat›` (`cmd-turn-interrupt:‹paneId›`), no key hint |
 | Turn | `Toggle target ‹seat›` (`cmd-target-toggle:‹paneId›`) |
@@ -280,15 +308,15 @@ Spec §8.1 adopted:
 | `Cmd+Enter` / `Ctrl+Enter` | composer input focused | Start turn |
 | `Cmd+1`–`4` / `Ctrl+1`–`4` | anywhere, palette closed | switch to Panes if needed, focus the visible pane at that slot; no-op if empty |
 | `Tab` / `Shift+Tab`, `←` / `→`, `Space` | as spec §8.1 | unchanged roving / focus order; `Space` toggles a target chip |
-| `Esc` | palette; quit dialog | closes the palette (A3); closes the quit dialog as **Keep running** (FDR-A4-3(e)); **never interrupts anything** |
+| `Esc` | palette; quit dialog | closes the palette (A3); closes the quit dialog as **Keep running**, which invokes `ack_quit` (FDR-A4-3(e) / D-725; amendment 2 §6.1); **never interrupts anything** |
 
 - Interrupt has **no key** in A4. `Cmd/Ctrl+Shift+.` is **reserved** for a future interrupt key **behind a confirm**, and is never `Esc`; A4 does not bind it.
 - Modifier detection is A3 Q2's (`metaKey && !ctrlKey` on macOS, `ctrlKey && !metaKey` elsewhere). No `Ctrl+F` / `Cmd+F`.
-- **D-680 supersession, for these keys only (C53, D-722, ruled 2026-11-27 10:36 PM ET):** `Cmd/Ctrl+Enter`, `Cmd/Ctrl+1–4` and the reserved `Cmd/Ctrl+Shift+.` supersede A3 pin Q2's "No other global shortcut is added" (D-680). D-680 still governs every other shortcut; adding any other key needs a new ruling. The A3 pin carries the `Amended by` marker on that text (§2.6).
+- **D-680 supersession, for these keys only (C53, D-722, ruled 2026-11-27 10:36 PM ET):** `Cmd/Ctrl+Enter`, `Cmd/Ctrl+1–4` and the reserved `Cmd/Ctrl+Shift+.` supersede A3 pin Q2's "No other global shortcut is added" (D-680). D-680 still governs every other shortcut; adding any other key needs a new ruling. The A3 pin records the supersession on its header `Amended by` pointer, not in the Q2 cell (§2.6).
 
 ### 5.7 Quit flow (FDR-5)
 
-Spec §10 adopted, with amendment 2 §6.1 as the mechanism: no running own-connection turns → quit immediately; one or more → the `role="alertdialog"` dialog (frame `quit-confirm.png`), body text verbatim, the list of running own-connection turns (hidden panes included, suffix `(hidden)`), `KEEP RUNNING` default focus, `QUIT AND INTERRUPT ‹n› TURN(S)` neutral (no red button), `Tab` trapped, `Esc` = Keep running (FDR-A4-3(e)). Confirming sends **zero** `turn/interrupt`; it invokes `confirm_quit`, and the engine records the interruptions.
+Spec §10 adopted, with amendment 2 §6.1 as the mechanism: no running own-connection turns → quit immediately; one or more → the `role="alertdialog"` dialog (frame `quit-confirm.png`), body text verbatim, the list of running own-connection turns (hidden panes included, suffix `(hidden)`), `KEEP RUNNING` default focus, `QUIT AND INTERRUPT ‹n› TURN(S)` neutral (no red button), `Tab` trapped, `Esc` = Keep running (FDR-A4-3(e) / D-725). **Keep running** (button or `Esc`) invokes `ack_quit`, which re-arms the quit guard (amendment 2 §6.1); it does not exit. Confirming sends **zero** `turn/interrupt` and **zero** `disconnect_engine`; it invokes `confirm_quit` once, and the engine records the interruptions.
 
 ### 5.8 Accessibility
 
@@ -304,9 +332,10 @@ A3 pin §6 binds unchanged (states, single-flight, `connect_engine` grammars G1-
 
 | State | Entered when | Turn pill | Send target | Interrupt |
 | --- | --- | --- | --- | --- |
-| Starting thread | `thread/start` in flight (single-flight per pane) | `○ IDLE` | disabled `starting thread` | disabled |
-| Start failed | `thread/start` rejected (R3 / R5) | `○ IDLE` | disabled `no thread loaded` | disabled; `Dismiss pane` allowed |
-| Idle | `thread/start` resolved, no turn yet | `○ IDLE` | enabled | disabled |
+| Draft | `New pane on seat` created the pane; no `thread/start` sent yet (FDR-A4-4 / D-727; addendum §6A) | `○ IDLE` | disabled `no thread loaded` | disabled; `cwd` field editable; `START THREAD` in the header cwd block; receipts well is the one-line `No thread yet` note; `Dismiss pane` allowed |
+| Starting thread | `thread/start` in flight (single-flight per pane) | `○ IDLE` | disabled `starting thread` | disabled; `cwd` field locked (`readonly`, state `○ STARTING`); no automatic `session/read` yet |
+| Start failed | `thread/start` rejected (R3 / R5 / F2) | `○ IDLE` | disabled `no thread loaded` | disabled; `cwd` field stays editable (state `✗ REFUSED`); header `START THREAD` retries; **no** automatic `session/read`; `Dismiss pane` allowed |
+| Idle | `thread/start` resolved, no turn yet | `○ IDLE` | enabled | disabled; `cwd` field read-only (`○ STARTED`, `Thread.cwd`); exactly one automatic `session/read` is issued on entry (§4.5); until it (or a user `Inspect room`) returns, `topLevel` and `head@open` show `not read yet` |
 | Running | `turn/start` resolved `inProgress`, or `turn/started` | `○ RUNNING` | disabled `turn active` | enabled (own connection) |
 | Interrupt pending | `turn/interrupt` sent, no `turn/completed` yet | `○ RUNNING` | disabled `turn active` | disabled, footer `turn/interrupt sent` |
 | Completed | `turn/completed` `completed`, confirmed by the §4.5 read | `○ COMPLETED` | enabled | disabled |
@@ -365,10 +394,12 @@ Rules: the machine is driven only by current-epoch `rpc_request` results and acc
 
 All checks run headless in `npm run check` (tsc, Biome, `node --test`, `bun test`) and `cargo test`, with **zero network, zero keychain, zero real TTY, zero real model, zero live engine spawn** in the JS tests (fake `invokeFn`, fake event listener, the A3 fake-DOM harness plus §2.3's extensions); Rust tests use fake socket peers. Protocol tests are amendment 2 §13.
 
-Spec §12.2 items 1-4, 6-8, 10-19 are adopted as written, with these edits:
-- **Item 5 (servedModel row):** under FDR-A4-2's default, streamed-only → `neutral` `○ NO RECEIPT` with the note, even with `vendorReported: true`; read-back `vendorReported: true` → `verified`; read-back `false` → `warn` `▲ UNVERIFIED`; none → `neutral`. If the Founder picks the spec's form, the spec's item 5 applies unchanged.
+Spec §12.2 items 1-8, 10-11, 13, 16-19 are adopted as written, with these edits:
+- **Item 5 (servedModel row):** applies **as written** (FDR-A4-2 / D-724): streamed-only → hint `"warn"` → `▲ UNVERIFIED`, even with `vendorReported: true`; never green until `session/read` confirms; read-back `vendorReported: true` → `verified`; read-back `false` → `warn` `▲ UNVERIFIED`; none → `neutral`.
 - **Item 9 (read-only via `thread/resume`):** **dropped** (D2). Replaced by: no code path sends `thread/resume`; the palette has no `cmd-pane-open-thread`; no pane renders a `read-only` banner or target reason.
-- **Item 14 (static CSS):** the "no `display: none` on seat text below 1200px" and 960–1199 track assertions follow FDR-A4-1's default; if the Founder picks the alternative, they become "the seat column is hidden below 1200px and chips wrap".
+- **Item 12 (live updates):** restated to match amendment 2 §3.4 item 2 and §13 (11): exactly one automatic `session/read` after a successful `thread/start` (11:51 PM ET narrowing of D-682), plus exactly one automatic `session/read` per completed turn on a visible pane, and none for a hidden pane until it is shown; **zero** automatic reads before `thread/start` succeeds or after a failed start; `room/updated` **never** triggers a `room/inspect` or a `session/read`, for any `reason`. The spec's "`reason` ≠ `"turn"` never reads" is weaker than the pin and is not adopted.
+- **Item 14 (static CSS):** the "no `display: none` on seat text below 1200px" and 960–1199 track assertions apply (FDR-A4-1 / D-723; hide-seat is rejected). The wrap assertions (`.cell-receipt` / `.receipt-chips` have `flex-wrap: wrap`; two-line Receipts row below 1200px) apply (FDR-A4-5, ruled 11:50 PM ET).
+- **Item 15 (quit):** no running own-connection turns → no dialog. Running → dialog lists exactly those turns, hidden panes included (there are no read-only panes in A4, D2). Default focus is Keep running; `Esc` keeps running and invokes `ack_quit`. Confirming invokes `confirm_quit` once, `disconnect_engine` zero times, `turn/interrupt` zero times.
 - **Item 17 (palette ids):** exactly A3's nine plus §5.5's list.
 
 Added by this pin:
@@ -377,7 +408,22 @@ Added by this pin:
 22. **Pane machine (§6.1):** table-driven over every transition; a second Start while Running sends nothing; an `{}` interrupt reply for a finished turn changes nothing; a stale-epoch result or event changes no pane, receipt or connection state; a `turn/start` result after `disconnect_engine` creates no pane.
 23. **Presence honesty:** no `turn/start` carries a `mode` key; a fake `-32007` with `reason: "headless-not-permitted"` renders `code` and `reason` chips verbatim, the pane stays `○ IDLE`, the connection stays `CONNECTED`, and `disconnect_engine` is invoked zero times.
 24. **R5 / R1 killed mutation (UI):** with a Running pane and `CONNECTED` state, an R5 or R1 rejection invokes `disconnect_engine` **zero** times and the pane stays Running.
-25. **`cwd` step (§5.3):** empty sends `thread/start {seatId}` without `cwd`; a relative path is refused before any `rpc_request`; an absolute path is sent unchanged; the typed `cwd` never appears as a `topLevel` chip.
+25. **`cwd` field (§5.3 / addendum §6A.10), C1–C15:**
+    - C1. `cwdCheck` table: `""` and `"/"` and `"/a b/"` ok (value unchanged); `"relative"`, `"./x"`, `"~/x"`, `" /x"` (leading space) reject, with the `~` reason only for `~`; a NUL rejects; 4096 bytes ok, 4097 rejects. Text is never trimmed.
+    - C2. Field state returns only the six words and only `neutral` or `fail`; never `verified` or `warn`. No element in the cwd block has a verified/warn pill.
+    - C3. Enter in state 3 sends zero `rpc_request`. Enter in states 1/2/4 sends exactly one `thread/start` whose params keys are exactly `{seatId, cwd}`, or exactly `{seatId}` when the text is empty.
+    - C4. A second Enter or click while state 5 sends nothing.
+    - C5. `Esc` restores the baseline text and sends nothing; `Esc` on an unchanged field only moves focus; the pane is never dismissed by `Esc`.
+    - C6. `Cmd/Ctrl+Enter` in the cwd input sends neither `thread/start` nor `turn/start`. Those keys start a turn only from the composer.
+    - C7. The input is `readonly` in state 5 and absent (plain text) in state 6; editable in states 1–4, including after a failed start.
+    - C8. State 6 shows `Thread.cwd` from the result (tested with a result whose `cwd` ≠ the typed text). The typed `cwd` never appears in any `topLevel` chip.
+    - C9. `-32602` with `data.issues` renders `✗ REFUSED`, chip `code -32602`, each issue verbatim; field stays editable; connection stays `CONNECTED`; `disconnect_engine` is invoked zero times.
+    - C10. An R5 string renders `✗ REFUSED` with the reason verbatim and no chips; `disconnect_engine` is invoked zero times.
+    - C11. `New pane on seat ‹seatId›` creates a Draft pane and sends no `rpc_request`; composer target reads `no thread loaded`; `Dismiss pane` on it sends nothing and removes it.
+    - C12. No `keydown` handler reacts to `f` with Ctrl or Meta; no new global handler exists.
+    - C13. Long-path static assertions: unfocused value rule has `direction: rtl`, `text-overflow: ellipsis` and `<bdi>`; stored value equals the typed text; `title` holds the full path.
+    - C14. No rule in `.cwd`, `.cwd-in` or `.fst` uses `--madc-green` or `--madc-yellow`.
+    - C15. State 4 is cleared only by an edit or a successful start, never by a timer.
 26. **Keys (C53):** the only new global handlers are `Cmd/Ctrl+Enter` (composer input only) and `Cmd/Ctrl+1–4`; `Cmd/Ctrl+Shift+.` and `Esc` never send `turn/interrupt`.
 27. **Engine untouched:** the diff touches no file under `packages/engine/`.
 
@@ -389,27 +435,37 @@ Added by this pin:
 | --- | --- |
 | D-660, D-666 | **Folded in** via amendment 2 §6 (9 s total exit bound pinned; code fix lands in the A4 build). D-660 stays `needs-confirmation` until Mike's ruling is on GitHub (FDR-7(a)) |
 | D-665 | **Folded in** by amendment 2 §7 (stdin error → exit 0 text for amendment 1 §3(a)) |
-| D-693 | **Folded in, pending ruling:** §5.2's §5.4 amendment lands; the item **closes only on the Founder's FDR-A4-1 ruling plus this merge** |
+| D-693 | **Closes on this merge.** Seat visibility (FDR-A4-1 / D-723, 11:33 PM ET) and chip wrap (FDR-A4-5, 11:50 PM ET) are both ruled. |
 | D-699 | **Folded in:** Safari < 18 opaque fallback confirmed (FDR-6(b)) and pinned in §5.2. Cited instead of D-694, which it superseded |
-| D-682 (A3 Q4) | **Narrowed** by §4.5 (FDR-4(c)); statement otherwise unchanged |
-| D-680 (A3 Q2) | **Superseded for the R6 keys only** (C53 / D-722); otherwise unchanged |
+| D-682 (A3 Q4) | **Narrowed** by §4.5: FDR-4(c) (one automatic read per completed turn on a visible pane) and further by the 11:51 PM ET ruling (exactly one automatic read after a successful `thread/start`). Selection-triggered reads and D7's "no Read command" stand. |
+| D-680 (A3 Q2) | **Superseded for the V6 keys only** (C53 / D-722); otherwise unchanged |
 | D-654, D-661, D-663, D-664 | **Stay open**, untouched (D-663 stays a separate amendment, FDR-7(b) / D-714) |
 | D-688, D-648, D-670, D-676 | Carried unchanged |
 | D-705, D-706 | Spec gate and this pin: satisfied by this PR at Founder merge |
-| D-707, D-708..D-715, D-716..D-721, D-722 | Relayed rulings, applied in §1.1 and amendment 2 §14; **`needs-confirmation`** (Clio ids, not on GitHub) |
-| FDR-A4-1..FDR-A4-4 | New open Founder decisions (§11) |
+| D-707, D-708..D-715, D-716..D-721, D-722, D-723..D-727 | Relayed rulings, applied in §1.1, §11 and amendment 2 §14; **`needs-confirmation`** (Clio ids, not on GitHub) |
+| FDR-A4-1 / D-723 | **RULED** 11:33 PM ET (relayed by MADC Architect): seat stays visible, folded into the thread cell below 1200px; hide-seat rejected |
+| FDR-A4-2 / D-724 | **RULED** 11:33 PM ET: streamed-only `servedModel` is `▲ UNVERIFIED`, never green; verified only after `session/read` |
+| FDR-A4-3 (a),(c)–(f) / D-725 | **RULED** 11:33 PM ET: Dismiss pane, hidden-pane tabs with summary chip, rightmost-slot reshow, Esc = Keep running, Table stale note |
+| FDR-A4-3(b) / D-726 | **RULED** deferred 11:33 PM ET: Reopen pane is carried debt; depends on D-708 (`thread/resume`) |
+| FDR-A4-4 / D-727 | **RULED** 11:33 PM ET: typed absolute `cwd` is a field in the pane header, not a palette field |
+| FDR-A4-5 | **RULED** 11:50 PM ET (relayed by MADC Architect): chips may wrap, never clip. Together with D-723, D-693 closes on this merge. No Clio id was given. |
 
 ---
 
-## 11. FOUNDER_DECISION_REQUIRED (open; each has a default the builder implements unless the Founder rules otherwise)
+## 11. A4 Founder rulings (FDR-A4-1..FDR-A4-5)
 
-- **FDR-A4-1: D-693 seat visibility below 1200px.** *Default (spec §15 recommendation):* keep the seat visible at every width; fold it into the thread cell below 1200px; chips wrap at every width; two-line Receipts row below 1200px. *Alternative:* hide the `seat` column below 1200px. D-693 closes only on this ruling plus merge.
-- **FDR-A4-2: tone of a streamed-only `servedModel`.** *Default (FDR-4(a)'s accepted text):* `○ NO RECEIPT` (neutral) with the note `streamed · confirmed by session/read after turn/completed`. *Alternative (spec §6.4, frames):* `▲ UNVERIFIED` (warn). Neither is ever green.
-- **FDR-A4-3: Iris additions not covered by a ruling** (spec: "my additions, not Mike's rulings"):
-  - (a) `Dismiss pane ‹seat›`, only for a pane whose `thread/start` failed (spec §5.5, §8.2). *Recommend:* accept.
-  - (b) `Reopen pane` on a disconnected pane, one `thread/resume` on click (spec §6.3). *Recommend:* **defer with `thread/resume`**; it cannot be built in A4 under FDR-1. In A4 the pane shows `connection ended · history only`.
-  - (c) Hidden-pane tabs at ≥ 1440 (seat plus `.pill--sm`, extending A3's `.pill--sm` use) and the `N hidden · names` summary chip below 1440 (spec §5.5). *Recommend:* accept.
-  - (d) A shown hidden pane takes the rightmost visible slot and the pane there becomes hidden (spec §5.5). *Recommend:* accept.
-  - (e) `Esc` on the quit dialog means **Keep running** (spec §8.1, §10). *Recommend:* accept.
-  - (f) The Table-view stale note `room changed · Inspect room to refresh` instead of any automatic `room/inspect` on `room/updated` (spec §9; amendment 2 §3.4 item 2). *Recommend:* accept.
-- **FDR-A4-4: `cwd` entry surface** (FDR-2 ruled the field; the spec draws none). *Default:* the two-step palette field in §5.3. Visual only; Iris may restyle within A3 palette tokens.
+FDR-A4-1..FDR-A4-4 were **RULED** on 2026-11-27 at 11:33 PM ET, relayed by MADC Architect; Clio **D-723..D-727**, `needs-confirmation` (not posted on GitHub). FDR-A4-5 was **RULED** at 11:50 PM ET, same relay; no Clio id was given. The post-start `session/read` (a further narrowing of D-682 on top of FDR-4(c), not a new FDR id) was **RULED** at 11:51 PM ET, same relay. The Founder's merge of this PR is the on-record act.
+
+- **FDR-A4-1 / D-723: D-693 seat visibility below 1200px.** **RULED.** The seat stays visible at every width; below 1200px it folds into the thread cell as a second line (`THREAD · SEAT`); two-line Receipts row below 1200px. **Rejected alternative:** hide the `seat` column below 1200px. Chip wrap is a separate ruling (FDR-A4-5, 11:50 PM ET). Together they close **D-693 on this merge**. §5.2.
+- **FDR-A4-2 / D-724: tone of a streamed-only `servedModel`.** **RULED.** Streamed-only (before `session/read` confirms) shows `▲ UNVERIFIED` (warn), never green. Verified only after `session/read`. This reconciles FDR-4(a)'s earlier `○ NO RECEIPT` recommendation to the spec and frames. `○ NO RECEIPT` remains only when there is no `servedModel` item. §4.3.
+- **FDR-A4-3: Iris additions not covered by an earlier ruling** (spec: "my additions, not Mike's rulings"):
+  - (a) `Dismiss pane ‹seat›`, for a pane that holds no thread (Draft, or whose `thread/start` failed) (spec §5.5, §8.2). **RULED: accept** (D-725).
+  - (b) `Reopen pane` on a disconnected pane, one `thread/resume` on click (spec §6.3). **RULED: defer** with `thread/resume` (**D-726**, carried debt, depends on D-708). It cannot be built in A4 under FDR-1. In A4 the pane shows `connection ended · history only`.
+  - (c) Hidden-pane tabs at ≥ 1440 (seat plus `.pill--sm`, extending A3's `.pill--sm` use) and the `N hidden · names` summary chip below 1440 (spec §5.5). **RULED: accept** (D-725).
+  - (d) A shown hidden pane takes the rightmost visible slot and the pane there becomes hidden (spec §5.5). **RULED: accept** (D-725).
+  - (e) `Esc` on the quit dialog means **Keep running** (spec §8.1, §10), which invokes `ack_quit` (amendment 2 §6.1). **RULED: accept** (D-725).
+  - (f) The Table-view stale note `room changed · Inspect room to refresh` instead of any automatic `room/inspect` on `room/updated` (spec §9; amendment 2 §3.4 item 2). **RULED: accept** (D-725).
+- **FDR-A4-4 / D-727: `cwd` entry surface** (FDR-2 ruled the field; the r1 frames drew none). **RULED.** Typed absolute `cwd` is entered in a field in the **pane header**, not a palette field. Specified in §5.3, which adopts addendum §6A (Draft pane; six field states; `cwdCheck` never trims; `START THREAD` in the header cwd block; Enter starts, Esc reverts; C1–C15). **Rejected alternative:** the two-step palette field. Iris's r2 / addendum frames now draw the field.
+- **FDR-A4-5: chip wrap (the §5.4 / D5 amendment).** **RULED** 2026-11-27 11:50 PM ET, relayed by MADC Architect (no Clio id was given). Amend §5.4 to "receipt chips may wrap onto further lines inside their track; they never clip." Together with D-723, **D-693 closes on this merge.** §5.2.
+
+- **Post-start `session/read` (further narrowing of D-682 on top of FDR-4(c); no new FDR or Clio id).** **RULED** 2026-11-27 11:51 PM ET, relayed by MADC Architect. After `thread/start` succeeds, the desktop makes exactly one automatic `session/read` so `worktree.topLevel` and `head@open` show straight away. A single read, no polling; none before `thread/start` succeeds and none after a failed start. The note `not read yet` applies only during the gap before that read returns. Named test and killed mutation: amendment 2 §13 (11b). §4.5.
