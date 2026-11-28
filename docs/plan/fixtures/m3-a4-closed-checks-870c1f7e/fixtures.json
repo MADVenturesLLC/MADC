@@ -1,0 +1,912 @@
+{
+  "sourceCommit": "870c1f7ec3aeca13190f306b23c5d91810675e09",
+  "rpcs": {
+    "initialize": {
+      "serverInfo": {
+        "name": "madc-engine",
+        "version": "0.0.0"
+      },
+      "protocolVersion": "madc-m1/1"
+    },
+    "seatList": {
+      "data": [
+        {
+          "id": "bad-seat",
+          "ok": false,
+          "path": "/tmp/madc-tmp/madc-capture-870c1f7e-92532/home/seats/bad-seat.json",
+          "code": -32006,
+          "issues": [
+            "role must be a non-empty string",
+            "standingInstructions must be a string",
+            "displayName must be a non-empty string at version 2",
+            "pinnedModel must be a non-empty string",
+            "preferredBacking must be a registry provider id",
+            "fallbacks must be an array of registry provider ids at version 2",
+            "memory must be an object",
+            "tools must be an object",
+            "policy must be an object",
+            "handoffs must be an object"
+          ]
+        },
+        {
+          "id": "daedalus",
+          "ok": true,
+          "path": "/tmp/madc-tmp/madc-capture-870c1f7e-92532/home/seats/daedalus.json",
+          "version": 2,
+          "displayName": "Daedalus",
+          "role": "architect",
+          "pinnedModel": "claude-sonnet-4-5",
+          "preferredBacking": "claude-code",
+          "fallbacks": [
+            "kimi-code"
+          ],
+          "memory": {
+            "mode": "file",
+            "path": "memory/daedalus.md"
+          },
+          "tools": {
+            "deny": [
+              "writes outside docs/**",
+              "git push to main"
+            ]
+          },
+          "policy": {
+            "headlessOk": true
+          },
+          "warnings": [
+            "seat daedalus: fallback kimi-code can never be eligible (fallback-lane-mismatch; assigned allowed-via-vendor-agent/vendor-session, candidate allowed-direct/payg)"
+          ]
+        },
+        {
+          "id": "hephaestus",
+          "ok": true,
+          "path": "/tmp/madc-tmp/madc-capture-870c1f7e-92532/home/seats/hephaestus.json",
+          "version": 2,
+          "displayName": "Hephaestus",
+          "role": "builder",
+          "pinnedModel": "gpt-5.1-codex",
+          "preferredBacking": "codex",
+          "fallbacks": [
+            "claude-code"
+          ],
+          "memory": {
+            "mode": "file",
+            "path": "memory/hephaestus.md"
+          },
+          "tools": {
+            "deny": [
+              "git push to main",
+              "branch-protection APIs"
+            ]
+          },
+          "policy": {
+            "headlessOk": true
+          },
+          "warnings": []
+        },
+        {
+          "id": "madc-default",
+          "ok": true,
+          "path": "/tmp/madc-tmp/madc-capture-870c1f7e-92532/home/seats/madc-default.json",
+          "version": 1,
+          "displayName": null,
+          "role": "general builder",
+          "pinnedModel": "kimi-coding/kimi-for-coding",
+          "preferredBacking": "kimi-code",
+          "fallbacks": [],
+          "memory": {
+            "mode": "file",
+            "path": "memory/madc-default.md"
+          },
+          "tools": {
+            "deny": []
+          },
+          "policy": {
+            "headlessOk": true
+          },
+          "warnings": []
+        },
+        {
+          "id": "prometheus",
+          "ok": true,
+          "path": "/tmp/madc-tmp/madc-capture-870c1f7e-92532/home/seats/prometheus.json",
+          "version": 2,
+          "displayName": "Prometheus",
+          "role": "idea and research",
+          "pinnedModel": "kimi-coding/kimi-for-coding",
+          "preferredBacking": "kimi-code",
+          "fallbacks": [],
+          "memory": {
+            "mode": "file",
+            "path": "memory/prometheus.md"
+          },
+          "tools": {
+            "deny": [
+              "writes outside docs/** and scratch"
+            ]
+          },
+          "policy": {
+            "headlessOk": true
+          },
+          "warnings": []
+        },
+        {
+          "id": "surface-architect",
+          "ok": true,
+          "path": "/tmp/madc-tmp/madc-capture-870c1f7e-92532/home/seats/surface-architect.json",
+          "version": 2,
+          "displayName": "Surface Architect",
+          "role": "contracts and pins",
+          "pinnedModel": "ollama-cloud/gpt-oss:120b",
+          "preferredBacking": "ollama-cloud",
+          "fallbacks": [],
+          "memory": {
+            "mode": "file",
+            "path": "memory/surface-architect.md"
+          },
+          "tools": {
+            "deny": [
+              "writes outside docs/plan/PIN-* and docs/**"
+            ]
+          },
+          "policy": {
+            "headlessOk": false
+          },
+          "warnings": []
+        }
+      ]
+    },
+    "threadStart": {
+      "params": {},
+      "result": {
+        "thread": {
+          "id": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+          "seatId": "madc-default",
+          "cwd": null,
+          "createdAt": 1795879709477,
+          "updatedAt": 1795879709477,
+          "status": "idle",
+          "preview": ""
+        }
+      }
+    },
+    "turnStart": {
+      "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+      "result": {
+        "turn": {
+          "id": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+          "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+          "status": "inProgress",
+          "items": [],
+          "error": null,
+          "startedAt": 1795879709491,
+          "completedAt": null
+        }
+      }
+    },
+    "turnInterrupt": {},
+    "sessionRead": {
+      "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+      "result": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "events": [
+          {
+            "v": 1,
+            "seq": 0,
+            "ts": 1795879709477,
+            "type": "session.open",
+            "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+            "seatId": "madc-default",
+            "prevHash": "0000000000000000000000000000000000000000000000000000000000000000",
+            "hash": "c5884aee5bf49c60e87601cd8f5842d01075c1f015839c07cb736d069305e9bc",
+            "payload": {
+              "cwd": null,
+              "backing": "kimi-code",
+              "providerId": "kimi-code",
+              "pinnedModel": "kimi-coding/kimi-for-coding",
+              "worktree": null,
+              "handoff": null
+            }
+          },
+          {
+            "v": 1,
+            "seq": 1,
+            "ts": 1795879709491,
+            "type": "turn.start",
+            "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+            "seatId": "madc-default",
+            "prevHash": "c5884aee5bf49c60e87601cd8f5842d01075c1f015839c07cb736d069305e9bc",
+            "hash": "5e7903b27a7eff3e37dadf44d4a1e06604adaa26ad0429898bafad75e7ad59f9",
+            "payload": {
+              "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+              "inputText": "capture turn 1",
+              "mode": "headless",
+              "presence": "absent"
+            }
+          },
+          {
+            "v": 1,
+            "seq": 2,
+            "ts": 1795879709495,
+            "type": "item",
+            "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+            "seatId": "madc-default",
+            "prevHash": "5e7903b27a7eff3e37dadf44d4a1e06604adaa26ad0429898bafad75e7ad59f9",
+            "hash": "c1da4ab8f149f5bf33bbc777156f0847ea3a38c76920da7522e77091b38547bf",
+            "payload": {
+              "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+              "item": {
+                "id": "item_354f4fa7a6eb493586c8bfce16a6d03a",
+                "kind": "userMessage",
+                "status": "completed",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "capture turn 1"
+                  }
+                ]
+              }
+            }
+          },
+          {
+            "v": 1,
+            "seq": 3,
+            "ts": 1795879709500,
+            "type": "item",
+            "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+            "seatId": "madc-default",
+            "prevHash": "c1da4ab8f149f5bf33bbc777156f0847ea3a38c76920da7522e77091b38547bf",
+            "hash": "7508aa2613cda673b85d728dc69a3d73b861bece6253384919b6558e480bd237",
+            "payload": {
+              "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+              "item": {
+                "id": "item_0eec2e8eae104be6b3a47f8ab2ac6836",
+                "kind": "toolCall",
+                "status": "completed",
+                "name": "noop_tool",
+                "arguments": null
+              }
+            }
+          },
+          {
+            "v": 1,
+            "seq": 4,
+            "ts": 1795879709503,
+            "type": "item",
+            "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+            "seatId": "madc-default",
+            "prevHash": "7508aa2613cda673b85d728dc69a3d73b861bece6253384919b6558e480bd237",
+            "hash": "83ba2113a7a1264a32b62be53d528b0905975188fbfaecdfc06d8b39b224af42",
+            "payload": {
+              "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+              "item": {
+                "id": "item_d771e91a9b8942f28af75446a3baa72d",
+                "kind": "toolResult",
+                "status": "completed",
+                "callId": "item_0eec2e8eae104be6b3a47f8ab2ac6836",
+                "name": "noop_tool",
+                "output": "ok",
+                "isError": false
+              }
+            }
+          },
+          {
+            "v": 1,
+            "seq": 5,
+            "ts": 1795879709508,
+            "type": "item",
+            "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+            "seatId": "madc-default",
+            "prevHash": "83ba2113a7a1264a32b62be53d528b0905975188fbfaecdfc06d8b39b224af42",
+            "hash": "0dda4da76ee3072d0ed30aff9453545e7a927099fd82447e42999fdea2733743",
+            "payload": {
+              "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+              "item": {
+                "id": "item_20dff18ad2694e9c89f21753ba3b90f1",
+                "kind": "servedModel",
+                "status": "completed",
+                "requestedModel": "claude-sonnet-4-5-20250929",
+                "servedModel": "claude-sonnet-4-5-20250929",
+                "backing": "anthropic-direct",
+                "providerId": "anthropic",
+                "lane": "allowed-direct",
+                "mode": "headless",
+                "fallbackFrom": null,
+                "vendorReported": true
+              }
+            }
+          },
+          {
+            "v": 1,
+            "seq": 6,
+            "ts": 1795879709508,
+            "type": "servedModel",
+            "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+            "seatId": "madc-default",
+            "prevHash": "0dda4da76ee3072d0ed30aff9453545e7a927099fd82447e42999fdea2733743",
+            "hash": "9978a197f81e61f2a9e81c43885734c495e89819c27c592545422a7b2dcb74a3",
+            "payload": {
+              "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+              "requestedModel": "claude-sonnet-4-5-20250929",
+              "servedModel": "claude-sonnet-4-5-20250929",
+              "backing": "anthropic-direct",
+              "providerId": "anthropic",
+              "lane": "allowed-direct",
+              "mode": "headless",
+              "fallbackFrom": null,
+              "vendorReported": true
+            }
+          },
+          {
+            "v": 1,
+            "seq": 7,
+            "ts": 1795879709512,
+            "type": "item",
+            "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+            "seatId": "madc-default",
+            "prevHash": "9978a197f81e61f2a9e81c43885734c495e89819c27c592545422a7b2dcb74a3",
+            "hash": "4132b3ea5ca4028072843e13ebee1d1cba0dea67e08dbeb8f2ecab6460c88106",
+            "payload": {
+              "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+              "item": {
+                "id": "item_7e419b12ee184d069c22c791437a8d7f",
+                "kind": "agentMessage",
+                "status": "completed",
+                "text": "hello world"
+              }
+            }
+          },
+          {
+            "v": 1,
+            "seq": 8,
+            "ts": 1795879709516,
+            "type": "turn.end",
+            "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+            "seatId": "madc-default",
+            "prevHash": "4132b3ea5ca4028072843e13ebee1d1cba0dea67e08dbeb8f2ecab6460c88106",
+            "hash": "96e1cf7a77c60efd116f5fbabd1d09579b9849af78738a2a08ea9ab005944af1",
+            "payload": {
+              "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+              "status": "completed",
+              "error": null
+            }
+          }
+        ],
+        "chainOk": true
+      }
+    },
+    "sessionSearch": {
+      "matches": [
+        {
+          "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+          "seatId": "madc-default",
+          "seq": 1,
+          "hash": "5e7903b27a7eff3e37dadf44d4a1e06604adaa26ad0429898bafad75e7ad59f9",
+          "ts": 1795879709491,
+          "type": "turn.start",
+          "snippet": "capture turn 1"
+        },
+        {
+          "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+          "seatId": "madc-default",
+          "seq": 2,
+          "hash": "c1da4ab8f149f5bf33bbc777156f0847ea3a38c76920da7522e77091b38547bf",
+          "ts": 1795879709495,
+          "type": "item",
+          "snippet": "capture turn 1"
+        }
+      ]
+    },
+    "roomInspect": {
+      "room": {
+        "home": "/tmp/madc-tmp/madc-capture-870c1f7e-92532/home",
+        "threads": [
+          {
+            "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+            "path": "/tmp/madc-tmp/madc-capture-870c1f7e-92532/home/sessions/thr_d52e84d0f6664c2eaf84f799f377b2d2.jsonl",
+            "seatId": "madc-default",
+            "level": "pass",
+            "chain": {
+              "ok": true
+            },
+            "handoff": {
+              "inbound": null,
+              "outboundCount": 0,
+              "oneWay": false
+            },
+            "worktree": {
+              "open": null,
+              "close": null,
+              "missing": false
+            },
+            "openDecisions": [],
+            "findings": []
+          }
+        ],
+        "counts": {
+          "threads": 1,
+          "pass": 1,
+          "warn": 0,
+          "fail": 0,
+          "openDecisions": 0
+        }
+      }
+    }
+  },
+  "notifications": [
+    {
+      "method": "thread/started",
+      "params": {
+        "thread": {
+          "id": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+          "seatId": "madc-default",
+          "cwd": null,
+          "createdAt": 1795879709477,
+          "updatedAt": 1795879709477,
+          "status": "idle",
+          "preview": ""
+        }
+      }
+    },
+    {
+      "method": "room/updated",
+      "params": {
+        "reason": "thread",
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2"
+      }
+    },
+    {
+      "method": "turn/started",
+      "params": {
+        "turn": {
+          "id": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+          "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+          "status": "inProgress",
+          "items": [],
+          "error": null,
+          "startedAt": 1795879709491,
+          "completedAt": null
+        }
+      }
+    },
+    {
+      "method": "room/updated",
+      "params": {
+        "reason": "turn",
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2"
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+        "item": {
+          "id": "item_354f4fa7a6eb493586c8bfce16a6d03a",
+          "kind": "userMessage",
+          "status": "inProgress",
+          "content": [
+            {
+              "type": "text",
+              "text": "capture turn 1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+        "item": {
+          "id": "item_354f4fa7a6eb493586c8bfce16a6d03a",
+          "kind": "userMessage",
+          "status": "completed",
+          "content": [
+            {
+              "type": "text",
+              "text": "capture turn 1"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+        "item": {
+          "id": "item_0eec2e8eae104be6b3a47f8ab2ac6836",
+          "kind": "toolCall",
+          "status": "inProgress",
+          "name": "noop_tool",
+          "arguments": null
+        }
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+        "item": {
+          "id": "item_0eec2e8eae104be6b3a47f8ab2ac6836",
+          "kind": "toolCall",
+          "status": "completed",
+          "name": "noop_tool",
+          "arguments": null
+        }
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+        "item": {
+          "id": "item_d771e91a9b8942f28af75446a3baa72d",
+          "kind": "toolResult",
+          "status": "inProgress",
+          "callId": "item_0eec2e8eae104be6b3a47f8ab2ac6836",
+          "name": "noop_tool",
+          "output": "ok",
+          "isError": false
+        }
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+        "item": {
+          "id": "item_d771e91a9b8942f28af75446a3baa72d",
+          "kind": "toolResult",
+          "status": "completed",
+          "callId": "item_0eec2e8eae104be6b3a47f8ab2ac6836",
+          "name": "noop_tool",
+          "output": "ok",
+          "isError": false
+        }
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+        "item": {
+          "id": "item_20dff18ad2694e9c89f21753ba3b90f1",
+          "kind": "servedModel",
+          "status": "inProgress",
+          "requestedModel": "claude-sonnet-4-5-20250929",
+          "servedModel": "claude-sonnet-4-5-20250929",
+          "backing": "anthropic-direct",
+          "providerId": "anthropic",
+          "lane": "allowed-direct",
+          "mode": "headless",
+          "fallbackFrom": null,
+          "vendorReported": true
+        }
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+        "item": {
+          "id": "item_20dff18ad2694e9c89f21753ba3b90f1",
+          "kind": "servedModel",
+          "status": "completed",
+          "requestedModel": "claude-sonnet-4-5-20250929",
+          "servedModel": "claude-sonnet-4-5-20250929",
+          "backing": "anthropic-direct",
+          "providerId": "anthropic",
+          "lane": "allowed-direct",
+          "mode": "headless",
+          "fallbackFrom": null,
+          "vendorReported": true
+        }
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+        "item": {
+          "id": "item_7e419b12ee184d069c22c791437a8d7f",
+          "kind": "agentMessage",
+          "status": "inProgress",
+          "text": ""
+        }
+      }
+    },
+    {
+      "method": "item/agentMessage/delta",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+        "itemId": "item_7e419b12ee184d069c22c791437a8d7f",
+        "delta": "hello "
+      }
+    },
+    {
+      "method": "item/agentMessage/delta",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+        "itemId": "item_7e419b12ee184d069c22c791437a8d7f",
+        "delta": "world"
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+        "item": {
+          "id": "item_7e419b12ee184d069c22c791437a8d7f",
+          "kind": "agentMessage",
+          "status": "completed",
+          "text": "hello world"
+        }
+      }
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "turn": {
+          "id": "turn_6d478e5fb0404abc934d35c93a7fddc4",
+          "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+          "status": "completed",
+          "items": [
+            {
+              "id": "item_354f4fa7a6eb493586c8bfce16a6d03a",
+              "kind": "userMessage",
+              "status": "completed",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "capture turn 1"
+                }
+              ]
+            },
+            {
+              "id": "item_0eec2e8eae104be6b3a47f8ab2ac6836",
+              "kind": "toolCall",
+              "status": "completed",
+              "name": "noop_tool",
+              "arguments": null
+            },
+            {
+              "id": "item_d771e91a9b8942f28af75446a3baa72d",
+              "kind": "toolResult",
+              "status": "completed",
+              "callId": "item_0eec2e8eae104be6b3a47f8ab2ac6836",
+              "name": "noop_tool",
+              "output": "ok",
+              "isError": false
+            },
+            {
+              "id": "item_20dff18ad2694e9c89f21753ba3b90f1",
+              "kind": "servedModel",
+              "status": "completed",
+              "requestedModel": "claude-sonnet-4-5-20250929",
+              "servedModel": "claude-sonnet-4-5-20250929",
+              "backing": "anthropic-direct",
+              "providerId": "anthropic",
+              "lane": "allowed-direct",
+              "mode": "headless",
+              "fallbackFrom": null,
+              "vendorReported": true
+            },
+            {
+              "id": "item_7e419b12ee184d069c22c791437a8d7f",
+              "kind": "agentMessage",
+              "status": "completed",
+              "text": "hello world"
+            }
+          ],
+          "error": null,
+          "startedAt": 1795879709491,
+          "completedAt": 1795879709516
+        }
+      }
+    },
+    {
+      "method": "room/updated",
+      "params": {
+        "reason": "turn",
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2"
+      }
+    },
+    {
+      "method": "turn/started",
+      "params": {
+        "turn": {
+          "id": "turn_ecb631b855fb4a3fb59adce0f2b1071d",
+          "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+          "status": "inProgress",
+          "items": [],
+          "error": null,
+          "startedAt": 1795879709523,
+          "completedAt": null
+        }
+      }
+    },
+    {
+      "method": "room/updated",
+      "params": {
+        "reason": "turn",
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2"
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_ecb631b855fb4a3fb59adce0f2b1071d",
+        "item": {
+          "id": "item_5b2f816f94424ccdb5df4ac9d499601c",
+          "kind": "userMessage",
+          "status": "inProgress",
+          "content": [
+            {
+              "type": "text",
+              "text": "interrupt-me"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_ecb631b855fb4a3fb59adce0f2b1071d",
+        "item": {
+          "id": "item_5b2f816f94424ccdb5df4ac9d499601c",
+          "kind": "userMessage",
+          "status": "completed",
+          "content": [
+            {
+              "type": "text",
+              "text": "interrupt-me"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_ecb631b855fb4a3fb59adce0f2b1071d",
+        "item": {
+          "id": "item_82bf225df5904048a6fb9d81753482f8",
+          "kind": "servedModel",
+          "status": "inProgress",
+          "requestedModel": "claude-sonnet-4-5-20250929",
+          "servedModel": "",
+          "backing": "anthropic-direct",
+          "providerId": "anthropic",
+          "lane": "allowed-direct",
+          "mode": "headless",
+          "fallbackFrom": null,
+          "vendorReported": false
+        }
+      }
+    },
+    {
+      "method": "item/started",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_ecb631b855fb4a3fb59adce0f2b1071d",
+        "item": {
+          "id": "item_a3cc2f4599e3490583d280d97f34ba8c",
+          "kind": "agentMessage",
+          "status": "inProgress",
+          "text": ""
+        }
+      }
+    },
+    {
+      "method": "item/agentMessage/delta",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_ecb631b855fb4a3fb59adce0f2b1071d",
+        "itemId": "item_a3cc2f4599e3490583d280d97f34ba8c",
+        "delta": "partial "
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_ecb631b855fb4a3fb59adce0f2b1071d",
+        "item": {
+          "id": "item_82bf225df5904048a6fb9d81753482f8",
+          "kind": "servedModel",
+          "status": "failed",
+          "requestedModel": "claude-sonnet-4-5-20250929",
+          "servedModel": "",
+          "backing": "anthropic-direct",
+          "providerId": "anthropic",
+          "lane": "allowed-direct",
+          "mode": "headless",
+          "fallbackFrom": null,
+          "vendorReported": false
+        }
+      }
+    },
+    {
+      "method": "item/completed",
+      "params": {
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+        "turnId": "turn_ecb631b855fb4a3fb59adce0f2b1071d",
+        "item": {
+          "id": "item_a3cc2f4599e3490583d280d97f34ba8c",
+          "kind": "agentMessage",
+          "status": "failed",
+          "text": "partial "
+        }
+      }
+    },
+    {
+      "method": "turn/completed",
+      "params": {
+        "turn": {
+          "id": "turn_ecb631b855fb4a3fb59adce0f2b1071d",
+          "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2",
+          "status": "interrupted",
+          "items": [
+            {
+              "id": "item_5b2f816f94424ccdb5df4ac9d499601c",
+              "kind": "userMessage",
+              "status": "completed",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "interrupt-me"
+                }
+              ]
+            },
+            {
+              "id": "item_82bf225df5904048a6fb9d81753482f8",
+              "kind": "servedModel",
+              "status": "failed",
+              "requestedModel": "claude-sonnet-4-5-20250929",
+              "servedModel": "",
+              "backing": "anthropic-direct",
+              "providerId": "anthropic",
+              "lane": "allowed-direct",
+              "mode": "headless",
+              "fallbackFrom": null,
+              "vendorReported": false
+            },
+            {
+              "id": "item_a3cc2f4599e3490583d280d97f34ba8c",
+              "kind": "agentMessage",
+              "status": "failed",
+              "text": "partial "
+            }
+          ],
+          "error": null,
+          "startedAt": 1795879709523,
+          "completedAt": 1795879709539
+        }
+      }
+    },
+    {
+      "method": "room/updated",
+      "params": {
+        "reason": "turn",
+        "threadId": "thr_d52e84d0f6664c2eaf84f799f377b2d2"
+      }
+    }
+  ]
+}
