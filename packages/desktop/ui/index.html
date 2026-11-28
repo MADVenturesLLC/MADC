@@ -20,35 +20,73 @@
       </div>
     </nav>
 
-    <main id="main-content">
+    <main id="main-content" data-view="table">
       <div class="col-left">
         <header class="section-head">
-          <span class="micro-label">ROOM/INSPECT</span>
-          <h1>Room</h1>
-          <p id="room-counts" class="counts-line">—</p>
+          <div class="section-head-top">
+            <div class="section-head-titles">
+              <span class="micro-label">ROOM/INSPECT</span>
+              <h1>Room</h1>
+              <p id="room-counts" class="counts-line">—</p>
+              <p id="room-stale-note" class="stale-note" hidden></p>
+            </div>
+            <div class="section-head-controls">
+              <div id="hidden-strip" class="hidden-strip" hidden></div>
+              <div id="view-toggle" class="view-toggle" role="radiogroup" aria-label="Workspace view">
+                <!-- biome-ignore lint/a11y/useSemanticElements: spec §5.2 segmented radio toggle -->
+                <button id="view-panes-btn" type="button" role="radio" aria-checked="false" tabindex="-1">PANES</button>
+                <!-- biome-ignore lint/a11y/useSemanticElements: spec §5.2 segmented radio toggle -->
+                <button id="view-table-btn" type="button" role="radio" aria-checked="true" tabindex="0">TABLE</button>
+              </div>
+            </div>
+          </div>
         </header>
 
-        <section class="well room-well" aria-label="Room threads">
-          <div class="room-thead" aria-hidden="true">
-            <span>evidence</span>
-            <span>thread</span>
-            <span class="room-thead-seat">seat</span>
-            <span>events</span>
-            <span>receipt</span>
-          </div>
-          <div id="room-rows" class="room-rows" role="listbox" aria-label="Room threads"></div>
+        <section id="table-view" class="table-view">
+          <section class="well room-well" aria-label="Room threads">
+            <div class="room-thead" aria-hidden="true">
+              <span>evidence</span>
+              <span class="room-thead-thread-wrap"><span>thread</span><span class="room-thead-sep"> · </span><span class="room-thead-seat">seat</span></span>
+              <span class="room-thead-seat-col">seat</span>
+              <span>events</span>
+              <span>receipt</span>
+            </div>
+            <div id="room-rows" class="room-rows" role="listbox" aria-label="Room threads"></div>
+          </section>
+
+          <section class="well receipts-well" aria-label="Receipts">
+            <div class="well-head">
+              <span class="micro-label">RECEIPTS</span>
+              <span class="well-head-meta">session receipts</span>
+            </div>
+            <div id="receipt-rows" class="receipt-rows"></div>
+          </section>
         </section>
 
-        <section class="well receipts-well" aria-label="Receipts">
-          <div class="well-head">
-            <span class="micro-label">RECEIPTS</span>
-            <span class="well-head-meta">session receipts</span>
-          </div>
-          <div id="receipt-rows" class="receipt-rows"></div>
+        <section id="panes-workspace" class="panes-workspace" hidden>
+          <div id="panes-grid" class="panes-grid"></div>
+          <section id="composer-card" class="card composer-card" aria-label="Multi-seat composer">
+            <div class="composer-targets-row">
+              <span class="micro-label">COMPOSE</span>
+              <div id="composer-targets" class="composer-targets"></div>
+              <span class="composer-meta">turn/start · one request per thread</span>
+            </div>
+            <div class="composer-input-row">
+              <input
+                id="composer-input"
+                type="text"
+                autocomplete="off"
+                spellcheck="false"
+                placeholder="Type a turn prompt"
+                aria-label="Turn prompt"
+              />
+              <button id="composer-start-btn" type="button" class="btn-primary">START TURN · 0 seats</button>
+            </div>
+          </section>
         </section>
       </div>
 
-      <div class="col-right">
+      <div id="col-right" class="col-right">
         <section class="card engine-card" aria-label="Engine connection">
           <div class="engine-card-head">
             <span class="micro-label">ENGINE</span>
@@ -111,6 +149,30 @@
         <kbd>Esc</kbd><span>close</span>
       </div>
     </div>
+
+    <div
+      id="quit-dialog"
+      class="quit-dialog glass"
+      role="alertdialog"
+      aria-modal="true"
+      aria-labelledby="quit-dialog-title"
+      hidden
+    >
+      <span class="micro-label">QUIT</span>
+      <h2 id="quit-dialog-title" class="quit-dialog-title">Quit MADC Desktop?</h2>
+      <p class="quit-dialog-body">
+        Quitting closes this window's engine connection. The engine then ends every running turn on
+        it as <b>interrupted</b> (<code>turn.end</code> status <code>interrupted</code>), including
+        turns in hidden panes. Threads other clients hold are not affected.
+      </p>
+      <div id="quit-dialog-list" class="well quit-dialog-list"></div>
+      <div class="quit-dialog-actions">
+        <button id="quit-keep-btn" type="button" class="btn-primary">KEEP RUNNING</button>
+        <button id="quit-confirm-btn" type="button" class="btn-secondary">QUIT AND INTERRUPT 0 TURN(S)</button>
+      </div>
+    </div>
+
+    <div id="live-region" class="sr-only" aria-live="polite"></div>
 
     <script type="module" src="./app.js"></script>
   </body>

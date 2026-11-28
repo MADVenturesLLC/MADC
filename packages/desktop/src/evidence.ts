@@ -27,8 +27,11 @@ export type PillLabel =
   | "CONNECTING"
   | "CONNECTED"
   | "DISCONNECTED"
+  | "RUNNING"
+  | "COMPLETED"
   | "UNVERIFIED"
   | "STOPPED"
-  | "FAILED";
+  | "FAILED"
+  | "INTERRUPTED";
 
 export { evidenceTone, isVerifiedReceipt } from "../ui/shell.js";

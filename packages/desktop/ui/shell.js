@@ -121,6 +121,76 @@ export const PALETTE_COMMANDS = Object.freeze([
     defaultMeta: null,
     keyHint: null,
   }),
+  Object.freeze({
+    id: "cmd-copy-head-open",
+    group: "Evidence",
+    name: "Copy head@open",
+    defaultMeta: null,
+    keyHint: null,
+  }),
+  Object.freeze({
+    id: "cmd-view-panes",
+    group: "Panes",
+    name: "Show Panes view",
+    defaultMeta: null,
+    keyHint: null,
+  }),
+  Object.freeze({
+    id: "cmd-view-table",
+    group: "Panes",
+    name: "Show Table view",
+    defaultMeta: null,
+    keyHint: null,
+  }),
+  Object.freeze({
+    id: "cmd-pane-focus-1",
+    group: "Panes",
+    name: "Focus pane 1",
+    defaultMeta: null,
+    keyHint: "Ctrl 1",
+  }),
+  Object.freeze({
+    id: "cmd-pane-focus-2",
+    group: "Panes",
+    name: "Focus pane 2",
+    defaultMeta: null,
+    keyHint: "Ctrl 2",
+  }),
+  Object.freeze({
+    id: "cmd-pane-focus-3",
+    group: "Panes",
+    name: "Focus pane 3",
+    defaultMeta: null,
+    keyHint: "Ctrl 3",
+  }),
+  Object.freeze({
+    id: "cmd-pane-focus-4",
+    group: "Panes",
+    name: "Focus pane 4",
+    defaultMeta: null,
+    keyHint: "Ctrl 4",
+  }),
+  Object.freeze({
+    id: "cmd-pane-hide",
+    group: "Panes",
+    name: "Hide pane",
+    defaultMeta: null,
+    keyHint: null,
+  }),
+  Object.freeze({
+    id: "cmd-pane-dismiss",
+    group: "Panes",
+    name: "Dismiss pane",
+    defaultMeta: null,
+    keyHint: null,
+  }),
+  Object.freeze({
+    id: "cmd-turn-start",
+    group: "Turn",
+    name: "Start turn",
+    defaultMeta: null,
+    keyHint: "Ctrl Enter",
+  }),
 ]);
 
 const PILL_GLYPHS = Object.freeze({
@@ -130,11 +200,19 @@ const PILL_GLYPHS = Object.freeze({
   fail: "✗",
 });
 
-const ALLOWED_PILL_LABELS = Object.freeze({
+export const ALLOWED_PILL_LABELS = Object.freeze({
   verified: new Set(["VERIFIED"]),
-  neutral: new Set(["NO RECEIPT", "IDLE", "CONNECTING", "CONNECTED", "DISCONNECTED"]),
+  neutral: new Set([
+    "NO RECEIPT",
+    "IDLE",
+    "CONNECTING",
+    "CONNECTED",
+    "DISCONNECTED",
+    "RUNNING",
+    "COMPLETED",
+  ]),
   warn: new Set(["UNVERIFIED", "STOPPED"]),
-  fail: new Set(["FAILED"]),
+  fail: new Set(["FAILED", "INTERRUPTED"]),
 });
 
 export function createFocusBarState(items = DEFAULT_FOCUS_BAR_ITEMS, initialIndex = 0) {
@@ -658,6 +736,505 @@ export function cwdCheck(text) {
   return { ok: true, reason: "syntax ok · engine not asked · Enter starts" };
 }
 
+/**
+ * Pure cwd field status mapper per addendum §6A.4.
+ * Returns ONLY { neutral, fail } and NEVER { verified, warn }.
+ */
+export function cwdFieldState(text, phase, refuseInfo = null) {
+  if (phase === "started") {
+    return { word: "STARTED", glyph: "○", tone: "neutral", reason: null };
+  }
+  if (phase === "starting") {
+    return {
+      word: "STARTING",
+      glyph: "○",
+      tone: "neutral",
+      reason: "field locked until thread/start returns",
+    };
+  }
+  if (phase === "refused") {
+    return {
+      word: "REFUSED",
+      glyph: "✗",
+      tone: "fail",
+      reason: refuseInfo?.message ? String(refuseInfo.message) : "thread/start refused",
+    };
+  }
+  const raw = String(text ?? "");
+  if (raw === "") {
+    return {
+      word: "NO CWD",
+      glyph: "○",
+      tone: "neutral",
+      reason: "optional · Enter starts without a cwd (worktree —)",
+    };
+  }
+  const check = cwdCheck(raw);
+  if (!check.ok) {
+    return {
+      word: "REJECTED",
+      glyph: "✗",
+      tone: "fail",
+      reason: `${check.reason} · nothing sent`,
+    };
+  }
+  return {
+    word: "UNCHECKED",
+    glyph: "○",
+    tone: "neutral",
+    reason: check.reason,
+  };
+}
+
+export function paneColumns(width) {
+  return Number(width) >= 1440 ? 4 : 2;
+}
+
+export function isWidePaneWidth(paneWidth) {
+  return Number(paneWidth) >= 520;
+}
+
+/**
+ * Turn-state pills NEVER carry a receipt and NEVER turn green (A4 pin §4.1, spec §6.1).
+ */
+export function turnPillForPane(pane) {
+  switch (pane?.state) {
+    case "running":
+    case "interrupt-pending":
+      return { tone: evidenceTone(null, "neutral"), label: "RUNNING" };
+    case "completed":
+      return { tone: evidenceTone(null, "neutral"), label: "COMPLETED" };
+    case "interrupted":
+      return { tone: evidenceTone(null, "fail"), label: "INTERRUPTED" };
+    case "failed":
+      return { tone: evidenceTone(null, "fail"), label: "FAILED" };
+    case "history":
+      return { tone: evidenceTone(null, "neutral"), label: "DISCONNECTED" };
+    default:
+      return { tone: evidenceTone(null, "neutral"), label: "IDLE" };
+  }
+}
+
+function methodErrorDataChips(err) {
+  const chips = [{ key: "code", value: String(err.code) }];
+  if (err.data && typeof err.data === "object" && !Array.isArray(err.data)) {
+    for (const [k, v] of Object.entries(err.data)) {
+      if (v === undefined) continue;
+      if (Array.isArray(v)) {
+        chips.push({ key: k, value: v.map((item) => sanitizeEngineText(item)).join("; ") });
+      } else if (typeof v === "object" && v !== null) {
+        chips.push({ key: k, value: sanitizeEngineText(JSON.stringify(v)) });
+      } else {
+        chips.push({ key: k, value: sanitizeEngineText(String(v)) });
+      }
+    }
+  }
+  return chips;
+}
+
+/**
+ * Derive the ordered §6.2/§6.4 pane receipt rows strictly from engine/read-back evidence.
+ */
+export function receiptRowsForPane(pane, readEntry = null, roomRow = null) {
+  const rows = [];
+  const isHistory = pane?.state === "history";
+  const effectiveRead = isHistory ? null : readEntry;
+  const effectiveRoomRow = isHistory ? null : roomRow;
+  const streamed = isHistory ? null : (pane?.streamedServedModel ?? null);
+
+  // 1. Method-error rows (turn/start, turn/interrupt, turn.end failure only; never thread/start).
+  if (!isHistory && pane?.methodError) {
+    const err = pane.methodError;
+    const chips = methodErrorDataChips(err);
+    const providerId = err.data?.providerId ? String(err.data.providerId) : "";
+    const status = err.data?.status ? String(err.data.status) : "";
+    const accessibleMeta = [providerId, status].filter(Boolean).join(" · ");
+    rows.push({
+      kind: "method-error",
+      label: String(err.method),
+      isField: false,
+      tone: evidenceTone(null, "fail"),
+      pillLabel: "FAILED",
+      chips,
+      note: sanitizeEngineText(err.rpcMessage ?? ""),
+      title: accessibleMeta || null,
+      accessibleName: accessibleMeta ? `${err.method} FAILED ${accessibleMeta}` : null,
+    });
+  }
+  if (!isHistory && pane?.state === "failed" && pane?.turnError) {
+    rows.push({
+      kind: "method-error",
+      label: "turn.end",
+      isField: false,
+      tone: evidenceTone(null, "fail"),
+      pillLabel: "FAILED",
+      chips: [{ key: "code", value: String(pane.turnError.code) }],
+      note: sanitizeEngineText(pane.turnError.message ?? ""),
+      title: null,
+      accessibleName: null,
+    });
+  }
+
+  // Locate seq-0 open worktree + latest turn servedModel from session/read events.
+  const events =
+    effectiveRead?.ok === true && Array.isArray(effectiveRead.result?.events)
+      ? effectiveRead.result.events
+      : [];
+  const openEvent = events.find((e) => e?.type === "session.open") ?? null;
+  const targetTurnId = pane?.turnId ?? pane?.completedTurnId ?? null;
+  let readServed = null;
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const ev = events[i];
+    if (ev?.type === "servedModel" && ev.payload && typeof ev.payload === "object") {
+      if (targetTurnId === null || ev.payload.turnId === targetTurnId) {
+        readServed = ev.payload;
+        break;
+      }
+    }
+  }
+
+  // 2. servedModel row (A4 §4.3 exact condition order).
+  if (effectiveRead?.ok === false) {
+    rows.push({
+      kind: "servedModel",
+      label: "servedModel",
+      isField: false,
+      tone: evidenceTone(null, "fail"),
+      pillLabel: "FAILED",
+      chips: [{ key: "servedModel", value: "—", muted: true }],
+      note: effectiveRead.note ?? "session/read failed",
+    });
+  } else if (effectiveRead?.ok === true) {
+    const chainOk = effectiveRead.result?.chainOk === true;
+    if (!chainOk) {
+      rows.push({
+        kind: "servedModel",
+        label: "servedModel",
+        isField: false,
+        tone: evidenceTone(null, "fail"),
+        pillLabel: "FAILED",
+        chips: [{ key: "servedModel", value: "—", muted: true }],
+        note: streamed ? "live value not confirmed by chain" : "chain not confirmed",
+      });
+    } else if (!readServed) {
+      if (streamed) {
+        rows.push({
+          kind: "servedModel",
+          label: "servedModel",
+          isField: false,
+          tone: evidenceTone(null, "fail"),
+          pillLabel: "FAILED",
+          chips: [
+            { key: "servedModel", value: sanitizeEngineText(streamed.servedModel ?? "") },
+            { key: "vendorReported", value: String(Boolean(streamed.vendorReported)) },
+          ],
+          note: "live value not confirmed by chain",
+        });
+      } else {
+        rows.push({
+          kind: "servedModel",
+          label: "servedModel",
+          isField: false,
+          tone: evidenceTone(null, "neutral"),
+          pillLabel: "NO RECEIPT",
+          chips: [{ key: "servedModel", value: "—", muted: true }],
+          note: null,
+        });
+      }
+    } else {
+      const sm = String(readServed.servedModel ?? "");
+      const vr = readServed.vendorReported === true;
+      const fb = readServed.fallbackFrom ?? null;
+      const streamMismatch =
+        streamed !== null &&
+        (String(streamed.servedModel ?? "") !== sm || Boolean(streamed.vendorReported) !== vr);
+
+      const chips = [
+        { key: "servedModel", value: sanitizeEngineText(sm) },
+        { key: "vendorReported", value: String(vr) },
+      ];
+      if (fb !== null && fb !== undefined) {
+        chips.push({ key: "fallbackFrom", value: sanitizeEngineText(String(fb)) });
+      }
+
+      if (streamMismatch) {
+        rows.push({
+          kind: "servedModel",
+          label: "servedModel",
+          isField: false,
+          tone: evidenceTone(null, "fail"),
+          pillLabel: "FAILED",
+          chips,
+          note: "live value differs from chain",
+        });
+      } else if (vr && sm.trim().length > 0) {
+        const tone = evidenceTone(
+          { kind: "servedModel", servedModel: sm, vendorReported: true },
+          "ok",
+        );
+        rows.push({
+          kind: "servedModel",
+          label: "servedModel",
+          isField: false,
+          tone,
+          pillLabel: "VERIFIED",
+          chips,
+          note: null,
+        });
+      } else {
+        const tone = evidenceTone(
+          { kind: "servedModel", servedModel: sm, vendorReported: vr },
+          "warn",
+        );
+        rows.push({
+          kind: "servedModel",
+          label: "servedModel",
+          isField: false,
+          tone,
+          pillLabel: "UNVERIFIED",
+          chips,
+          note: sm.trim().length === 0 ? "servedModel empty" : null,
+        });
+      }
+    }
+  } else if (streamed) {
+    const sm = String(streamed.servedModel ?? "");
+    const vr = Boolean(streamed.vendorReported);
+    rows.push({
+      kind: "servedModel",
+      label: "servedModel",
+      isField: false,
+      tone: evidenceTone(null, "warn"),
+      pillLabel: "UNVERIFIED",
+      chips: [
+        { key: "servedModel", value: sanitizeEngineText(sm) },
+        { key: "vendorReported", value: String(vr) },
+      ],
+      note: "streamed · confirmed by session/read after turn/completed",
+    });
+  } else {
+    rows.push({
+      kind: "servedModel",
+      label: "servedModel",
+      isField: false,
+      tone: evidenceTone(null, "neutral"),
+      pillLabel: "NO RECEIPT",
+      chips: [{ key: "servedModel", value: "—", muted: true }],
+      note: null,
+    });
+  }
+
+  // 3. lane row (field, never toned, note `field · not a receipt`, D-719).
+  const laneValue = readServed?.lane ?? streamed?.lane ?? null;
+  rows.push({
+    kind: "lane",
+    label: "lane",
+    isField: true,
+    tone: "neutral",
+    pillLabel: null,
+    chips: [
+      laneValue
+        ? { key: "lane", value: sanitizeEngineText(String(laneValue)) }
+        : { key: "lane", value: "—", muted: true },
+    ],
+    note: "field · not a receipt",
+  });
+
+  // 4 & 5. worktree.topLevel (field) and head@open (sha receipt, NO chainOk requirement, D-720).
+  const worktreeOpen = openEvent?.payload?.worktree ?? effectiveRoomRow?.worktree?.open ?? null;
+  const hasAnyRead =
+    !isHistory &&
+    (Boolean(pane?.hasReadYet) || effectiveRead?.ok === true || effectiveRoomRow !== null);
+  const topLevel =
+    worktreeOpen && typeof worktreeOpen.topLevel === "string" && worktreeOpen.topLevel.length > 0
+      ? worktreeOpen.topLevel
+      : null;
+
+  rows.push({
+    kind: "worktree.topLevel",
+    label: "worktree.topLevel",
+    isField: true,
+    tone: "neutral",
+    pillLabel: null,
+    chips: [
+      topLevel !== null
+        ? {
+            key: "topLevel",
+            value: sanitizeEngineText(topLevel),
+            title: sanitizeEngineText(topLevel),
+            bdi: true,
+          }
+        : { key: "topLevel", value: "—", muted: true },
+    ],
+    note:
+      topLevel !== null
+        ? "field · not a receipt"
+        : !hasAnyRead
+          ? "field · not a receipt · not read yet"
+          : "field · not a receipt · no git work tree recorded",
+  });
+
+  const headSha =
+    worktreeOpen && typeof worktreeOpen.head === "string" && GIT_SHA_HEX.test(worktreeOpen.head)
+      ? worktreeOpen.head
+      : null;
+  const headMissing = effectiveRoomRow?.worktree?.missing === true;
+  if (headSha !== null) {
+    const tone = evidenceTone({ kind: "sha", sha: headSha }, "ok");
+    rows.push({
+      kind: "head@open",
+      label: "head@open",
+      isField: false,
+      tone,
+      pillLabel: tone === "verified" ? "VERIFIED" : "NO RECEIPT",
+      chips: [{ key: "sha", value: headSha.slice(0, 12), title: headSha }],
+      note: headMissing ? "worktree missing on disk" : null,
+    });
+  } else {
+    rows.push({
+      kind: "head@open",
+      label: "head@open",
+      isField: false,
+      tone: evidenceTone(null, "neutral"),
+      pillLabel: "NO RECEIPT",
+      chips: [{ key: "sha", value: "—", muted: true }],
+      note: !hasAnyRead ? "not read yet" : null,
+    });
+  }
+
+  // 6. hash row (reset on turn/started until turn/completed read returns).
+  if (
+    !isHistory &&
+    pane?.hashMovedOnTurnStart &&
+    (pane.state === "running" || pane.state === "interrupt-pending")
+  ) {
+    rows.push({
+      kind: "hash",
+      label: "hash",
+      isField: false,
+      tone: evidenceTone(null, "neutral"),
+      pillLabel: "NO RECEIPT",
+      chips: [
+        { key: "hash", value: "—", muted: true },
+        { key: "events", value: "—", muted: true },
+      ],
+      note: "chain head moved · read after turn/completed",
+    });
+  } else if (effectiveRead?.ok === false) {
+    rows.push({
+      kind: "hash",
+      label: "hash",
+      isField: false,
+      tone: evidenceTone(null, "fail"),
+      pillLabel: "FAILED",
+      chips: [
+        { key: "hash", value: "—", muted: true },
+        { key: "events", value: "—", muted: true },
+      ],
+      note: effectiveRead.note ?? "session/read failed",
+    });
+  } else if (effectiveRead?.ok === true) {
+    const chainOk = effectiveRead.result?.chainOk === true;
+    const lastEv = events.length > 0 ? events[events.length - 1] : null;
+    const tailHash = typeof lastEv?.hash === "string" ? lastEv.hash : "";
+    const evCount = String(events.length);
+    if (!chainOk) {
+      rows.push({
+        kind: "hash",
+        label: "hash",
+        isField: false,
+        tone: evidenceTone(null, "fail"),
+        pillLabel: "FAILED",
+        chips: [
+          { key: "chainOk", value: "false" },
+          { key: "events", value: "—", muted: true },
+        ],
+        note: "session/read chainOk false",
+      });
+    } else if (SHA256_HEX.test(tailHash)) {
+      const tone = evidenceTone({ kind: "hash", chainOk: true, hash: tailHash }, "ok");
+      rows.push({
+        kind: "hash",
+        label: "hash",
+        isField: false,
+        tone,
+        pillLabel: tone === "verified" ? "VERIFIED" : "NO RECEIPT",
+        chips: [
+          { key: "hash", value: tailHash.slice(0, 12), title: tailHash },
+          { key: "chainOk", value: "true" },
+          { key: "events", value: evCount },
+        ],
+        note: null,
+      });
+    } else {
+      rows.push({
+        kind: "hash",
+        label: "hash",
+        isField: false,
+        tone: evidenceTone(null, "neutral"),
+        pillLabel: "NO RECEIPT",
+        chips: [
+          { key: "hash", value: "—", muted: true },
+          { key: "events", value: evCount },
+        ],
+        note: null,
+      });
+    }
+  } else {
+    rows.push({
+      kind: "hash",
+      label: "hash",
+      isField: false,
+      tone: evidenceTone(null, "neutral"),
+      pillLabel: "NO RECEIPT",
+      chips: [
+        { key: "hash", value: "—", muted: true },
+        { key: "events", value: "—", muted: true },
+      ],
+      note: null,
+    });
+  }
+
+  return rows;
+}
+
+/**
+ * Pure composer target mapper per spec §7.2 / pin §5.4 (exact verbatim disabled reasons).
+ */
+export function composerTargets(panes, selectedSet, boundEpoch, connectionState) {
+  return panes.map((pane) => {
+    let disabledReason = null;
+    let title = null;
+    if (pane.state === "draft" || pane.state === "start-failed" || pane.unloaded32002) {
+      disabledReason = "no thread loaded";
+    } else if (pane.state === "starting-thread") {
+      disabledReason = "starting thread";
+    } else if (
+      connectionState !== "CONNECTED" ||
+      pane.state === "history" ||
+      (boundEpoch !== null && pane.boundEpoch !== boundEpoch)
+    ) {
+      disabledReason = "not connected";
+    } else if (pane.state === "starting-turn") {
+      disabledReason = "starting turn";
+    } else if (pane.state === "running" || pane.state === "interrupt-pending") {
+      disabledReason = "turn active";
+    } else if (pane.state === "refused") {
+      disabledReason = "refused -32007";
+      title = pane.refused32007?.reason ?? null;
+    }
+    const enabled = disabledReason === null;
+    return {
+      paneId: pane.paneId,
+      seatId: pane.seatId,
+      selected: enabled && selectedSet.has(pane.paneId),
+      enabled,
+      disabledReason,
+      title,
+    };
+  });
+}
+
 function validatePillInput(tone, label) {
   const allowed = ALLOWED_PILL_LABELS[tone];
   if (!allowed?.has(label)) {
@@ -666,13 +1243,13 @@ function validatePillInput(tone, label) {
 }
 
 export function renderPill(doc, input) {
-  const { tone, label, context, small = false, role = "status" } = input;
+  const { tone, label, context, ariaLabel, small = false, role = "status" } = input;
   validatePillInput(tone, label);
   const el = doc.createElement("span");
   el.className = small ? "pill pill--sm" : "pill";
   el.setAttribute("data-tone", tone);
   el.setAttribute("role", role);
-  el.setAttribute("aria-label", context ? `${tone}, ${context}` : tone);
+  el.setAttribute("aria-label", ariaLabel ?? (context ? `${tone}, ${context}` : tone));
 
   const glyphEl = doc.createElement("span");
   glyphEl.className = "pill-glyph";
@@ -689,12 +1266,12 @@ export function renderPill(doc, input) {
 }
 
 function updatePillElement(doc, el, input) {
-  const { tone, label, context, small = false, role = "status" } = input;
+  const { tone, label, context, ariaLabel, small = false, role = "status" } = input;
   validatePillInput(tone, label);
   el.className = small ? "pill pill--sm" : "pill";
   el.setAttribute("data-tone", tone);
   el.setAttribute("role", role);
-  el.setAttribute("aria-label", context ? `${tone}, ${context}` : tone);
+  el.setAttribute("aria-label", ariaLabel ?? (context ? `${tone}, ${context}` : tone));
 
   const glyphEl = doc.createElement("span");
   glyphEl.className = "pill-glyph";
@@ -708,7 +1285,7 @@ function updatePillElement(doc, el, input) {
   el.replaceChildren(glyphEl, labelEl);
 }
 
-function renderChip(doc, key, value, title = null, mutedValue = false) {
+function renderChip(doc, key, value, title = null, mutedValue = false, useBdi = false) {
   const chip = doc.createElement("span");
   chip.className = "chip";
 
@@ -717,10 +1294,17 @@ function renderChip(doc, key, value, title = null, mutedValue = false) {
   k.textContent = key;
 
   const v = doc.createElement("span");
-  v.className = mutedValue ? "chip-v chip-v--muted" : "chip-v";
-  v.textContent = value;
+  v.className = useBdi ? "chip-v chip-v--rtl" : mutedValue ? "chip-v chip-v--muted" : "chip-v";
+  if (useBdi) {
+    const bdi = doc.createElement("bdi");
+    bdi.textContent = value;
+    v.appendChild(bdi);
+  } else {
+    v.textContent = value;
+  }
   if (title) {
     v.setAttribute("title", title);
+    chip.setAttribute("aria-label", `${key} ${title}`);
   }
 
   chip.appendChild(k);
@@ -1005,6 +1589,33 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
   const quitListEl = optionalEl("quit-dialog-list");
   const quitKeepBtnEl = optionalEl("quit-keep-btn");
   const quitConfirmBtnEl = optionalEl("quit-confirm-btn");
+  const viewToggleEl = optionalEl("view-toggle");
+  const viewPanesBtnEl = optionalEl("view-panes-btn");
+  const viewTableBtnEl = optionalEl("view-table-btn");
+  const tableViewEl = optionalEl("table-view");
+  const colRightEl = optionalEl("col-right");
+  const panesWorkspaceEl = optionalEl("panes-workspace");
+  const panesGridEl = optionalEl("panes-grid");
+  const hiddenStripEl = optionalEl("hidden-strip");
+  const composerTargetsEl = optionalEl("composer-targets");
+  const composerInputEl = optionalEl("composer-input");
+  const composerStartBtnEl = optionalEl("composer-start-btn");
+  const liveRegionEl = optionalEl("live-region");
+  const cwdInputEls = new Map();
+  const paneRegionEls = new Map();
+
+  const currentViewportWidth = () =>
+    typeof env.viewportWidth === "number"
+      ? env.viewportWidth
+      : typeof globalObj?.innerWidth === "number"
+        ? globalObj.innerWidth
+        : 1200;
+
+  const announceLive = (msg) => {
+    if (liveRegionEl) {
+      liveRegionEl.textContent = sanitizeEngineText(msg);
+    }
+  };
 
   paletteKeycapEl.textContent = isMac ? "⌘K" : "Ctrl K";
 
@@ -1036,6 +1647,8 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
   let selectedThreadId = null;
   let roomInspectErrorNote = null;
   const sessionReadCache = new Map();
+  const tableRefusalReceipts = [];
+  const unavailableSeats = new Set();
   const inFlightReads = new Set();
   const pendingFollowUpReads = new Set();
   const sessionReceipts = [];
@@ -1170,8 +1783,24 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       connectionState === "CONNECTING" || disconnectPending !== null || isConnected;
   }
 
+  function recordTableRefusal(method, seatId, cls) {
+    if (cls?.kind !== "rpc") return;
+    const chips = methodErrorDataChips(cls);
+    chips.push({ key: "seat", value: sanitizeEngineText(seatId) });
+    tableRefusalReceipts.push({
+      label: method,
+      tone: evidenceTone(null, "fail"),
+      pillLabel: "FAILED",
+      context: `${method} code ${cls.code}`,
+      chips,
+      note: cls.rpcMessage ? sanitizeEngineText(cls.rpcMessage) : null,
+    });
+    renderReceiptsWell();
+  }
+
   function renderReceiptsWell() {
-    const nodes = sessionReceipts.map((item) => {
+    const allItems = [...sessionReceipts, ...tableRefusalReceipts];
+    const nodes = allItems.map((item) => {
       const row = doc.createElement("div");
       row.className = "receipt-row";
       row.setAttribute("data-tone", item.tone);
@@ -1209,7 +1838,32 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     receiptRowsEl.replaceChildren(...nodes);
   }
 
+  function findFocusedPaneEvidence() {
+    const focused = panes.find((p) => p.paneId === focusedPaneId) ?? null;
+    if (!focused?.threadId) return { hash: null, servedModel: null, headOpen: null };
+    const readEntry = sessionReadCache.get(focused.threadId) ?? null;
+    const rows = receiptRowsForPane(focused, readEntry, null);
+    let hash = null;
+    let servedModel = null;
+    let headOpen = null;
+    for (const r of rows) {
+      if (r.kind === "hash" && r.tone === "verified") {
+        hash = r.chips.find((c) => c.key === "hash")?.title ?? null;
+      }
+      if (r.kind === "servedModel" && r.tone === "verified") {
+        servedModel = r.chips.find((c) => c.key === "servedModel")?.value ?? null;
+      }
+      if (r.kind === "head@open" && r.tone === "verified") {
+        headOpen = r.chips.find((c) => c.key === "sha")?.title ?? null;
+      }
+    }
+    return { hash, servedModel, headOpen };
+  }
+
   function findBestChainHead() {
+    const paneEv = findFocusedPaneEvidence();
+    if (paneEv.hash !== null) return paneEv.hash;
+
     const threads = Array.isArray(currentRoom?.threads) ? currentRoom.threads : [];
     const verifiedHashFor = (thr) => {
       if (!thr) return null;
@@ -1230,6 +1884,531 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       if (hash !== null) return hash;
     }
     return null;
+  }
+
+  function renderWorkspace() {
+    const activeView = viewMode === "panes" ? "panes" : "table";
+    mainEl.setAttribute("data-view", activeView);
+    if (tableViewEl) tableViewEl.hidden = activeView !== "table";
+    if (colRightEl) colRightEl.hidden = activeView !== "table";
+    if (panesWorkspaceEl) panesWorkspaceEl.hidden = activeView !== "panes";
+
+    if (viewPanesBtnEl && viewTableBtnEl) {
+      viewPanesBtnEl.setAttribute("aria-checked", String(activeView === "panes"));
+      viewPanesBtnEl.tabIndex = activeView === "panes" ? 0 : -1;
+      viewTableBtnEl.setAttribute("aria-checked", String(activeView === "table"));
+      viewTableBtnEl.tabIndex = activeView === "table" ? 0 : -1;
+    }
+
+    const vpWidth = currentViewportWidth();
+    const maxCols = paneColumns(vpWidth);
+    const visiblePanes = panes.filter((p) => p.visible);
+    const hiddenPanes = panes.filter((p) => !p.visible);
+
+    if (hiddenStripEl) {
+      hiddenStripEl.hidden = activeView !== "panes" || hiddenPanes.length === 0;
+      if (activeView === "panes" && hiddenPanes.length > 0) {
+        if (vpWidth >= 1440) {
+          const tabs = hiddenPanes.map((hp) => {
+            const tab = doc.createElement("button");
+            tab.className = "hidden-tab";
+            tab.setAttribute("type", "button");
+            const seatEl = doc.createElement("span");
+            seatEl.textContent = sanitizeEngineText(hp.seatId);
+            const tp = turnPillForPane(hp);
+            const pill = renderPill(doc, {
+              tone: tp.tone,
+              label: tp.label,
+              small: true,
+              ariaLabel: `turn ${tp.label}`,
+            });
+            tab.appendChild(seatEl);
+            tab.appendChild(pill);
+            tab.addEventListener("click", () => {
+              showPane(hp.paneId);
+            });
+            return tab;
+          });
+          hiddenStripEl.replaceChildren(...tabs);
+        } else {
+          const summaryBtn = doc.createElement("button");
+          summaryBtn.className = "hidden-summary";
+          summaryBtn.setAttribute("type", "button");
+          const countEl = doc.createElement("span");
+          countEl.className = "hidden-summary-count";
+          countEl.textContent = `${hiddenPanes.length} hidden`;
+          const namesEl = doc.createElement("span");
+          namesEl.className = "hidden-summary-names";
+          namesEl.textContent = hiddenPanes.map((hp) => sanitizeEngineText(hp.seatId)).join(" · ");
+          summaryBtn.appendChild(countEl);
+          summaryBtn.appendChild(namesEl);
+          summaryBtn.addEventListener("click", () => {
+            paletteQuery = "Show pane";
+            openPalette();
+          });
+          hiddenStripEl.replaceChildren(summaryBtn);
+        }
+      } else {
+        hiddenStripEl.replaceChildren();
+      }
+    }
+
+    if (panesGridEl) {
+      const colCount = Math.max(1, Math.min(maxCols, visiblePanes.length || 1));
+      const paneWidth = (vpWidth - 56 - Math.max(0, colCount - 1) * 14) / colCount;
+      const isWide = isWidePaneWidth(paneWidth);
+      panesGridEl.setAttribute("data-cols", String(maxCols));
+
+      const paneNodes = visiblePanes.map((pane, idx) => {
+        const card = doc.createElement("section");
+        card.className = "pane";
+        card.tabIndex = -1;
+        card.setAttribute("role", "region");
+        card.setAttribute(
+          "aria-label",
+          `${sanitizeEngineText(pane.seatId)} pane, ${pane.threadId ?? "no thread yet"}`,
+        );
+        card.setAttribute("data-pane-id", pane.paneId);
+        card.setAttribute("data-focused", String(focusedPaneId === pane.paneId));
+        paneRegionEls.set(pane.paneId, card);
+
+        // 1. Header
+        const header = doc.createElement("div");
+        header.className = "pane-header";
+
+        const topRow = doc.createElement("div");
+        topRow.className = "pane-header-top";
+
+        const identity = doc.createElement("div");
+        identity.className = "pane-identity";
+
+        const titleRow = doc.createElement("div");
+        titleRow.className = "pane-title-row";
+        const posEl = doc.createElement("span");
+        posEl.className = "pane-pos";
+        posEl.textContent = String(idx + 1);
+        const seatEl = doc.createElement("span");
+        seatEl.className = "pane-seat";
+        seatEl.textContent = sanitizeEngineText(pane.seatId);
+        titleRow.appendChild(posEl);
+        titleRow.appendChild(seatEl);
+
+        const threadLine = doc.createElement("div");
+        threadLine.className = "pane-thread-line";
+        if (pane.state === "starting-thread") {
+          threadLine.textContent = "thread/start · pending";
+        } else if (pane.threadId) {
+          threadLine.textContent = pane.turnId
+            ? `${pane.threadId} · ${pane.turnId}`
+            : pane.threadId;
+        } else {
+          threadLine.textContent = "no thread yet";
+        }
+
+        identity.appendChild(titleRow);
+        identity.appendChild(threadLine);
+
+        const tp = turnPillForPane(pane);
+        const turnPill = renderPill(doc, {
+          tone: tp.tone,
+          label: tp.label,
+          ariaLabel: `turn ${tp.label}`,
+        });
+
+        topRow.appendChild(identity);
+        topRow.appendChild(turnPill);
+        header.appendChild(topRow);
+
+        // Header cwd block (§6A)
+        const cwdBlock = doc.createElement("div");
+        cwdBlock.className = "cwd";
+        const isStartedOrHistory =
+          pane.state !== "draft" &&
+          pane.state !== "starting-thread" &&
+          pane.state !== "start-failed";
+
+        if (isStartedOrHistory) {
+          cwdInputEls.delete(pane.paneId);
+          const startedRow = doc.createElement("div");
+          startedRow.className = "cwd-started";
+          const keyEl = doc.createElement("span");
+          keyEl.className = "cwd-key";
+          keyEl.textContent = "cwd";
+          const valEl = doc.createElement("span");
+          const hasCwdVal = typeof pane.threadCwd === "string" && pane.threadCwd.length > 0;
+          valEl.className = hasCwdVal ? "cwd-val-ro" : "cwd-val-ro cwd-val-ro--muted";
+          const bdi = doc.createElement("bdi");
+          bdi.textContent = hasCwdVal ? sanitizeEngineText(pane.threadCwd) : "—";
+          valEl.appendChild(bdi);
+          if (hasCwdVal) {
+            const safeCwd = sanitizeEngineText(pane.threadCwd);
+            valEl.setAttribute("title", safeCwd);
+            valEl.setAttribute("aria-label", `cwd ${safeCwd}`);
+          } else {
+            valEl.setAttribute("aria-label", "cwd none");
+          }
+          const st = cwdFieldState("", "started");
+          const fstEl = doc.createElement("span");
+          fstEl.className = "fst";
+          fstEl.setAttribute("data-tone", st.tone);
+          const gEl = doc.createElement("span");
+          gEl.className = "g";
+          gEl.setAttribute("aria-hidden", "true");
+          gEl.textContent = st.glyph;
+          const wEl = doc.createElement("span");
+          wEl.textContent = st.word;
+          fstEl.appendChild(gEl);
+          fstEl.appendChild(wEl);
+
+          startedRow.appendChild(keyEl);
+          startedRow.appendChild(valEl);
+          startedRow.appendChild(fstEl);
+          cwdBlock.appendChild(startedRow);
+
+          if (pane.cwdSent !== null && pane.threadCwd !== null && pane.threadCwd !== pane.cwdSent) {
+            const noteLine = doc.createElement("div");
+            noteLine.className = "cwd-reason";
+            noteLine.textContent = `engine path · typed ${sanitizeEngineText(pane.cwdSent)}`;
+            cwdBlock.appendChild(noteLine);
+          }
+        } else {
+          const phase =
+            pane.state === "starting-thread"
+              ? "starting"
+              : pane.state === "start-failed"
+                ? "refused"
+                : "draft";
+          const st = cwdFieldState(pane.cwdText, phase, pane.cwdRefusal);
+
+          const row1 = doc.createElement("div");
+          row1.className = "cwd-row";
+          const labelEl = doc.createElement("label");
+          labelEl.className = "cwd-key";
+          const inputId = `cwd-in-${pane.paneId}`;
+          const reasonId = `cwd-reason-${pane.paneId}`;
+          labelEl.setAttribute("for", inputId);
+          labelEl.textContent = "cwd";
+
+          const inWrap = doc.createElement("div");
+          inWrap.className = "cwd-in-wrap";
+          const inputEl = doc.createElement("input");
+          inputEl.id = inputId;
+          inputEl.className = "cwd-in";
+          inputEl.setAttribute("type", "text");
+          inputEl.setAttribute("placeholder", "/absolute/path · optional");
+          inputEl.setAttribute("aria-describedby", reasonId);
+          if (st.tone === "fail") {
+            inputEl.setAttribute("aria-invalid", "true");
+            inputEl.setAttribute("data-cwd-fail", "true");
+          }
+          if (phase === "starting") {
+            inputEl.readOnly = true;
+            inputEl.setAttribute("aria-readonly", "true");
+          }
+          inputEl.value = pane.cwdText;
+          if (pane.cwdText.length > 0) {
+            inputEl.setAttribute("title", sanitizeEngineText(pane.cwdText));
+          }
+          cwdInputEls.set(pane.paneId, inputEl);
+
+          const row2 = doc.createElement("div");
+          row2.className = "cwd-row2";
+          const fstEl = doc.createElement("span");
+          fstEl.className = "fst";
+          fstEl.setAttribute("data-tone", st.tone);
+          const gEl = doc.createElement("span");
+          gEl.className = "g";
+          gEl.setAttribute("aria-hidden", "true");
+          gEl.textContent = st.glyph;
+          const wEl = doc.createElement("span");
+          wEl.textContent = st.word;
+          fstEl.appendChild(gEl);
+          fstEl.appendChild(wEl);
+
+          const startBtn = doc.createElement("button");
+          startBtn.className = "btn-sm";
+          startBtn.setAttribute("type", "button");
+          startBtn.textContent = "START THREAD";
+          startBtn.disabled =
+            st.word === "REJECTED" || phase === "starting" || connectionState !== "CONNECTED";
+          startBtn.addEventListener("click", () => {
+            void startThread(pane.paneId);
+          });
+
+          row2.appendChild(fstEl);
+          row2.appendChild(startBtn);
+
+          const reasonEl = doc.createElement("div");
+          reasonEl.id = reasonId;
+          reasonEl.className = "cwd-reason";
+          const effectiveReason = pane.cwdLostConnection
+            ? "connection ended before thread/start returned"
+            : (st.reason ?? "");
+          reasonEl.textContent = sanitizeEngineText(effectiveReason);
+
+          inputEl.addEventListener("input", (ev) => {
+            const nextVal = String(ev?.target?.value ?? inputEl.value ?? "");
+            setPaneCwdText(pane.paneId, nextVal);
+            const nextSt = cwdFieldState(nextVal, "draft", null);
+            fstEl.setAttribute("data-tone", nextSt.tone);
+            gEl.textContent = nextSt.glyph;
+            wEl.textContent = nextSt.word;
+            reasonEl.textContent = sanitizeEngineText(nextSt.reason ?? "");
+            startBtn.disabled = nextSt.word === "REJECTED" || connectionState !== "CONNECTED";
+            if (nextSt.tone === "fail") {
+              inputEl.setAttribute("aria-invalid", "true");
+              inputEl.setAttribute("data-cwd-fail", "true");
+            } else {
+              inputEl.removeAttribute("aria-invalid");
+              inputEl.removeAttribute("data-cwd-fail");
+            }
+          });
+
+          inputEl.addEventListener("keydown", (ev) => {
+            if (ev?.isComposing) return;
+            const k = ev?.key;
+            if (k === "Enter") {
+              if (ev.metaKey || ev.ctrlKey || ev.altKey || ev.shiftKey) {
+                return; // C6: Cmd/Ctrl+Enter does nothing in cwd field
+              }
+              ev.preventDefault?.();
+              const curCheck = cwdCheck(pane.cwdText);
+              if (!curCheck.ok) {
+                announceLive(`${pane.seatId}: cwd REJECTED ${curCheck.reason}`);
+                return;
+              }
+              void startThread(pane.paneId);
+              return;
+            }
+            if (k === "Escape") {
+              ev.preventDefault?.();
+              ev.stopPropagation?.();
+              if (pane.cwdText !== pane.cwdBaseline) {
+                pane.cwdText = pane.cwdBaseline;
+                pane.cwdRefusal = null;
+                pane.cwdLostConnection = false;
+                if (pane.state === "start-failed") pane.state = "draft";
+                inputEl.value = pane.cwdText;
+                const reverted = cwdFieldState(pane.cwdText, "draft", null);
+                fstEl.setAttribute("data-tone", reverted.tone);
+                gEl.textContent = reverted.glyph;
+                wEl.textContent = reverted.word;
+                reasonEl.textContent = sanitizeEngineText(reverted.reason ?? "");
+                startBtn.disabled = reverted.word === "REJECTED" || connectionState !== "CONNECTED";
+              } else {
+                card.focus();
+              }
+            }
+          });
+
+          inWrap.appendChild(inputEl);
+          row1.appendChild(labelEl);
+          row1.appendChild(inWrap);
+          cwdBlock.appendChild(row1);
+          cwdBlock.appendChild(row2);
+          if (pane.cwdRefusal?.kind === "rpc") {
+            const chipsRow = doc.createElement("div");
+            chipsRow.className = "cwd-chips";
+            chipsRow.appendChild(renderChip(doc, "code", String(pane.cwdRefusal.code)));
+            if (
+              pane.cwdRefusal.data &&
+              typeof pane.cwdRefusal.data === "object" &&
+              !Array.isArray(pane.cwdRefusal.data)
+            ) {
+              for (const [dk, dv] of Object.entries(pane.cwdRefusal.data)) {
+                if (dk === "issues" || dv === undefined || typeof dv === "object") continue;
+                chipsRow.appendChild(renderChip(doc, dk, sanitizeEngineText(String(dv))));
+              }
+            }
+            cwdBlock.appendChild(chipsRow);
+            if (Array.isArray(pane.cwdRefusal.issues) && pane.cwdRefusal.issues.length > 0) {
+              const ul = doc.createElement("ul");
+              ul.className = "cwd-issues";
+              for (const issue of pane.cwdRefusal.issues) {
+                const li = doc.createElement("li");
+                li.textContent = sanitizeEngineText(issue);
+                ul.appendChild(li);
+              }
+              cwdBlock.appendChild(ul);
+            }
+          } else {
+            cwdBlock.appendChild(reasonEl);
+          }
+        }
+        header.appendChild(cwdBlock);
+        card.appendChild(header);
+
+        // 2. Starting banner
+        if (pane.state === "starting-thread") {
+          const banner = doc.createElement("div");
+          banner.className = "pane-banner";
+          banner.textContent =
+            "Starting thread. thread/start pending. No turn can start until it returns.";
+          card.appendChild(banner);
+        }
+
+        // 3. Receipts well
+        const well = doc.createElement("div");
+        well.className = "pane-receipts";
+        if (
+          pane.state === "draft" ||
+          pane.state === "starting-thread" ||
+          pane.state === "start-failed"
+        ) {
+          const noteEl = doc.createElement("div");
+          noteEl.className = "pane-no-thread";
+          noteEl.textContent = "No thread yet. Receipts appear after thread/start returns.";
+          well.appendChild(noteEl);
+        } else {
+          const readEntry = pane.threadId ? (sessionReadCache.get(pane.threadId) ?? null) : null;
+          const roomRow =
+            pane.threadId && Array.isArray(currentRoom?.threads)
+              ? (currentRoom.threads.find((t) => t.threadId === pane.threadId) ?? null)
+              : null;
+          const rRows = receiptRowsForPane(pane, readEntry, roomRow);
+          for (const rr of rRows) {
+            const rowEl = doc.createElement("div");
+            rowEl.className = isWide
+              ? "pane-receipt-row pane-receipt-row--wide"
+              : "pane-receipt-row";
+            if (rr.title) rowEl.setAttribute("title", sanitizeEngineText(rr.title));
+            if (rr.accessibleName)
+              rowEl.setAttribute("aria-label", sanitizeEngineText(rr.accessibleName));
+
+            const kEl = doc.createElement("span");
+            kEl.className = "pane-receipt-key";
+            kEl.textContent = rr.label;
+            rowEl.appendChild(kEl);
+
+            if (rr.isField) {
+              const fnEl = doc.createElement("span");
+              fnEl.className = "pane-field-note";
+              fnEl.textContent = rr.note ?? "field · not a receipt";
+              rowEl.appendChild(fnEl);
+            } else if (rr.pillLabel) {
+              rowEl.appendChild(
+                renderPill(doc, {
+                  tone: rr.tone,
+                  label: rr.pillLabel,
+                  context: rr.note ?? rr.label,
+                  role: rr.tone === "fail" ? "alert" : "status",
+                }),
+              );
+            }
+
+            const cEl = doc.createElement("span");
+            cEl.className = "receipt-chips";
+            for (const ch of rr.chips) {
+              cEl.appendChild(
+                renderChip(
+                  doc,
+                  ch.key,
+                  ch.value,
+                  ch.title ?? null,
+                  ch.muted ?? false,
+                  ch.bdi ?? false,
+                ),
+              );
+            }
+            if (!rr.isField && rr.note) {
+              const nEl = doc.createElement("span");
+              nEl.className = "row-note";
+              nEl.textContent = sanitizeEngineText(rr.note);
+              cEl.appendChild(nEl);
+            }
+            rowEl.appendChild(cEl);
+            well.appendChild(rowEl);
+          }
+        }
+        card.appendChild(well);
+
+        // 4. Footer
+        const footer = doc.createElement("div");
+        footer.className = "pane-footer";
+        const reasonSpan = doc.createElement("span");
+        reasonSpan.className = "pane-footer-reason";
+        reasonSpan.textContent = sanitizeEngineText(pane.footerReason ?? "");
+        footer.appendChild(reasonSpan);
+
+        const actionBtn = doc.createElement("button");
+        actionBtn.className = "btn-sm";
+        actionBtn.setAttribute("type", "button");
+        if (
+          pane.state === "draft" ||
+          pane.state === "starting-thread" ||
+          pane.state === "start-failed"
+        ) {
+          actionBtn.textContent = "DISMISS PANE";
+          actionBtn.disabled = pane.state === "starting-thread";
+          actionBtn.addEventListener("click", () => {
+            dismissPane(pane.paneId);
+          });
+        } else {
+          actionBtn.textContent = "INTERRUPT TURN";
+          actionBtn.disabled =
+            connectionState !== "CONNECTED" ||
+            disconnectPending !== null ||
+            pane.boundEpoch !== (boundEpoch ?? epoch) ||
+            pane.state !== "running" ||
+            pane.turnPendingInterrupt;
+          actionBtn.addEventListener("click", () => {
+            void interruptTurn(pane.paneId);
+          });
+        }
+        footer.appendChild(actionBtn);
+        card.appendChild(footer);
+        return card;
+      });
+
+      panesGridEl.replaceChildren(...paneNodes);
+    }
+
+    if (composerTargetsEl && composerStartBtnEl) {
+      const targetSpecs = composerTargets(panes, selectedTargets, boundEpoch, connectionState);
+      const chipNodes = targetSpecs.map((t) => {
+        const btn = doc.createElement("button");
+        btn.className = "composer-target";
+        btn.setAttribute("type", "button");
+        btn.setAttribute("aria-pressed", String(t.selected));
+        if (!t.enabled) {
+          btn.setAttribute("aria-disabled", "true");
+          btn.disabled = true;
+        }
+        if (t.title) {
+          btn.setAttribute("title", sanitizeEngineText(t.title));
+        }
+        const gEl = doc.createElement("span");
+        gEl.className = "composer-target-glyph";
+        gEl.setAttribute("aria-hidden", "true");
+        gEl.textContent = t.selected ? "■" : "□";
+        const labelEl = doc.createElement("span");
+        labelEl.textContent = t.disabledReason
+          ? `${sanitizeEngineText(t.seatId)} · ${t.disabledReason}`
+          : sanitizeEngineText(t.seatId);
+        btn.appendChild(gEl);
+        btn.appendChild(labelEl);
+        btn.addEventListener("click", () => {
+          toggleComposerTarget(t.paneId);
+        });
+        btn.addEventListener("keydown", (ev) => {
+          if (ev?.key === " ") {
+            ev.preventDefault?.();
+            toggleComposerTarget(t.paneId);
+          }
+        });
+        return btn;
+      });
+      composerTargetsEl.replaceChildren(...chipNodes);
+
+      const selectedCount = targetSpecs.filter((t) => t.selected).length;
+      const inputHasText = String(composerInputEl?.value ?? "").trim().length > 0;
+      composerStartBtnEl.textContent = `START TURN · ${selectedCount} seat(s)`;
+      composerStartBtnEl.disabled =
+        connectionState !== "CONNECTED" ||
+        disconnectPending !== null ||
+        selectedCount === 0 ||
+        !inputHasText;
+    }
   }
 
   function renderRoomTable() {
@@ -1424,6 +2603,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
   function markEpochEndedOnPanes() {
     pendingFollowUpReads.clear();
     seatSummaries = [];
+    unavailableSeats.clear();
     for (const pane of panes) {
       if (pane.state === "starting-thread") {
         pane.state = "draft";
@@ -1445,6 +2625,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         selectedTargets.delete(pane.paneId);
       }
     }
+    renderWorkspace();
   }
 
   function startDisconnect(targetStateAfterResolve) {
@@ -1559,6 +2740,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         JSON.stringify({ connection: lastConnectionInfo, room: roomRes }, null, 2),
       );
       renderRoomTable();
+      renderWorkspace();
       if (paletteOpen) renderPalette();
     } catch (err) {
       if (reqEpoch !== epoch) {
@@ -1653,6 +2835,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         }
       }
       renderRoomTable();
+      renderWorkspace();
       if (paletteOpen) renderPalette();
     } catch (err) {
       if (reqEpoch !== epoch || (trigger === "selection" && reqGen !== inspectGeneration)) {
@@ -1907,8 +3090,16 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     const clipboard = globalObj?.navigator?.clipboard;
     const hasClipboard = typeof clipboard?.writeText === "function";
     const chainHead = findBestChainHead();
+    const paneEv = findFocusedPaneEvidence();
+    const activeEpoch = boundEpoch ?? epoch;
+    const visiblePanes = panes.filter((p) => p.visible);
+    const hiddenPanes = panes.filter((p) => !p.visible);
+    const focusedPane = panes.find((p) => p.paneId === focusedPaneId) ?? null;
+    const targetSpecs = composerTargets(panes, selectedTargets, boundEpoch, connectionState);
+    const inputTextPresent = String(composerInputEl?.value ?? "").trim().length > 0;
+    const selectedEnabledCount = targetSpecs.filter((t) => t.selected && t.enabled).length;
 
-    return PALETTE_COMMANDS.map((cmd) => {
+    const base = PALETTE_COMMANDS.map((cmd) => {
       if (cmd.id === "cmd-connect") {
         let meta = cmd.defaultMeta;
         if (disconnectPending !== null) meta = "disconnecting";
@@ -1948,10 +3139,147 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         if (!hasClipboard) {
           return { ...cmd, disabled: true, meta: "clipboard unavailable" };
         }
-        return { ...cmd, disabled: true, meta: "no servedModel receipt" };
+        return {
+          ...cmd,
+          disabled: paneEv.servedModel === null,
+          meta: paneEv.servedModel !== null ? paneEv.servedModel : "no servedModel receipt",
+        };
+      }
+      if (cmd.id === "cmd-copy-head-open") {
+        if (!hasClipboard) {
+          return { ...cmd, disabled: true, meta: "clipboard unavailable" };
+        }
+        return {
+          ...cmd,
+          disabled: paneEv.headOpen === null,
+          meta: paneEv.headOpen !== null ? paneEv.headOpen.slice(0, 12) : "no head@open receipt",
+        };
+      }
+      if (cmd.id === "cmd-view-panes") {
+        return {
+          ...cmd,
+          disabled: viewMode === "panes",
+          meta: viewMode === "panes" ? "active" : null,
+        };
+      }
+      if (cmd.id === "cmd-view-table") {
+        return {
+          ...cmd,
+          disabled: viewMode === "table",
+          meta: viewMode === "table" ? "active" : null,
+        };
+      }
+      if (
+        cmd.id === "cmd-pane-focus-1" ||
+        cmd.id === "cmd-pane-focus-2" ||
+        cmd.id === "cmd-pane-focus-3" ||
+        cmd.id === "cmd-pane-focus-4"
+      ) {
+        const slotIdx = Number(cmd.id.slice(-1)) - 1;
+        const slotPane = visiblePanes[slotIdx] ?? null;
+        return {
+          ...cmd,
+          disabled: slotPane === null,
+          keyHint: `${isMac ? "⌘" : "Ctrl "}${slotIdx + 1}`,
+          meta: slotPane ? sanitizeEngineText(slotPane.seatId) : "empty slot",
+        };
+      }
+      if (cmd.id === "cmd-pane-hide") {
+        const canHide = Boolean(focusedPane?.visible) && panes.length > 1;
+        return {
+          ...cmd,
+          name: focusedPane ? `Hide pane ${sanitizeEngineText(focusedPane.seatId)}` : "Hide pane",
+          disabled: !canHide,
+          meta: canHide ? null : "cannot hide",
+        };
+      }
+      if (cmd.id === "cmd-pane-dismiss") {
+        const canDismiss =
+          focusedPane !== null &&
+          (focusedPane.state === "draft" || focusedPane.state === "start-failed");
+        return {
+          ...cmd,
+          name: focusedPane
+            ? `Dismiss pane ${sanitizeEngineText(focusedPane.seatId)}`
+            : "Dismiss pane",
+          disabled: !canDismiss,
+          meta: canDismiss ? null : "holds thread or none",
+        };
+      }
+      if (cmd.id === "cmd-turn-start") {
+        const canStart = isConnected && inputTextPresent && selectedEnabledCount > 0;
+        return {
+          ...cmd,
+          disabled: !canStart,
+          keyHint: isMac ? "⌘↵" : "Ctrl ↵",
+          meta: isConnected
+            ? selectedEnabledCount > 0
+              ? `${selectedEnabledCount} target(s)`
+              : "no target"
+            : "not connected",
+        };
       }
       return { ...cmd, disabled: false, meta: cmd.defaultMeta };
     });
+
+    const dynamic = [];
+    for (const seat of seatSummaries) {
+      const seatId = String(seat.id);
+      const seatOk = seat.ok === true && !unavailableSeats.has(seatId);
+      const enabled = isConnected && seatOk;
+      dynamic.push({
+        id: `cmd-pane-new:${seatId}`,
+        group: "Panes",
+        name: `New pane on seat ${sanitizeEngineText(seatId)}`,
+        defaultMeta: null,
+        keyHint: null,
+        disabled: !enabled,
+        meta: !isConnected
+          ? "not connected"
+          : seat.ok !== true
+            ? `seat load failed ${seat.code ?? ""}`.trim()
+            : unavailableSeats.has(seatId)
+              ? "seat unavailable"
+              : null,
+      });
+    }
+    for (const hp of hiddenPanes) {
+      dynamic.push({
+        id: `cmd-pane-show:${hp.paneId}`,
+        group: "Panes",
+        name: `Show pane ${sanitizeEngineText(hp.seatId)}`,
+        defaultMeta: null,
+        keyHint: null,
+        disabled: false,
+        meta: null,
+      });
+    }
+    for (const p of panes) {
+      if (p.boundEpoch === activeEpoch && p.state === "running" && !p.turnPendingInterrupt) {
+        dynamic.push({
+          id: `cmd-turn-interrupt:${p.paneId}`,
+          group: "Turn",
+          name: `Interrupt turn on ${sanitizeEngineText(p.seatId)}`,
+          defaultMeta: null,
+          keyHint: null,
+          disabled: !isConnected,
+          meta: isConnected ? p.turnId : "not connected",
+        });
+      }
+    }
+    for (const ts of targetSpecs) {
+      dynamic.push({
+        id: `cmd-target-toggle:${ts.paneId}`,
+        group: "Turn",
+        name: `Toggle target ${sanitizeEngineText(ts.seatId)}`,
+        defaultMeta: null,
+        keyHint: null,
+        disabled: !ts.enabled,
+        meta: ts.disabledReason ?? (ts.selected ? "selected" : "unselected"),
+      });
+    }
+
+    return [...base, ...dynamic];
   }
 
   function currentPaletteState() {
@@ -2158,7 +3486,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       completedTurnId: null,
       footerReason: "no thread loaded",
     };
-    const maxCols = 4;
+    const maxCols = paneColumns(currentViewportWidth());
     if (visibleCount >= maxCols) {
       const visiblePanes = panes.filter((p) => p.visible);
       const rightmost = visiblePanes[visiblePanes.length - 1];
@@ -2166,6 +3494,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     }
     panes.push(pane);
     focusedPaneId = pane.paneId;
+    renderWorkspace();
     return paneSnapshot(pane);
   }
 
@@ -2207,6 +3536,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     pane.cwdLostConnection = false;
     pane.state = "starting-thread";
     pane.footerReason = "thread/start pending";
+    renderWorkspace();
 
     try {
       const res = await invokeFn("rpc_request", { method: "thread/start", params });
@@ -2220,6 +3550,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
           pane.cwdLostConnection = true;
           pane.footerReason = "no thread loaded";
         }
+        renderWorkspace();
         return;
       }
       const thread = res?.thread;
@@ -2235,6 +3566,8 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       if (focusedPaneId === pane.paneId) {
         selectedTargets.add(pane.paneId);
       }
+      announceLive(`${pane.seatId}: cwd STARTED ${thread.id}`);
+      renderWorkspace();
       void triggerSessionRead(thread.id, "post-start");
     } catch (err) {
       if (reqEpoch !== epoch || (reqBoundEpoch !== null && reqBoundEpoch !== boundEpoch)) {
@@ -2243,6 +3576,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
           pane.cwdLostConnection = true;
           pane.footerReason = "no thread loaded";
         }
+        renderWorkspace();
         return;
       }
       const cls = classifyRpcError(err);
@@ -2262,6 +3596,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
           settleQuitState();
           renderConnectionChrome();
         }
+        renderWorkspace();
         return;
       }
       if (cls.kind === "transport") {
@@ -2277,6 +3612,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
           renderConnectionChrome();
           await startDisconnect("FAILED");
         }
+        renderWorkspace();
         return;
       }
       // R5 / R1 / R3 refusal on thread/start stays in Start failed (cwd block) and never reads.
@@ -2293,10 +3629,15 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         };
         if (cls.code === -32005 || cls.code === -32006) {
           pane.seatUnavailable = true;
+          unavailableSeats.add(pane.seatId);
         }
+        recordTableRefusal("thread/start", pane.seatId, cls);
+        announceLive(`${pane.seatId}: cwd REFUSED ${cls.code} ${cls.rpcMessage}`);
       } else {
         pane.cwdRefusal = { kind: cls.kind, message: cls.message, issues: [] };
+        announceLive(`${pane.seatId}: cwd REFUSED ${cls.message}`);
       }
+      renderWorkspace();
     }
   }
 
@@ -2329,6 +3670,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
 
     const reqEpoch = epoch;
     const reqBoundEpoch = boundEpoch;
+    let allReturnedTurn = true;
 
     await Promise.all(
       targets.map(async (pane) => {
@@ -2337,6 +3679,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         pane.state = "starting-turn";
         pane.footerReason = "starting turn";
         selectedTargets.delete(pane.paneId);
+        renderWorkspace();
         try {
           const res = await invokeFn("rpc_request", {
             method: "turn/start",
@@ -2350,6 +3693,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
             (reqBoundEpoch !== null && reqBoundEpoch !== boundEpoch) ||
             connectionState !== "CONNECTED"
           ) {
+            allReturnedTurn = false;
             return;
           }
           if (pane.methodError?.method === "turn/start") {
@@ -2366,9 +3710,13 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
               pane.streamedServedModel = null;
               pane.hashMovedOnTurnStart = true;
               pane.footerReason = "manual · sent once";
+              announceLive(`${pane.seatId}: turn RUNNING`);
             }
+          } else {
+            allReturnedTurn = false;
           }
         } catch (err) {
+          allReturnedTurn = false;
           if (reqEpoch !== epoch || (reqBoundEpoch !== null && reqBoundEpoch !== boundEpoch)) {
             return;
           }
@@ -2390,16 +3738,23 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
               rpcMessage: cls.rpcMessage,
               data: cls.data,
             };
+            recordTableRefusal("turn/start", pane.seatId, cls);
             if (cls.code === -32007) {
               pane.state = "refused";
+              const reason = String(cls.data?.reason ?? cls.rpcMessage);
               pane.refused32007 = {
                 code: -32007,
-                reason: String(cls.data?.reason ?? cls.rpcMessage),
+                reason,
                 providerId: String(cls.data?.providerId ?? ""),
                 status: String(cls.data?.status ?? ""),
                 data: cls.data,
               };
               pane.footerReason = "refused · no network";
+              announceLive(`${pane.seatId}: turn/start refused -32007 ${reason}`);
+            } else if (cls.code === -32002) {
+              pane.unloaded32002 = true;
+              pane.state = prevTerminalState;
+              pane.footerReason = cls.rpcMessage;
             } else if (cls.code === -32004 && typeof cls.data?.activeTurnId === "string") {
               pane.state = "running";
               pane.turnId = cls.data.activeTurnId;
@@ -2432,6 +3787,10 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         }
       }),
     );
+    if (allReturnedTurn && composerInputEl) {
+      composerInputEl.value = "";
+    }
+    renderWorkspace();
   }
 
   async function interruptTurn(paneId) {
@@ -2448,6 +3807,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     pane.turnPendingInterrupt = true;
     pane.state = "interrupt-pending";
     pane.footerReason = "turn/interrupt sent";
+    renderWorkspace();
 
     try {
       await invokeFn("rpc_request", {
@@ -2464,6 +3824,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       if (pane.methodError?.method === "turn/interrupt") {
         pane.methodError = null;
       }
+      renderWorkspace();
       // Result `{}` changes nothing; state settles only on `turn/completed`.
     } catch (err) {
       if (reqEpoch !== epoch || (reqBoundEpoch !== null && reqBoundEpoch !== boundEpoch)) {
@@ -2481,6 +3842,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
           pane.state = "running";
           pane.footerReason = cls.message;
         }
+        renderWorkspace();
         return;
       }
       if (cls.kind === "rpc") {
@@ -2490,10 +3852,12 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
           rpcMessage: cls.rpcMessage,
           data: cls.data,
         };
+        recordTableRefusal("turn/interrupt", pane.seatId, cls);
         if (pane.state === "interrupt-pending" && pane.turnId === targetTurnId) {
           pane.state = "running";
           pane.footerReason = cls.rpcMessage;
         }
+        renderWorkspace();
         return;
       }
       if (cls.kind === "not-connected") {
@@ -2525,9 +3889,12 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     if (pane.state !== "draft" && pane.state !== "start-failed") return false;
     panes.splice(idx, 1);
     selectedTargets.delete(paneId);
+    cwdInputEls.delete(paneId);
+    paneRegionEls.delete(paneId);
     if (focusedPaneId === paneId) {
       focusedPaneId = panes.find((p) => p.visible)?.paneId ?? panes[0]?.paneId ?? null;
     }
+    renderWorkspace();
     return true;
   }
 
@@ -2539,6 +3906,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     if (focusedPaneId === paneId) {
       focusedPaneId = panes.find((p) => p.visible)?.paneId ?? null;
     }
+    renderWorkspace();
     return true;
   }
 
@@ -2547,7 +3915,8 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     if (!pane) return false;
     if (!pane.visible) {
       const visiblePanes = panes.filter((p) => p.visible);
-      if (visiblePanes.length >= 4) {
+      const maxCols = paneColumns(currentViewportWidth());
+      if (visiblePanes.length >= maxCols) {
         const rightmost = visiblePanes[visiblePanes.length - 1];
         if (rightmost) rightmost.visible = false;
       }
@@ -2564,6 +3933,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       pane.needsTurnRead = false;
       void triggerSessionRead(pane.threadId, "turn-completed");
     }
+    renderWorkspace();
     return true;
   }
 
@@ -2571,9 +3941,17 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     const pane = panes.find((p) => p.paneId === paneId);
     if (!pane) return false;
     if (!pane.visible) {
-      return showPane(paneId);
+      showPane(paneId);
+    } else {
+      focusedPaneId = pane.paneId;
+      renderWorkspace();
     }
-    focusedPaneId = pane.paneId;
+    if (pane.state === "draft" || pane.state === "start-failed") {
+      const inputEl = cwdInputEls.get(pane.paneId);
+      inputEl?.focus?.();
+    } else {
+      paneRegionEls.get(pane.paneId)?.focus?.();
+    }
     return true;
   }
 
@@ -2587,6 +3965,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     } else {
       selectedTargets.add(paneId);
     }
+    renderWorkspace();
     return true;
   }
 
@@ -2648,8 +4027,10 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
           pane.hashMovedOnTurnStart = true;
           pane.footerReason = "manual · sent once";
           selectedTargets.delete(pane.paneId);
+          announceLive(`${pane.seatId}: turn RUNNING`);
         }
       }
+      renderWorkspace();
       return;
     }
 
@@ -2666,6 +4047,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
           pane.streamedServedModel = item;
         }
       }
+      renderWorkspace();
       return;
     }
 
@@ -2680,13 +4062,16 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         if (turn.status === "completed") {
           pane.state = "completed";
           pane.turnError = null;
+          announceLive(`${pane.seatId}: turn COMPLETED`);
         } else if (turn.status === "interrupted") {
           pane.state = "interrupted";
           pane.turnError = null;
           pane.footerReason = "turn ended · interrupted";
+          announceLive(`${pane.seatId}: turn INTERRUPTED`);
         } else if (turn.status === "failed") {
           pane.state = "failed";
           pane.turnError = turn.error ?? null;
+          announceLive(`${pane.seatId}: turn FAILED`);
         } else {
           continue;
         }
@@ -2697,6 +4082,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
           pane.needsTurnRead = true;
         }
       }
+      renderWorkspace();
     }
   }
 
@@ -2822,6 +4208,8 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         return;
       case "cmd-focus-engine":
         closePalette(false);
+        viewMode = "table";
+        renderWorkspace();
         applyFocus(focusBarSelect(focusState, "connection"), true);
         return;
       case "cmd-focus-room":
@@ -2843,8 +4231,85 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
         }
         break;
       }
-      case "cmd-copy-served-model":
+      case "cmd-copy-served-model": {
+        const sm = findFocusedPaneEvidence().servedModel;
+        if (sm && typeof globalObj?.navigator?.clipboard?.writeText === "function") {
+          void globalObj.navigator.clipboard.writeText(sm);
+        }
         break;
+      }
+      case "cmd-copy-head-open": {
+        const sha = findFocusedPaneEvidence().headOpen;
+        if (sha && typeof globalObj?.navigator?.clipboard?.writeText === "function") {
+          void globalObj.navigator.clipboard.writeText(sha);
+        }
+        break;
+      }
+      case "cmd-view-panes":
+        viewMode = "panes";
+        closePalette(true);
+        renderWorkspace();
+        return;
+      case "cmd-view-table":
+        viewMode = "table";
+        closePalette(true);
+        renderWorkspace();
+        return;
+      case "cmd-pane-focus-1":
+      case "cmd-pane-focus-2":
+      case "cmd-pane-focus-3":
+      case "cmd-pane-focus-4": {
+        const slotIdx = Number(cmdId.slice(-1)) - 1;
+        const visiblePanes = panes.filter((p) => p.visible);
+        const slotPane = visiblePanes[slotIdx];
+        closePalette(false);
+        if (slotPane) {
+          viewMode = "panes";
+          focusPane(slotPane.paneId);
+        }
+        return;
+      }
+      case "cmd-pane-hide":
+        closePalette(true);
+        if (focusedPaneId) hidePane(focusedPaneId);
+        return;
+      case "cmd-pane-dismiss":
+        closePalette(true);
+        if (focusedPaneId) dismissPane(focusedPaneId);
+        return;
+      case "cmd-turn-start":
+        closePalette(true);
+        await startTurn(composerInputEl?.value ?? "");
+        return;
+      default:
+        if (typeof cmdId === "string" && cmdId.startsWith("cmd-pane-new:")) {
+          const seatId = cmdId.slice("cmd-pane-new:".length);
+          closePalette(false);
+          viewMode = "panes";
+          const created = createDraftPane(seatId);
+          const inputEl = cwdInputEls.get(created.paneId);
+          inputEl?.focus?.();
+          inputEl?.setSelectionRange?.(0, (inputEl.value ?? "").length);
+          return;
+        }
+        if (typeof cmdId === "string" && cmdId.startsWith("cmd-pane-show:")) {
+          const pid = cmdId.slice("cmd-pane-show:".length);
+          closePalette(false);
+          viewMode = "panes";
+          focusPane(pid);
+          return;
+        }
+        if (typeof cmdId === "string" && cmdId.startsWith("cmd-turn-interrupt:")) {
+          const pid = cmdId.slice("cmd-turn-interrupt:".length);
+          closePalette(true);
+          await interruptTurn(pid);
+          return;
+        }
+        if (typeof cmdId === "string" && cmdId.startsWith("cmd-target-toggle:")) {
+          const pid = cmdId.slice("cmd-target-toggle:".length);
+          toggleComposerTarget(pid);
+          break;
+        }
     }
     closePalette(true);
   }
@@ -2856,12 +4321,82 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     renderPalette();
   });
 
+  if (viewPanesBtnEl && viewTableBtnEl && viewToggleEl) {
+    viewPanesBtnEl.addEventListener("click", () => {
+      viewMode = "panes";
+      renderWorkspace();
+    });
+    viewTableBtnEl.addEventListener("click", () => {
+      viewMode = "table";
+      renderWorkspace();
+    });
+    viewToggleEl.addEventListener("keydown", (ev) => {
+      if (ev?.key === "ArrowLeft" || ev?.key === "ArrowRight") {
+        ev.preventDefault?.();
+        viewMode = viewMode === "panes" ? "table" : "panes";
+        renderWorkspace();
+        (viewMode === "panes" ? viewPanesBtnEl : viewTableBtnEl).focus();
+      }
+    });
+  }
+
+  if (composerInputEl) {
+    composerInputEl.addEventListener("input", () => {
+      renderWorkspace();
+    });
+  }
+
+  if (composerStartBtnEl) {
+    composerStartBtnEl.addEventListener("click", () => {
+      void startTurn(composerInputEl?.value ?? "");
+    });
+  }
+
+  if (quitKeepBtnEl) {
+    quitKeepBtnEl.addEventListener("click", () => {
+      void ackQuit();
+    });
+  }
+
+  if (quitConfirmBtnEl) {
+    quitConfirmBtnEl.addEventListener("click", () => {
+      void confirmQuit();
+    });
+  }
+
   const handleGlobalKeydown = (ev) => {
     const key = ev?.key;
-    const isToggle =
-      typeof key === "string" &&
-      key.toLowerCase() === "k" &&
-      (isMac ? Boolean(ev.metaKey && !ev.ctrlKey) : Boolean(ev.ctrlKey && !ev.metaKey));
+    const modOnly = isMac
+      ? Boolean(ev?.metaKey && !ev?.ctrlKey)
+      : Boolean(ev?.ctrlKey && !ev?.metaKey);
+
+    if (quitDialogOpen) {
+      if (key === "Escape") {
+        ev.preventDefault?.();
+        void ackQuit();
+        return;
+      }
+      if (key === "Tab") {
+        ev.preventDefault?.();
+        if (doc.activeElement === quitKeepBtnEl) {
+          quitConfirmBtnEl?.focus?.();
+        } else {
+          quitKeepBtnEl?.focus?.();
+        }
+        return;
+      }
+      if (key === "Enter") {
+        ev.preventDefault?.();
+        if (doc.activeElement === quitConfirmBtnEl) {
+          void confirmQuit();
+        } else {
+          void ackQuit();
+        }
+      }
+      return;
+    }
+
+    const isToggle = typeof key === "string" && key.toLowerCase() === "k" && modOnly;
 
     if (isToggle) {
       ev.preventDefault?.();
@@ -2870,39 +4405,71 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
       return;
     }
 
-    if (!paletteOpen) return;
-
-    if (key === "Escape") {
-      ev.preventDefault?.();
-      closePalette(true);
-      return;
-    }
-
-    if (key === "Tab") {
-      ev.preventDefault?.();
-      paletteInputEl.focus();
-      return;
-    }
-
-    if (key === "ArrowDown" || key === "ArrowUp" || key === "Home" || key === "End") {
-      ev.preventDefault?.();
-      const stepped = stepPalette(currentPaletteState(), key);
-      paletteActiveId = stepped.activeId;
-      renderPalette();
-      return;
-    }
-
-    if (key === "Enter") {
-      ev.preventDefault?.();
-      const state = currentPaletteState();
-      if (state.activeId) {
-        void executePaletteCommand(state.activeId);
+    if (paletteOpen) {
+      if (key === "Escape") {
+        ev.preventDefault?.();
+        closePalette(true);
+        return;
       }
+
+      if (key === "Tab") {
+        ev.preventDefault?.();
+        paletteInputEl.focus();
+        return;
+      }
+
+      if (key === "ArrowDown" || key === "ArrowUp" || key === "Home" || key === "End") {
+        ev.preventDefault?.();
+        const stepped = stepPalette(currentPaletteState(), key);
+        paletteActiveId = stepped.activeId;
+        renderPalette();
+        return;
+      }
+
+      if (key === "Enter") {
+        ev.preventDefault?.();
+        const state = currentPaletteState();
+        if (state.activeId) {
+          void executePaletteCommand(state.activeId);
+        }
+      }
+      return;
+    }
+
+    // Palette & quit dialog closed: V6 keys (C53 / D-722).
+    if (
+      modOnly &&
+      !ev?.shiftKey &&
+      !ev?.altKey &&
+      (key === "1" || key === "2" || key === "3" || key === "4")
+    ) {
+      ev.preventDefault?.();
+      const slotIdx = Number(key) - 1;
+      const visiblePanes = panes.filter((p) => p.visible);
+      const slotPane = visiblePanes[slotIdx];
+      if (slotPane) {
+        viewMode = "panes";
+        focusPane(slotPane.paneId);
+      }
+      return;
+    }
+
+    if (
+      modOnly &&
+      key === "Enter" &&
+      composerInputEl !== null &&
+      doc.activeElement === composerInputEl
+    ) {
+      ev.preventDefault?.();
+      void startTurn(composerInputEl.value ?? "");
     }
   };
 
   renderConnectionChrome();
   renderReceiptsWell();
+  renderWorkspace();
+  renderPalette();
+  if (quitDialogEl) quitDialogEl.hidden = true;
 
   return {
     getFocusState: () => focusState,
@@ -2931,6 +4498,7 @@ export function bindDesktopShell(doc, invokeFn = invokeTauri, env = {}) {
     toggleComposerTarget,
     setViewMode: (mode) => {
       viewMode = mode === "panes" ? "panes" : "table";
+      renderWorkspace();
     },
     getViewMode: () => viewMode,
     getPanes: () => panes.map(paneSnapshot),

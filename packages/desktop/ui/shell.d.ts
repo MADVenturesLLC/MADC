@@ -16,24 +16,42 @@ export const FORWARDED_ENGINE_EVENTS: ReadonlySet<string>;
 
 export const DEFAULT_FOCUS_BAR_ITEMS: readonly FocusBarItem[];
 
+export type PaletteCommandId =
+  | "cmd-connect"
+  | "cmd-inspect-room"
+  | "cmd-disconnect"
+  | "cmd-focus-engine"
+  | "cmd-focus-room"
+  | "cmd-focus-decisions"
+  | "cmd-focus-search"
+  | "cmd-copy-chain-head"
+  | "cmd-copy-served-model"
+  | "cmd-copy-head-open"
+  | "cmd-view-panes"
+  | "cmd-view-table"
+  | "cmd-pane-focus-1"
+  | "cmd-pane-focus-2"
+  | "cmd-pane-focus-3"
+  | "cmd-pane-focus-4"
+  | "cmd-pane-hide"
+  | "cmd-pane-dismiss"
+  | "cmd-turn-start"
+  | `cmd-pane-new:${string}`
+  | `cmd-pane-show:${string}`
+  | `cmd-turn-interrupt:${string}`
+  | `cmd-target-toggle:${string}`;
+
 export type PaletteCommand = {
-  readonly id:
-    | "cmd-connect"
-    | "cmd-inspect-room"
-    | "cmd-disconnect"
-    | "cmd-focus-engine"
-    | "cmd-focus-room"
-    | "cmd-focus-decisions"
-    | "cmd-focus-search"
-    | "cmd-copy-chain-head"
-    | "cmd-copy-served-model";
-  readonly group: "Engine" | "Focus" | "Evidence";
+  readonly id: PaletteCommandId;
+  readonly group: "Engine" | "Focus" | "Evidence" | "Panes" | "Turn";
   readonly name: string;
   readonly defaultMeta: string | null;
   readonly keyHint: string | null;
   readonly disabled?: boolean;
   readonly meta?: string | null;
 };
+
+export const ALLOWED_PILL_LABELS: Readonly<Record<EvidenceTone, ReadonlySet<PillLabel>>>;
 
 export type PaletteMatch = {
   readonly command: PaletteCommand;
@@ -54,6 +72,7 @@ export type PillInput = {
   readonly tone: EvidenceTone;
   readonly label: PillLabel;
   readonly context?: string;
+  readonly ariaLabel?: string;
   readonly small?: boolean;
   readonly role?: "status" | "alert";
 };
@@ -271,7 +290,82 @@ export function acceptQuitRequest(
   payload: QuitRequestedPayload | unknown,
 ): QuitRequestDecision;
 
+export type CwdFieldPhase = "draft" | "starting" | "refused" | "started";
+
+export type CwdFieldStateResult = {
+  readonly word: "NO CWD" | "UNCHECKED" | "REJECTED" | "REFUSED" | "STARTING" | "STARTED";
+  readonly glyph: "○" | "✗";
+  readonly tone: "neutral" | "fail";
+  readonly reason: string | null;
+};
+
+export type PaneReceiptChip = {
+  readonly key: string;
+  readonly value: string;
+  readonly title?: string | null;
+  readonly muted?: boolean;
+  readonly bdi?: boolean;
+};
+
+export type PaneReceiptRowSpec = {
+  readonly kind:
+    | "method-error"
+    | "servedModel"
+    | "lane"
+    | "worktree.topLevel"
+    | "head@open"
+    | "hash";
+  readonly label: string;
+  readonly isField: boolean;
+  readonly tone: EvidenceTone;
+  readonly pillLabel: PillLabel | null;
+  readonly chips: readonly PaneReceiptChip[];
+  readonly note: string | null;
+  readonly title?: string | null;
+  readonly accessibleName?: string | null;
+};
+
 export function cwdCheck(text: string): { readonly ok: boolean; readonly reason: string };
+
+export function cwdFieldState(
+  text: string,
+  phase: CwdFieldPhase,
+  refuseInfo?: { readonly message?: string } | null,
+): CwdFieldStateResult;
+
+export function paneColumns(width: number): 2 | 4;
+
+export function isWidePaneWidth(paneWidth: number): boolean;
+
+export function turnPillForPane(pane: { readonly state: PaneLifecycleState }): {
+  readonly tone: "neutral" | "fail";
+  readonly label: PillLabel;
+};
+
+export function receiptRowsForPane(
+  pane: Record<string, unknown>,
+  readEntry?: {
+    readonly ok: boolean;
+    readonly result?: Record<string, unknown>;
+    readonly note?: string;
+  } | null,
+  roomRow?: Record<string, unknown> | null,
+  connectionState?: DesktopConnectionState,
+): readonly PaneReceiptRowSpec[];
+
+export function composerTargets(
+  panes: readonly DesktopPaneSnapshot[],
+  selectedSet: ReadonlySet<string>,
+  boundEpoch: number | null,
+  connectionState: DesktopConnectionState,
+): readonly {
+  readonly paneId: string;
+  readonly seatId: string;
+  readonly selected: boolean;
+  readonly enabled: boolean;
+  readonly disabledReason: string | null;
+  readonly title: string | null;
+}[];
 
 export function renderPill(doc: ShellDocument, input: PillInput): ShellElement;
 
@@ -303,10 +397,12 @@ export type ShellElement = {
   textContent: string | null;
   tabIndex: number;
   value?: string;
+  readOnly?: boolean;
   hidden?: boolean;
   disabled?: boolean;
   inert?: boolean;
   title?: string;
+  setSelectionRange?(start: number, end: number): void;
   readonly children: ArrayLike<ShellElement>;
   setAttribute(name: string, value: string): void;
   getAttribute(name: string): string | null;
@@ -329,7 +425,11 @@ export type ShellDocument = {
 export function bindDesktopShell(
   doc: ShellDocument,
   invokeFn?: (cmd: string, args?: Record<string, unknown>) => Promise<unknown>,
-  env?: { readonly globalObj?: unknown; readonly platform?: string },
+  env?: {
+    readonly globalObj?: unknown;
+    readonly platform?: string;
+    readonly viewportWidth?: number;
+  },
 ): {
   readonly getFocusState: () => FocusBarState;
   readonly getConnectionState: () => DesktopConnectionState;

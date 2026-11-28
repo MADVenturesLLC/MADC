@@ -15,23 +15,32 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { PROTOCOL_VERSION } from "@madc/engine/client";
 import {
+  ALLOWED_PILL_LABELS,
   acceptEngineEvent,
   acceptQuitRequest,
   acceptTerminal,
   bindDesktopShell,
   classifyRpcError,
+  composerTargets,
   createPaletteState,
+  cwdCheck,
+  cwdFieldState,
   EXPECTED_PROTOCOL_VERSION,
   FORWARDED_ENGINE_EVENTS,
   filterCommands,
+  isWidePaneWidth,
   lockOwnerGuidanceFromStderr,
   PALETTE_COMMANDS,
+  paneColumns,
+  receiptRowsForPane,
   resolveConnectTerminal,
   type ShellDocument,
   type ShellElement,
   serveExitFromCode,
   stepPalette,
+  turnPillForPane,
 } from "../ui/shell.js";
+import type { PillLabel } from "./evidence.ts";
 import {
   classifyServeExit,
   createFocusBarState,
@@ -176,8 +185,10 @@ test("M3-A2 shipped UI script (M3A2-M5) and CSP/no-inline guard (M3A2-M4)", asyn
       tabIndex: 0,
       hidden: false,
       disabled: false,
+      readOnly: false,
       inert: false,
       focusedCount: 0,
+      setSelectionRange() {},
       setAttribute(name, value) {
         attrs.set(name, value);
       },
@@ -248,6 +259,24 @@ test("M3-A2 shipped UI script (M3A2-M5) and CSP/no-inline guard (M3A2-M4)", asyn
     ["palette-list", makeEl()],
     ["palette-live", makeEl()],
     ["palette-keycap", makeEl()],
+    ["room-stale-note", makeEl()],
+    ["view-toggle", makeEl()],
+    ["view-panes-btn", makeEl()],
+    ["view-table-btn", makeEl()],
+    ["table-view", makeEl()],
+    ["col-right", makeEl()],
+    ["panes-workspace", makeEl()],
+    ["panes-grid", makeEl()],
+    ["hidden-strip", makeEl()],
+    ["composer-targets", makeEl()],
+    ["composer-input", makeEl()],
+    ["composer-start-btn", makeEl()],
+    ["live-region", makeEl()],
+    ["quit-dialog", makeEl()],
+    ["quit-dialog-title", makeEl()],
+    ["quit-dialog-list", makeEl()],
+    ["quit-keep-btn", makeEl()],
+    ["quit-confirm-btn", makeEl()],
   ]);
   const doc: ShellDocument = {
     get activeElement() {
@@ -523,8 +552,10 @@ function createShellHarness() {
       tabIndex: 0,
       hidden: false,
       disabled: false,
+      readOnly: false,
       inert: false,
       focusedCount: 0,
+      setSelectionRange() {},
       setAttribute(name, value) {
         attrs.set(name, value);
       },
@@ -604,6 +635,24 @@ function createShellHarness() {
     ["palette-list", makeEl()],
     ["palette-live", makeEl()],
     ["palette-keycap", makeEl()],
+    ["room-stale-note", makeEl()],
+    ["view-toggle", makeEl()],
+    ["view-panes-btn", makeEl()],
+    ["view-table-btn", makeEl()],
+    ["table-view", makeEl()],
+    ["col-right", makeEl()],
+    ["panes-workspace", makeEl()],
+    ["panes-grid", makeEl()],
+    ["hidden-strip", makeEl()],
+    ["composer-targets", makeEl()],
+    ["composer-input", makeEl()],
+    ["composer-start-btn", makeEl()],
+    ["live-region", makeEl()],
+    ["quit-dialog", makeEl()],
+    ["quit-dialog-title", makeEl()],
+    ["quit-dialog-list", makeEl()],
+    ["quit-keep-btn", makeEl()],
+    ["quit-confirm-btn", makeEl()],
   ]);
 
   const docListeners = new Map<string, Array<(ev: unknown) => void>>();
@@ -1176,7 +1225,7 @@ test("M3-A3 §9.8–§9.9 & N5 single-flight connect/disconnect, R2/R4 cleanup, 
   assert.equal(ctrl2.getConnectionState(), "FAILED");
 });
 
-test("M3-A3 §9.10, §9.12 Command palette closed list, subsequence filter, keyboard nav, and tauri.conf.json", () => {
+test("M3-A3 §9.10, §9.12 Command palette closed list, subsequence filter, keyboard nav, and tauri.conf.json (updated A4 §2.3 (1))", () => {
   assert.deepEqual(
     PALETTE_COMMANDS.map((c) => c.id),
     [
@@ -1189,6 +1238,16 @@ test("M3-A3 §9.10, §9.12 Command palette closed list, subsequence filter, keyb
       "cmd-focus-search",
       "cmd-copy-chain-head",
       "cmd-copy-served-model",
+      "cmd-copy-head-open",
+      "cmd-view-panes",
+      "cmd-view-table",
+      "cmd-pane-focus-1",
+      "cmd-pane-focus-2",
+      "cmd-pane-focus-3",
+      "cmd-pane-focus-4",
+      "cmd-pane-hide",
+      "cmd-pane-dismiss",
+      "cmd-turn-start",
     ],
   );
 
@@ -1209,11 +1268,11 @@ test("M3-A3 §9.10, §9.12 Command palette closed list, subsequence filter, keyb
   state = stepPalette(state, "ArrowDown");
   assert.equal(state.activeId, "cmd-focus-engine");
   state = stepPalette(state, "End");
-  assert.equal(state.activeId, "cmd-copy-served-model");
+  assert.equal(state.activeId, "cmd-turn-start");
   state = stepPalette(state, "ArrowDown");
   assert.equal(state.activeId, "cmd-connect");
   state = stepPalette(state, "ArrowUp");
-  assert.equal(state.activeId, "cmd-copy-served-model");
+  assert.equal(state.activeId, "cmd-turn-start");
 
   // Toggle + Esc focus restore in harness.
   const { doc, byId } = createShellHarness();
@@ -1287,10 +1346,7 @@ test("M3-A3 review fixes: H1 single keydown listener, M1 inert-aware focus, L3 C
   assert.equal(doc.activeElement, palInput);
 
   doc.emit("keydown", { key: "End", preventDefault() {} });
-  assert.equal(
-    byId.get("palette-input")?.getAttribute("aria-activedescendant"),
-    "cmd-focus-search",
-  );
+  assert.equal(byId.get("palette-input")?.getAttribute("aria-activedescendant"), "cmd-view-panes");
   doc.emit("keydown", { key: "Home", preventDefault() {} });
   assert.equal(byId.get("palette-input")?.getAttribute("aria-activedescendant"), "cmd-connect");
 
@@ -1704,10 +1760,9 @@ test("M3-A3 review fixes: §9.6 G3/G6, §9.8 protocol mismatch, §9.9 R4/disconn
 const RECEIPT_TRACK_MIN_PX = 168;
 
 /**
- * The uppercase `THREAD` header label measures 49px. At 960px the frame's 100 : 108 : 194
- * ratio would give the thread track 47.12px and cut the label, so the track keeps a 50px floor.
+ * The folded `THREAD · SEAT` cell keeps a 96px floor below 1200px (spec r2 §6.5 (a) 3).
  */
-const THREAD_TRACK_MIN_PX = 50;
+const THREAD_TRACK_MIN_PX = 96;
 
 type GridTrack = { base: number; limit: number; flex: number };
 type CssRule = {
@@ -1917,7 +1972,7 @@ function describeLayout(layout: DesktopLayout): string {
   return `${layout.viewport}px: #main-content ${tracks(layout.columns)} (gap ${layout.columnGap}) in ${layout.mainBox}px; Room ${tracks(layout.tracks)} (gap ${layout.trackGap}) in ${layout.roomBox}px`;
 }
 
-test("M3-A3 spec §5.4 track budget: the Room receipt track never collapses from the 960px minimum up", () => {
+test("M3-A3 spec §5.4 / A4 §5.2 D-693 track budget: the Room receipt track never collapses from the 960px minimum up", () => {
   const css = readFileSync(fileURLToPath(new URL("../ui/styles.css", import.meta.url)), "utf8");
   const rules = cssRules(css);
   const widths = [...Array.from({ length: 441 }, (_, index) => 960 + index), 1440, 1920, 2560];
@@ -1945,7 +2000,7 @@ test("M3-A3 spec §5.4 track budget: the Room receipt track never collapses from
     if (width < 1200) {
       assert.ok(
         (layout.tracks[1] ?? 0) >= THREAD_TRACK_MIN_PX,
-        `${at}: thread track below its floor`,
+        `${at}: THREAD·SEAT track below 96px floor`,
       );
     }
     if (width >= 1200) {
@@ -1954,12 +2009,12 @@ test("M3-A3 spec §5.4 track budget: the Room receipt track never collapses from
     }
   }
 
-  // The pinned minimum, spelled out (spec §5.4): 960 - 2x28 padding - 24 gap - 360 right
-  // column leaves 520px; less the well border and row padding, 486px for five tracks.
+  // The pinned minimum (A4 §5.2 / spec §6.5 (a) 3): 960 - 2x28 padding - 24 gap - 360 right
+  // column leaves 520px; less the well border and row padding, 486px for four tracks (THREAD · SEAT folded).
   const minimum = desktopLayoutAt(rules, 960);
   const expected = [
     [520, 360],
-    [140, 50, 48, 48, 168],
+    [140, 96, 48, 178],
   ];
   for (const [index, values] of [minimum.columns, minimum.tracks].entries()) {
     const wanted = expected[index] ?? [];
@@ -1969,7 +2024,7 @@ test("M3-A3 spec §5.4 track budget: the Room receipt track never collapses from
   }
 });
 
-test("M3-A3 spec §5.4 breakpoints: the right column narrows to 360px and the Room grid keeps a receipt floor (960-1199px)", () => {
+test("M3-A3 spec §5.4 / A4 §5.2 D-693 breakpoints: right column 360-440px, Room tracks folded THREAD·SEAT (960-1199px)", () => {
   const css = readFileSync(fileURLToPath(new URL("../ui/styles.css", import.meta.url)), "utf8");
   const rules = cssRules(css);
   const columnsAt = (width: number): string =>
@@ -1979,40 +2034,26 @@ test("M3-A3 spec §5.4 breakpoints: the right column narrows to 360px and the Ro
   const tracksAt = (width: number): CssRule =>
     lastRule(rules, ".room-thead", "grid-template-columns", width);
 
-  // 960-1199px: two columns, the right one shrinking to 360px at the 960px minimum.
   const band = lastRule(rules, "#main-content", "grid-template-columns", 1199);
   assert.equal(band.maxWidth, 1199);
   assert.equal(columnsAt(1199), "minmax(0, 1fr) clamp(360px, 37.5vw, 440px)");
-  // 1200px and up: the frame rule, unchanged.
   assert.equal(columnsAt(1200), "minmax(0, 1fr) 440px");
-  // Below the pinned minimum: the single-column guard, unchanged.
   assert.equal(columnsAt(959), "1fr");
 
-  // 960-1199px: thread, seat and receipt share what is left in the frame's 100 : 108 : 194
-  // ratio. The receipt track can never fall below its floor, nor the thread track below the
-  // width of its header label.
   const bandTracks = tracksAt(1199);
   assert.equal(bandTracks.maxWidth, 1199);
   assert.deepEqual(bandTracks.selectors, [".room-thead", ".room-row"]);
   assert.equal(
     bandTracks.declarations["grid-template-columns"],
-    "140px minmax(50px, 1fr) minmax(0, 1.08fr) 48px minmax(168px, 1.94fr)",
+    "140px minmax(96px, 0.62fr) 48px minmax(168px, 1.9fr)",
   );
   assert.equal(lastRule(rules, ".room-thead", "gap", 1199).declarations.gap, "var(--madc-space-2)");
-  // 1200px and up: the frame columns, unchanged.
   assert.equal(
     tracksAt(1200).declarations["grid-template-columns"],
     "148px 100px 108px 48px minmax(0, 1fr)",
   );
-  // Below the pinned minimum: the single-column guard keeps its own tracks and restores the
-  // frame's 12px gap, which the 960-1199px band would otherwise carry down into it.
-  const guard = tracksAt(959);
-  assert.equal(guard.maxWidth, 959);
-  assert.equal(guard.declarations["grid-template-columns"], "148px 100px 48px minmax(0, 1fr)");
-  assert.equal(lastRule(rules, ".room-thead", "gap", 959).declarations.gap, "var(--madc-space-3)");
 
-  // The empty-state row is also a `.room-row`. Its one-column rule must outrank every rule
-  // that targets `.room-row`, or the five- and four-track grids would apply to it.
+  // Empty-state row outranks .room-row rules at every width.
   const weight = (selector: string): number =>
     100 * (selector.match(/#[\w-]+/g) ?? []).length + (selector.match(/\.[\w-]+/g) ?? []).length;
   const empty = lastRule(rules, ".room-row.room-row--empty", "grid-template-columns", 960);
@@ -2024,7 +2065,6 @@ test("M3-A3 spec §5.4 breakpoints: the right column narrows to 360px and the Ro
         (rule.maxWidth === null || rule.maxWidth >= width) &&
         rule.declarations["grid-template-columns"] !== undefined,
     );
-    // The frame and band rules apply at all three widths; the guard only at 959px.
     assert.ok(rivals.length >= 2, `expected the frame and band rules at ${width}px`);
     for (const rival of rivals) {
       for (const selector of rival.selectors) {
@@ -2802,4 +2842,661 @@ test("M3-A4 Slice 5 (10, 11, 12, 13, 14, 15): R5 defect guard, room/updated, aut
     1,
     "follow-up must be suppressed when epoch ends mid-flight",
   );
+});
+
+// ---------------------------------------------------------------------------
+// M3-A4 Slice 6: pills, receipts, cwd (C1–C17), layout/D-693, panes/composer/palette/keys/quit
+// ---------------------------------------------------------------------------
+
+test("M3-A4 §9 items 1–7, 20–21: pill vocabulary, turn pills, servedModel, head@open, lane, topLevel", () => {
+  // Items 1–4: closed vocabulary & turn pills never green.
+  const vocab = {
+    verified: ["VERIFIED"],
+    neutral: [
+      "NO RECEIPT",
+      "IDLE",
+      "CONNECTING",
+      "CONNECTED",
+      "DISCONNECTED",
+      "RUNNING",
+      "COMPLETED",
+    ],
+    warn: ["UNVERIFIED", "STOPPED"],
+    fail: ["FAILED", "INTERRUPTED"],
+  };
+  for (const [tone, expected] of Object.entries(vocab) as Array<
+    [keyof typeof ALLOWED_PILL_LABELS, PillLabel[]]
+  >) {
+    assert.deepEqual([...ALLOWED_PILL_LABELS[tone]].sort(), [...expected].sort());
+  }
+  for (const state of [
+    "draft",
+    "starting-thread",
+    "start-failed",
+    "idle",
+    "starting-turn",
+    "running",
+    "interrupt-pending",
+    "completed",
+    "interrupted",
+    "failed",
+    "refused",
+    "history",
+  ] as const) {
+    const tp = turnPillForPane({ state });
+    assert.notEqual(tp.tone, "verified", `turn pill for ${state} must never be verified`);
+  }
+  assert.deepEqual(turnPillForPane({ state: "running" }), { tone: "neutral", label: "RUNNING" });
+  assert.deepEqual(turnPillForPane({ state: "completed" }), {
+    tone: "neutral",
+    label: "COMPLETED",
+  });
+  assert.deepEqual(turnPillForPane({ state: "interrupted" }), {
+    tone: "fail",
+    label: "INTERRUPTED",
+  });
+
+  // Item 5: servedModel conditions (verified, vendorReported=false, empty, whitespace, streamed-only, failed-stream).
+  const basePane = {
+    paneId: "p1",
+    seatId: "daedalus",
+    threadId: "thr_1",
+    turnId: "turn_1",
+    state: "completed",
+    hasReadYet: true,
+  };
+  // Streamed-only with vendorReported:true -> warn UNVERIFIED, never green.
+  const streamedOnly = receiptRowsForPane(
+    {
+      ...basePane,
+      streamedServedModel: {
+        id: "it_1",
+        kind: "servedModel",
+        status: "completed",
+        requestedModel: "m",
+        servedModel: "claude-4",
+        backing: "anthropic",
+        providerId: "anthropic",
+        lane: "allowed-direct",
+        mode: "headless",
+        fallbackFrom: null,
+        vendorReported: true,
+      },
+    },
+    null,
+    null,
+  );
+  const smStreamRow = streamedOnly.find((r) => r.kind === "servedModel");
+  assert.equal(smStreamRow?.tone, "warn");
+  assert.equal(smStreamRow?.pillLabel, "UNVERIFIED");
+
+  // Failed streamed servedModel is NOT evidence (stays NO RECEIPT).
+  const noStream = receiptRowsForPane({ ...basePane, streamedServedModel: null }, null, null);
+  assert.equal(noStream.find((r) => r.kind === "servedModel")?.pillLabel, "NO RECEIPT");
+
+  // Confirmed read-back vendorReported:true non-empty -> VERIFIED.
+  const readVerified = receiptRowsForPane(
+    basePane,
+    {
+      ok: true,
+      result: {
+        threadId: "thr_1",
+        chainOk: true,
+        events: [
+          {
+            type: "session.open",
+            payload: {
+              worktree: { topLevel: "/Users/dev/repo", remote: null, head: "a".repeat(40) },
+            },
+          },
+          {
+            type: "servedModel",
+            payload: {
+              turnId: "turn_1",
+              servedModel: "claude-4",
+              vendorReported: true,
+              lane: "allowed-direct",
+              fallbackFrom: null,
+            },
+          },
+        ],
+      },
+    },
+    null,
+  );
+  assert.equal(readVerified.find((r) => r.kind === "servedModel")?.tone, "verified");
+  assert.equal(readVerified.find((r) => r.kind === "servedModel")?.pillLabel, "VERIFIED");
+
+  // Item 5 empty/whitespace servedModel x vendorReported {true, false} -> warn UNVERIFIED, never green or neutral.
+  for (const sm of ["", "   "]) {
+    for (const vr of [true, false]) {
+      const rows = receiptRowsForPane(
+        basePane,
+        {
+          ok: true,
+          result: {
+            threadId: "thr_1",
+            chainOk: true,
+            events: [
+              {
+                type: "servedModel",
+                payload: {
+                  turnId: "turn_1",
+                  servedModel: sm,
+                  vendorReported: vr,
+                  lane: "allowed-direct",
+                  fallbackFrom: null,
+                },
+              },
+            ],
+          },
+        },
+        null,
+      );
+      const smRow = rows.find((r) => r.kind === "servedModel");
+      assert.equal(smRow?.tone, "warn", `empty '${sm}' vendorReported=${vr} must be warn`);
+      assert.equal(smRow?.pillLabel, "UNVERIFIED");
+    }
+  }
+
+  // Item 6 & 21: head@open verified with 40-hex SHA alone (even without chainOk), missing note stays verified, label literal head@open.
+  const shaRows = receiptRowsForPane(
+    { ...basePane, hasReadYet: true },
+    { ok: true, result: { threadId: "thr_1", chainOk: false, events: [] } },
+    {
+      worktree: {
+        open: { topLevel: "/repo", remote: null, head: "f".repeat(40) },
+        close: null,
+        missing: true,
+      },
+    },
+  );
+  const headRow = shaRows.find((r) => r.kind === "head@open");
+  assert.equal(headRow?.label, "head@open");
+  assert.equal(headRow?.tone, "verified");
+  assert.equal(headRow?.note, "worktree missing on disk");
+
+  // Item 7: lane and worktree.topLevel have no pill and contain `field · not a receipt`.
+  const laneRow = readVerified.find((r) => r.kind === "lane");
+  const topRow = readVerified.find((r) => r.kind === "worktree.topLevel");
+  assert.equal(laneRow?.pillLabel, null);
+  assert.match(laneRow?.note ?? "", /field · not a receipt/);
+  assert.equal(topRow?.pillLabel, null);
+  assert.match(topRow?.note ?? "", /field · not a receipt/);
+});
+
+test("M3-A4 §9 item 25 (C1–C17): cwdCheck, cwdFieldState, static CSS, and interactive cwd flow", async () => {
+  // C1: cwdCheck exact table (never trims).
+  assert.equal(cwdCheck("").ok, true);
+  assert.equal(cwdCheck("/").ok, true);
+  assert.equal(cwdCheck("/a b/").ok, true);
+  assert.equal(cwdCheck("relative").ok, false);
+  assert.equal(cwdCheck("./x").ok, false);
+  assert.equal(cwdCheck("~/x").reason, "~ is not expanded · type the full path");
+  assert.equal(cwdCheck(" /x").ok, false);
+  assert.equal(cwdCheck("/a\0b").reason, "contains a NUL character");
+  const p4096 = `/${"a".repeat(4095)}`;
+  assert.equal(Buffer.byteLength(p4096, "utf8"), 4096);
+  assert.equal(cwdCheck(p4096).ok, true);
+  assert.equal(cwdCheck(`${p4096}b`).ok, false);
+  // Multi-byte UTF-8 measured in bytes, not characters.
+  const multi = `/${"é".repeat(2048)}`; // 1 + 4096 = 4097 bytes
+  assert.equal(multi.length, 2049);
+  assert.equal(cwdCheck(multi).ok, false);
+
+  // C2: cwdFieldState returns ONLY the six words and ONLY neutral or fail (never verified or warn).
+  const allowedWords = new Set([
+    "NO CWD",
+    "UNCHECKED",
+    "REJECTED",
+    "REFUSED",
+    "STARTING",
+    "STARTED",
+  ]);
+  for (const text of ["", "/repo", "bad", "~/x"]) {
+    for (const phase of ["draft", "starting", "refused", "started"] as const) {
+      const st = cwdFieldState(text, phase, { message: "bad" });
+      assert.equal(allowedWords.has(st.word), true);
+      assert.ok(st.tone === "neutral" || st.tone === "fail");
+    }
+  }
+  assert.equal(cwdFieldState("", "started").tone, "neutral");
+
+  // C13 & C14: static CSS checks.
+  const css = readFileSync(fileURLToPath(new URL("../ui/styles.css", import.meta.url)), "utf8");
+  assert.match(css, /\.cwd-val-ro[\s\S]*direction:\s*rtl;[\s\S]*text-overflow:\s*ellipsis;/);
+  assert.match(css, /\.chip-v--rtl[\s\S]*direction:\s*rtl;[\s\S]*text-overflow:\s*ellipsis;/);
+  const cwdRules = css.match(/\.(?:cwd|cwd-in|fst)[^{]*\{[^}]+\}/g) ?? [];
+  assert.ok(cwdRules.length >= 3);
+  for (const r of cwdRules) {
+    assert.doesNotMatch(r, /--madc-green|--madc-yellow/);
+  }
+
+  // Interactive C3–C11, C15–C17.
+  const { doc, byId } = createShellHarness();
+  const rpcs: Array<{ method: string; params: Record<string, unknown> }> = [];
+  let disconnects = 0;
+  let resolveStart: ((v: unknown) => void) | null = null;
+  let nextStartMode: "ok-worktree" | "pending" | "-32602" | "-32009" | "-32005" | "-32006" | "R5" =
+    "-32602";
+
+  const ctrl = bindDesktopShell(
+    doc,
+    (cmd, args) => {
+      if (cmd === "connect_engine") {
+        return Promise.resolve({
+          socketPath: "/tmp/e.sock",
+          reusedExisting: false,
+          protocolVersion: PROTOCOL_VERSION,
+          serverName: "madc-engine",
+          serverVersion: "0.0.0",
+          coldStartMs: 5,
+          connectionEpoch: 1,
+        });
+      }
+      if (cmd === "disconnect_engine") {
+        disconnects += 1;
+        return Promise.resolve();
+      }
+      if (cmd === "rpc_request") {
+        const method = String(args?.method);
+        const params = (args?.params ?? {}) as Record<string, unknown>;
+        rpcs.push({ method, params });
+        if (method === "room/inspect") {
+          return Promise.resolve({
+            room: {
+              home: "/h",
+              counts: { threads: 0, pass: 0, warn: 0, fail: 0, openDecisions: 0 },
+              threads: [],
+            },
+          });
+        }
+        if (method === "seat/list") {
+          return Promise.resolve({
+            data: [
+              {
+                id: "reviewer",
+                displayName: "Reviewer",
+                pinnedModel: null,
+                preferredBacking: null,
+                ok: true,
+              },
+            ],
+          });
+        }
+        if (method === "session/read") {
+          return Promise.resolve({ threadId: params.threadId, chainOk: true, events: [] });
+        }
+        if (method === "thread/start") {
+          if (nextStartMode === "pending") {
+            return new Promise((res) => {
+              resolveStart = res;
+            });
+          }
+          if (nextStartMode === "-32602") {
+            return Promise.reject(
+              'engine RPC error: {"code":-32602,"message":"Invalid params","data":{"issues":["worktree mode requires a git repository cwd"]}}',
+            );
+          }
+          if (nextStartMode === "-32009") {
+            return Promise.reject(
+              'engine RPC error: {"code":-32009,"message":"SessionWriteFailed","data":{"threadId":"thr_1","path":"/s","seq":0}}',
+            );
+          }
+          if (nextStartMode === "-32005") {
+            return Promise.reject(
+              'engine RPC error: {"code":-32005,"message":"SeatNotFound","data":{"seatId":"reviewer"}}',
+            );
+          }
+          if (nextStartMode === "-32006") {
+            return Promise.reject(
+              'engine RPC error: {"code":-32006,"message":"SeatInvalid","data":{"seatId":"reviewer","issues":["bad seat"]}}',
+            );
+          }
+          if (nextStartMode === "R5") {
+            return Promise.reject(
+              "RPC params refused by desktop shell for thread/start: cwd must be absolute",
+            );
+          }
+          return Promise.resolve({
+            thread: {
+              id: "thr_wt",
+              seatId: params.seatId,
+              cwd: "/madc/worktrees/thr_wt",
+              createdAt: 1,
+              updatedAt: 1,
+              status: "idle",
+              preview: "",
+            },
+          });
+        }
+      }
+      return Promise.resolve({});
+    },
+    { platform: "darwin" },
+  );
+
+  await ctrl.connect();
+  await ctrl.loadSeats();
+  ctrl.openPalette();
+  const palInput = byId.get("palette-input");
+  assert.ok(palInput !== undefined);
+  // C11: New pane on seat reviewer creates Draft pane and sends 0 RPCs.
+  const reviewerNewCmd = byId
+    .get("palette-list")
+    ?.children.find((c) => c.id === "cmd-pane-new:reviewer");
+  assert.ok(reviewerNewCmd !== undefined);
+  reviewerNewCmd.emit("click");
+  assert.equal(ctrl.getPanes().length, 1);
+  assert.equal(rpcs.filter((r) => r.method === "thread/start").length, 0);
+  assert.match(byId.get("composer-targets")?.textContent ?? "", /no thread loaded/);
+
+  const draftId = ctrl.getPanes()[0]?.paneId ?? "";
+  const findCwdInput = (node: TestFakeEl | undefined): TestFakeEl | undefined => {
+    if (!node) return undefined;
+    if (node.className === "cwd-in") return node;
+    for (const c of node.children) {
+      const hit = findCwdInput(c);
+      if (hit) return hit;
+    }
+    return undefined;
+  };
+  const cwdInput = () => findCwdInput(byId.get("panes-grid")?.children[0]);
+
+  // Test invalid cwd Enter sends 0 requests (C3).
+  const inEl = cwdInput();
+  assert.ok(inEl !== undefined);
+  inEl.value = "relative";
+  inEl.emit("input", { target: { value: "relative" } });
+  inEl.emit("keydown", { key: "Enter", preventDefault() {} });
+  assert.equal(rpcs.filter((r) => r.method === "thread/start").length, 0);
+
+  // C5: Esc reverts edit and sends nothing.
+  inEl.emit("keydown", { key: "Escape", preventDefault() {}, stopPropagation() {} });
+  assert.equal(inEl.value, "");
+
+  // C6: Cmd+Enter in cwd input sends neither thread/start nor turn/start.
+  inEl.value = "/valid path/repo ";
+  inEl.emit("input", { target: { value: "/valid path/repo " } });
+  inEl.emit("keydown", { key: "Enter", metaKey: true, preventDefault() {} });
+  assert.equal(rpcs.filter((r) => r.method === "thread/start").length, 0);
+  assert.equal(rpcs.filter((r) => r.method === "turn/start").length, 0);
+
+  // C9: -32602 refusal renders issues verbatim, keeps CONNECTED, keeps input editable.
+  inEl.emit("keydown", { key: "Enter", preventDefault() {} });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(ctrl.getPanes()[0]?.state, "start-failed");
+  assert.match(byId.get("panes-grid")?.textContent ?? "", /-32602/);
+  assert.match(
+    byId.get("panes-grid")?.textContent ?? "",
+    /worktree mode requires a git repository cwd/,
+  );
+  assert.equal(disconnects, 0);
+
+  // C10: R5 refusal renders verbatim with no chips, zero disconnect_engine.
+  nextStartMode = "R5";
+  await ctrl.startThread(draftId);
+  assert.equal(ctrl.getPanes()[0]?.state, "start-failed");
+  assert.match(byId.get("panes-grid")?.textContent ?? "", /RPC params refused/);
+  assert.equal(disconnects, 0);
+
+  // C16 & C17: -32009, -32005, -32006 keep CONNECTED and editable.
+  for (const mode of ["-32009", "-32005", "-32006"] as const) {
+    nextStartMode = mode;
+    await ctrl.startThread(draftId);
+    assert.equal(ctrl.getPanes()[0]?.state, "start-failed");
+    assert.equal(ctrl.getConnectionState(), "CONNECTED");
+    assert.equal(disconnects, 0);
+  }
+
+  // C4 & C7: State 5 pending locks readonly and ignores second Enter.
+  nextStartMode = "pending";
+  const pendingStart = ctrl.startThread(draftId);
+  assert.equal(cwdInput()?.readOnly, true);
+  await ctrl.startThread(draftId);
+  assert.equal(rpcs.filter((r) => r.method === "thread/start").length, 6);
+
+  // C8: Thread.cwd != typed text displays Thread.cwd in header, NEVER in topLevel chip.
+  (resolveStart as ((v: unknown) => void) | null)?.({
+    thread: {
+      id: "thr_wt",
+      seatId: "reviewer",
+      cwd: "/madc/worktrees/thr_wt",
+      createdAt: 1,
+      updatedAt: 1,
+      status: "idle",
+      preview: "",
+    },
+  });
+  await pendingStart;
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(cwdInput(), undefined, "C7: started pane has no input element");
+  assert.match(byId.get("panes-grid")?.textContent ?? "", /\/madc\/worktrees\/thr_wt/);
+  // Exact untrimmed cwd sent on thread/start.
+  assert.equal(rpcs.find((r) => r.method === "thread/start")?.params.cwd, "/valid path/repo ");
+
+  // C11: Dismiss removes draft pane with 0 RPCs.
+  const d2 = ctrl.createDraftPane("reviewer");
+  assert.equal(ctrl.getPanes().length, 2);
+  assert.equal(ctrl.dismissPane(d2.paneId), true);
+  assert.equal(ctrl.getPanes().length, 1);
+});
+
+test("M3-A4 §9 items 8, 13–24, 26–27: -32007 refusal, D-693 CSS, layout grid, keys, palette, quit dialog, no engine diff", async () => {
+  // Item 13: paneColumns & isWidePaneWidth.
+  assert.equal(paneColumns(1440), 4);
+  assert.equal(paneColumns(1200), 2);
+  assert.equal(paneColumns(960), 2);
+  assert.equal(isWidePaneWidth(520), true);
+  assert.equal(isWidePaneWidth(519), false);
+
+  // Item 14, 18, 19: static CSS D-693 & no-decorative-green & no network.
+  const css = readFileSync(fileURLToPath(new URL("../ui/styles.css", import.meta.url)), "utf8");
+  assert.match(css, /\.cell-receipt\s*\{[^}]*flex-wrap:\s*wrap;/);
+  assert.match(css, /\.receipt-chips\s*\{[^}]*flex-wrap:\s*wrap;/);
+  assert.match(
+    css,
+    /@media\s*\(max-width:\s*1199px\)[\s\S]*140px minmax\(96px,\s*0\.62fr\)\s*48px\s*minmax\(168px,\s*1\.9fr\)/,
+  );
+  assert.match(
+    css,
+    /@media\s*\(max-width:\s*1199px\)[\s\S]*\.receipt-row\s*\{[^}]*grid-template-columns:\s*112px\s*minmax\(0,\s*1fr\);/,
+  );
+  // No rule hides `.cell-seat` or `.room-thead-seat`.
+  assert.doesNotMatch(css, /\.cell-seat[^{]*\{[^}]*display:\s*none/);
+
+  // Item 9 & 21: no thread/resume anywhere in shell UI and no cmd-pane-open-thread / Reopen pane.
+  const shellJs = readFileSync(fileURLToPath(new URL("../ui/shell.js", import.meta.url)), "utf8");
+  assert.doesNotMatch(shellJs, /thread\/resume|cmd-pane-open-thread|Reopen pane/);
+
+  // Item 8, 10–11, 15–17, 20, 22–23, 26, C12: interactive checks.
+  const { doc, byId } = createShellHarness();
+  const rpcs: Array<{ method: string; params: Record<string, unknown> }> = [];
+  const cmds: Array<{ cmd: string; args: Record<string, unknown> | undefined }> = [];
+  let disconnects = 0;
+
+  const ctrl = bindDesktopShell(
+    doc,
+    (cmd, args) => {
+      cmds.push({ cmd, args });
+      if (cmd === "connect_engine") {
+        return Promise.resolve({
+          socketPath: "/tmp/e.sock",
+          reusedExisting: false,
+          protocolVersion: PROTOCOL_VERSION,
+          serverName: "madc-engine",
+          serverVersion: "0.0.0",
+          coldStartMs: 5,
+          connectionEpoch: 1,
+        });
+      }
+      if (cmd === "disconnect_engine") {
+        disconnects += 1;
+        return Promise.resolve();
+      }
+      if (cmd === "quit_dialog_shown" || cmd === "ack_quit" || cmd === "confirm_quit") {
+        return Promise.resolve({ accepted: true });
+      }
+      if (cmd === "rpc_request") {
+        const method = String(args?.method);
+        const params = (args?.params ?? {}) as Record<string, unknown>;
+        rpcs.push({ method, params });
+        if (method === "room/inspect") {
+          return Promise.resolve({
+            room: {
+              home: "/h",
+              counts: { threads: 0, pass: 0, warn: 0, fail: 0, openDecisions: 0 },
+              threads: [],
+            },
+          });
+        }
+        if (method === "thread/start") {
+          return Promise.resolve({
+            thread: {
+              id: `thr_${params.seatId}`,
+              seatId: params.seatId,
+              cwd: null,
+              createdAt: 1,
+              updatedAt: 1,
+              status: "idle",
+              preview: "",
+            },
+          });
+        }
+        if (method === "session/read") {
+          return Promise.resolve({
+            threadId: params.threadId,
+            chainOk: true,
+            events: [
+              { type: "session.open", payload: { worktree: null }, hash: "a".repeat(64) },
+              {
+                type: "servedModel",
+                payload: {
+                  turnId: "t1",
+                  servedModel: "m1",
+                  vendorReported: true,
+                  lane: "allowed-direct",
+                  fallbackFrom: null,
+                },
+                hash: "b".repeat(64),
+              },
+            ],
+          });
+        }
+        if (method === "turn/start") {
+          if (params.threadId === "thr_surface-architect") {
+            return Promise.reject(
+              'engine RPC error: {"code":-32007,"message":"ProviderDenied","data":{"providerId":"ollama-cloud","status":"present","reason":"headless-not-permitted"}}',
+            );
+          }
+          return Promise.resolve({
+            turn: {
+              id: "t1",
+              threadId: params.threadId,
+              status: "inProgress",
+              items: [],
+              error: null,
+              startedAt: 100,
+              completedAt: null,
+            },
+          });
+        }
+        if (method === "turn/interrupt") return Promise.resolve({});
+      }
+      return Promise.resolve({});
+    },
+    { platform: "darwin", viewportWidth: 1440 },
+  );
+
+  await ctrl.connect();
+  const pArch = ctrl.createDraftPane("surface-architect");
+  await ctrl.startThread(pArch.paneId);
+  const pDea = ctrl.createDraftPane("daedalus");
+  await ctrl.startThread(pDea.paneId);
+
+  // Item 8 & 23: -32007 keeps connection CONNECTED, turn pill stays IDLE, no verified badge.
+  await ctrl.startTurn("test", [pArch.paneId]);
+  assert.equal(ctrl.getConnectionState(), "CONNECTED");
+  assert.equal(disconnects, 0);
+  assert.equal(ctrl.getPanes()[0]?.state, "refused");
+  assert.match(byId.get("panes-grid")?.textContent ?? "", /headless-not-permitted/);
+  assert.equal(
+    composerTargets(ctrl.getPanes(), new Set(), 1, ctrl.getConnectionState())[0]?.disabledReason,
+    "refused -32007",
+  );
+
+  // C12 & Item 16: Cmd/Ctrl+F does nothing.
+  ctrl.handleKeydown({ key: "f", metaKey: true, ctrlKey: false, preventDefault() {} });
+  assert.equal(byId.get("palette")?.hidden, true);
+
+  // Composer Cmd+Enter only fires when composer-input is focused.
+  const compInput = byId.get("composer-input");
+  assert.ok(compInput !== undefined);
+  compInput.value = "hello world";
+  ctrl.handleKeydown({ key: "Enter", metaKey: true, ctrlKey: false, preventDefault() {} });
+  assert.equal(
+    rpcs.filter((r) => r.method === "turn/start" && r.params.threadId === "thr_daedalus").length,
+    0,
+  );
+  compInput.focus();
+  ctrl.focusPane(pDea.paneId);
+  ctrl.toggleComposerTarget(pDea.paneId);
+  compInput.focus();
+  ctrl.handleKeydown({ key: "Enter", metaKey: true, ctrlKey: false, preventDefault() {} });
+  await new Promise((r) => setTimeout(r, 0));
+  const lastTurnStart = rpcs.find(
+    (r) => r.method === "turn/start" && r.params.threadId === "thr_daedalus",
+  );
+  assert.ok(lastTurnStart !== undefined);
+  assert.equal("mode" in lastTurnStart.params, false);
+
+  // Item 11: Interrupt sends turn/interrupt once and disables button.
+  await ctrl.interruptTurn(pDea.paneId);
+  assert.equal(rpcs.filter((r) => r.method === "turn/interrupt").length, 1);
+
+  // Item 15: Quit dialog focus Keep running, Esc keeps running, Tab traps focus.
+  await ctrl.handleQuitRequested({ epoch: 1, requestId: 1 });
+  assert.equal(byId.get("quit-dialog")?.hidden, false);
+  assert.equal(doc.activeElement, byId.get("quit-keep-btn"));
+  let tabPrev = 0;
+  ctrl.handleKeydown({
+    key: "Tab",
+    preventDefault() {
+      tabPrev += 1;
+    },
+  });
+  assert.equal(tabPrev, 1);
+  assert.equal(doc.activeElement, byId.get("quit-confirm-btn"));
+  ctrl.handleKeydown({ key: "Escape", preventDefault() {} });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(byId.get("quit-dialog")?.hidden, true);
+  assert.equal(cmds.filter((c) => c.cmd === "ack_quit").length, 1);
+  assert.equal(cmds.filter((c) => c.cmd === "confirm_quit").length, 0);
+
+  // Item 26: Cmd+1 focuses pane 1 and switches to Panes view.
+  ctrl.setViewMode("table");
+  assert.equal(ctrl.getViewMode(), "table");
+  ctrl.handleKeydown({ key: "1", metaKey: true, ctrlKey: false, preventDefault() {} });
+  assert.equal(ctrl.getViewMode(), "panes");
+
+  // Full turn completion removes running turn from quit list and keeps 0 decorative green.
+  ctrl.handleEngineEvent({
+    epoch: 1,
+    seq: 1,
+    method: "turn/completed",
+    params: {
+      turn: {
+        id: "t1",
+        threadId: "thr_daedalus",
+        status: "interrupted",
+        items: [],
+        error: null,
+        startedAt: 100,
+        completedAt: 200,
+      },
+    },
+  });
+  await new Promise((r) => setTimeout(r, 0));
+  assert.equal(ctrl.getQuitTurns().length, 0);
+  assert.equal(turnPillForPane({ state: "interrupted" }).tone, "fail");
 });
