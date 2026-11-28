@@ -1950,9 +1950,11 @@ pub trait EventSink: Send + Sync + 'static {
     fn emit_quit_requested(&self, payload: Value) -> Result<(), String>;
 }
 
+#[cfg(test)]
 #[derive(Default)]
 pub struct NullEventSink;
 
+#[cfg(test)]
 impl EventSink for NullEventSink {
     fn emit_engine_event(&self, _payload: Value) -> Result<(), String> {
         Ok(())
@@ -2459,6 +2461,7 @@ pub(crate) struct StopState {
     cancel_stream: Option<UnixStream>,
     spawned: Option<SpawnedServe>,
     in_flight: Option<Arc<StopInFlight>>,
+    #[allow(dead_code)]
     reader_done: Arc<AtomicBool>,
     hooks: Option<Arc<TestStopHooks>>,
 }
@@ -3231,6 +3234,7 @@ impl SocketClient {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
     pub fn reader_done(&self) -> bool {
         self.inner
             .stop_state
@@ -3239,6 +3243,7 @@ impl SocketClient {
             .unwrap_or(true)
     }
 
+    #[cfg(test)]
     pub fn late_reply_count(&self) -> u64 {
         self.inner
             .owner
@@ -3247,6 +3252,7 @@ impl SocketClient {
             .unwrap_or(0)
     }
 
+    #[cfg(test)]
     pub fn discarded_notification_count(&self) -> u64 {
         self.inner
             .owner
@@ -3380,12 +3386,13 @@ impl SocketClient {
         }
     }
 
+    #[cfg(test)]
     pub fn disconnect(self) {
         self.close_and_stop("disconnect", Instant::now() + DISCONNECT_STOP_BOUND);
     }
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, test))]
 pub fn connect_or_spawn(config: &LaunchConfig) -> Result<SocketClient, String> {
     connect_or_spawn_with_sink(config, Arc::new(NullEventSink))
 }
@@ -3598,6 +3605,7 @@ impl DesktopController {
         }
     }
 
+    #[cfg(test)]
     pub fn set_client_for_test(&self, client: SocketClient) {
         *self.stop_fallback.lock().unwrap_or_else(|p| p.into_inner()) =
             Some(Arc::clone(&client.inner.stop_state));
@@ -5618,6 +5626,7 @@ mod tests {
         let tmp = std::env::temp_dir().join(format!("madc-tl2-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&tmp);
         let listener = UnixListener::bind(&tmp).unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
         let peer = thread::spawn(move || {
             let (s1, _) = listener.accept().unwrap();
             let mut w1 = s1.try_clone().unwrap();
@@ -5639,6 +5648,7 @@ mod tests {
                 }
             }
             let _ = w2.flush();
+            let _ = done_rx.recv();
         });
 
         let sink = Arc::new(TestSink::default());
@@ -5660,6 +5670,7 @@ mod tests {
         assert!(err2.contains("overflow"), "got: {err2}");
         assert!(sink.engine_events.lock().unwrap().is_empty(), "Handshake overflow emits nothing (L2)");
 
+        let _ = done_tx.send(());
         peer.join().unwrap();
         let _ = std::fs::remove_file(&tmp);
     }
