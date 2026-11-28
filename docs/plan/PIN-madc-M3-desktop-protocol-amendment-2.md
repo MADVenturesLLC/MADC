@@ -38,6 +38,8 @@
 
 *r18 (2026-11-28, early AM ET): text-only. Folds every Low and Info from MADC Architect r5 and Argus r5 of `90eb51b6` (both MERGE-READY, nothing above Low). The failure-path cite at §4.3 rule 2 is rule 4 (an `exit` pending at `Ok(N)` takes rule 3). The unreachable "clears on next accepted shown-ack" clause is deleted; `QUIT_FALLBACK_TTL` is the only expiry and is counted on a monotonic clock. An empty or whitespace-only `servedModel` falls through to `▲ UNVERIFIED` (D-718 / D-724 stay literal; no Founder question). The quit record uses `settled` only. The "allow" close decision sets `shutting_down` in the same critical section. Test (7s) names its capture script and committed fixture path. A4 §8 and §11 mirror the 8 MiB accepted limit, the emit spike, and the 30 s TTL (builder default, pending Founder confirmation), and add Founder-visible items for the silent second close (while the mark is live) and the `disconnect`/`exit` terminal-reason contract. The r7 and r9 §17 rows are marked superseded by r13. The PR body is not retried; a ready body is at `/workspace/a4-pin-wt-prbody.md`. Dispositions in §17.*
 
+*r19 (2026-11-28, early AM ET): answers Copilot's review of `8512a845` (review `6096698203`, one new High: `4726148909`). The `CONNECTING` handoff branch no longer refers to rules 3 or 4 (those are guarded by `CONNECTED` / `boundEpoch`). After `Ok(N)` with a matching pending terminal, the failure and `exit` transitions are stated in that branch, including pane termination and the single `disconnect_engine` cleanup. Reply `4726148909`. The four outdated r12 Highs are replied, outdated, and still unresolved on GitHub. This is the one allowed follow-up for r18. The PR body is not retried. Dispositions in §17.*
+
 **Authority:**
 
 - `docs/plan/PIN-madc-M3-desktop-protocol.md` (base; §2, §3, §4), blob `2c022f33…` at the base.
@@ -403,7 +405,10 @@ Only `madc/transport-closed` changes connection state. The UI's states are the A
 
 1. **At most once per epoch.** If `ev.epoch <= terminalHandled`, ignore it.
 2. **`CONNECTING` (the connect handoff).** If `ev.epoch` is not below `boundEpoch` (or there is no `boundEpoch`), keep it as `pendingTerminal`; if one is already kept, the higher epoch wins. Otherwise ignore it. Epochs are strictly increasing, and an unpublished epoch emits nothing (L2), so the only terminal that can match is the one for the epoch `connect_engine` is about to return. When `connect_engine` resolves:
-   - `Ok(N)` and `pendingTerminal.epoch === N`: bind N, set `terminalHandled = N`, and take the **failure path** (rule 4), unless `pendingTerminal.reason === "exit"`, in which case take rule 3 (no `FAILED`, no `disconnect_engine`). The UI never enters `CONNECTED` for N.
+   - `Ok(N)` and `pendingTerminal.epoch === N`: bind N, set `terminalHandled = N`. The UI never enters `CONNECTED` for N. Rules 3 and 4's `CONNECTED` / `boundEpoch` guards do **not** apply in this branch, so the transition is stated here, not by reference:
+     - if `pendingTerminal.reason === "exit"`: mark panes with an in-flight turn `ended (connection closed)`. No `FAILED`, no `disconnect_engine`. The §6 exit path is already running.
+     - otherwise: state → `✗ FAILED`; panes with an in-flight turn → `ended (connection closed)`; then **one** `disconnect_engine` under the A3 §6.1 single-flight/cleanup rule (Connect disabled until it settles, no retry, no `connect_engine`). In Rust that call finds `Closed` and runs only the idempotent L7 cleanup.
+     Quit candidates for N, if any, are settled.
    - `Ok(N)` with no matching `pendingTerminal`: enter `CONNECTED` for N and discard `pendingTerminal`.
    - `Err`: take the A3 connect-failure path and discard `pendingTerminal`.
 3. **`ev.epoch === boundEpoch` and `reason === "exit"`: a confirmed quit or `RunEvent::Exit`.** Set `terminalHandled`, and mark panes with an in-flight turn `ended (connection closed)`. No `FAILED`, no `disconnect_engine`. The §6 exit path is already running.
@@ -664,6 +669,7 @@ Killed mutations: discarding the reserved slot on `Terminated → Closed` (Copil
 
 (T-L11) **UI terminal handling and handoff (L11),** table over `acceptTerminal` and `connect_engine` resolution:
 - A terminal for N during `CONNECTING`, then `Ok(N)`: `FAILED`, one `disconnect_engine`, never `CONNECTED`.
+- A terminal for N during `CONNECTING` with `reason === "exit"`, then `Ok(N)`: no `FAILED`, no `disconnect_engine`, never `CONNECTED`; panes with an in-flight turn are marked `ended (connection closed)`.
 - A terminal during `CONNECTING`, then `Err`: discarded.
 - A terminal for N in `CONNECTED`: `FAILED`, one `disconnect_engine`, and no `connect_engine` or `rpc_request` follows.
 - A terminal for N while `disconnectPending`: no `FAILED` and no second `disconnect_engine`; `DISCONNECTED` when the call resolves.
@@ -1071,3 +1077,11 @@ Architect r5 (`REVIEW-pr81-90eb51b6.md`) and Argus r5 (`ARGUS-r5-pr81-90eb51b6.m
 | Argus r5 I-6 | A4 §8 did not mirror amendment 2 §12 items 6 and 8 or the TTL | **Fixed.** A4 §8 items 8–10 and the §11 Founder-visible table now mirror the emit spike, the `shutdown(Both)` wake, and `QUIT_FALLBACK_TTL = 30 s` (builder default, pending Founder confirmation). |
 | Argus r5 I-7 | Forward-compat: a later engine event type would F2 `session/read` | **Carried**, already accepted in r14 (Architect L-3 then) as a named choice. No tightening in r18. |
 | A4 §11 Founder-visible | Architect §6 and Argus: the silent second close and the `disconnect`/`exit` contract were not in the A4 Founder-visible list | **Fixed.** The §11 Founder-visible table now includes: (a) while the quit-fallback mark is live (within the TTL after a dialog that never rendered, or after a failed emit), a second close silently exits and interrupts turns, with no dialog; after the TTL, a later close shows the dialog again; (b) the r13 `madc/transport-closed` reason `disconnect`/`exit` contract change. The silent-exit path is the one both reviewers described (while the mark is live), not after the TTL expires. |
+
+### r19 — Copilot review of `8512a845` (2026-11-28, early AM ET)
+
+Copilot review `6096698203` of head `8512a845d192bba7d733d2ecfb321c8e9782bcb7` (3:12 AM ET) opened one new High and again listed the four outdated r12 threads (N13–N16), which are replied, outdated, and still unresolved on GitHub. Docs only; sources not edited; this PR is not merged; the PR body is not retried. FDR-A4-6 is unchanged. This is the one allowed follow-up for r18.
+
+| # | Finding | Disposition |
+| --- | --- | --- |
+| C18-1 (`4726148909`, High) | The `CONNECTING` handoff branch cited the failure path as rule 4 (and `exit` as rule 3), but those rules are guarded by `CONNECTED` and `ev.epoch === boundEpoch`; during the handoff the UI is still `CONNECTING` and `boundEpoch` may not yet be set, so a literal reading left the transition and cleanup undefined | **Fixed.** After `Ok(N)` with a matching pending terminal, that branch states the transitions itself: `exit` marks in-flight panes ended, with no `FAILED` and no `disconnect_engine`; any other reason is `FAILED`, panes ended, and one `disconnect_engine` under the A3 §6.1 single-flight/cleanup rule. The UI never enters `CONNECTED` for N. Test (T-L11) covers both the failure and `exit` handoff cases. Reply `4726148909`. |
